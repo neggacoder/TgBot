@@ -1,0 +1,250 @@
+"""Аккаунты, сессии и права веб-панели.
+
+Панель рассчитана на публикацию наружу (Tailscale Funnel отдаёт её в
+интернет, а не только в вашу сеть), поэтому здесь всё нарочито строго:
+пароли — только argon2id-хешем, сессия — подписанная кука с истечением,
+неудачные входы считаются и блокируются, а любой мутирующий запрос требует
+CSRF-токен.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+import sys
+from dataclasses import dataclass
+from typing import Optional
+
+# см. комментарий в __init__.py — модули бота лежат уровнем выше
+_BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BOT_DIR not in sys.path:
+    sys.path.insert(0, _BOT_DIR)
+
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from fastapi import HTTPException, Request, status
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+
+import db
+
+logger = logging.getLogger(__name__)
+
+SESSION_COOKIE = "botpanel_session"
+CSRF_COOKIE = "botpanel_csrf"
+CSRF_HEADER = "X-CSRF-Token"
+
+SESSION_TTL_SECONDS = 12 * 3600
+# Порог перебора: после стольких неудач за окно вход временно закрывается.
+LOGIN_FAIL_LIMIT = 7
+LOGIN_FAIL_WINDOW_MINUTES = 15
+
+MIN_PASSWORD_LENGTH = 10
+
+ROLE_OWNER = "owner"
+ROLE_ADMIN = "admin"
+ROLE_MEMBER = "member"
+STAFF_ROLES = (ROLE_OWNER, ROLE_ADMIN)
+
+_hasher = PasswordHasher()
+
+
+@dataclass
+class PanelUser:
+    id: int
+    username: str
+    role: str
+    tg_user_id: Optional[int] = None
+    tg_full_name: Optional[str] = None
+
+    @property
+    def is_owner(self) -> bool:
+        return self.role == ROLE_OWNER
+
+    @property
+    def is_member(self) -> bool:
+        return self.role == ROLE_MEMBER
+
+    @property
+    def display_name(self) -> str:
+        return self.tg_full_name or self.username
+
+
+def hash_password(password: str) -> str:
+    return _hasher.hash(password)
+
+
+def verify_password(password_hash: str, password: str) -> bool:
+    try:
+        _hasher.verify(password_hash, password)
+        return True
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
+
+
+def needs_rehash(password_hash: str) -> bool:
+    try:
+        return _hasher.check_needs_rehash(password_hash)
+    except Exception:
+        return False
+
+
+def validate_password(password: str) -> Optional[str]:
+    """Возвращает текст ошибки или None, если пароль годится."""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Пароль должен быть не короче {MIN_PASSWORD_LENGTH} символов."
+    if password.isdigit():
+        return "Пароль из одних цифр слишком легко подобрать."
+    if password.lower() in {"password", "qwerty123456", "administrator"}:
+        return "Это слишком очевидный пароль."
+    return None
+
+
+def validate_username(username: str) -> Optional[str]:
+    if not (3 <= len(username) <= 64):
+        return "Логин должен быть от 3 до 64 символов."
+    if not all(ch.isalnum() or ch in "._-" for ch in username):
+        return "В логине можно использовать буквы, цифры, точку, дефис и подчёркивание."
+    return None
+
+
+# --- сессии ---------------------------------------------------------------
+
+def _session_secret() -> str:
+    """Ключ подписи сессий.
+
+    Берётся из окружения; если не задан — генерируется разовый, и тогда все
+    сессии умрут при перезапуске. Это неудобно, но безопаснее, чем зашитый
+    в код секрет.
+    """
+    secret = os.getenv("PANEL_SESSION_SECRET")
+    if not secret:
+        secret = _RUNTIME_SECRET
+    return secret
+
+
+_RUNTIME_SECRET = secrets.token_urlsafe(48)
+
+
+def _serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(_session_secret(), salt="botpanel-session")
+
+
+def issue_session(user_id: int) -> str:
+    return _serializer().dumps({"uid": user_id})
+
+
+def read_session(token: str) -> Optional[int]:
+    try:
+        data = _serializer().loads(token, max_age=SESSION_TTL_SECONDS)
+        return int(data["uid"])
+    except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
+        return None
+
+
+def new_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+# --- защита от перебора ---------------------------------------------------
+
+def client_ip(request: Request) -> Optional[str]:
+    """IP клиента с учётом обратного прокси Tailscale."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return request.client.host[:64] if request.client else None
+
+
+async def login_is_blocked(username: str, ip: Optional[str]) -> bool:
+    fails = await db.count_failed_logins(username, ip, LOGIN_FAIL_WINDOW_MINUTES)
+    return fails >= LOGIN_FAIL_LIMIT
+
+
+# --- проверка запроса -----------------------------------------------------
+
+async def current_user(request: Request) -> Optional[PanelUser]:
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+    user_id = read_session(token)
+    if user_id is None:
+        return None
+    row = await db.get_panel_user_by_id(user_id)
+    if not row or row.get("disabled"):
+        return None
+    return PanelUser(
+        id=row["id"], username=row["username"], role=row["role"],
+        tg_user_id=row.get("tg_user_id"), tg_full_name=row.get("tg_full_name"),
+    )
+
+
+async def require_user(request: Request) -> PanelUser:
+    """Доступ для ПЕРСОНАЛА (owner/admin). Участник (member) сюда НЕ проходит —
+    так все существующие админ-эндпоинты, висящие на require_user, остаются
+    закрытыми для участников без пере-аудита каждого. Участник ходит через
+    require_member (отдельные read-only эндпоинты)."""
+    user = await current_user(request)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Нужен вход")
+    if user.role not in STAFF_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Доступно только администраторам")
+    return user
+
+
+async def require_member(request: Request) -> PanelUser:
+    """Доступ для аккаунта-участника (роль member) — а также для персонала
+    (admin/owner), самостоятельно привязавшего свой аккаунт к Telegram
+    (POST /api/link-telegram): тогда те же member-эндпоинты работают под их
+    собственным tg_user_id, дополнительно к обычной админ-панели."""
+    user = await current_user(request)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Нужен вход")
+    if user.is_member:
+        return user
+    if user.role in STAFF_ROLES and user.tg_user_id is not None:
+        return user
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Раздел для участников")
+
+
+async def require_owner(request: Request) -> PanelUser:
+    user = await require_user(request)
+    if not user.is_owner:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Доступно только владельцу")
+    return user
+
+
+def verify_csrf(request: Request) -> None:
+    """Сверяет токен из заголовка с кукой (double submit cookie).
+
+    Без этого любой сторонний сайт мог бы, пока вы залогинены, заставить ваш
+    браузер отправить сообщение от имени бота.
+    """
+    sent = request.headers.get(CSRF_HEADER)
+    expected = request.cookies.get(CSRF_COOKIE)
+    if not sent or not expected or not secrets.compare_digest(sent, expected):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Неверный CSRF-токен")
+
+
+# --- первый запуск --------------------------------------------------------
+
+_setup_token: Optional[str] = None
+
+
+def setup_token() -> Optional[str]:
+    return _setup_token
+
+
+def generate_setup_token() -> str:
+    global _setup_token
+    _setup_token = secrets.token_urlsafe(24)
+    return _setup_token
+
+
+def clear_setup_token() -> None:
+    global _setup_token
+    _setup_token = None
+
+
+def check_setup_token(token: str) -> bool:
+    return bool(_setup_token) and secrets.compare_digest(token, _setup_token or "")

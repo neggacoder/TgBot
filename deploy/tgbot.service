@@ -1,0 +1,46 @@
+[Unit]
+Description=Телеграм-бот (long polling)
+Documentation=file:/opt/neongelion/bot/README.md
+After=network-online.target mysql.service
+Wants=network-online.target
+
+# systemd 229+ ждёт эти ключи именно в [Unit] — в [Service] они игнорируются.
+StartLimitBurst=5
+StartLimitIntervalSec=180
+
+[Service]
+Type=simple
+User=neongelion
+Group=neongelion
+WorkingDirectory=/opt/neongelion/bot
+
+ExecStart=/opt/neongelion/bot/venv/bin/python bot.py
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgbot
+
+# --- ограничение прав ------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# В отличие от панели, боту нужно писать на диск: при первом запуске он
+# скачивает шрифты и картинки эмодзи для стикеров-цитат в bot/assets/,
+# а «.скажи» складывает временные mp3 в /tmp (он приватный, см. PrivateTmp).
+ReadWritePaths=/opt/neongelion/bot/assets
+
+[Install]
+WantedBy=multi-user.target

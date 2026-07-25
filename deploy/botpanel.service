@@ -1,0 +1,57 @@
+[Unit]
+Description=Веб-панель управления телеграм-ботом
+Documentation=file:/opt/neongelion/bot/README.md
+# Панель без базы бесполезна: ждём и сеть, и MySQL. Если MySQL на другой
+# машине — строку с mysql.service уберите, останется только сеть.
+After=network-online.target mysql.service
+Wants=network-online.target
+
+# Если панель падает сразу при старте (нет BOT_TOKEN, недоступна база) —
+# перестаём долбиться и оставляем сервис в failed, чтобы это было заметно.
+# Начиная с systemd 229 эти два ключа относятся именно к [Unit]; в [Service]
+# они молча игнорируются.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+User=neongelion
+Group=neongelion
+WorkingDirectory=/opt/neongelion/bot
+
+# .env читает сам python-dotenv из WorkingDirectory, поэтому EnvironmentFile
+# здесь не нужен — и заодно не приходится подгонять .env под более строгий
+# синтаксис systemd (он не понимает кавычки и подстановки как shell).
+ExecStart=/opt/neongelion/bot/venv/bin/python -m webpanel
+
+Restart=always
+RestartSec=5
+
+# Логи уходят в journalctl -u botpanel
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botpanel
+
+# --- ограничение прав ------------------------------------------------------
+# Панель смотрит в интернет через Tailscale Funnel, поэтому даём ей минимум:
+# читать свой каталог, писать — никуда.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Ограничивать исходящие адреса (IPAddressAllow) здесь НЕЛЬЗЯ: панель сама
+# ходит в api.telegram.org, чтобы отправлять сообщения от имени бота.
+# Слушающий сокет и так поднят только на 127.0.0.1 — см. PANEL_HOST.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+{
+  "notify_chat_id": -1003006533138,
+  "notify_topic_id": 23849,
+  "invite_link": "https://t.me/AcademHall",
+  "admin_ids": [
+    8114583471,
+    7199505649
+  ],
+  "welcome_message": null,
+  "link_message_template": null,
+  "reject_message": null,
+  "test_mode_admins": []
+}

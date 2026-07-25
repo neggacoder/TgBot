@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark light">
+<title>Панель управления ботом</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Спрайт иконок. Инлайном, потому что политика безопасности страницы
+     запрещает грузить что-либо со сторонних адресов, а иконочные шрифты
+     ещё и мигают при загрузке. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="ic-send" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4 20-7z"/></symbol>
+    <symbol id="ic-chats" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="ic-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+    <symbol id="ic-chart" viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></symbol>
+    <symbol id="ic-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.36.44.63.82.76H21a2 2 0 0 1 0 4h-.09c-.38.13-.68.4-.82.76z"/></symbol>
+    <symbol id="ic-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+    <!-- Для раздела «Аккаунты» — карточка-удостоверение: ключ в 18px читается
+         как символ Марса, а не как ключ. -->
+    <symbol id="ic-id" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><circle cx="8.5" cy="10" r="2"/><path d="M5 16.5c.6-1.4 1.9-2.2 3.5-2.2s2.9.8 3.5 2.2M15 9.5h4M15 13.5h4"/></symbol>
+    <symbol id="ic-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+    <symbol id="ic-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></symbol>
+    <symbol id="ic-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></symbol>
+    <symbol id="ic-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></symbol>
+    <symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="ic-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="ic-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
+    <symbol id="ic-empty" viewBox="0 0 24 24"><path d="M21 15V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9m18 0-3-3H6l-3 3m18 0v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3"/></symbol>
+    <symbol id="ic-bot" viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M9 14h.01M15 14h.01"/><circle cx="12" cy="3" r="1"/></symbol>
+    <symbol id="ic-mute" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5zM23 9l-6 6M17 9l6 6"/></symbol>
+    <symbol id="ic-unmute" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5zM15.54 8.46a5 5 0 0 1 0 7.07"/></symbol>
+    <symbol id="ic-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+    <symbol id="ic-kick" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M18 8l4 4-4 4"/></symbol>
+    <symbol id="ic-undo" viewBox="0 0 24 24"><path d="M3 7v6h6"/><path d="M3.51 13a9 9 0 1 0 2.13-9.36L3 7"/></symbol>
+    <symbol id="ic-crown" viewBox="0 0 24 24"><path d="M3 7l4 4 5-7 5 7 4-4v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></symbol>
+    <!-- Роли чата: театральная маска — роль как амплуа, а не как уровень прав
+         (для тех иконка-корона, #ic-crown). -->
+    <symbol id="ic-mask" viewBox="0 0 24 24"><path d="M4 4h16v7a8 8 0 0 1-8 8 8 8 0 0 1-8-8V4z"/><path d="M8.5 9.5h.01M15.5 9.5h.01M9 14c.8.8 1.9 1.2 3 1.2s2.2-.4 3-1.2"/></symbol>
+    <symbol id="ic-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="ic-user" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+    <!-- Типы вложений в ленте: бот присылает их строкой с эмодзи в начале,
+         панель рисует своей иконкой — см. mediaKind() в app.js. -->
+    <symbol id="ic-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></symbol>
+    <symbol id="ic-video" viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="m22 8-6 4 6 4V8z"/></symbol>
+    <symbol id="ic-file" viewBox="0 0 24 24"><path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7l-5-5z"/><path d="M14 2v5h5"/></symbol>
+    <symbol id="ic-sticker" viewBox="0 0 24 24"><path d="M15 3H6a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h6l9-9V6a3 3 0 0 0-3-3z"/><path d="M12 21v-6h6"/></symbol>
+    <symbol id="ic-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10z"/></symbol>
+    <!-- Переключатель темы и шпаргалка по горячим клавишам -->
+    <symbol id="ic-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 1.6v2.6M12 19.8v2.6M4.2 4.2l1.9 1.9M17.9 17.9l1.9 1.9M1.6 12h2.6M19.8 12h2.6M4.2 19.8l1.9-1.9M17.9 6.1l1.9-1.9"/></symbol>
+    <symbol id="ic-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+    <symbol id="ic-keyboard" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></symbol>
+    <!-- РП-действия и себяшки -->
+    <symbol id="ic-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+    <symbol id="ic-power" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></symbol>
+    <!-- Права администратора Telegram: бот подписывает их эмодзи (в чате это
+         уместно), панель рисует иконками — см. RIGHT_ICONS в app.js. -->
+    <symbol id="ic-pin" viewBox="0 0 24 24"><path d="M12 17v5M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6z"/></symbol>
+    <symbol id="ic-tag" viewBox="0 0 24 24"><path d="M20.6 13.4 12 22l-9-9V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5"/></symbol>
+    <symbol id="ic-eye-off" viewBox="0 0 24 24"><path d="M17.9 17.9A9.9 9.9 0 0 1 12 20c-7 0-11-8-11-8a19 19 0 0 1 5.1-6.1m3.9-1.7A10 10 0 0 1 12 4c7 0 11 8 11 8a19 19 0 0 1-2.3 3.4M1 1l22 22"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
+    <symbol id="ic-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+    <symbol id="ic-sliders" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+    <symbol id="ic-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="ic-spark" viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></symbol>
+    <symbol id="ic-heart" viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 1 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z"/></symbol>
+    <symbol id="ic-ring" viewBox="0 0 24 24"><circle cx="12" cy="14" r="7"/><path d="M9 3h6l-1.5 4h-3z"/></symbol>
+    <symbol id="ic-medal" viewBox="0 0 24 24"><circle cx="12" cy="15" r="6"/><path d="M8.5 2 12 9l3.5-7"/></symbol>
+    <symbol id="ic-shield-x" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9.5 9.5l5 5m0-5-5 5"/></symbol>
+  </defs>
+</svg>
+
+<!-- Экран входа / первой настройки -->
+<div id="auth" class="auth hidden">
+  <form class="auth-card" id="auth-form">
+    <div class="auth-logo"><svg class="ic"><use href="#ic-bot"/></svg></div>
+    <h1 id="auth-title">Вход в панель</h1>
+    <p class="hint" id="auth-hint">Введите логин и пароль.</p>
+    <div id="auth-msg"></div>
+    <label><span>Логин</span><input type="text" id="auth-user" autocomplete="username" required></label>
+    <label><span>Пароль</span><input type="password" id="auth-pass" autocomplete="current-password" required></label>
+    <button class="primary block" type="submit">Войти</button>
+    <button type="button" class="link-btn" id="member-toggle">Я участник — войти по коду</button>
+  </form>
+
+  <!-- Вход участника по одноразовому коду от бота (команда «сайт» в личке) -->
+  <form class="auth-card hidden" id="member-form">
+    <div class="auth-logo"><svg class="ic"><use href="#ic-user"/></svg></div>
+    <h1>Вход участника</h1>
+    <p class="hint">Напишите боту в личку слово «сайт» — он пришлёт код. Введите его здесь.</p>
+    <div id="member-msg"></div>
+    <label><span>Код</span><input type="text" id="member-code" autocomplete="one-time-code" placeholder="Например, K7P2M9QF" required></label>
+    <button class="primary block" type="submit">Войти</button>
+    <button type="button" class="link-btn" id="member-back">← Вход для персонала</button>
+  </form>
+</div>
+
+<!-- Экран участника: read-only обзор того, что умеет бот -->
+<div id="member" class="member-screen hidden">
+  <header class="member-head">
+    <div class="brand">
+      <svg class="ic brand-ic"><use href="#ic-bot"/></svg>
+      <div><b>Что умеет бот</b><small id="member-who"></small></div>
+    </div>
+    <div class="member-head-actions">
+      <!-- Только у персонала (admin/owner), самостоятельно привязавшего свой
+           аккаунт к Telegram: чистый участник сюда попадает напрямую и
+           возвращаться ему некуда. -->
+      <button class="ghost hidden" id="member-back-to-panel"><svg class="ic"><use href="#ic-undo"/></svg>Назад в панель</button>
+      <button class="ghost theme-btn" id="member-theme" title="Сменить тему">
+        <svg class="ic ic-moon-part"><use href="#ic-moon"/></svg>
+        <svg class="ic ic-sun-part"><use href="#ic-sun"/></svg>
+      </button>
+      <button class="ghost" id="member-logout"><svg class="ic"><use href="#ic-logout"/></svg>Выйти</button>
+    </div>
+  </header>
+  <nav class="member-tabs" id="member-tabs">
+    <button type="button" class="member-tab active" data-mtab="rel"><svg class="ic"><use href="#ic-heart"/></svg>Отношения</button>
+    <button type="button" class="member-tab" data-mtab="family"><svg class="ic"><use href="#ic-crown"/></svg>Семья</button>
+    <button type="button" class="member-tab" data-mtab="clans"><svg class="ic"><use href="#ic-shield"/></svg>Кланы</button>
+    <button type="button" class="member-tab" data-mtab="caps"><svg class="ic"><use href="#ic-message"/></svg>Возможности</button>
+  </nav>
+  <main class="member-content" id="member-content">
+    <div id="member-toast" class="toast-area"></div>
+    <div class="member-panel" data-panel="rel"><div id="member-rel"></div></div>
+    <div class="member-panel hidden" data-panel="family"><div id="member-family"></div></div>
+    <div class="member-panel hidden" data-panel="clans"><div id="member-clans"></div></div>
+    <div class="member-panel hidden" data-panel="caps"><div id="member-caps"></div></div>
+  </main>
+</div>
+
+<!-- Основной интерфейс -->
+<div id="app" class="layout hidden">
+  <nav class="sidebar">
+    <div class="brand">
+      <svg class="ic brand-ic"><use href="#ic-bot"/></svg>
+      <div><b>Панель бота</b><small id="who"></small></div>
+    </div>
+
+    <button class="nav-btn active" data-view="send"><svg class="ic"><use href="#ic-send"/></svg>Написать</button>
+    <button class="nav-btn" data-view="chats"><svg class="ic"><use href="#ic-chats"/></svg>Чаты и люди</button>
+    <button class="nav-btn" data-view="chatroles"><svg class="ic"><use href="#ic-mask"/></svg>Роли чата</button>
+    <button class="nav-btn" data-view="moderation"><svg class="ic"><use href="#ic-shield"/></svg>Модерация</button>
+    <button class="nav-btn" data-view="complaints"><svg class="ic"><use href="#ic-alert"/></svg>Жалобы
+      <span class="nav-count hidden" id="complaints-badge">0</span></button>
+    <button class="nav-btn owner-only hidden" data-view="tgadmins"><svg class="ic"><use href="#ic-crown"/></svg>Админы чата</button>
+    <button class="nav-btn" data-view="stats"><svg class="ic"><use href="#ic-chart"/></svg>Статистика</button>
+    <button class="nav-btn" data-view="actions"><svg class="ic"><use href="#ic-wand"/></svg>Действия</button>
+    <button class="nav-btn" data-view="cmdtree"><svg class="ic"><use href="#ic-sliders"/></svg>Дерево команд</button>
+    <button class="nav-btn" data-view="settings"><svg class="ic"><use href="#ic-settings"/></svg>Настройки</button>
+    <button class="nav-btn owner-only hidden" data-view="users"><svg class="ic"><use href="#ic-id"/></svg>Аккаунты</button>
+
+    <div class="sidebar-foot">
+      <button class="ghost block theme-btn" id="theme-toggle" title="Сменить тему (T)">
+        <svg class="ic ic-moon-part"><use href="#ic-moon"/></svg>
+        <svg class="ic ic-sun-part"><use href="#ic-sun"/></svg>
+        <span id="theme-label">Тема</span>
+      </button>
+      <button class="ghost block" id="keys-help" title="Горячие клавиши (?)">
+        <svg class="ic"><use href="#ic-keyboard"/></svg>Клавиши
+      </button>
+      <button class="ghost block" id="logout"><svg class="ic"><use href="#ic-logout"/></svg>Выйти</button>
+    </div>
+  </nav>
+
+  <main class="content">
+    <div id="global-msg" class="toast-area"></div>
+
+    <!-- Написать -->
+    <section class="view" id="view-send">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-send"/></svg>Написать от имени бота</h2>
+        <p class="sub">Сообщение уйдёт в чат от бота. Действие попадёт в журнал.</p>
+      </header>
+
+      <!-- Форма и лента чата стоят рядом: пишешь, глядя на то, что сейчас
+           происходит в чате, а не прокручивая страницу туда-сюда. -->
+      <div class="split">
+        <div>
+          <div class="card">
+            <label><span>Чат</span><select id="send-chat"></select></label>
+
+            <label>
+              <span>Текст <em class="tip">можно HTML: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;, &lt;a href&gt; · Ctrl+Enter — отправить</em></span>
+              <textarea id="send-text" placeholder="Что написать в чат…"></textarea>
+              <em class="counter" id="send-counter">0 / 4096</em>
+            </label>
+            <div id="reply-chip" class="reply-chip hidden"></div>
+
+            <div class="row">
+              <label class="narrow"><span>Ответ на сообщение</span><input type="number" id="send-reply" placeholder="ID"></label>
+              <label class="narrow"><span>Топик</span><input type="number" id="send-topic" placeholder="ID"></label>
+            </div>
+
+            <div class="form-foot">
+              <button class="primary" id="send-btn"><svg class="ic"><use href="#ic-send"/></svg>Отправить</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3><svg class="ic"><use href="#ic-image"/></svg>Картинка</h3>
+            <label><span>Файл</span><input type="file" id="send-photo" accept="image/*"></label>
+            <label><span>Подпись</span><input type="text" id="send-caption" placeholder="Необязательно"></label>
+            <div class="form-foot">
+              <button class="ghost" id="send-photo-btn"><svg class="ic"><use href="#ic-image"/></svg>Отправить картинку</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="sticky-col">
+          <!-- Лента последних сообщений. Клик по строке подставляет её id в
+               «Ответ на сообщение» — иначе id пришлось бы искать руками. -->
+          <div class="card feed" id="feed">
+            <div class="feed-head">
+              <span>Последние сообщения</span>
+              <span class="feed-status" id="feed-status">подключение…</span>
+            </div>
+            <div class="feed-list" id="feed-list"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Чаты и люди -->
+    <section class="view hidden" id="view-chats">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-chats"/></svg>Чаты и люди</h2>
+        <p class="sub">Участники — это те, кого бот видел в чате.</p>
+      </header>
+
+      <div class="card">
+        <h3>Чаты</h3>
+        <div class="table-wrap">
+          <table><thead><tr><th>Чат</th><th>ID</th><th class="num">Людей</th></tr></thead>
+            <tbody id="chats-table"></tbody></table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Участники</h3>
+        <div class="row">
+          <label><span>Чат</span><select id="members-chat"></select></label>
+          <label>
+            <span>Поиск</span>
+            <span class="input-icon">
+              <svg class="ic"><use href="#ic-search"/></svg>
+              <input type="text" id="members-q" placeholder="Имя, @ник, ID или роль («модер»)">
+            </span>
+          </label>
+          <label class="narrow"><span>Роль</span>
+            <select id="members-role"><option value="">Любая</option></select>
+          </label>
+          <label class="narrow"><span>Сортировка</span>
+            <select id="members-sort">
+              <option value="recent">Недавно активные</option>
+              <option value="messages_desc">Больше сообщений</option>
+              <option value="messages_asc">Меньше сообщений</option>
+              <option value="name">По имени</option>
+            </select>
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table><thead><tr><th>Участник</th><th>Роль</th><th>Ник</th><th>Сообщ.</th><th>ID</th><th></th></tr></thead>
+            <tbody id="members-table"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Роли чата (chat_roles) — именные роли участников. Не путать с ролями
+         на вкладке «Чаты и люди»: там уровни прав в боте. -->
+    <section class="view hidden" id="view-chatroles">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-mask"/></svg>Роли чата</h2>
+        <p class="sub">Кто какую роль носит, какие свободны и какие забронированы.
+          Занимают и меняют роли в чате — здесь только просмотр.</p>
+      </header>
+
+      <div class="card">
+        <div class="row">
+          <label><span>Чат</span><select id="chatroles-chat"></select></label>
+          <label>
+            <span>Поиск</span>
+            <span class="input-icon">
+              <svg class="ic"><use href="#ic-search"/></svg>
+              <input type="text" id="chatroles-q" placeholder="Название роли, категория, имя или @ник участника">
+            </span>
+          </label>
+          <label class="narrow"><span>Категория</span>
+            <select id="chatroles-category"><option value="">Любая</option></select>
+          </label>
+        </div>
+        <div class="chips" id="chatroles-filters"></div>
+      </div>
+
+      <div class="card">
+        <h3>Добавить роль</h3>
+        <form class="row" id="chatrole-add">
+          <label><span>Название</span>
+            <input type="text" id="chatrole-name" maxlength="64" placeholder="Например, Аска Лэнгли" required>
+          </label>
+          <label class="narrow"><span>Категория</span>
+            <input type="text" id="chatrole-category" maxlength="64" placeholder="Необязательно">
+          </label>
+          <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
+        </form>
+        <p class="sub">Роль появится в списке сразу — модерацию проходят только заявки от участников.</p>
+      </div>
+
+      <div class="card">
+        <h3>Роли</h3>
+        <div id="chatroles-list"></div>
+      </div>
+    </section>
+
+    <!-- Модерация -->
+    <section class="view hidden" id="view-moderation">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-shield"/></svg>Модерация</h2>
+        <p class="sub">Начните вводить имя — участник подставится из списка.
+          Можно и наоборот: нажать «Модерация» в строке на вкладке «Чаты и люди».</p>
+      </header>
+
+      <!-- Фильтр слов: сообщения с этими словами бот удаляет сразу (админы
+           освобождены). Список общий для бота. -->
+      <div class="card">
+        <h3><svg class="ic"><use href="#ic-ban"/></svg>Фильтр слов
+          <span class="rights-count" id="word-filter-count">0</span></h3>
+        <p class="sub">Сообщение с любым из этих слов бот удаляет немедленно. Совпадение
+          по целому слову, без учёта регистра. На администраторов не действует.</p>
+        <form class="row" id="word-filter-add">
+          <label><span>Слово или фраза</span>
+            <input type="text" id="word-filter-input" maxlength="128" placeholder="например: спам" required>
+          </label>
+          <button class="danger" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Запретить</button>
+        </form>
+        <div id="word-filter-list" class="chips"></div>
+      </div>
+
+      <!-- Заявки на рест: показываем только когда они есть, чтобы пустой блок
+           не занимал место над рабочей формой. -->
+      <div class="card hidden" id="rest-requests-card">
+        <h3><svg class="ic"><use href="#ic-clock"/></svg>Заявки на рест
+          <span class="rights-count" id="rest-requests-count">0</span></h3>
+        <p class="sub">Пока рест действует, участник не считается неактивным и его не зовёт созыв.</p>
+        <div id="rest-requests-list"></div>
+      </div>
+
+      <div class="card">
+        <label><span>Чат</span><select id="mod-chat"></select></label>
+
+        <div class="row">
+          <label>
+            <span>Кого модерируем</span>
+            <span class="input-icon">
+              <svg class="ic"><use href="#ic-search"/></svg>
+              <input type="text" id="mod-search" placeholder="Имя, @ник, ID или роль («модер»)" autocomplete="off">
+            </span>
+          </label>
+          <label class="narrow"><span>Роль</span>
+            <select id="mod-role"><option value="">Любая</option></select>
+          </label>
+        </div>
+
+        <div id="mod-picked" class="picked hidden"></div>
+        <div id="mod-suggest" class="suggest hidden"></div>
+
+        <!-- Список подставляет сюда user_id; поле остаётся на случай, когда
+             человека ещё нет в known_users (бот его не видел) и ID известен
+             из другого места. -->
+        <details id="mod-manual">
+          <summary>Указать ID вручную</summary>
+          <label><span>ID участника</span><input type="number" id="mod-user" placeholder="123456789"></label>
+        </details>
+
+        <div class="row">
+          <label class="narrow"><span>Минут <em class="tip">0 — навсегда</em></span><input type="number" id="mod-minutes" value="60"></label>
+          <label><span>Причина</span><input type="text" id="mod-reason" placeholder="Необязательно"></label>
+        </div>
+
+        <!-- Снимающие наказание кнопки отделены от карающих: раньше «Снять
+             мут» и «Бан» выглядели одинаково и стояли вперемешку. -->
+        <div class="actions">
+          <button class="ghost" data-mod="unmute"><svg class="ic"><use href="#ic-unmute"/></svg>Снять мут</button>
+          <button class="ghost" data-mod="unban"><svg class="ic"><use href="#ic-undo"/></svg>Разбан</button>
+          <span class="sep"></span>
+          <button class="danger" data-mod="mute"><svg class="ic"><use href="#ic-mute"/></svg>Мут</button>
+          <button class="danger" data-mod="kick"><svg class="ic"><use href="#ic-kick"/></svg>Кик</button>
+          <button class="danger" data-mod="ban"><svg class="ic"><use href="#ic-ban"/></svg>Бан</button>
+        </div>
+        <p class="hint">Telegram не даёт ограничивать администраторов, поэтому при муте или бане
+          админа бот сначала снимает с него права и запоминает их. «Снять мут» и «Разбан»
+          возвращают права обратно.</p>
+      </div>
+
+      <!-- Варны выбранного участника. Показываются, только когда человек
+           выбран: без него блок пустой и лишний. -->
+      <div class="card hidden" id="mod-warns-card">
+        <h3><svg class="ic"><use href="#ic-alert"/></svg>Предупреждения
+          <span class="rights-count" id="mod-warns-count">0</span></h3>
+        <p class="sub" id="mod-warns-hint">При достижении лимита бот банит участника и обнуляет счётчик.</p>
+        <div id="mod-warns-list"></div>
+        <div class="row">
+          <label class="narrow"><span>Дней <em class="tip">пусто — 7</em></span>
+            <input type="number" id="mod-warn-days" min="1" max="3650" placeholder="7">
+          </label>
+          <label><span>Причина</span><input type="text" id="mod-warn-reason" placeholder="Необязательно"></label>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="mod-unwarn"><svg class="ic"><use href="#ic-undo"/></svg>Снять последний</button>
+          <span class="sep"></span>
+          <button class="danger" id="mod-warn"><svg class="ic"><use href="#ic-alert"/></svg>Выдать варн</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Жалобы -->
+    <section class="view hidden" id="view-complaints">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-alert"/></svg>Жалобы</h2>
+        <p class="sub">Жалобу можно подать анонимно — тогда её автор не показывается
+          нигде, включая эту страницу. Решение по жалобе видно только администраторам.</p>
+      </header>
+
+      <div class="split">
+        <div class="card">
+          <h3>На кого жалуются</h3>
+          <div id="complaints-targets"></div>
+        </div>
+        <div class="card">
+          <h3 id="complaints-title">Выберите человека</h3>
+          <div id="complaints-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Админы чата (Telegram) -->
+    <section class="view hidden" id="view-tgadmins">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-crown"/></svg>Администраторы чата</h2>
+        <p class="sub">Настоящий статус администратора в Telegram — не путать с уровнями бота
+          («модератор», «администратор»), которые показаны у участников. Боту нужно право
+          «Добавление новых администраторов», и снимать он может только тех, кого назначал сам.</p>
+      </header>
+
+      <div class="card">
+        <label><span>Чат</span><select id="tga-chat"></select></label>
+        <div id="tga-list"></div>
+      </div>
+
+      <div class="card">
+        <h3><svg class="ic"><use href="#ic-plus"/></svg>Назначить администратора</h3>
+        <label>
+          <span>Кого назначаем</span>
+          <span class="input-icon">
+            <svg class="ic"><use href="#ic-search"/></svg>
+            <input type="text" id="tga-search" placeholder="Имя, @ник или ID" autocomplete="off">
+          </span>
+        </label>
+        <div id="tga-picked" class="picked hidden"></div>
+        <div id="tga-suggest" class="suggest hidden"></div>
+
+        <label class="narrow"><span>Должность <em class="tip">необязательно</em></span>
+          <input type="text" id="tga-title" maxlength="16" placeholder="например: Смотритель">
+        </label>
+
+        <span class="field-title">Права</span>
+        <div id="tga-rights"></div>
+
+        <div class="form-foot">
+          <button class="primary" id="tga-promote"><svg class="ic"><use href="#ic-crown"/></svg>Назначить</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Статистика -->
+    <section class="view hidden" id="view-stats">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-chart"/></svg>Статистика</h2>
+        <p class="sub">По выбранному чату за период.</p>
+      </header>
+
+      <div class="card">
+        <div class="row">
+          <label><span>Чат</span><select id="stats-chat"></select></label>
+          <label class="narrow"><span>Дней</span><input type="number" id="stats-days" value="7"></label>
+          <div class="grow-0"><button class="primary" id="stats-load"><svg class="ic"><use href="#ic-chart"/></svg>Показать</button></div>
+        </div>
+        <div id="stats-out"></div>
+      </div>
+
+      <div class="card">
+        <h3>Журнал действий бота</h3>
+        <div class="table-wrap">
+          <table><thead><tr><th>Когда</th><th>Событие</th><th>Детали</th></tr></thead>
+            <tbody id="logs-table"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- РП-действия и себяшки -->
+    <section class="view hidden" id="view-cmdtree">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-sliders"/></svg>Дерево команд</h2>
+        <p class="sub">Все команды бота по категориям — со словом-триггером и требуемым уровнем.
+          Владелец может менять уровень прямо здесь: бот подхватит через несколько секунд.</p>
+      </header>
+      <input type="text" id="cmdtree-q" class="cmdtree-search" placeholder="Поиск по команде или триггеру…" autocomplete="off">
+      <div id="cmdtree-body"></div>
+      <header class="page-head" style="margin-top: var(--gap-4)">
+        <h2>🎖 Пороги наград</h2>
+        <p class="sub">Кто может выдавать награду какой степени. Правки применяются в чатах через несколько секунд.</p>
+      </header>
+      <div id="reward-levels-body"></div>
+    </section>
+
+    <section class="view hidden" id="view-actions">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-wand"/></svg>Действия</h2>
+        <p class="sub">РП-действия (обнять, ударить…) и себяшки (чихнуть, пукнуть…). В фразах
+          <code>{actor}</code> и <code>{target}</code> — для РП, <code>{user}</code> — для себяшек.
+          Правки применяются в чатах через несколько секунд, перезапуск не нужен.</p>
+      </header>
+
+      <div class="chips" id="actions-kind" style="margin-bottom: var(--gap-3)">
+        <button class="chip active" data-kind="rp">РП-действия</button>
+        <button class="chip" data-kind="self">Себяшки</button>
+      </div>
+
+      <div class="card">
+        <h3>Новое действие</h3>
+        <form class="row" id="action-add">
+          <label class="narrow"><span>Ключ</span>
+            <input type="text" id="action-key" maxlength="64" placeholder="например: обнять" required>
+          </label>
+          <label><span>Первая фраза</span>
+            <input type="text" id="action-phrase" maxlength="512" placeholder="{actor} обнимает {target}" required>
+          </label>
+          <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
+        </form>
+      </div>
+
+      <div id="actions-list"></div>
+
+      <div class="card hidden" id="synonyms-card">
+        <h3>Синонимы <span class="muted">(альтернативные слова для РП-команд)</span></h3>
+        <form class="row" id="synonym-add">
+          <label class="narrow"><span>Слово</span>
+            <input type="text" id="synonym-word" maxlength="64" placeholder="обнимашки" required>
+          </label>
+          <label class="narrow"><span>Действие</span>
+            <input type="text" id="synonym-key" maxlength="64" placeholder="обнять" required>
+          </label>
+          <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
+        </form>
+        <div id="synonyms-list"></div>
+      </div>
+
+      <div class="card" style="margin-top: var(--gap-4)" id="propose-actions-card">
+        <h3><svg class="ic"><use href="#ic-wand"/></svg>Предложения
+          <span class="muted">(команды «предложить …» — с кнопками Да/Нет)</span></h3>
+        <p class="sub">У каждого действия — 3 набора фраз (предложение / согласие / отказ, бот берёт
+          случайную) и свои кулдаун/таймаут в секундах. Правки применяются в чатах через несколько секунд.</p>
+        <form class="row" id="propose-action-add">
+          <label class="narrow"><span>Ключ</span>
+            <input type="text" id="propose-action-key" maxlength="64" placeholder="например: romashka" required>
+          </label>
+          <label><span>Фраза предложения</span>
+            <input type="text" id="propose-action-phrase" maxlength="512" placeholder="{actor} зовёт {target}…" required>
+          </label>
+          <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
+        </form>
+        <div id="propose-actions-list"></div>
+        <h3 style="margin-top: var(--gap-3)">Синонимы <span class="muted">(альтернативные слова триггера)</span></h3>
+        <form class="row" id="propose-synonym-add">
+          <label class="narrow"><span>Слово</span>
+            <input type="text" id="propose-synonym-word" maxlength="64" placeholder="ромашка" required>
+          </label>
+          <label class="narrow"><span>Действие</span>
+            <input type="text" id="propose-synonym-key" maxlength="64" placeholder="romashka" required>
+          </label>
+          <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
+        </form>
+        <div id="propose-synonyms-list"></div>
+      </div>
+
+      <!-- Отн-жесты (обнять/поцеловать/…): у них, в отличие от РП-действий, есть
+           название, слова-триггеры, шаблон ответной реакции и фото по полу пары. -->
+      <div class="card" style="margin-top: var(--gap-4)">
+        <h3><svg class="ic"><use href="#ic-mask"/></svg>Отн-жесты
+          <span class="muted">(команды «отн …», фразы и фото)</span></h3>
+        <p class="sub">Фото кладутся в папки по полу пары (парень+девушка / парень+парень /
+          девушка+девушка). Правки применяются в чатах за несколько секунд.</p>
+        <form class="row" id="gesture-add">
+          <label class="narrow"><span>Ключ (латиница)</span>
+            <input type="text" id="gesture-key" maxlength="32" placeholder="wink" required>
+          </label>
+          <label class="narrow"><span>Название</span>
+            <input type="text" id="gesture-name" maxlength="64" placeholder="Подмигнуть" required>
+          </label>
+          <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить жест</button>
+        </form>
+      </div>
+      <div id="gestures-list"></div>
+    </section>
+
+    <!-- Настройки -->
+    <section class="view hidden" id="view-settings">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-settings"/></svg>Настройки бота</h2>
+        <p class="sub">Тексты сообщений. Менять может только владелец.</p>
+      </header>
+
+      <!-- Привязка личного Telegram-аккаунта: персонал может видеть тот же
+           экран участника, что и обычные люди, под своим собственным
+           tg-аккаунтом (см. POST /api/link-telegram). -->
+      <div class="card" id="tg-link-card">
+        <h3><svg class="ic"><use href="#ic-user"/></svg>Мой Telegram</h3>
+        <div id="tg-link-unlinked">
+          <p class="hint">Привяжите аккаунт к своему Telegram, чтобы открыть экран участника
+            (браки, кланы, питомцы — как видят остальные). Напишите боту в личку слово
+            «сайт», получите код и введите его здесь.</p>
+          <div class="row">
+            <label><span>Код из бота</span><input type="text" id="tg-link-code" autocomplete="one-time-code" placeholder="Например, K7P2M9QF"></label>
+            <div class="grow-0"><button class="primary" id="tg-link-save"><svg class="ic"><use href="#ic-check"/></svg>Привязать</button></div>
+          </div>
+        </div>
+        <div id="tg-link-linked" class="hidden">
+          <div class="msg ok" id="tg-link-status"></div>
+          <button class="ghost" id="tg-link-open-member"><svg class="ic"><use href="#ic-user"/></svg>Мой профиль участника</button>
+        </div>
+      </div>
+
+      <div id="settings-list"></div>
+    </section>
+
+    <!-- Аккаунты -->
+    <section class="view hidden" id="view-users">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-id"/></svg>Аккаунты панели</h2>
+        <p class="sub">Владелец может всё, включая аккаунты. Администратор — всё, кроме них.</p>
+      </header>
+
+      <div class="card">
+        <h3>Пользователи</h3>
+        <div class="table-wrap">
+          <table><thead><tr><th>Логин</th><th>Роль</th><th>Последний вход</th><th></th></tr></thead>
+            <tbody id="users-table"></tbody></table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3><svg class="ic"><use href="#ic-id"/></svg>Новый аккаунт</h3>
+        <div class="row">
+          <label><span>Логин</span><input type="text" id="nu-name" placeholder="moderator"></label>
+          <label><span>Пароль <em class="tip">от 10 символов</em></span><input type="password" id="nu-pass"></label>
+          <label class="narrow"><span>Роль</span>
+            <select id="nu-role"><option value="admin">Администратор</option><option value="owner">Владелец</option></select>
+          </label>
+          <div class="grow-0"><button class="primary" id="nu-create"><svg class="ic"><use href="#ic-plus"/></svg>Создать</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3><svg class="ic"><use href="#ic-key"/></svg>Сменить свой пароль</h3>
+        <div class="row">
+          <label><span>Новый пароль</span><input type="password" id="pw-new"></label>
+          <div class="grow-0"><button class="ghost" id="pw-save">Сменить</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Последние входы</h3>
+        <div class="table-wrap">
+          <table><thead><tr><th>Когда</th><th>Логин</th><th>Адрес</th><th>Итог</th></tr></thead>
+            <tbody id="logins-table"></tbody></table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+    "kisses": {
+        "ff":["link1","link2"],
+        "mf":["link1","link2"],
+        "mm":["link1","link2"]
+    },
+    "hugs": {
+        "ff":["link1","link2"],
+        "mf":["link1","link2"],
+        "mm":["link1","link2"]
+    }
+}

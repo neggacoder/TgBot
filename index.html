@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>НЕ ТРОГАЙ!</title>
+    <style>
+        /* Базовые стили для центрирования */
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: #121212;
+            font-family: 'Arial Black', Gadget, sans-serif;
+            overflow: hidden;
+            user-select: none; /* Чтобы текст нельзя было случайно выделить */
+        }
+
+        /* Стиль огромной надписи */
+        .warning-text {
+            font-size: 8rem; /* Огромный размер */
+
+            color: #ffff00; /* Меняет цвет на предупреждающий желтый */
+            text-shadow: 0 0 30px rgba(255, 255, 0, 0.8);
+            text-transform: uppercase;
+            letter-spacing: 5px;
+            cursor: pointer;
+            transition: color 0.2s ease;
+        }
+
+        /* Анимация испуганного дрожания при наведении */
+        .warning-text:hover {
+            color: #ff3333;
+            text-shadow: 0 0 20px rgba(255, 51, 51, 0.5);
+            animation: shake 0.1s infinite;
+        }
+
+        /* Описание анимации тряски */
+        @keyframes shake {
+            0% { transform: translate(2px, 1px) rotate(0deg); }
+            10% { transform: translate(-1px, -2px) rotate(-1deg); }
+            20% { transform: translate(-3px, 0px) rotate(1deg); }
+            30% { transform: translate(0px, 2px) rotate(0deg); }
+            40% { transform: translate(1px, -1px) rotate(1deg); }
+            50% { transform: translate(-1px, 2px) rotate(-1deg); }
+            60% { transform: translate(-3px, 1px) rotate(0deg); }
+            70% { transform: translate(2px, 1px) rotate(-1deg); }
+            80% { transform: translate(-1px, -1px) rotate(1deg); }
+            90% { transform: translate(2px, 2px) rotate(0deg); }
+            100% { transform: translate(1px, -2px) rotate(-1deg); }
+        }
+
+        /* Стили для мобильных устройств (чтобы текст влезал в экран) */
+        @media (max-width: 768px) {
+            .warning-text {
+                font-size: 3.5rem;
+                text-align: center;
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="warning-text">Не трогайте</div>
+
+</body>
+</html>

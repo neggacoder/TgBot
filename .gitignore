@@ -1,0 +1,8 @@
+
+# PowerShell stderr artifact accidentally captured into the archive (Compress-Archive redirect mishap)
+$null
+*.zip
+.env
+*__pycache__/
+*venv/
+*.pytest_cache/
