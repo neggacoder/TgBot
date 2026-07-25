@@ -1045,6 +1045,8 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "farm_yield_set":  {"phrase": "ферма урожайность {число}", "category": "Экономика", "level": LEVEL_ADMIN},
     "shop_list":       {"phrase": "магазин", "category": "Экономика", "level": 0},
     "stock_market": {"phrase": "!биржа / !купить {сумма} / !продать {сумма} / !дивиденды", "category": "Экономика", "level": 0},
+    "daily_top_manual": {"phrase": "!выдать топ активности — вручную начислить сегодняшнюю награду топ-5", "category": "Экономика", "level": LEVEL_ADMIN},
+    "stock_set_price":  {"phrase": "!биржа цена {число} — вручную установить курс акций", "category": "Экономика", "level": LEVEL_ADMIN},
     "bank_status":   {"phrase": "!банк — баланс вклада и кредита", "category": "Экономика", "level": 0},
     "bank_deposit":  {"phrase": "!банк вклад {сумма} {срок: 1/3/7} — открыть вклад", "category": "Экономика", "level": 0},
     "bank_withdraw": {"phrase": "!банк снять — забрать созревший вклад", "category": "Экономика", "level": 0},
@@ -20884,18 +20886,18 @@ STOCK_LOOP_CHECK_INTERVAL = 3600  # проверяем раз в час, сра�
 
 async def stock_market_loop() -> None:
     """Раз в час: меняет курс акций каждого чата на случайный процент
-    (-20%..+30%) и начисляет дивиденды (5% от invested) всем держателям."""
+    (-10%..+50%) и начисляет дивиденды (5% от invested) всем держателям."""
     while True:
         try:
             await asyncio.sleep(STOCK_LOOP_CHECK_INTERVAL)
             
             # Используем текущее время (желательно UTC с timezone для надежности)
-            now = datetime.datetime.now(timezone.utc)
+            now = datetime.utcnow()
             
             rows = await db.list_stock_market_rows()
             for row in rows:
                 chat_id = row["chat_id"]
-                last_change = row.get("last_change_time")  # Предполагается, что в БД хранится datetime
+                last_change = row.get("last_change_at")
                 
                 # Если с момента последнего изменения прошло меньше 55 минут, пропускаем 
                 # (небольшой запас в 5 минут защитит от микро-сдвигов asyncio.sleep)
@@ -20977,16 +20979,44 @@ async def weekly_digest_loop() -> None:
 # 5 монет за каждое своё сообщение.
 # ============================================================================
 DAILY_TOP_REWARD_HOUR_UTC = 23
-DAILY_TOP_REWARD_COUNT = 5
+DAILY_TOP_REWARD_COUNT = 10
 DAILY_TOP_REWARD_PER_MESSAGE = 5
 DAILY_TOP_REWARD_CHECK_INTERVAL = 300  # проверяем каждые 5 минут, срабатывает раз в сутки
 _DAILY_TOP_LAST_KEY = "dailytop_last_date"
 
 
+async def _pay_daily_top_reward(chat_id: int) -> Optional[str]:
+    """Начисляет сегодняшнюю награду топ-5 активных в указанном чате.
+    Возвращает готовый текст для отправки в чат, либо None, если сегодня
+    в чате никто не писал. Общая логика для планового запуска
+    (daily_top_reward_loop) и ручной команды «!выдать топ активности»."""
+    now = datetime.utcnow()
+    rows, _total = await db.list_top_messages_period(
+        chat_id, now.date(), limit=DAILY_TOP_REWARD_COUNT
+    )
+    if not rows:
+        return None
+
+    lines = ["🏅 <b>Ежедневная награда за активность</b>", DIVIDER]
+    any_rewarded = False
+    for row in rows:
+        count = int(row["message_count"])
+        reward = count * DAILY_TOP_REWARD_PER_MESSAGE
+        if reward <= 0:
+            continue
+        await db.add_coins(chat_id, row["user_id"], reward)
+        any_rewarded = True
+        lines.append(f"{mention_id(row['user_id'])} — {count} сообщ. → +{reward} i¢")
+
+    return "\n".join(lines) if any_rewarded else None
+
+
 async def daily_top_reward_loop() -> None:
-    """Каждый день в 23:00 UTC начисляет i¢ топ-5 активным участникам каждого
-    чата за сегодняшние сообщения (5 i¢ за сообщение). Защита от повторного
-    начисления при рестарте — дата последнего запуска хранится в bot_data."""
+    """Каждый день в 12:00 UTC начисляет i¢ топ-5 активным участникам каждого
+    чата за сегодняшние сообщения (5 i¢ за сообщение). Дедупликация — по
+    каждому чату отдельно (ключ включает chat_id), поэтому ручной запуск
+    команды «!выдать топ активности» в конкретном чате не приводит к
+    повторному начислению этому же чату при плановом срабатывании в 12:00."""
     while True:
         try:
             await asyncio.sleep(DAILY_TOP_REWARD_CHECK_INTERVAL)
@@ -20995,51 +21025,78 @@ async def daily_top_reward_loop() -> None:
                 continue
 
             today_str = now.date().isoformat()
-            last_row = await db.get_data(_DAILY_TOP_LAST_KEY)
-            if last_row and last_row.get("data_value") == today_str:
-                continue  # уже начисляли сегодня
-
             chat_ids = await db.list_active_chat_ids()
             for chat_id in chat_ids:
+                last_key = f"{_DAILY_TOP_LAST_KEY}:{chat_id}"
+                last_row = await db.get_data(last_key)
+                if last_row and last_row.get("data_value") == today_str:
+                    continue  # этому чату уже начисляли сегодня
+
                 try:
-                    rows, _total = await db.list_top_messages_period(
-                        chat_id, now.date(), limit=DAILY_TOP_REWARD_COUNT
-                    )
+                    text = await _pay_daily_top_reward(chat_id)
+                    if text:
+                        await bot.send_message(chat_id, text)
                 except Exception:
-                    logger.exception("daily_top_reward_loop: не удалось получить топ чата %s", chat_id)
-                    continue
-                if not rows:
-                    continue
+                    logger.exception("daily_top_reward_loop: ошибка в чате %s", chat_id)
 
-                lines = ["🏅 <b>Ежедневная награда за активность</b>", DIVIDER]
-                any_rewarded = False
-                for row in rows:
-                    count = int(row["message_count"])
-                    reward = count * DAILY_TOP_REWARD_PER_MESSAGE
-                    if reward <= 0:
-                        continue
-                    try:
-                        await db.add_coins(chat_id, row["user_id"], reward)
-                    except Exception:
-                        logger.exception("daily_top_reward_loop: не удалось начислить монеты user_id=%s", row["user_id"])
-                        continue
-                    any_rewarded = True
-                    lines.append(f"{mention_id(row['user_id'])} — {count} сообщ. → +{reward} i¢")
-
-                if any_rewarded:
-                    try:
-                        await bot.send_message(chat_id, "\n".join(lines))
-                    except Exception:
-                        logger.warning(
-                            "daily_top_reward_loop: не удалось отправить сообщение в чат %s",
-                            chat_id, exc_info=True,
-                        )
-
-            await db.set_data(_DAILY_TOP_LAST_KEY, today_str)
+                await db.set_data(last_key, today_str)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Сбой в цикле ежедневной награды за активность")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+        "!выдать топ активности", "!выдать топ", "выдать топ активности",
+    )),
+)
+async def cmd_daily_top_manual(message: Message):
+    if not has_level(message.from_user.id, required_level("daily_top_manual")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(required_level('daily_top_manual'))}» и выше.")
+        return
+    chat_id = message.chat.id
+    today_str = datetime.utcnow().date().isoformat()
+    last_key = f"{_DAILY_TOP_LAST_KEY}:{chat_id}"
+    try:
+        text = await _pay_daily_top_reward(chat_id)
+    except Exception:
+        logger.exception("cmd_daily_top_manual: ошибка начисления в чате %s", chat_id)
+        await message.reply("⚠️ Не удалось начислить награду — произошла ошибка.")
+        return
+    await db.set_data(last_key, today_str)  # чтобы плановый запуск в 12:00 не начислил повторно
+    if text:
+        await message.answer(text)
+    else:
+        await message.reply("Сегодня ещё никто не написал ни одного сообщения в этом чате — начислять некому.")
+    await db.add_log("daily_top_reward_manual", chat_id=chat_id, actor_id=message.from_user.id)
+
+
+
+    STOCK_SET_PRICE_RE = re.compile(r"(?i)^!биржа\s+цена\s+(\S+)$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(STOCK_SET_PRICE_RE.match(t.strip()))),
+)
+async def cmd_stock_set_price(message: Message):
+    if not has_level(message.from_user.id, required_level("stock_set_price")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(required_level('stock_set_price'))}» и выше.")
+        return
+    m = STOCK_SET_PRICE_RE.match(message.text.strip())
+    price = parse_amount(m.group(1))
+    if price is None or price <= 0:
+        await message.reply("Не понял цену. Например: <code>!биржа цена 150</code> или <code>!биржа цена 1.5к</code>")
+        return
+    await db.set_stock_price(message.chat.id, float(price), datetime.utcnow())
+    await db.add_log("stock_price_set", chat_id=message.chat.id, actor_id=message.from_user.id, details=str(price))
+    await message.reply(f"📈 Курс акций этого чата вручную установлен: <b>{float(price):.2f}</b> i¢/акция.")
+
+
 
 SHOP_RESTOCK_HOUR_UTC = 15
 SHOP_RESTOCK_CHECK_INTERVAL = 300

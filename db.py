@@ -6421,6 +6421,7 @@ async def ensure_stock_market_tables() -> None:
         "last_change_date DATE NULL"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    await _add_column_if_missing("stock_market", "last_change_at", "DATETIME NULL")
     await _execute(
         "CREATE TABLE IF NOT EXISTS stock_holdings ("
         "chat_id BIGINT NOT NULL, "
@@ -6651,12 +6652,13 @@ async def get_stock_price(chat_id: int) -> float:
 async def list_stock_market_rows() -> list[dict]:
     """Все чаты, где биржа уже использовалась — для суточного пересчёта цены
     в фоновом цикле (stock_market_loop)."""
-    return await _fetchall("SELECT chat_id, price, last_change_date FROM stock_market")
+    return await _fetchall("SELECT chat_id, price, last_change_date, last_change_at FROM stock_market")
 
 
 async def set_stock_price(chat_id: int, price: float, change_date) -> None:
     await _execute(
-        "UPDATE stock_market SET price = %s, last_change_date = %s WHERE chat_id = %s",
+        "UPDATE stock_market SET price = %s, last_change_date = %s, last_change_at = UTC_TIMESTAMP() "
+        "WHERE chat_id = %s",
         (max(price, 0.01), change_date, chat_id),
     )
 
