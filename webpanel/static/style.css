@@ -100,12 +100,22 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* --- иконки --------------------------------------------------------------
    Один размер и currentColor: иконка всегда в цвет текста рядом. */
+/* Иконки: спрайт нарисован в сетке 24×24, а показываем мы его в самых разных
+   размерах — от 12px у бейджей до 26px у пустых состояний. Раньше штрих
+   масштабировался вместе с символом, и одна и та же ширина 1.8 давала на
+   экране от 0.9px до 1.95px: на одном экране соседние иконки выходили разной
+   жирности, отсюда ощущение «кривых».
+
+   Лечится vector-effect="non-scaling-stroke" — он стоит атрибутом на фигурах
+   внутри каждого <symbol> (см. спрайт в index.html), а НЕ здесь: свойство
+   не наследуемое, и через теневое дерево <use> из CSS до фигур не достать.
+   Теперь stroke-width задаётся сразу в экранных пикселях и одинаков всюду. */
 .ic {
   width: 18px; height: 18px;
   flex: 0 0 auto;
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.8;
+  stroke-width: 1.6;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -711,6 +721,70 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .chart-empty { padding: var(--gap-4); text-align: center; color: var(--muted); font-size: 13px; }
+
+/* Режимы биржи: три крупные кнопки вместо трёх полей ввода — выбрать режим
+   можно, не считая проценты в уме. Ручные поля прячутся в <details>. */
+.preset-grid {
+  display: grid; gap: var(--gap-2);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  margin-bottom: var(--gap-3);
+}
+.preset {
+  display: block; text-align: left; cursor: pointer;
+  padding: var(--gap-3); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); background: var(--panel-2);
+  color: inherit; font: inherit;
+  transition: border-color .12s, background .12s;
+}
+.preset:hover { border-color: var(--accent); }
+.preset:focus-visible { outline: none; box-shadow: var(--ring); }
+.preset.on { border-color: var(--accent); background: var(--accent-soft); }
+.preset b { display: block; font-size: 15px; }
+.preset span { display: block; margin-top: 2px; font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; }
+.preset small { display: block; margin-top: 2px; font-size: 11.5px; color: var(--muted); }
+
+.tune { margin-bottom: var(--gap-2); }
+.tune > summary {
+  cursor: pointer; font-size: 13px; color: var(--muted);
+  padding: 4px 0; list-style: none;
+}
+.tune > summary::-webkit-details-marker { display: none; }
+.tune > summary::before { content: "▸ "; }
+.tune[open] > summary::before { content: "▾ "; }
+.tune > summary:hover { color: var(--text); }
+
+/* Линейный график курса биржи. SVG растягивается по ширине карточки
+   (preserveAspectRatio="none"), поэтому все штрихи — non-scaling-stroke,
+   иначе растяжение по X размазало бы линию в клин. Цвет — акцент темы для
+   роста и --danger для падения: это единственная серия на графике. */
+.spark-wrap { display: flex; gap: var(--gap-2); align-items: stretch; }
+.spark-y {
+  display: flex; flex-direction: column; justify-content: space-between;
+  font-size: 10px; color: var(--muted); text-align: right;
+  font-variant-numeric: tabular-nums; flex: 0 0 auto; min-width: 34px;
+  padding: 1px 0;
+}
+.spark {
+  flex: 1 1 auto; width: 100%; height: 150px; min-width: 0;
+  border-bottom: 1px solid var(--line);
+  overflow: visible;
+}
+.spark-line {
+  fill: none; stroke: var(--accent); stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.spark-area { fill: var(--accent-soft); stroke: none; }
+.spark.down .spark-line { stroke: var(--danger); }
+.spark.down .spark-area { fill: color-mix(in srgb, var(--danger) 14%, transparent); }
+/* Точки — только цель для наведения (нативный title с точным значением),
+   поэтому почти прозрачны, пока на них не навели. */
+.spark-dot { fill: var(--accent); opacity: 0; vector-effect: non-scaling-stroke; }
+.spark.down .spark-dot { fill: var(--danger); }
+.spark-dot:hover { opacity: 1; }
+@media (prefers-reduced-motion: no-preference) {
+  .spark-dot { transition: opacity .1s; }
+}
 
 /* Фильтр слов: чипы со словами и кнопкой удаления. */
 .word-chip { gap: 4px; padding-right: 4px; }

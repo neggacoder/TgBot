@@ -964,7 +964,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "reward_remove_all": {"phrase": "снять все награды (ответом или @username/ID)",    "category": "Награды", "level": LEVEL_ADMIN},
 
     "item_use": {"phrase": "использовать {ключ предмета} @username[или reply] — 10 применений на предмет, потом пропадает", "category": "Экономика", "level": 0},
-    "item_sell": {"phrase": "!продать {ключ предмета} [количество] — продать предмет за 80% цены (только если ни разу не использован)", "category": "Экономика", "level": 0},
+    "item_sell": {"phrase": "магазин продать {ключ предмета} [количество] — продать предмет за 80% цены (только если ни разу не использован)", "category": "Экономика", "level": 0},
     "grant_level":     {"phrase": "+модератор/+админ/+старший (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "revoke_admin":    {"phrase": "-админ / снять (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "promote_demote":  {"phrase": "повысить / понизить [@username|ID] [уровень 0-3] (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
@@ -1059,15 +1059,15 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "casino_dice":    {"phrase": "!кости {ставка} {число 1-6} — казино: кости, угадал → x6", "category": "Экономика", "level": 0},
     "casino_coin":    {"phrase": "!орёл {ставка} / !решка {ставка} — казино: орёл/решка, x2", "category": "Экономика", "level": 0},
     "casino_poker":   {"phrase": "!покер {ставка} — казино: покер, комбинация x2-x10", "category": "Экономика", "level": 0},
-    "titles_list":       {"phrase": "титулы", "category": "Экономика", "level": 0},
-    "title_buy":         {"phrase": "купить титул {ключ}", "category": "Экономика", "level": 0},
-    "title_equip":       {"phrase": "титул {ключ} / -титул", "category": "Экономика", "level": 0},
+    "titles_list":       {"phrase": "титул — список титулов", "category": "Экономика", "level": 0},
+    "title_buy":         {"phrase": "титул купить {ключ}", "category": "Экономика", "level": 0},
+    "title_equip":       {"phrase": "титул надеть {ключ} / титул снять", "category": "Экономика", "level": 0},
     "farm_top":        {"phrase": "топ монет", "category": "Экономика", "level": 0},
     "farm_yield_set":  {"phrase": "ферма урожайность {число}", "category": "Экономика", "level": LEVEL_ADMIN},
     "shop_list":       {"phrase": "магазин", "category": "Экономика", "level": 0},
-    "stock_market": {"phrase": "!биржа / !купить {сумма} / !продать {сумма} / !дивиденды", "category": "Экономика", "level": 0},
+    "stock_market": {"phrase": "биржа / биржа купить {сумма} / биржа продать {сумма} / биржа дивиденды", "category": "Экономика", "level": 0},
     "daily_top_manual": {"phrase": "!выдать топ активности — вручную начислить сегодняшнюю награду топ-5", "category": "Экономика", "level": LEVEL_ADMIN},
-    "stock_set_price":  {"phrase": "!биржа цена {число} — вручную установить курс акций", "category": "Экономика", "level": LEVEL_ADMIN},
+    "stock_set_price":  {"phrase": "биржа цена {число} — вручную установить курс акций", "category": "Экономика", "level": LEVEL_ADMIN},
     "bank_status":   {"phrase": "!банк — баланс вклада и кредита", "category": "Экономика", "level": 0},
     "bank_deposit":  {"phrase": "!банк вклад {сумма} {срок: 1/3/7} — открыть вклад", "category": "Экономика", "level": 0},
     "bank_withdraw": {"phrase": "!банк снять — забрать созревший вклад", "category": "Экономика", "level": 0},
@@ -1077,9 +1077,9 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "bank_auto_reject_toggle": {"phrase": "+банк автоотказ-кредит / -банк автоотказ-кредит", "category": "Экономика", "level": OWNER_LEVEL},
     "bank_blacklist_manage": {"phrase": "банк чс добавить/удалить/список (ответом или @username/ID)", "category": "Экономика", "level": LEVEL_ADMIN},
     "shop_manage":     {"phrase": "магазин добавить/удалить/вкл/выкл", "category": "Экономика", "level": LEVEL_ADMIN},
-    "shop_buy":        {"phrase": "купить ключ", "category": "Экономика", "level": 0},
+    "shop_buy":        {"phrase": "магазин купить {ключ}", "category": "Экономика", "level": 0},
     "inventory_view":  {"phrase": "инвентарь / мой инвентарь", "category": "Экономика", "level": 0},
-    "gift_item":       {"phrase": "подарить ключ (ответом или @username/ID)", "category": "Экономика", "level": 0},
+    "gift_item":       {"phrase": "магазин подарить {ключ} (ответом или @username/ID)", "category": "Экономика", "level": 0},
     "lootbox_info":    {"phrase": "!лутбокс — список редкостей и ваши боксы", "category": "Экономика", "level": 0},
     "lootbox_buy":     {"phrase": "!лутбокс купить {редкость} [количество]", "category": "Экономика", "level": 0},
     "lootbox_open":    {"phrase": "!лутбокс открыть {редкость} [количество]", "category": "Экономика", "level": 0},
@@ -1154,9 +1154,10 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "robbery_run":     {"phrase": "!ограбить / !ограбить бинокль @username", "category": "Экономика", "level": 0},
     "robbery_stats":   {"phrase": "стата ограблений / моя стата ограблений", "category": "Экономика", "level": 0},
     "robbery_top":     {"phrase": "топ грабителей", "category": "Экономика", "level": 0},
-    "robbery_pardon":  {"phrase": "купить откуп / откуп — снять надзор за 100 000 i¢", "category": "Экономика", "level": 0},
+    "robbery_pardon":  {"phrase": "откуп — снять надзор за 100 000 i¢", "category": "Экономика", "level": 0},
     "race_play":       {"phrase": "!гонки {ставка} — гонки лошадей (казино), лошадь выбирается кнопкой", "category": "Экономика", "level": 0},
     "achievement_pin": {"phrase": "закрепить ачивку {код} / открепить ачивку", "category": "Разное", "level": 0},
+    "stock_settings":  {"phrase": "биржа настройки / биржа настройки рост|падение|дивиденды {число} / биржа настройки спокойная|обычная|азартная", "category": "Экономика", "level": LEVEL_ADMIN},
 }
 
 
@@ -12381,7 +12382,7 @@ _YESNO_MAYBE = (
 )
 
 # Триггеры: «!данет {вопрос}» и разговорные «бот данет …» / «бот да нет …».
-YESNO_CMD_RE = re.compile(r"^(?:!данет|бот\s+данет|бот\s+да\s+нет)\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
+YESNO_CMD_RE = re.compile(r"^(?:!?данет|бот\s+данет|бот\s+да\s+нет)\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
 def _yesno_answer() -> str:
@@ -12832,9 +12833,11 @@ async def cmd_ship_reset(message: Message):
 # ============================================================================
 FARM_COOLDOWN = timedelta(hours=4)
 STOCK_MAX_INVEST = 100_000       # максимум вложений на человека
-STOCK_DIVIDEND_RATE = 0.1      # 10% от invested в сутки
-STOCK_MIN_CHANGE = -0.10        # -10%
-STOCK_MAX_CHANGE = 0.50         # +50%
+# Границы шага курса и процент дивидендов задаются на чат и живут в БД:
+# значения по умолчанию — в DEFAULT таблицы stock_settings (db.py), рабочие
+# читает stock_market_loop через db.get_stock_settings, правит админ в
+# веб-панели, раздел «Биржа». Констант здесь намеренно нет: дублирующая
+# копия умолчаний рано или поздно разошлась бы со схемой.
 FARM_TRIGGERS = {"ферма", "!бизнес", "фарма", "фармить"}
 FARM_BASE_MIN = 40
 FARM_BASE_MAX = 120
@@ -13420,7 +13423,32 @@ async def cmd_item_use(message: Message):
         )
 
 
-SELL_ITEM_RE = re.compile(r"(?i)^!продать\s+(\S+)(?:\s+(\d+))?$")
+SELL_ITEM_RE = re.compile(r"(?i)^(?:!?магазин\s+продать|!продать)\s+(\S+)(?:\s+(\d+))?$")
+# «!продать 500» одинаково похоже на продажу акций и на продажу предмета
+# с ключом «500» — раньше эту форму молча забирал продавец предметов, и
+# продажа акций была недостижима. Теперь голое число просит уточнения.
+LEGACY_SELL_AMOUNT_RE = re.compile(r"(?i)^!продать\s+(\S+)$")
+
+
+def _is_legacy_sell_amount(text: str) -> bool:
+    m = LEGACY_SELL_AMOUNT_RE.match(text.strip())
+    if m is None:
+        return False
+    amount = parse_amount(m.group(1))
+    return amount is not None and amount > 0
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and _is_legacy_sell_amount(t)),
+)
+async def cmd_legacy_sell_amount_hint(message: Message):
+    arg = html.escape(LEGACY_SELL_AMOUNT_RE.match(message.text.strip()).group(1))
+    await message.reply(
+        "⚠️ Команда «!продать» разделена — уточните, что именно продаёте:\n"
+        f"• <code>биржа продать {arg}</code> — акции на бирже\n"
+        f"• <code>магазин продать {arg}</code> — предмет из инвентаря"
+    )
 
 
 @router.message(
@@ -13428,7 +13456,7 @@ SELL_ITEM_RE = re.compile(r"(?i)^!продать\s+(\S+)(?:\s+(\d+))?$")
     F.text.func(lambda t: bool(t) and bool(SELL_ITEM_RE.match(t.strip()))),
 )
 async def cmd_sell_item(message: Message):
-    """«!продать {ключ} [количество]» — продаёт предмет(ы) из инвентаря за 80%
+    """«магазин продать {ключ} [количество]» — продаёт предмет(ы) из инвентаря за 80%
     их цены в магазине. Продать можно только предмет, который ни разу не
     использовался (см. item_usage / ITEM_USE_LIMIT)."""
     match = SELL_ITEM_RE.match(message.text.strip())
@@ -13527,7 +13555,7 @@ async def cmd_robbery(message: Message):
     if await db.is_under_surveillance(chat_id, user_id):
         await message.reply(
             "🚨 Вы под надзором — грабежи для вас недоступны.\n"
-            f"Снять надзор: <code>купить откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
+            f"Снять надзор: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
         )
         return
     now = datetime.utcnow()
@@ -13635,7 +13663,7 @@ async def cmd_robbery(message: Message):
             if newly_caught:
                 surveillance_line = (
                     f"\n🚨 Вас поймали {strikes}-й раз — теперь вы <b>под надзором</b> и не можете "
-                    f"грабить.\nСнять: <code>купить откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
+                    f"грабить.\nСнять: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
                 )
             elif strikes < robbery.SURVEILLANCE_STRIKES_LIMIT:
                 left = robbery.SURVEILLANCE_STRIKES_LIMIT - strikes
@@ -13699,7 +13727,7 @@ async def cmd_robbery_top(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("купить откуп", "откуп")),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!откуп", "купить откуп", "откуп")),
 )
 async def cmd_robbery_pardon(message: Message):
     if not _check_misc_access(message.from_user.id, "robbery_pardon"):
@@ -13738,8 +13766,8 @@ CASINO_DAILY_BONUS = 100
 CASINO_MAX_BET = 100_000
 CASINO_DICE_RE = re.compile(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
 CASINO_COIN_RE = re.compile(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
-CASINO_POKER_RE = re.compile(r"(?i)^!покер\s+(\S+)$")
-CASINO_TOPUP_RE = re.compile(r"(?i)^!казино\s+пополнить\s+(\S+)$")
+CASINO_POKER_RE = re.compile(r"(?i)^!?покер\s+(\S+)$")
+CASINO_TOPUP_RE = re.compile(r"(?i)^!?казино\s+пополнить\s+(\S+)$")
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -13856,7 +13884,7 @@ def _format_poker_hand(cards: list[tuple[int, str]]) -> str:
 # ---------- Казино: баланс + ежедневный бонус ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "!казино баланс"),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!казино баланс", "казино баланс")),
 )
 async def cmd_casino_balance(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_balance"):
@@ -13871,7 +13899,7 @@ async def cmd_casino_balance(message: Message):
     await message.answer("\n".join(lines))
 
 
-CASINO_WITHDRAW_RE = re.compile(r"(?i)^!казино\s+вывести\s+(\S+)$")
+CASINO_WITHDRAW_RE = re.compile(r"(?i)^!?казино\s+вывести\s+(\S+)$")
 
 
 @router.message(
@@ -14084,7 +14112,7 @@ async def cmd_casino_poker(message: Message):
 # ============================================================================
 # Модуль «Гонки» — ставки на лошадей, баланс общий с «!казино баланс».
 # ============================================================================
-RACE_CMD_RE = re.compile(r"(?i)^!гонки\s+(\S+)$")
+RACE_CMD_RE = re.compile(r"(?i)^!?гонки\s+(\S+)$")
 RACE_JOIN_SECONDS = 15
 RACE_STEPS = 15
 RACE_TRACK_WIDTH = 15
@@ -14329,14 +14357,23 @@ def _stock_holding_lines(price: float, holding: dict) -> list[str]:
         f"💼 Вложено: {invested} i¢ / {STOCK_MAX_INVEST} i¢",
     ]
     if pending > 0:
-        lines.append(f"💰 Накопленные дивиденды: {pending:.0f} i¢ (забрать — «!дивиденды»)")
+        lines.append(f"💰 Накопленные дивиденды: {pending:.0f} i¢ (забрать — «биржа дивиденды»)")
     lines.append(f"🏆 Всего заработано на бирже: {profit_total} i¢")
     return lines
 
 
+# Команды биржи сгруппированы под общим словом-разделом «биржа» («!» перед
+# ним необязателен), чтобы «купить»/«продать» нельзя было спутать с магазином.
+# Старые одиночные формы «!купить»/«!продать» неоднозначны и теперь отвечают
+# подсказкой (cmd_legacy_buy_hint / cmd_legacy_sell_amount_hint), а «!дивиденды»
+# однозначна и работает молчаливым алиасом.
+STOCK_BUY_RE = re.compile(r"(?i)^!?биржа\s+купить(?:\s+(\S+))?$")
+STOCK_SELL_RE = re.compile(r"(?i)^!?биржа\s+продать(?:\s+(\S+))?$")
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "!биржа"),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!биржа", "биржа")),
 )
 async def cmd_stock_market(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
@@ -14353,21 +14390,21 @@ async def cmd_stock_market(message: Message):
     ]
     lines.extend(_stock_holding_lines(price, holding))
     lines.append("")
-    lines.append("<code>!купить {сумма}</code> · <code>!продать {сумма}</code> · <code>!дивиденды</code>")
+    lines.append("<code>биржа купить {сумма}</code> · <code>биржа продать {сумма}</code> · <code>биржа дивиденды</code>")
     await message.answer("\n".join(lines))
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "!купить"),
+    F.text.func(lambda t: bool(t) and bool(STOCK_BUY_RE.match(t.strip()))),
 )
 async def cmd_stock_buy(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
         return
-    parts = message.text.strip().split()
-    amount = parse_amount(parts[1]) if len(parts) >= 2 else None
+    raw = STOCK_BUY_RE.match(message.text.strip()).group(1)
+    amount = parse_amount(raw) if raw else None
     if amount is None or amount <= 0:
-        await message.reply("Использование: <code>!купить {сумма}</code>\nНапример: <code>!купить 500</code> или <code>!купить 5к</code>")
+        await message.reply("Использование: <code>биржа купить {сумма}</code>\nНапример: <code>биржа купить 500</code> или <code>биржа купить 5к</code>")
         return
 
     
@@ -14398,15 +14435,15 @@ async def cmd_stock_buy(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "!продать"),
+    F.text.func(lambda t: bool(t) and bool(STOCK_SELL_RE.match(t.strip()))),
 )
 async def cmd_stock_sell(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
         return
-    parts = message.text.strip().split()
-    amount = parse_amount(parts[1]) if len(parts) >= 2 else None
+    raw = STOCK_SELL_RE.match(message.text.strip()).group(1)
+    amount = parse_amount(raw) if raw else None
     if amount is None or amount <= 0:
-        await message.reply("Использование: <code>!продать {сумма}</code>\nНапример: <code>!продать 300</code> или <code>!продать 3к</code>")
+        await message.reply("Использование: <code>биржа продать {сумма}</code>\nНапример: <code>биржа продать 300</code> или <code>биржа продать 3к</code>")
         return
 
     chat_id, user_id = message.chat.id, message.from_user.id
@@ -14436,7 +14473,7 @@ async def cmd_stock_sell(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "!дивиденды"),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!биржа дивиденды", "биржа дивиденды", "!дивиденды")),
 )
 async def cmd_stock_dividends(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
@@ -14455,12 +14492,30 @@ async def cmd_stock_dividends(message: Message):
         await grant_achievement(chat_id, user_id, "investor")
 
 
+# ----------------------------------------------------------------------------
+# Подсказки по старым неоднозначным формам. «!купить {сумма}» раньше означало
+# биржу, но «купить {ключ}» — магазин, а «купить титул {ключ}» — титулы; по
+# одному слову намерение не восстановить, поэтому вместо угадывания отвечаем
+# списком новых форм. Однозначные старые формы («купить {ключ}», «титулы»,
+# «откуп», «!дивиденды») продолжают работать молча.
+# ----------------------------------------------------------------------------
+LEGACY_BUY_RE = re.compile(r"(?i)^!купить(?:\s+(.*))?$")
 
 
-
-
-
-
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(LEGACY_BUY_RE.match(t.strip()))),
+)
+async def cmd_legacy_buy_hint(message: Message):
+    arg = (LEGACY_BUY_RE.match(message.text.strip()).group(1) or "").strip()
+    suffix = f" {html.escape(arg)}" if arg else " {сумма}"
+    key_suffix = f" {html.escape(arg)}" if arg else " {ключ}"
+    await message.reply(
+        "⚠️ Команда «!купить» разделена — уточните, что именно покупаете:\n"
+        f"• <code>биржа купить{suffix}</code> — акции на бирже\n"
+        f"• <code>магазин купить{key_suffix}</code> — товар из магазина чата\n"
+        f"• <code>титул купить{key_suffix}</code> — титул"
+    )
 
 
 # ============================================================================
@@ -14468,11 +14523,11 @@ async def cmd_stock_dividends(message: Message):
 # в момент открытия) и кредиты с комиссией и дневной пеней за просрочку.
 # Ставки и параметры кредита настраиваются админами командами «банк ...».
 # ============================================================================
-BANK_STATUS_RE = re.compile(r"(?i)^!банк$")
-BANK_DEPOSIT_RE = re.compile(r"(?i)^!банк\s+вклад\s+(\S+)\s+(\d+)$")
-BANK_WITHDRAW_RE = re.compile(r"(?i)^!банк\s+снять$")
-BANK_CREDIT_RE = re.compile(r"(?i)^!банк\s+кредит\s+(\S+)$")
-BANK_REPAY_RE = re.compile(r"(?i)^!банк\s+погасить\s+(\S+)$")
+BANK_STATUS_RE = re.compile(r"(?i)^!?банк$")
+BANK_DEPOSIT_RE = re.compile(r"(?i)^!?банк\s+вклад\s+(\S+)\s+(\d+)$")
+BANK_WITHDRAW_RE = re.compile(r"(?i)^!?банк\s+снять$")
+BANK_CREDIT_RE = re.compile(r"(?i)^!?банк\s+кредит\s+(\S+)$")
+BANK_REPAY_RE = re.compile(r"(?i)^!?банк\s+погасить\s+(\S+)$")
 
 BANK_RATE_SET_RE = re.compile(r"(?i)^банк\s+ставка\s+(1|3|7)д?\s+(\d+(?:\.\d+)?)$")
 BANK_CREDIT_FEE_RE = re.compile(r"(?i)^банк\s+кредит\s+комиссия\s+(\d+(?:\.\d+)?)$")
@@ -15070,8 +15125,16 @@ async def bank_penalty_loop() -> None:
 # за ачивки (см. правку grant_achievement() ниже). Активный титул хранится
 # в profile_cards.active_title и показывается в /профиль рядом с именем.
 # ============================================================================
-TITLE_BUY_RE = re.compile(r"(?i)^купить\s+титул\s+(\S+)$")
-TITLE_EQUIP_RE = re.compile(r"(?i)^титул\s+(\S+)$")
+# Слово-раздел «титул» собирает список/покупку/надеть/снять в одном месте;
+# «!» перед разделом необязателен, а старые формы («титулы», «купить титул X»,
+# «титул X», «-титул») остаются рабочими алиасами.
+TITLE_BUY_RE = re.compile(r"(?i)^(?:!?титул\s+купить|купить\s+титул)\s+(\S+)$")
+# Негативный просмотр в короткой ветке обязателен: без него «титул снять»
+# разбирается как «надеть титул с ключом снять» — короткая ветка стоит
+# в файле раньше cmd_title_unequip и забрала бы команду себе.
+TITLE_EQUIP_RE = re.compile(
+    r"(?i)^(?:!?титул\s+надеть|титул(?!\s+(?:купить|надеть|снять)\b))\s+(\S+)$"
+)
 
 async def titles_list_page(chat_id: int, user_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     owned = {t["title_key"] for t in await db.list_user_titles(chat_id, user_id)}
@@ -15095,8 +15158,8 @@ async def titles_list_page(chat_id: int, user_id: int, page: int) -> tuple[str, 
             status = "🔒 только за ачивку"
         lines.append(f"{t['name']} (<code>{key}</code>) — {status}")
     lines.append("")
-    lines.append("Купить: <code>купить титул {ключ}</code>")
-    lines.append("Надеть: <code>титул {ключ}</code> · снять: <code>-титул</code>")
+    lines.append("Купить: <code>титул купить {ключ}</code>")
+    lines.append("Надеть: <code>титул надеть {ключ}</code> · снять: <code>титул снять</code>")
     text = "\n".join(lines)
 
     if total_pages == 1:
@@ -15114,7 +15177,7 @@ async def titles_list_page(chat_id: int, user_id: int, page: int) -> tuple[str, 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "титулы"),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!титул", "титул", "титулы")),
 )
 async def cmd_titles_list(message: Message):
     if not _check_misc_access(message.from_user.id, "titles_list"):
@@ -15154,7 +15217,7 @@ async def cmd_title_buy(message: Message):
     key = TITLE_BUY_RE.match(message.text.strip()).group(1).casefold()
     title = await db.get_title(key)
     if title is None or title.get("price") is None:
-        await message.reply("Такого титула нет в продаже. Список — «титулы».")
+        await message.reply("Такого титула нет в продаже. Список — «титул».")
         return
 
     chat_id, user_id = message.chat.id, message.from_user.id
@@ -15167,7 +15230,7 @@ async def cmd_title_buy(message: Message):
         return
     await db.grant_title(chat_id, user_id, key)
     await db.add_log("title_bought", chat_id=chat_id, actor_id=user_id, details=key)
-    await message.reply(f"✅ Куплено: {title['name']} за {title['price']} i¢.\nНадеть: «титул {key}»")
+    await message.reply(f"✅ Куплено: {title['name']} за {title['price']} i¢.\nНадеть: «титул надеть {key}»")
 
 
 @router.message(
@@ -15181,7 +15244,7 @@ async def cmd_title_equip(message: Message):
     chat_id, user_id = message.chat.id, message.from_user.id
 
     if not await db.has_title(chat_id, user_id, key):
-        await message.reply("У вас нет такого титула. Список — «титулы».")
+        await message.reply("У вас нет такого титула. Список — «титул».")
         return
     title = await db.get_title(key)
     await db.set_active_title(chat_id, user_id, key)
@@ -15190,23 +15253,48 @@ async def cmd_title_equip(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "-титул"),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!титул снять", "титул снять", "-титул")),
 )
 async def cmd_title_unequip(message: Message):
     if not _check_misc_access(message.from_user.id, "title_equip"):
         return
     await db.set_active_title(message.chat.id, message.from_user.id, None)
     await message.reply("Титул снят.")
+
+
+# Замыкающий обработчик раздела: всё, что начинается с «титул», но не
+# разобрано конкретными обработчиками выше, получает список подкоманд, а не
+# молчание. Голое «титул» сюда не доходит — его забирает cmd_titles_list.
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(re.match(r"(?i)^!?титул\s+\S", t.strip()))),
+)
+async def cmd_title_usage(message: Message):
+    if not _check_misc_access(message.from_user.id, "titles_list"):
+        return
+    await message.reply(
+        "🎖 <b>Титулы</b>\n"
+        "<code>титул</code> — список титулов\n"
+        "<code>титул купить {ключ}</code>\n"
+        "<code>титул надеть {ключ}</code>\n"
+        "<code>титул снять</code>"
+    )
+
+
 # ============================================================================
 # Модуль «Магазин и инвентарь» — простые предметы без спецэффектов, покупаются
 # за i¢ (см. «Экономика» выше) и дарятся другим участникам. Каталог настраивают
 # админы отдельно для каждого чата.
 # ============================================================================
-SHOP_ADD_RE = re.compile(r"(?is)^магазин\s+добавить\s+(\S+)\s+(\S+)\s+(.+)$")
-SHOP_DELETE_RE = re.compile(r"(?i)^магазин\s+удалить\s+(\S+)$")
-SHOP_TOGGLE_RE = re.compile(r"(?i)^магазин\s+(вкл|выкл)\s+(\S+)$")
-SHOP_BUY_RE = re.compile(r"(?i)^купить\s+(\S+)$")
-SHOP_GIFT_RE = re.compile(r"(?i)^подарить\s+(\S+)\s*(.*)$")
+# Слово-раздел «магазин» (продажа предмета — SELL_ITEM_RE выше, там же
+# рядом с остальной логикой инвентаря). «!» везде необязателен, а короткие
+# формы без слова-раздела («купить {ключ}», «подарить {ключ}») сохранены.
+_SHOP_NS_RE = re.compile(r"(?i)^!?магазин\s")
+SHOP_ADD_RE = re.compile(r"(?is)^!?магазин\s+добавить\s+(\S+)\s+(\S+)\s+(.+)$")
+SHOP_DELETE_RE = re.compile(r"(?i)^!?магазин\s+удалить\s+(\S+)$")
+SHOP_TOGGLE_RE = re.compile(r"(?i)^!?магазин\s+(вкл|выкл)\s+(\S+)$")
+SHOP_BUY_RE = re.compile(r"(?i)^(?:!?магазин\s+купить|купить)\s+(\S+)$")
+SHOP_GIFT_RE = re.compile(r"(?i)^(?:!?магазин\s+подарить|подарить)\s+(\S+)\s*(.*)$")
 
 def shop_item_line(item: dict) -> str:
     desc = f" — {html.escape(item['description'])}" if item.get("description") else ""
@@ -15594,7 +15682,7 @@ async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineK
 
     lines = ["🏪 <b>Магазин чата</b>", DIVIDER]
     lines.extend(shop_item_line(i) for i in chunk)
-    lines.append("\nКупить: <code>купить ключ</code>")
+    lines.append("\nКупить: <code>магазин купить {ключ}</code> · продать: <code>магазин продать {ключ}</code>")
     text = "\n".join(lines)
 
     if total_pages == 1:
@@ -15609,7 +15697,7 @@ async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineK
     return text, InlineKeyboardMarkup(inline_keyboard=[nav])
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("магазин","магаз")),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!магазин","!магаз","магазин","магаз")),
 )
 async def cmd_shop_list(message: Message):
     text, kb = await shop_list_page(message.chat.id, 0)
@@ -16063,10 +16151,16 @@ async def cmd_inventory(message: Message):
     F.text.func(lambda t: bool(t) and bool(SHOP_GIFT_RE.match(t.strip()))),
 )
 async def cmd_gift_item(message: Message):
-    m = SHOP_GIFT_RE.match(message.text.strip())
+    raw = message.text.strip()
+    m = SHOP_GIFT_RE.match(raw)
     item_key = m.group(1).casefold()
 
-    target, _remaining = await resolve_command_target(message, trigger_words=2)
+    # У старой формы «подарить {ключ}» слов-триггеров два, у новой
+    # «магазин подарить {ключ}» — три; голый ID цели идёт сразу после них.
+    # Текст резолверу не подменяем: entity.offset считается по message.text,
+    # и срез @username по укороченной строке уехал бы.
+    trigger_words = 3 if _SHOP_NS_RE.match(raw) else 2
+    target, _remaining = await resolve_command_target(message, trigger_words=trigger_words)
     if target is None and message.reply_to_message:
         target = message.reply_to_message.from_user
     if target is None:
@@ -16111,6 +16205,27 @@ async def cmd_gift_item(message: Message):
     gift_count = await _increment_gift_count(message.chat.id, message.from_user.id)
     if gift_count >= 20:
         await grant_achievement(message.chat.id, message.from_user.id, "generous_20")
+
+
+# Замыкающий обработчик раздела «магазин» — см. пояснение у cmd_title_usage.
+# Стоит после всех конкретных подкоманд магазина, включая «магазин продать»
+# (она объявлена выше, рядом с остальной логикой инвентаря).
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(re.match(r"(?i)^!?магазин\s+\S", t.strip()))),
+)
+async def cmd_shop_usage(message: Message):
+    lines = [
+        "🏪 <b>Магазин</b>",
+        "<code>магазин</code> — список товаров",
+        "<code>магазин купить {ключ}</code>",
+        "<code>магазин продать {ключ} [количество]</code>",
+        "<code>магазин подарить {ключ}</code> (ответом или @username/ID)",
+    ]
+    if has_level(message.from_user.id, required_level("shop_manage")):
+        lines.append("<code>магазин добавить {ключ} {цена} {название}</code>")
+        lines.append("<code>магазин удалить {ключ}</code> · <code>магазин вкл|выкл {ключ}</code>")
+    await message.reply("\n".join(lines))
 
 # ============================================================================
 # Модуль «Лутбоксы» — случайные коробки за i¢, дающие случайный предмет из
@@ -16243,7 +16358,7 @@ async def lootbox_list_text(chat_id: int, user_id: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "!лутбокс"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] in ("!лутбокс", "лутбокс")),
 )
 async def cmd_lootbox(message: Message):
     if not _check_misc_access(message.from_user.id, "lootbox_info"):
@@ -21431,36 +21546,56 @@ STOCK_LOOP_CHECK_INTERVAL = 3600  # проверяем раз в час, сра�
 
 
 async def stock_market_loop() -> None:
-    """Раз в час: меняет курс акций каждого чата на случайный процент
-    (-10%..+50%) и начисляет дивиденды (5% от invested) всем держателям."""
+    """Раз в час: меняет курс акций каждого чата на случайный процент в
+    пределах, заданных для этого чата (по умолчанию -10%..+50%, настраивается
+    в веб-панели), пишет точку в историю курса и начисляет дивиденды.
+
+    Дивиденды именно суточные: сам цикл крутится раз в час, но
+    list_stock_holdings_due_for_dividend отсекает тех, кому уже начисляли
+    сегодня."""
     while True:
         try:
             await asyncio.sleep(STOCK_LOOP_CHECK_INTERVAL)
-            
+
             # Используем текущее время (желательно UTC с timezone для надежности)
             now = datetime.utcnow()
-            
+
+            # Чистка истории курса — раз за проход цикла, одним запросом на все
+            # чаты сразу, а не внутри цикла по чатам.
+            try:
+                await db.prune_stock_price_history(now - timedelta(days=db.STOCK_HISTORY_KEEP_DAYS))
+            except Exception:
+                logger.exception("Не удалось почистить историю курса биржи")
+
             rows = await db.list_stock_market_rows()
             for row in rows:
                 chat_id = row["chat_id"]
                 last_change = row.get("last_change_at")
-                
-                # Если с момента последнего изменения прошло меньше 55 минут, пропускаем 
+
+                # Если с момента последнего изменения прошло меньше 55 минут, пропускаем
                 # (небольшой запас в 5 минут защитит от микро-сдвигов asyncio.sleep)
                 if last_change and (now - last_change).total_seconds() < 3300:
                     continue
 
+                settings = await db.get_stock_settings(chat_id)
+                min_change = float(settings["min_change_percent"]) / 100
+                max_change = float(settings["max_change_percent"]) / 100
+                dividend_rate = float(settings["dividend_percent"]) / 100
+                if min_change > max_change:      # админ мог перепутать поля местами
+                    min_change, max_change = max_change, min_change
+
                 old_price = float(row["price"])
-                change_percent = random.uniform(STOCK_MIN_CHANGE, STOCK_MAX_CHANGE)
+                change_percent = random.uniform(min_change, max_change)
                 new_price = max(old_price * (1 + change_percent), 0.01)
-                
+
                 # Передаем 'now' вместо 'today' (в метод set_stock_price запишите текущий datetime)
                 await db.set_stock_price(chat_id, new_price, now)
+                await db.add_stock_price_point(chat_id, new_price, change_percent * 100, now, "auto")
 
                 # Передаем 'now' для фиксации времени начисления дивидендов
                 due = await db.list_stock_holdings_due_for_dividend(chat_id, now)
                 for holder in due:
-                    dividend = float(holder["invested"]) * STOCK_DIVIDEND_RATE
+                    dividend = float(holder["invested"]) * dividend_rate
                     await db.accrue_dividend(chat_id, holder["user_id"], dividend, now)
 
                 try:
@@ -21635,7 +21770,7 @@ async def cmd_daily_top_manual(message: Message):
 # неё как на глобальную. В итоге проверка фильтра падала с NameError на КАЖДОМ
 # сообщении, доходившем до этого места роутера, и все команды, объявленные
 # ниже по файлу, переставали работать.
-STOCK_SET_PRICE_RE = re.compile(r"(?i)^!биржа\s+цена\s+(\S+)$")
+STOCK_SET_PRICE_RE = re.compile(r"(?i)^!?биржа\s+цена\s+(\S+)$")
 
 
 @router.message(
@@ -21650,11 +21785,178 @@ async def cmd_stock_set_price(message: Message):
     m = STOCK_SET_PRICE_RE.match(message.text.strip())
     price = parse_amount(m.group(1))
     if price is None or price <= 0:
-        await message.reply("Не понял цену. Например: <code>!биржа цена 150</code> или <code>!биржа цена 1.5к</code>")
+        await message.reply("Не понял цену. Например: <code>биржа цена 150</code> или <code>биржа цена 1.5к</code>")
         return
-    await db.set_stock_price(message.chat.id, float(price), datetime.utcnow())
+    now = datetime.utcnow()
+    old_price = await db.get_stock_price(message.chat.id)
+    await db.set_stock_price(message.chat.id, float(price), now)
+    change = ((float(price) / old_price - 1) * 100) if old_price else None
+    await db.add_stock_price_point(message.chat.id, float(price), change, now, "manual")
     await db.add_log("stock_price_set", chat_id=message.chat.id, actor_id=message.from_user.id, details=str(price))
     await message.reply(f"📈 Курс акций этого чата вручную установлен: <b>{float(price):.2f}</b> i¢/акция.")
+
+
+# Настройки биржи прямо из чата — то же, что в веб-панели, для тех, кому
+# удобнее не открывать сайт. Слово «настройки» третьим словом обязательно:
+# без него «биржа дивиденды» — это команда участника «забрать дивиденды»,
+# и «биржа дивиденды 5» читалось бы как опечатка в ней, а не как настройка.
+STOCK_CFG_SHOW_RE = re.compile(r"(?i)^!?биржа\s+настройки$")
+STOCK_CFG_SET_RE = re.compile(r"(?i)^!?биржа\s+настройки\s+(рост|падение|дивиденды)\s+(\S+)$")
+# Готовые режимы: числа те же, что у пресетов в веб-панели.
+STOCK_PRESETS = {
+    "спокойная": (-5.0, 5.0, 2.0),
+    "обычная":   (-15.0, 15.0, 5.0),
+    "азартная":  (-30.0, 30.0, 10.0),
+}
+STOCK_CFG_PRESET_RE = re.compile(
+    r"(?i)^!?биржа\s+настройки\s+(" + "|".join(STOCK_PRESETS) + r")$"
+)
+
+
+def _stock_settings_lines(s: dict) -> list[str]:
+    lo = float(s["min_change_percent"])
+    hi = float(s["max_change_percent"])
+    div = float(s["dividend_percent"])
+    avg = (lo + hi) / 2
+    per_day = ((1 + avg / 100) ** 24 - 1) * 100
+    if abs(avg) < 0.5:
+        verdict = "✅ курс в среднем стоит на месте — деньги не печатаются"
+    elif avg > 0:
+        verdict = "⚠️ курс в среднем растёт — со временем это разгонит инфляцию"
+    else:
+        verdict = "⚠️ курс в среднем падает — вложения будут таять"
+    day_text = f"{per_day:+.0f}%" if abs(per_day) < 100_000 else f"×{per_day / 100:.0e}"
+    return [
+        "⚙️ <b>Настройки биржи</b>",
+        DIVIDER,
+        f"📉 Максимальное падение за час: <b>{lo:+.1f}%</b>",
+        f"📈 Максимальный рост за час: <b>{hi:+.1f}%</b>",
+        f"💰 Дивиденды: <b>{div:.1f}%</b> от вложенного в сутки",
+        "",
+        f"Средний шаг: <b>{avg:+.2f}%</b> в час → примерно <b>{day_text}</b> в сутки.",
+        verdict,
+    ]
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(STOCK_CFG_SHOW_RE.match(t.strip()))),
+)
+async def cmd_stock_settings_show(message: Message):
+    if not has_level(message.from_user.id, required_level("stock_settings")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Команда доступна только с уровнем «{level_name(required_level('stock_settings'))}» и выше."
+            )
+        return
+    lines = _stock_settings_lines(await db.get_stock_settings(message.chat.id))
+    lines += [
+        "",
+        "Изменить: <code>биржа настройки рост 15</code> · "
+        "<code>биржа настройки падение -15</code> · "
+        "<code>биржа настройки дивиденды 5</code>",
+        "Готовые режимы: <code>биржа настройки спокойная</code> · "
+        "<code>обычная</code> · <code>азартная</code>",
+    ]
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(STOCK_CFG_PRESET_RE.match(t.strip()))),
+)
+async def cmd_stock_settings_preset(message: Message):
+    if not has_level(message.from_user.id, required_level("stock_settings")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Команда доступна только с уровнем «{level_name(required_level('stock_settings'))}» и выше."
+            )
+        return
+    name = STOCK_CFG_PRESET_RE.match(message.text.strip()).group(1).casefold()
+    lo, hi, div = STOCK_PRESETS[name]
+    await db.set_stock_settings(
+        message.chat.id, min_change_percent=lo, max_change_percent=hi, dividend_percent=div,
+    )
+    await db.add_log(
+        "stock_settings_set", chat_id=message.chat.id, actor_id=message.from_user.id,
+        details=f"пресет «{name}»: {lo:+.2f}%..{hi:+.2f}%, дивиденды {div:.2f}%",
+    )
+    lines = [f"✅ Режим биржи: <b>{name}</b>.", ""]
+    lines += _stock_settings_lines(await db.get_stock_settings(message.chat.id))
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(STOCK_CFG_SET_RE.match(t.strip()))),
+)
+async def cmd_stock_settings_set(message: Message):
+    if not has_level(message.from_user.id, required_level("stock_settings")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Команда доступна только с уровнем «{level_name(required_level('stock_settings'))}» и выше."
+            )
+        return
+    m = STOCK_CFG_SET_RE.match(message.text.strip())
+    field = m.group(1).casefold()
+    try:
+        value = float(m.group(2).replace(",", "."))
+    except ValueError:
+        await message.reply("Не понял число. Например: <code>биржа настройки рост 15</code>")
+        return
+
+    current = await db.get_stock_settings(message.chat.id)
+    lo = float(current["min_change_percent"])
+    hi = float(current["max_change_percent"])
+    if field == "дивиденды":
+        if not 0 <= value <= 100:
+            await message.reply("Дивиденды должны быть в пределах 0…100% в сутки.")
+            return
+        await db.set_stock_settings(message.chat.id, dividend_percent=value)
+    else:
+        if not -100 <= value <= 100:
+            await message.reply("Процент должен быть в пределах от -100 до 100.")
+            return
+        if field == "рост":
+            hi = value
+        else:
+            # «падение 15» и «падение -15» — одно и то же: знак подразумевается.
+            lo = -abs(value)
+        if lo > hi:
+            await message.reply(
+                f"Нижняя граница ({lo:+.1f}%) не может быть выше верхней ({hi:+.1f}%)."
+            )
+            return
+        await db.set_stock_settings(message.chat.id, min_change_percent=lo, max_change_percent=hi)
+
+    await db.add_log(
+        "stock_settings_set", chat_id=message.chat.id, actor_id=message.from_user.id,
+        details=f"{field} = {value}",
+    )
+    await message.answer("\n".join(_stock_settings_lines(await db.get_stock_settings(message.chat.id))))
+
+
+# Замыкающий обработчик раздела «биржа» — см. пояснение у cmd_title_usage.
+# Обязан стоять ниже cmd_stock_set_price, иначе съел бы «биржа цена {число}».
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(re.match(r"(?i)^!?биржа\s+\S", t.strip()))),
+)
+async def cmd_stock_usage(message: Message):
+    if not _check_misc_access(message.from_user.id, "stock_market"):
+        return
+    lines = [
+        "📈 <b>Биржа</b>",
+        "<code>биржа</code> — курс и ваши акции",
+        "<code>биржа купить {сумма}</code>",
+        "<code>биржа продать {сумма}</code>",
+        "<code>биржа дивиденды</code>",
+    ]
+    if has_level(message.from_user.id, required_level("stock_set_price")):
+        lines.append("<code>биржа цена {число}</code>")
+    if has_level(message.from_user.id, required_level("stock_settings")):
+        lines.append("<code>биржа настройки</code> — границы курса и дивиденды")
+    await message.reply("\n".join(lines))
 
 
 

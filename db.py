@@ -6719,9 +6719,12 @@ async def add_coins(chat_id: int, user_id: int, amount: int) -> int:
 
 # ----------------------------------------------------------------------------
 # Биржа: "акции" общие на весь чат (единая цена), у каждого пользователя —
-# доля (shares), стоимость которой = shares * текущая_цена. Цена раз в сутки
-# случайно меняется на -20%..+30% (см. stock_market_loop в bot.py). Дивиденды
-# копятся раз в сутки (5% от invested) и забираются командой "!дивиденды".
+# доля (shares), стоимость которой = shares * текущая_цена. Раз в час цена
+# меняется на случайный процент в границах stock_settings этого чата
+# (см. stock_market_loop в bot.py), а каждое изменение попадает в
+# stock_price_history — из неё веб-панель рисует график. Дивиденды копятся
+# раз в сутки (процент — там же, в stock_settings) и забираются командой
+# "биржа дивиденды".
 # ----------------------------------------------------------------------------
 async def ensure_stock_market_tables() -> None:
     await _execute(
@@ -6732,6 +6735,43 @@ async def ensure_stock_market_tables() -> None:
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
     await _add_column_if_missing("stock_market", "last_change_at", "DATETIME NULL")
+    # Настройки биржи на чат — те же принципы, что у bank_settings: строка
+    # заводится лениво, значения по умолчанию совпадают с константами бота.
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS stock_settings ("
+        "chat_id BIGINT NOT NULL PRIMARY KEY, "
+        "min_change_percent DECIMAL(6,2) NOT NULL DEFAULT -10.00, "
+        "max_change_percent DECIMAL(6,2) NOT NULL DEFAULT 50.00, "
+        "dividend_percent DECIMAL(6,2) NOT NULL DEFAULT 10.00"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    # История курса для графика в веб-панели. Точка пишется при каждом
+    # изменении цены (плановом и ручном); старше STOCK_HISTORY_KEEP_DAYS
+    # чистится фоновым циклом бота.
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS stock_price_history ("
+        "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+        "chat_id BIGINT NOT NULL, "
+        "price DECIMAL(14,4) NOT NULL, "
+        "change_percent DECIMAL(8,3) NULL, "
+        "source VARCHAR(16) NOT NULL DEFAULT 'auto', "
+        "created_at DATETIME NOT NULL, "
+        "INDEX idx_stock_hist_chat_time (chat_id, created_at), "
+        # Отдельный индекс по времени — под чистку старых точек: она идёт
+        # одним DELETE по всем чатам сразу, и составной (chat_id, created_at)
+        # ей не подходит, там created_at второй колонкой.
+        "INDEX idx_stock_hist_time (created_at)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    # Затравка графика: чатам, где биржа уже работала, но истории ещё нет,
+    # добавляем одну точку с текущей ценой. Без неё график первые часы после
+    # обновления показывал бы «точек пока мало» во всех чатах сразу.
+    await _execute(
+        "INSERT INTO stock_price_history (chat_id, price, change_percent, source, created_at) "
+        "SELECT m.chat_id, m.price, NULL, 'seed', COALESCE(m.last_change_at, UTC_TIMESTAMP()) "
+        "FROM stock_market m "
+        "WHERE NOT EXISTS (SELECT 1 FROM stock_price_history h WHERE h.chat_id = m.chat_id)"
+    )
     await _execute(
         "CREATE TABLE IF NOT EXISTS stock_holdings ("
         "chat_id BIGINT NOT NULL, "
@@ -6973,6 +7013,64 @@ async def set_stock_price(chat_id: int, price: float, change_date) -> None:
     )
 
 
+# --- Настройки биржи на чат ---------------------------------------------
+STOCK_HISTORY_KEEP_DAYS = 30
+
+
+async def get_stock_settings(chat_id: int) -> dict:
+    row = await _fetchone("SELECT * FROM stock_settings WHERE chat_id = %s", (chat_id,))
+    if row:
+        return row
+    await _execute("INSERT IGNORE INTO stock_settings (chat_id) VALUES (%s)", (chat_id,))
+    return await _fetchone("SELECT * FROM stock_settings WHERE chat_id = %s", (chat_id,))
+
+
+async def set_stock_settings(
+    chat_id: int, min_change_percent: Optional[float] = None,
+    max_change_percent: Optional[float] = None, dividend_percent: Optional[float] = None,
+) -> None:
+    """Сохраняет только переданные поля. Границы диапазона и знак процентов
+    проверяет вызывающий код (бот и веб-панель) — сюда приходят уже готовые
+    значения."""
+    await get_stock_settings(chat_id)
+    sets, params = [], []
+    if min_change_percent is not None:
+        sets.append("min_change_percent = %s"); params.append(min_change_percent)
+    if max_change_percent is not None:
+        sets.append("max_change_percent = %s"); params.append(max_change_percent)
+    if dividend_percent is not None:
+        sets.append("dividend_percent = %s"); params.append(dividend_percent)
+    if not sets:
+        return
+    params.append(chat_id)
+    await _execute(f"UPDATE stock_settings SET {', '.join(sets)} WHERE chat_id = %s", tuple(params))
+
+
+# --- История курса -------------------------------------------------------
+async def add_stock_price_point(
+    chat_id: int, price: float, change_percent: Optional[float], created_at, source: str = "auto",
+) -> None:
+    await _execute(
+        "INSERT INTO stock_price_history (chat_id, price, change_percent, source, created_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (chat_id, max(price, 0.01), change_percent, source, created_at),
+    )
+
+
+async def list_stock_price_history(chat_id: int, since, limit: int = 2000) -> list[dict]:
+    """Точки курса чата начиная с `since`, от старых к новым."""
+    return await _fetchall(
+        "SELECT price, change_percent, source, created_at FROM stock_price_history "
+        "WHERE chat_id = %s AND created_at >= %s ORDER BY created_at ASC LIMIT %s",
+        (chat_id, since, limit),
+    )
+
+
+async def prune_stock_price_history(before) -> None:
+    """Удаляет точки курса старше `before` во всех чатах разом."""
+    await _execute("DELETE FROM stock_price_history WHERE created_at < %s", (before,))
+
+
 async def get_stock_holding(chat_id: int, user_id: int) -> dict:
     row = await _fetchone(
         "SELECT shares, invested, pending_dividends, total_profit, last_accrual_date, last_dividend_at "
@@ -7027,17 +7125,25 @@ async def sell_stock(chat_id: int, user_id: int, sell_value: int, price: float) 
 
 
 async def list_stock_holdings_due_for_dividend(chat_id: int, today) -> list[dict]:
-    """Держатели акций этого чата, кому ещё не начисляли дивиденды сегодня."""
+    """Держатели акций этого чата, кому ещё не начисляли дивиденды сегодня.
+
+    last_accrual_date — колонка типа DATE, а вызывающий код работает с
+    datetime: цикл биржи крутится раз в час. Раньше datetime подставлялся
+    в сравнение как есть, и MySQL приводил DATE к полуночи того же дня —
+    условие «дата < сегодня 14:30» оставалось истинным весь день, поэтому
+    дивиденды капали каждый час вместо раза в сутки. Отсюда явный CAST
+    аргумента к дате: сравниваем день с днём."""
     return await _fetchall(
         "SELECT user_id, invested FROM stock_holdings WHERE chat_id = %s AND invested > 0 "
-        "AND (last_accrual_date IS NULL OR last_accrual_date < %s)",
+        "AND (last_accrual_date IS NULL OR last_accrual_date < CAST(%s AS DATE))",
         (chat_id, today),
     )
 
 
 async def accrue_dividend(chat_id: int, user_id: int, amount: float, today) -> None:
     await _execute(
-        "UPDATE stock_holdings SET pending_dividends = pending_dividends + %s, last_accrual_date = %s "
+        "UPDATE stock_holdings SET pending_dividends = pending_dividends + %s, "
+        "last_accrual_date = CAST(%s AS DATE) "
         "WHERE chat_id = %s AND user_id = %s",
         (amount, today, chat_id, user_id),
     )

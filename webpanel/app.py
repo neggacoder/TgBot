@@ -1393,6 +1393,83 @@ async def api_command_tree_set_level(
     return result
 
 
+# --- Биржа: график курса и настройки волатильности -------------------------
+# Читает и пишет только персонал (require_user = owner/admin): курс акций —
+# это денежная масса чата, участнику здесь делать нечего.
+STOCK_PERIODS = {"24h": 1, "7d": 7, "30d": 30}
+STOCK_CHANGE_LIMIT = 100.0     # ±100% за шаг — дальше это уже не биржа, а рулетка
+STOCK_DIVIDEND_LIMIT = 100.0   # 100% от вложенного в сутки
+
+
+@app.get("/api/stock")
+async def api_stock(
+    chat_id: int, period: str = "7d", user: PanelUser = Depends(auth.require_user),
+):
+    days = STOCK_PERIODS.get(period)
+    if days is None:
+        raise HTTPException(400, "Период должен быть 24h, 7d или 30d.")
+    now = datetime.utcnow()
+    since = now - timedelta(days=days)
+    settings = await db.get_stock_settings(chat_id)
+    history = await db.list_stock_price_history(chat_id, since)
+    price = await db.get_stock_price(chat_id)
+    points = [
+        {
+            "t": row["created_at"].isoformat(),
+            "price": float(row["price"]),
+            "change": float(row["change_percent"]) if row["change_percent"] is not None else None,
+            "source": row["source"],
+        }
+        for row in history
+    ]
+    # Дотягиваем линию до «сейчас»: курс держится ровно до следующего
+    # изменения, так что горизонтальный хвост — не выдумка, а факт. Заодно
+    # у чата с единственной точкой (свежая затравка) появляется вторая, и
+    # график рисуется вместо заглушки «точек пока мало».
+    if points and points[-1]["t"] != now.isoformat():
+        points.append({"t": now.isoformat(), "price": price, "change": None, "source": "now"})
+    return {
+        "price": price,
+        "period": period,
+        "points": points,
+        "settings": {
+            "min_change_percent": float(settings["min_change_percent"]),
+            "max_change_percent": float(settings["max_change_percent"]),
+            "dividend_percent": float(settings["dividend_percent"]),
+        },
+    }
+
+
+class StockSettingsBody(BaseModel):
+    chat_id: int
+    min_change_percent: float
+    max_change_percent: float
+    dividend_percent: float
+
+
+@app.post("/api/stock/settings")
+async def api_stock_settings(
+    body: StockSettingsBody, request: Request, user: PanelUser = Depends(auth.require_user),
+):
+    auth.verify_csrf(request)
+    lo, hi, div = body.min_change_percent, body.max_change_percent, body.dividend_percent
+    for value, name in ((lo, "падение"), (hi, "рост")):
+        if not -STOCK_CHANGE_LIMIT <= value <= STOCK_CHANGE_LIMIT:
+            raise HTTPException(400, f"Максимальное {name} должно быть в пределах ±{STOCK_CHANGE_LIMIT:.0f}%.")
+    if lo > hi:
+        raise HTTPException(400, "Нижняя граница не может быть выше верхней.")
+    if not 0 <= div <= STOCK_DIVIDEND_LIMIT:
+        raise HTTPException(400, f"Дивиденды должны быть в пределах 0…{STOCK_DIVIDEND_LIMIT:.0f}%.")
+    await db.set_stock_settings(
+        body.chat_id, min_change_percent=lo, max_change_percent=hi, dividend_percent=div,
+    )
+    await db.add_log(
+        "stock_settings_set", chat_id=body.chat_id, actor_id=user.id,
+        details=f"{lo:+.2f}%..{hi:+.2f}%, дивиденды {div:.2f}%",
+    )
+    return {"ok": True}
+
+
 # --- Пороги наград (степени 1-8 → минимальный уровень доступа) -------------
 REWARD_DEGREES = tuple(range(1, 9))
 REWARD_LEVELS = (roles.LEVEL_MEMBER, roles.LEVEL_MODERATOR, roles.LEVEL_ADMIN, roles.LEVEL_SENIOR, roles.OWNER_LEVEL)

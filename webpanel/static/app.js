@@ -1095,6 +1095,7 @@ $$(".nav-btn").forEach((btn) => {
     if (view === "settings") loadSettings();
     if (view === "users") loadUsers();
     if (view === "stats") { loadStatsData(); loadLogs(); }
+    if (view === "stock") loadStockData();
     if (view === "tgadmins") loadTgAdmins();
     if (view === "chatroles") loadChatRoles();
     if (view === "moderation") { loadRestRequests(); loadWordFilter(); }
@@ -1237,7 +1238,7 @@ async function loadChats() {
     const options = chats
       .map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`)
       .join("");
-    ["#send-chat", "#members-chat", "#mod-chat", "#stats-chat", "#tga-chat", "#chatroles-chat"].forEach((sel) => {
+    ["#send-chat", "#members-chat", "#mod-chat", "#stats-chat", "#stock-chat", "#tga-chat", "#chatroles-chat"].forEach((sel) => {
       $(sel).innerHTML = options || `<option value="">Чатов пока нет</option>`;
     });
     $("#chats-table").innerHTML = chats.map((c) => `
@@ -3136,6 +3137,179 @@ $("#tga-promote").addEventListener("click", async () => {
   } catch (err) {
     say("#global-msg", err.message, "err");
   }
+});
+
+// --- биржа ----------------------------------------------------------------
+
+// Линейный график курса: одна серия, поэтому один цвет. Рисуем инлайновым SVG
+// в viewBox 0..100 x 0..100 с preserveAspectRatio="none" — тогда график тянется
+// по ширине карточки без пересчёта на resize и без единого обработчика.
+// Толщину линии компенсируем vector-effect, иначе растяжение размажет её.
+function lineChart(title, subtitle, points) {
+  if (points.length < 2) {
+    return `<div class="chart-block"><h3>${escapeHtml(title)}</h3>
+      <div class="chart-empty">${icon("chart")}Точек пока мало — график появится
+      после нескольких изменений курса</div></div>`;
+  }
+  const values = points.map((p) => p.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  // Плоскую линию (min === max) иначе поделили бы на ноль — рисуем по центру.
+  const span = max - min || 1;
+  const x = (i) => (i / (points.length - 1)) * 100;
+  const y = (v) => 100 - ((v - min) / span) * 100;
+
+  const line = points.map((p, i) => `${x(i).toFixed(2)},${y(p.value).toFixed(2)}`).join(" ");
+  const area = `0,100 ${line} 100,100`;
+  const last = points[points.length - 1];
+  const first = points[0];
+  const growth = first.value ? ((last.value / first.value - 1) * 100) : 0;
+  const trend = growth >= 0 ? "up" : "down";
+
+  // Подписи оси Y — только три (низ/середина/верх): больше на узкой карточке
+  // не читается, а точное значение точки видно в нативном title при наведении.
+  const fmt = (v) => (v >= 1000 ? Math.round(v).toLocaleString("ru-RU") : v.toFixed(2));
+  const dots = points.map((p, i) => `<circle class="spark-dot" cx="${x(i).toFixed(2)}"
+    cy="${y(p.value).toFixed(2)}" r="1.4"><title>${escapeHtml(p.title)}</title></circle>`).join("");
+
+  return `<div class="chart-block">
+    <h3>${escapeHtml(title)}</h3>
+    <p class="chart-sub">${escapeHtml(subtitle)}</p>
+    <div class="spark-wrap">
+      <div class="spark-y"><span>${fmt(max)}</span><span>${fmt((max + min) / 2)}</span><span>${fmt(min)}</span></div>
+      <svg class="spark ${trend}" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        <polygon class="spark-area" points="${area}"/>
+        <polyline class="spark-line" points="${line}"/>
+        ${dots}
+      </svg>
+    </div>
+    <div class="bar-axis"><span>${escapeHtml(first.axis)}</span><span style="text-align:right">${escapeHtml(last.axis)}</span></div>
+    <div class="stat-grid" style="margin-top:var(--gap-3)">
+      ${statCell(fmt(last.value), "курс сейчас")}
+      ${statCell(`${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, "за период")}
+      ${statCell(fmt(min), "минимум")}
+      ${statCell(fmt(max), "максимум")}
+    </div>
+  </div>`;
+}
+
+// Средний процент за шаг — то самое число, из-за которого «биржа печатает
+// деньги»: если оно заметно больше нуля, курс растёт экспоненциально.
+function stockForecast(lo, hi, div) {
+  if (![lo, hi, div].every(Number.isFinite)) return "";
+  const avg = (lo + hi) / 2;
+  const perDay = (Math.pow(1 + avg / 100, 24) - 1) * 100;
+  let verdict;
+  if (Math.abs(avg) < 0.5) verdict = "ok";
+  else if (avg > 0) verdict = "warn";
+  else verdict = "warn";
+  const dayText = Math.abs(perDay) > 100000
+    ? `${(perDay / 100).toExponential(1)}×`
+    : `${perDay >= 0 ? "+" : ""}${perDay.toFixed(0)}%`;
+  const note = verdict === "ok"
+    ? "курс в среднем стоит на месте — деньги не печатаются"
+    : (avg > 0 ? "курс в среднем растёт — со временем это разгонит инфляцию"
+               : "курс в среднем падает — вложения будут таять");
+  return `<p class="msg ${verdict === "ok" ? "ok" : "err"}" style="margin-top:8px">
+    Средний шаг: <b>${avg >= 0 ? "+" : ""}${avg.toFixed(2)}%</b> в час → примерно
+    <b>${dayText}</b> в сутки. ${escapeHtml(note)}.
+    Дивиденды добавляют держателям ещё <b>${div.toFixed(1)}%</b> от вложенного в сутки.</p>`;
+}
+
+// Пресеты — те же числа, что у «биржа настройки {режим}» в боте (STOCK_PRESETS).
+const STOCK_PRESETS = {
+  "спокойная": [-5, 5, 2],
+  "обычная": [-15, 15, 5],
+  "азартная": [-30, 30, 10],
+};
+
+function refreshStockForecast() {
+  const lo = Number($("#stock-min").value);
+  const hi = Number($("#stock-max").value);
+  const div = Number($("#stock-div").value);
+  $("#stock-forecast").innerHTML = stockForecast(lo, hi, div);
+  // Подсвечиваем режим, если текущие числа в точности совпали с ним.
+  $$("#stock-presets .preset").forEach((b) => {
+    const p = STOCK_PRESETS[b.dataset.preset];
+    b.classList.toggle("on", p && p[0] === lo && p[1] === hi && p[2] === div);
+  });
+}
+
+function applyStockPreset(name) {
+  const p = STOCK_PRESETS[name];
+  if (!p) return;
+  $("#stock-min").value = p[0];
+  $("#stock-max").value = p[1];
+  $("#stock-div").value = p[2];
+  refreshStockForecast();
+}
+
+async function loadStockData() {
+  const chatId = $("#stock-chat").value;
+  if (!chatId) return;
+  const period = $("#stock-period").value;
+  $("#stock-out").innerHTML = skeleton(3);
+  try {
+    const d = await api(`/api/stock?chat_id=${chatId}&period=${encodeURIComponent(period)}`);
+    const withTime = period === "24h";
+    const points = d.points.map((p) => {
+      const dt = new Date(p.t + "Z");
+      const stamp = withTime
+        ? dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+        : dt.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+      const change = p.change == null ? "" : ` (${p.change >= 0 ? "+" : ""}${p.change.toFixed(1)}%)`;
+      const manual = { manual: ", вручную", seed: ", на момент запуска", now: ", сейчас" }[p.source] || "";
+      return {
+        value: p.price,
+        axis: stamp,
+        title: `${dt.toLocaleString("ru-RU")}: ${p.price.toFixed(2)} i¢${change}${manual}`,
+      };
+    });
+    const periodName = { "24h": "за сутки", "7d": "за неделю", "30d": "за месяц" }[period];
+    $("#stock-out").innerHTML =
+      lineChart("Курс акций", `Каждая точка — изменение курса ${periodName}.`, points);
+
+    $("#stock-min").value = d.settings.min_change_percent;
+    $("#stock-max").value = d.settings.max_change_percent;
+    $("#stock-div").value = d.settings.dividend_percent;
+    refreshStockForecast();
+    // Ручные поля раскрываем только если настройки не совпали ни с одним
+    // режимом — иначе три кнопки и есть весь нужный интерфейс.
+    $("#stock-tune").open = !$("#stock-presets .preset.on");
+  } catch (err) {
+    $("#stock-out").innerHTML = "";
+    say("#stock-msg", err.message, "err");
+  }
+}
+
+async function saveStockSettings() {
+  const chatId = $("#stock-chat").value;
+  if (!chatId) return;
+  try {
+    await api("/api/stock/settings", {
+      method: "POST",
+      body: {
+        chat_id: Number(chatId),
+        min_change_percent: Number($("#stock-min").value),
+        max_change_percent: Number($("#stock-max").value),
+        dividend_percent: Number($("#stock-div").value),
+      },
+    });
+    say("#stock-msg", "Настройки биржи сохранены.");
+  } catch (err) {
+    say("#stock-msg", err.message, "err");
+  }
+}
+
+$$("#stock-presets .preset").forEach((btn) => {
+  btn.addEventListener("click", () => applyStockPreset(btn.dataset.preset));
+});
+$("#stock-load").addEventListener("click", loadStockData);
+$("#stock-chat").addEventListener("change", loadStockData);
+$("#stock-period").addEventListener("change", loadStockData);
+$("#stock-save").addEventListener("click", saveStockSettings);
+["#stock-min", "#stock-max", "#stock-div"].forEach((sel) => {
+  $(sel).addEventListener("input", refreshStockForecast);
 });
 
 // --- статистика -----------------------------------------------------------
