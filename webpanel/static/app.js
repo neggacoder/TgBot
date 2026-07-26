@@ -1094,7 +1094,8 @@ $$(".nav-btn").forEach((btn) => {
     $(`#view-${view}`).classList.remove("hidden");
     if (view === "settings") loadSettings();
     if (view === "users") loadUsers();
-    if (view === "stats") { loadStatsData(); loadLogs(); }
+    if (view === "stats") loadStatsData();
+    if (view === "logs") loadLogs();
     if (view === "stock") loadStockData();
     if (view === "tgadmins") loadTgAdmins();
     if (view === "chatroles") loadChatRoles();
@@ -1291,6 +1292,9 @@ async function loadChats() {
     ["#send-chat", "#members-chat", "#mod-chat", "#stats-chat", "#stock-chat", "#tga-chat", "#chatroles-chat"].forEach((sel) => {
       $(sel).innerHTML = options || `<option value="">Чатов пока нет</option>`;
     });
+    // В фильтре журнала «все чаты» — вариант по умолчанию, поэтому список
+    // чатов добавляется к нему, а не заменяет его.
+    if ($("#logs-chat")) $("#logs-chat").innerHTML = `<option value="">Все чаты</option>` + options;
     $("#chats-table").innerHTML = chats.map((c) => `
       <tr><td><div class="person">${avatar(c.title, c.chat_id)}<span>${escapeHtml(c.title)}</span></div></td>
           <td class="mono">${c.chat_id}</td>
@@ -3459,15 +3463,99 @@ async function loadStatsData() {
 
 $("#stats-load").addEventListener("click", loadStatsData);
 
+// Журнал: поиск + фильтры + постраничная выдача.
+const LOGS_PAGE = 50;
+let _logsOffset = 0;
+let _logsTotal = 0;
+// Типы событий приходят с сервера вместе с первой страницей; заполняем
+// выпадающий список один раз, иначе он сбрасывал бы выбор на каждый ввод.
+let _logsTypesFilled = false;
+let _logsTimer = null;
+
+function logsQueryString() {
+  const p = new URLSearchParams();
+  const q = $("#logs-q").value.trim();
+  if (q) p.set("q", q);
+  const type = $("#logs-type").value;
+  if (type) p.set("event_type", type);
+  const days = $("#logs-days").value;
+  if (days && days !== "0") p.set("days", days);
+  const chat = $("#logs-chat").value;
+  if (chat) p.set("chat_id", chat);
+  const uid = $("#logs-user").value.trim();
+  if (uid) p.set("user_id", uid);
+  p.set("limit", LOGS_PAGE);
+  p.set("offset", _logsOffset);
+  return p.toString();
+}
+
 async function loadLogs() {
+  const table = $("#logs-table");
+  if (!table) return;
   try {
-    const data = await api("/api/logs?limit=50");
-    $("#logs-table").innerHTML = data.logs.map((l) => `
-      <tr><td class="muted" style="white-space:nowrap">${fmtDate(l.created_at)}</td>
-          <td><span class="badge">${escapeHtml(l.event_type)}</span></td>
-          <td class="muted">${escapeHtml(l.details || "")}</td></tr>`).join("")
-      || empty(3, "Журнал пока пуст");
-  } catch (err) { /* журнал не критичен */ }
+    const data = await api(`/api/logs/search?${logsQueryString()}`);
+    _logsTotal = data.total;
+
+    if (!_logsTypesFilled && data.event_types) {
+      $("#logs-type").innerHTML = `<option value="">Все события</option>` +
+        data.event_types.map((t) =>
+          `<option value="${escapeHtml(t.event_type)}">${escapeHtml(t.event_type)} (${t.n})</option>`).join("");
+      _logsTypesFilled = true;
+    }
+
+    table.innerHTML = data.logs.map((l) => {
+      // Время приходит в UTC — показываем в зоне того, кто смотрит панель.
+      const dt = new Date(l.created_at + "Z");
+      const who = [
+        l.actor_id ? `<span class="mono">${l.actor_id}</span>` : "",
+        l.target_id ? `→ <span class="mono">${l.target_id}</span>` : "",
+      ].filter(Boolean).join(" ");
+      return `<tr>
+        <td class="muted mono" style="white-space:nowrap" title="${escapeHtml(dt.toLocaleString("ru-RU"))}">${escapeHtml(dt.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }))}</td>
+        <td><span class="badge">${escapeHtml(l.event_type)}</span></td>
+        <td class="muted">${who || "—"}</td>
+        <td class="muted">${escapeHtml(l.details || "")}</td></tr>`;
+    }).join("") || empty(4, "Ничего не найдено — попробуйте ослабить фильтры");
+
+    const from = _logsTotal ? _logsOffset + 1 : 0;
+    const to = Math.min(_logsOffset + LOGS_PAGE, _logsTotal);
+    $("#logs-count").textContent = _logsTotal
+      ? `Показаны ${from}–${to} из ${_logsTotal}`
+      : "Записей нет";
+    $("#logs-prev").disabled = _logsOffset <= 0;
+    $("#logs-next").disabled = _logsOffset + LOGS_PAGE >= _logsTotal;
+  } catch (err) {
+    table.innerHTML = empty(4, err.message);
+  }
+}
+
+// Ввод в поиске не дёргает сервер на каждую букву.
+function scheduleLogsReload() {
+  clearTimeout(_logsTimer);
+  _logsTimer = setTimeout(() => { _logsOffset = 0; loadLogs(); }, 300);
+}
+
+if ($("#logs-q")) {
+  $("#logs-q").addEventListener("input", scheduleLogsReload);
+  ["#logs-type", "#logs-days", "#logs-chat"].forEach((sel) =>
+    $(sel).addEventListener("change", () => { _logsOffset = 0; loadLogs(); }));
+  $("#logs-user").addEventListener("input", scheduleLogsReload);
+  $("#logs-prev").addEventListener("click", () => {
+    _logsOffset = Math.max(0, _logsOffset - LOGS_PAGE);
+    loadLogs();
+  });
+  $("#logs-next").addEventListener("click", () => {
+    if (_logsOffset + LOGS_PAGE < _logsTotal) { _logsOffset += LOGS_PAGE; loadLogs(); }
+  });
+  $("#logs-reset").addEventListener("click", () => {
+    $("#logs-q").value = "";
+    $("#logs-type").value = "";
+    $("#logs-days").value = "7";
+    $("#logs-chat").value = "";
+    $("#logs-user").value = "";
+    _logsOffset = 0;
+    loadLogs();
+  });
 }
 
 // --- настройки ------------------------------------------------------------

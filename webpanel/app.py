@@ -3954,6 +3954,55 @@ async def api_logs(limit: int = 50, user: PanelUser = Depends(auth.require_user)
     return {"logs": await db.get_recent_logs(limit=min(limit, 200))}
 
 
+LOGS_PAGE_MAX = 200
+
+
+@app.get("/api/logs/search")
+async def api_logs_search(
+    q: Optional[str] = None,
+    event_type: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    days: Optional[int] = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: PanelUser = Depends(auth.require_user),
+):
+    """Журнал с поиском, фильтрами и постраничной выдачей."""
+    since = None
+    if days and days > 0:
+        since = datetime.utcnow() - timedelta(days=min(days, 365))
+    rows, total = await db.search_logs(
+        query=(q or "").strip() or None,
+        event_type=(event_type or "").strip() or None,
+        chat_id=chat_id,
+        user_id=user_id,
+        since=since,
+        limit=max(1, min(limit, LOGS_PAGE_MAX)),
+        offset=max(0, offset),
+    )
+    return {
+        "logs": [
+            {
+                "id": r["id"],
+                # Отдаём ISO в UTC — переводит в местное время уже браузер,
+                # у него зона пользователя точнее любой серверной настройки.
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "event_type": r["event_type"],
+                "chat_id": r["chat_id"],
+                "actor_id": r["actor_id"],
+                "target_id": r["target_id"],
+                "details": r["details"],
+            }
+            for r in rows
+        ],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "event_types": await db.list_log_event_types(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Настройки бота
 # ---------------------------------------------------------------------------

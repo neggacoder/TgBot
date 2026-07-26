@@ -149,6 +149,22 @@ DEFAULT_GROUP_JOIN_TEXT = "👋 Встречайте — в чат вступи�
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def log_suppressed(where: str, exc: BaseException) -> None:
+    """Записать ошибку, которую мы осознанно НЕ пробрасываем дальше.
+
+    Раньше в таких местах стоял голый `except Exception: pass`, и сорок пять
+    ошибок исчезали бесследно. Именно так, например, годами молчала неработавшая
+    ежедневная награда: исключение ловилось и выбрасывалось в никуда.
+
+    Пишем WARNING без traceback, а не exception(): подавляющее большинство этих
+    мест — отправка сообщения в чат, который выгнал бота или закрыл ЛС. Это
+    ожидаемая ситуация, и стек на каждую такую ошибку залил бы журнал так, что
+    в нём перестали бы находиться настоящие поломки. Тип и текст ошибки при
+    этом сохраняются — по ним причина видна.
+    """
+    logger.warning("Подавлена ошибка в %s: %s: %s", where, type(exc).__name__, exc)
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
@@ -391,8 +407,8 @@ async def handle_member_joined(chat_id: int, user, inviter_id: Optional[int]) ->
                     f"🎖 {mention_id(user.id)}, за вами была бронь — роль «{html.escape(role['name'])}» "
                     "закреплена за вами."
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log_suppressed("handle_member_joined", exc)
 
         # Настраиваемое приветствие в самой группе (см. admin-панель →
         # «Тексты сообщений» → «Приветствие в группе (вход)»).
@@ -465,8 +481,8 @@ async def handle_member_left(chat_id: int, user) -> None:
                 await bot.send_message(
                     chat_id, f"Роль «{html.escape(freed_name)}» освобождена — участник покинул чат."
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log_suppressed("handle_member_left", exc)
     except Exception:
         logger.exception("Не удалось обработать выход участника из чата")
 
@@ -1458,8 +1474,8 @@ async def react(chat_id: int, message_id: int, emoji: str, fallback_text: str | 
         if fallback_text:
             try:
                 await bot.send_message(chat_id, fallback_text)
-            except Exception:
-                pass
+            except Exception as exc:
+                log_suppressed("react", exc)
 
 
 def mention_id(user_id: int, full_name: str | None = None, username: str | None = None) -> str:
@@ -3384,8 +3400,8 @@ async def admin_add_level(message: Message, state: FSMContext):
             f"🎉 Вас назначили администратором бота ({level_name(level)}).\n"
             "Слово «админка» — открыть панель (если доступна вашему уровню), «помощь» — список команд модерации.",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("admin_add_level", exc)
 
 
 @router.message(F.chat.type == "private", StateFilter(AdminStates.menu_admins), F.text.func(lambda t: bool(t) and re.match(r"^❌ .+\((\d+)\)$", t.strip())))
@@ -5033,8 +5049,8 @@ async def _complaint_decide(message: Message, state: FSMContext, complaint_id: i
             complaint["reporter_id"],
             f"{verdict}\n\nПричина, которую вы указывали:\n{html.escape(complaint['reason'])}",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("_complaint_decide", exc)
 
 
 @router.message(F.chat.type == "private", StateFilter(ComplaintStates.menu_detail), F.text.func(lambda t: bool(t) and re.match(r"^✅ Принять №(\d+)$", t.strip())))
@@ -5433,8 +5449,8 @@ async def anon_report(callback: CallbackQuery):
     for admin_id in _admins_at_or_above(required_level("complaints")):
         try:
             await bot.send_message(admin_id, notify_text)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("anon_report", exc)
 
 
 @router.message(
@@ -6459,8 +6475,8 @@ async def _role_proposal_decision(callback: CallbackQuery, approve: bool) -> Non
         if proposer:
             try:
                 await bot.send_message(proposer, f"✅ Ваша заявка на роль «{html.escape(role['name'])}» одобрена.")
-            except Exception:
-                pass
+            except Exception as exc:
+                log_suppressed("_role_proposal_decision", exc)
         alert_text = f"Роль «{role['name']}» добавлена в список."
     else:
         role = await db.get_role(chat_id, role_id)
@@ -6477,8 +6493,8 @@ async def _role_proposal_decision(callback: CallbackQuery, approve: bool) -> Non
                 await bot.send_message(
                     role["proposed_by"], f"❌ Ваша заявка на роль «{html.escape(role['name'])}» отклонена."
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log_suppressed("_role_proposal_decision", exc)
         alert_text = "Заявка отклонена."
 
     try:
@@ -6523,8 +6539,8 @@ async def cmd_role_approve(message: Message):
     if proposer:
         try:
             await bot.send_message(proposer, f"✅ Ваша заявка на роль «{html.escape(role['name'])}» одобрена.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("cmd_role_approve", exc)
 
 
 @router.message(F.text.func(lambda t: bool(t) and bool(re.match(r"^роль отклонить (\d+)$", t.strip().casefold()))))
@@ -6550,8 +6566,8 @@ async def cmd_role_reject(message: Message):
     if role and role.get("proposed_by"):
         try:
             await bot.send_message(role["proposed_by"], f"❌ Ваша заявка на роль «{html.escape(role['name'])}» отклонена.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("cmd_role_reject", exc)
 
 
 @router.message(F.reply_to_message, F.text.func(lambda t: bool(t) and t.strip().casefold().startswith("роль отдать ")))
@@ -6862,8 +6878,8 @@ async def _resolve_role_target(message: Message) -> tuple[Optional[int], Optiona
             chat = await bot.get_chat(username)
             if chat.type == "private":
                 return chat.id, chat.username or username, chat.full_name or chat.first_name
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("_resolve_role_target", exc)
     return None, None, None
 
 
@@ -7279,8 +7295,8 @@ async def prompt_role_pick_for_applicant(user_id: int) -> None:
                 "хотя бы одна, вы сможете выбрать её через «сменить роль». Это не "
                 "помешает получению ссылки.",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("prompt_role_pick_for_applicant", exc)
         return
     try:
         await bot.send_message(
@@ -7430,8 +7446,8 @@ async def handle_give_link(callback: CallbackQuery):
         await db.add_log("testmode_off", actor_id=target_user_id)
         try:
             await bot.send_message(target_user_id, "🧪 Тестовый режим «Входящего» выключен автоматически.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("handle_give_link", exc)
 
     await callback.answer("Ссылка отправлена пользователю ✅")
 
@@ -7509,8 +7525,8 @@ async def handle_reject_confirm(callback: CallbackQuery):
         await db.add_log("testmode_off", actor_id=target_user_id)
         try:
             await bot.send_message(target_user_id, "🧪 Тестовый режим «Входящего» выключен автоматически.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("handle_reject_confirm", exc)
 
     await callback.answer("Отказ отправлен пользователю")
 
@@ -9176,8 +9192,8 @@ async def _auto_unlock_chat(chat_id: int, delay_seconds: float, expected_until: 
     levels_line = f"\nТакже вернул права: {', '.join(restored_levels)}" if restored_levels else ""
     try:
         await bot.send_message(chat_id, f"🔓 <b>Чат открыт автоматически</b>\nСрок закрытия истёк.{levels_line}")
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("_auto_unlock_chat", exc)
     await db.add_log("chat_unlock", chat_id=chat_id, details="авто (истёк срок)")
 
 
@@ -9311,8 +9327,8 @@ async def cb_chat_lock_level(callback: CallbackQuery):
             f"🔇 <b>{level_name(level)}</b> больше не могут писать в этом чате — до открытия чата.\n"
             f"Затронуто: {muted}\n👤 Выключил: {actor_name}"
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("cb_chat_lock_level", exc)
     await db.add_log(
         "chat_lock_level", chat_id=chat_id, actor_id=callback.from_user.id, details=f"{level}:{muted}"
     )
@@ -9385,11 +9401,10 @@ async def spend_coins(chat_id: int, user_id: int, amount: int) -> bool:
         return True
     if await is_account_frozen(chat_id, user_id):
         return False
-    wallet = await db.get_wallet(chat_id, user_id)
-    if int(wallet.get("coins", 0)) < amount:
-        return False
-    await db.add_coins(chat_id, user_id, -amount)
-    return True
+    # Проверку «хватает ли» и само списание делает один запрос в db —
+    # см. try_spend_coins: раздельные чтение и вычитание позволяли двум
+    # одновременным командам списать одни и те же монеты дважды.
+    return await db.try_spend_coins(chat_id, user_id, amount)
 
 
 
@@ -10328,8 +10343,8 @@ async def confirm_nuke(callback: CallbackQuery):
                 can_pin_messages=False,
             )
             demoted += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("confirm_nuke", exc)
         await asyncio.sleep(0.1)
 
     # 2. Баним всех известных боту участников чата.
@@ -10342,8 +10357,8 @@ async def confirm_nuke(callback: CallbackQuery):
         try:
             await bot.ban_chat_member(chat_id, user_id)
             banned += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("confirm_nuke", exc)
         await asyncio.sleep(0.05)
 
     # 3. Перебором пытаемся удалить как можно больше сообщений чата — с
@@ -10361,8 +10376,8 @@ async def confirm_nuke(callback: CallbackQuery):
                 deleted += 1
         except TelegramForbiddenError:
             break  # бота вот-вот выкинут/у бота нет прав вообще — дальше пробовать бессмысленно
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("confirm_nuke", exc)
         if msg_id % 25 == 0:
             await asyncio.sleep(0.3)  # не долбить Telegram флудом
 
@@ -10380,12 +10395,12 @@ async def confirm_nuke(callback: CallbackQuery):
             f"☢️ Готово: снято прав — {demoted}, удалено участников — {banned}, "
             f"удалено сообщений — {deleted}. Бот покидает чат.",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("confirm_nuke", exc)
     try:
         await bot.leave_chat(chat_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("confirm_nuke", exc)
 
 
 @router.callback_query(F.data.startswith("nuke_no:"))
@@ -10527,9 +10542,14 @@ async def cmd_confiscate(message: Message):
         await message.reply("У этого пользователя нечего конфисковывать (баланс 0 i¢).")
         return
 
-    await db.add_coins(message.chat.id, target.id, -amount)
+    # take_coins_up_to не даст балансу уйти в минус, даже если человек
+    # успел потратить монеты между чтением баланса выше и этой строкой.
+    taken = await db.take_coins_up_to(message.chat.id, target.id, amount)
     name = await display_name(message.chat.id, target)
-    await message.reply(f"👮 Конфисковано у {name}: <b>{amount}</b> i¢. Остаток: {balance - amount} i¢.")
+    left = await db.get_wallet(message.chat.id, target.id)
+    await message.reply(
+        f"👮 Конфисковано у {name}: <b>{taken}</b> i¢. Остаток: {left.get('coins', 0)} i¢."
+    )
     await db.add_log(
         "account_confiscate", chat_id=message.chat.id, actor_id=message.from_user.id,
         target_id=target.id, details=str(amount),
@@ -11717,8 +11737,8 @@ def _download_bg_url(url: str) -> Optional[bytes]:
         try:
             with open(cache_path, "rb") as f:
                 return f.read()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("_download_bg_url", exc)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -11741,8 +11761,8 @@ def _pick_quote_bg_photo() -> Optional[bytes]:
         try:
             with open(path, "rb") as f:
                 return f.read()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("_pick_quote_bg_photo", exc)
     urls = QUOTE_BG_URLS.copy()
     random.shuffle(urls)
     for url in urls:
@@ -13305,6 +13325,12 @@ async def cmd_bcoin(message: Message):
         return
 
     new_chat_balance = await db.record_chat_investment(chat_id, user_id, amount)
+    if new_chat_balance is None:
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Недостаточно монет в мешке: у вас {wallet.get('coins', 0)} i¢, нужно {amount}."
+        )
+        return
     await db.add_log("chat_coin_invest", chat_id=chat_id, actor_id=user_id, details=str(amount))
     await message.reply(
         f"☢️ Вы вложили <b>{amount}</b> i¢ в баланс чата!\n"
@@ -13830,12 +13856,11 @@ async def cmd_robbery_pardon(message: Message):
     if not await db.is_under_surveillance(chat_id, user_id):
         await message.reply("Вы и так не под надзором.")
         return
-    wallet = await db.get_wallet(chat_id, user_id)
     price = robbery.SURVEILLANCE_PARDON_PRICE
-    if int(wallet.get("coins", 0)) < price:
+    if not await spend_coins(chat_id, user_id, price):
+        wallet = await db.get_wallet(chat_id, user_id)
         await message.reply(f"Недостаточно монет: у вас {wallet.get('coins', 0)} i¢, нужно {price}.")
         return
-    await db.add_coins(chat_id, user_id, -price)
     await db.clear_robbery_surveillance(chat_id, user_id)
     await message.reply(f"✅ Откуп оплачен ({price} i¢) — надзор снят, можно грабить снова.")
     await db.add_log("robbery_pardon", chat_id=chat_id, actor_id=user_id)
@@ -13890,8 +13915,12 @@ async def cmd_casino_roulette(message: Message):
         return
 
     chat_id, user_id = message.chat.id, message.from_user.id
-    wallet = await db.get_wallet(chat_id, user_id)
-    if int(wallet.get("coins", 0)) < bet_amount:
+    # Ставку списываем ДО розыгрыша, одним атомарным запросом. Раньше баланс
+    # только проверялся, а списывался лишь при проигрыше, — и две рулетки,
+    # запущенные одновременно, обе проходили проверку с одними и теми же
+    # монетами: можно было играть на деньги, которых нет.
+    if not await spend_coins(chat_id, user_id, bet_amount):
+        wallet = await db.get_wallet(chat_id, user_id)
         await message.reply(
             f"Недостаточно монет: у вас {wallet.get('coins', 0)} i¢, ставка {bet_amount} i¢."
         )
@@ -13907,10 +13936,11 @@ async def cmd_casino_roulette(message: Message):
         # Фартовый час / крупье не в духе — событие чата множит только
         # выигрыш, ставка не трогается (см. chat_events.py).
         delta = max(1, round(delta * await event_multiplier(chat_id, chat_events.T_CASINO)))
-        await db.add_coins(chat_id, user_id, delta)
+        # Ставка уже списана выше — возвращаем её вместе с выигрышем.
+        await db.add_coins(chat_id, user_id, bet_amount + delta)
         outcome_text = f"✅ <b>Выигрыш!</b> +{delta} i¢ (x{multiplier})"
     else:
-        await db.add_coins(chat_id, user_id, -bet_amount)
+        # Ставка уже списана — доплачивать нечего.
         outcome_text = f"❌ <b>Проигрыш.</b> -{bet_amount} i¢"
 
     await message.answer(
@@ -14327,8 +14357,8 @@ async def _race_countdown(chat_id: int) -> None:
         active_races.pop(chat_id, None)
         try:
             await bot.send_message(chat_id, "🐎 Никто не сделал ставку — гонка отменена.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("_race_countdown", exc)
         return
     await _run_race(chat_id, race)
 
@@ -14394,8 +14424,8 @@ async def _run_race(chat_id: int, race: dict) -> None:
 
     try:
         await bot.send_message(chat_id, "\n".join(lines))
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("_run_race", exc)
 
     await db.add_log("race_finished", chat_id=chat_id, details=f"winner={winner_num}")
     active_races.pop(chat_id, None)
@@ -14905,8 +14935,8 @@ async def confirm_bank_credit(callback: CallbackQuery):
             f"{html.escape(chat_obj.title or str(chat_id))}.\n"
             f"К возврату: {data['debt']} i¢ в течение {data['term_days']} дн.",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("confirm_bank_credit", exc)
     await db.add_log("bank_credit_approved", chat_id=chat_id, actor_id=callback.from_user.id, target_id=user_id)
     await callback.answer("Одобрено ✅")
 
@@ -14938,8 +14968,8 @@ async def decline_bank_credit(callback: CallbackQuery):
         pass
     try:
         await bot.send_message(user_id, "❌ Ваша заявка на кредит отклонена администратором.")
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("decline_bank_credit", exc)
     await db.add_log("bank_credit_declined", chat_id=chat_id, actor_id=callback.from_user.id, target_id=user_id)
     await callback.answer("Отклонено")
 
@@ -14962,13 +14992,12 @@ async def cmd_bank_repay(message: Message):
         await message.reply("У вас нет активного кредита.")
         return
 
-    wallet = await db.get_wallet(chat_id, user_id)
     pay = min(amount, int(account["credit_debt"]))
-    if int(wallet.get("coins", 0)) < pay:
+    if not await spend_coins(chat_id, user_id, pay):
+        wallet = await db.get_wallet(chat_id, user_id)
         await message.reply(f"Недостаточно монет: у вас {wallet.get('coins', 0)} i¢, нужно {pay}.")
         return
 
-    await db.add_coins(chat_id, user_id, -pay)
     remaining = await db.reduce_bank_credit_debt(chat_id, user_id, pay)
     if remaining:
         await message.reply(f"✅ Погашено {pay} i¢. Остаток долга: {remaining} i¢.")
@@ -15209,8 +15238,8 @@ async def bank_penalty_loop() -> None:
                             f"долг ({new_debt} i¢) списан принудительно (баланс мог уйти в минус), "
                             f"выдано предупреждение ({warn_count}/{WARN_LIMIT}).",
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_suppressed("bank_penalty_loop", exc)
                     await db.add_log(
                         "bank_credit_force_collected", chat_id=chat_id, target_id=user_id, details=str(new_debt)
                     )
@@ -15224,8 +15253,8 @@ async def bank_penalty_loop() -> None:
                         f"{penalty_percent:g}%. Новый долг: {new_debt} i¢. "
                         "Погасить: «!банк погасить {сумма}».",
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_suppressed("bank_penalty_loop", exc)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -15709,11 +15738,9 @@ async def cmd_prof_upgrade(message: Message):
     if await db.has_profession_upgrade(message.chat.id, message.from_user.id, key):
         await message.reply("У вас уже куплено это улучшение.")
         return
-    wallet = await db.get_wallet(message.chat.id, message.from_user.id)
-    if wallet.get("coins", 0) < up["price"]:
+    if not await spend_coins(message.chat.id, message.from_user.id, up["price"]):
         await message.reply(f"Недостаточно монет: нужно {up['price']} i¢.")
         return
-    await db.add_coins(message.chat.id, message.from_user.id, -up["price"])
     await db.add_profession_upgrade(message.chat.id, message.from_user.id, key)
     await message.reply(f"✅ Куплено: {up['name']} — {up['effect']}")
 
@@ -15732,11 +15759,9 @@ async def cmd_prof_break(message: Message):
     F.text.func(lambda t: bool(t) and t.strip().casefold() == "!работа буст"),
 )
 async def cmd_prof_boost(message: Message):
-    wallet = await db.get_wallet(message.chat.id, message.from_user.id)
-    if wallet.get("coins", 0) < 50:
+    if not await spend_coins(message.chat.id, message.from_user.id, 50):
         await message.reply("Нужно 50 i¢ на энергетик.")
         return
-    await db.add_coins(message.chat.id, message.from_user.id, -50)
     new_energy = await db.adjust_profession_energy(message.chat.id, message.from_user.id, 30)
     await message.reply(f"⚡ Энергетик выпит! Энергия: {new_energy}/100.")
 
@@ -17493,8 +17518,8 @@ async def cmd_grant_level(message: Message):
     await message.reply(f"✅ {target_name} назначен(а): {level_name(level)}")
     try:
         await bot.send_message(target.id, f"🎉 Вам выданы права: {level_name(level)} (в чате {message.chat.title or message.chat.id}).")
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("cmd_grant_level", exc)
 
 
 @router.message(
@@ -17649,8 +17674,8 @@ async def cmd_promote_demote(message: Message):
             f"{'🎉' if new_level > target_level else 'ℹ️'} Ваш уровень прав в боте изменён: "
             f"{level_name(new_level)} (в чате {message.chat.title or message.chat.id}).",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("cmd_promote_demote", exc)
 
 
 # ============================================================================
@@ -17953,8 +17978,8 @@ async def _auto_unmute(chat_id: int, user_id: int, expected_until_iso: str) -> N
     try:
         name = await display_name_by_id(chat_id, user_id)
         await bot.send_message(chat_id, f"🔊 Мут {name} истёк — снят автоматически.")
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("_auto_unmute", exc)
     await db.add_log("unmute", chat_id=chat_id, target_id=user_id, details="авто (истёк срок)")
 
 
@@ -18116,8 +18141,8 @@ async def confirm_admin_action(callback: CallbackQuery):
         else:
             dm_text = "🔨 В группе с вас сняты права администратора, и вы были забанены."
         await bot.send_message(target_id, dm_text)
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("confirm_admin_action", exc)
 
     if until is not None:
         asyncio.create_task(_auto_restore_admin_hold(chat_id, target_id, until.isoformat()))
@@ -18431,8 +18456,8 @@ async def confirm_self_destruct_step2(callback: CallbackQuery):
                 can_invite_users=False,
                 can_pin_messages=False,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("confirm_self_destruct_step2", exc)
 
     # Снимаем внутренние права бота (уровень админа в БД), если были.
     if get_level(initiator_id) > 0 and not is_owner(initiator_id):
@@ -18845,9 +18870,12 @@ async def cmd_reward(message: Message):
     lines = remaining.split("\n", 1)
     first_line_tokens = lines[0].strip().split()
     if len(first_line_tokens) < 2 or not first_line_tokens[1].isdigit() or not (1 <= int(first_line_tokens[1]) <= 8):
+        # Голый except здесь ловил бы и KeyboardInterrupt с SystemExit.
+        # Присваивание по индексу умеет падать ровно одним способом —
+        # когда второго слова нет, — его и ловим.
         try:
             first_line_tokens[1] = 1
-        except:
+        except IndexError:
             first_line_tokens.append(1)
 
         # await message.reply(
@@ -21429,22 +21457,22 @@ async def confirm_rest(callback: CallbackQuery):
             pass
         try:
             await callback.message.answer(memo)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("confirm_rest", exc)
     try:
         await bot.send_message(
             row["chat_id"],
             f"🌴 {mention_id(row['user_id'])} теперь в ресте до <b>{fmt_dt(until)}</b> "
             "— не считается неактивным.",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("confirm_rest", exc)
     try:
         await bot.send_message(row["user_id"], f"✅ Ваша заявка на рест одобрена, до {fmt_dt(until)}.")
     except TelegramForbiddenError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("confirm_rest", exc)
     await db.add_log("rest_approved", chat_id=row["chat_id"], actor_id=callback.from_user.id, target_id=row["user_id"])
     await sync_role_title(row["chat_id"], row["user_id"])
     await callback.answer("Одобрено ✅")
@@ -21478,8 +21506,8 @@ async def decline_rest(callback: CallbackQuery):
         await bot.send_message(row["user_id"], "❌ Ваша заявка на рест отклонена администратором.")
     except TelegramForbiddenError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("decline_rest", exc)
     await db.add_log("rest_rejected", chat_id=row["chat_id"], actor_id=callback.from_user.id, target_id=row["user_id"])
     await callback.answer("Отклонено")
 
@@ -21756,8 +21784,8 @@ async def stock_market_loop() -> None:
                         f"{sign} <b>Биржа</b>: курс акций изменился на {change_percent * 100:+.1f}% "
                         f"и теперь составляет {new_price:.2f} i¢.",
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_suppressed("stock_market_loop", exc)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -22196,7 +22224,9 @@ async def _apply_moment_event(chat_id: int, event: chat_events.Event) -> Optiona
             return None
         victim = random.choice(holders)
         stolen = max(1, int(int(victim["coins"]) * event.amount / 100))
-        await db.add_coins(chat_id, int(victim["user_id"]), -stolen)
+        stolen = await db.take_coins_up_to(chat_id, int(victim["user_id"]), stolen)
+        if not stolen:
+            return None      # у жертвы уже пусто — событие не состоялось
         name = await display_name_by_id(chat_id, int(victim["user_id"]))
         return chat_events.describe(event, name=html.escape(name), amount=stolen)
 
@@ -22246,8 +22276,8 @@ async def _announce_event_end(chat_id: int, key: str) -> None:
         return
     try:
         await bot.send_message(chat_id, event.ends_text)
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed("_announce_event_end", exc)
 
 
 async def fire_chat_event(chat_id: int, event: chat_events.Event) -> bool:
@@ -22893,8 +22923,8 @@ async def grant_achievement(
                     try:
                         who = await display_name_by_id(chat_id, user_id)
                         await bot.send_message(chat_id, f"🎖 {who} получает титул «{title['name']}»!")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_suppressed("grant_achievement", exc)
     except Exception:
         logger.exception("Не удалось проверить/выдать титул за ачивку %s", code)
 
@@ -24603,13 +24633,13 @@ async def cmd_marriage_extend(message: Message):
             await message.reply("🧊 Ваш счёт заморожен — продление недоступно.")
             return
         wallet = await db.get_wallet(chat_id, user_id)
-        if int(wallet.get("coins", 0)) < cost:
+        if not await spend_coins(chat_id, user_id, cost):
+            wallet = await db.get_wallet(chat_id, user_id)
             await message.reply(
                 f"Недостаточно монет: продление на {days} сут. стоит {cost} i¢, "
                 f"а у вас {wallet.get('coins', 0)} i¢."
             )
             return
-        await db.add_coins(chat_id, user_id, -cost)
 
     new_expiry = await db.extend_marriage(chat_id, user_id, days)
     if new_expiry is None:
@@ -25936,13 +25966,13 @@ async def _run_call(chat_id: int, targets: list[dict], header_text: Optional[str
             await asyncio.sleep(CALL_BATCH_DELAY)
         try:
             await bot.send_message(chat_id, "📣 Созыв окончен.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("_run_call", exc)
     except asyncio.CancelledError:
         try:
             await bot.send_message(chat_id, "⏹ Созыв остановлен.")
-        except Exception:
-            pass
+        except Exception as exc:
+            log_suppressed("_run_call", exc)
     finally:
         active_calls.pop(chat_id, None)
 
@@ -28800,8 +28830,8 @@ async def mute_expiry_sweep_loop() -> None:
                 try:
                     name = await display_name_by_id(chat_id, user_id)
                     await bot.send_message(chat_id, f"🔊 Мут {name} истёк — снят автоматически.")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_suppressed("mute_expiry_sweep_loop", exc)
         except Exception:
             logger.exception("Ошибка в mute_expiry_sweep_loop")
         await asyncio.sleep(MUTE_SWEEP_INTERVAL)
@@ -28820,8 +28850,8 @@ async def role_reservation_expiry_loop():
                         role["reserved_user_id"],
                         f"⌛ Бронь роли «{html.escape(role['name'])}» истекла — роль снова свободна.",
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_suppressed("role_reservation_expiry_loop", exc)
         except Exception:
             logger.exception("Ошибка при снятии протухших броней ролей")
         await asyncio.sleep(3600)

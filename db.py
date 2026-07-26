@@ -2259,6 +2259,71 @@ async def get_recent_logs(limit: int = 15) -> list[dict]:
     )
 
 
+async def list_log_event_types() -> list[dict]:
+    """Какие типы событий вообще встречаются, с числом записей — для
+    выпадающего фильтра в панели: список строится по фактическим данным,
+    а не по захардкоженному перечню, который рано или поздно отстанет."""
+    return await _fetchall(
+        "SELECT event_type, COUNT(*) AS n FROM logs "
+        "GROUP BY event_type ORDER BY n DESC, event_type ASC"
+    )
+
+
+async def search_logs(
+    query: Optional[str] = None,
+    event_type: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    since=None,
+    until=None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Журнал с поиском и фильтрами. Возвращает (строки, всего_подходящих).
+
+    Условия собираются списком и подставляются параметрами — ни одна часть
+    пользовательского ввода не попадает в текст запроса. query ищется по
+    details и по идентификаторам, приведённым к строке: админ обычно помнит
+    «что-то про 12345», а не в какой именно колонке этот номер лежит.
+    """
+    where, params = [], []
+    if event_type:
+        where.append("event_type = %s")
+        params.append(event_type)
+    if chat_id is not None:
+        where.append("chat_id = %s")
+        params.append(chat_id)
+    if user_id is not None:
+        where.append("(actor_id = %s OR target_id = %s)")
+        params.extend([user_id, user_id])
+    if since is not None:
+        where.append("created_at >= %s")
+        params.append(since)
+    if until is not None:
+        where.append("created_at < %s")
+        params.append(until)
+    if query:
+        # LIKE по свободному тексту: escape'им спецсимволы шаблона, иначе
+        # «100%» в поиске превратилось бы в «что угодно».
+        safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{safe}%"
+        where.append(
+            "(details LIKE %s OR event_type LIKE %s "
+            "OR CAST(actor_id AS CHAR) LIKE %s OR CAST(target_id AS CHAR) LIKE %s "
+            "OR CAST(chat_id AS CHAR) LIKE %s)"
+        )
+        params.extend([like] * 5)
+
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    total_row = await _fetchone(f"SELECT COUNT(*) AS n FROM logs{clause}", tuple(params))
+    total = int(total_row["n"] or 0) if total_row else 0
+    rows = await _fetchall(
+        f"SELECT * FROM logs{clause} ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+        (*params, limit, offset),
+    )
+    return rows, total
+
+
 # ----------------------------------------------------------------------------
 # Награды (медали) — модуль «Награды», по образцу Iris. 8 степеней, привязаны
 # к чату. Нумерация награды в списке пользователя (для «снять награду N») —
@@ -6706,6 +6771,56 @@ async def get_wallet(chat_id: int, user_id: int) -> dict:
     }
 
 
+async def try_spend_coins(chat_id: int, user_id: int, amount: int) -> bool:
+    """Атомарно списывает amount, если на балансе столько есть.
+
+    True — списали, False — не хватило (баланс не тронут).
+
+    Проверка и списание ОБЯЗАНЫ быть одним запросом. Раньше вызывающий код
+    делал это в три захода — прочитать баланс, сравнить, вычесть, — и между
+    чтением и вычитанием пролезала вторая команда того же человека: обе
+    видели «денег хватает», обе списывали, баланс уходил в минус. Никакой
+    экзотики для воспроизведения не нужно: aiogram обрабатывает апдейты
+    параллельно, достаточно отправить две покупки подряд.
+
+    Условие coins >= %s стоит прямо в UPDATE, поэтому решение принимает СУБД
+    под блокировкой строки, и второй запрос просто не найдёт, что обновлять.
+    """
+    if amount <= 0:
+        return True
+    await get_wallet(chat_id, user_id)  # гарантирует наличие строки
+    changed = await _execute(
+        "UPDATE economy_wallets SET coins = coins - %s "
+        "WHERE chat_id = %s AND user_id = %s AND coins >= %s",
+        (amount, chat_id, user_id, amount),
+    )
+    return bool(changed)
+
+
+async def take_coins_up_to(chat_id: int, user_id: int, amount: int) -> int:
+    """Забирает не больше amount и не больше того, что есть. Возвращает,
+    сколько реально забрали.
+
+    Для конфискации и краж: там сумма считается от баланса, прочитанного
+    мгновением раньше, и при одновременной трате баланс мог бы уйти в минус.
+    GREATEST(..., 0) в самом UPDATE исключает это независимо от гонок.
+    """
+    if amount <= 0:
+        return 0
+    await get_wallet(chat_id, user_id)
+    row = await _fetchone(
+        "SELECT coins FROM economy_wallets WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    before = int(row["coins"]) if row else 0
+    await _execute(
+        "UPDATE economy_wallets SET coins = GREATEST(coins - %s, 0) "
+        "WHERE chat_id = %s AND user_id = %s",
+        (amount, chat_id, user_id),
+    )
+    return min(amount, max(before, 0))
+
+
 async def add_coins(chat_id: int, user_id: int, amount: int) -> int:
     await get_wallet(chat_id, user_id)  # гарантирует наличие строки
     await _execute(
@@ -6740,9 +6855,14 @@ async def ensure_stock_market_tables() -> None:
     await _execute(
         "CREATE TABLE IF NOT EXISTS stock_settings ("
         "chat_id BIGINT NOT NULL PRIMARY KEY, "
-        "min_change_percent DECIMAL(6,2) NOT NULL DEFAULT -10.00, "
-        "max_change_percent DECIMAL(6,2) NOT NULL DEFAULT 50.00, "
-        "dividend_percent DECIMAL(6,2) NOT NULL DEFAULT 10.00"
+        # Диапазон симметричный, средний шаг ровно 0: биржа перестаёт быть
+        # генератором денег и становится игрой с нулевой суммой. Прежние
+        # -10/+50 давали средний +20% в час — это +7850% в сутки, из-за чего
+        # экономика и раздувалась. Меняете числа — держите середину около нуля,
+        # ответ на «биржа настройки» показывает её прямо в чате.
+        "min_change_percent DECIMAL(6,2) NOT NULL DEFAULT -15.00, "
+        "max_change_percent DECIMAL(6,2) NOT NULL DEFAULT 15.00, "
+        "dividend_percent DECIMAL(6,2) NOT NULL DEFAULT 5.00"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
     # История курса для графика в веб-панели. Точка пишется при каждом
@@ -8164,17 +8284,22 @@ async def restock_shop_items(chat_id: int, add: int = 3) -> int:
     )
 
 
-async def record_chat_investment(chat_id: int, user_id: int, amount: int) -> int:
+async def record_chat_investment(chat_id: int, user_id: int, amount: int) -> Optional[int]:
     """Списывает `amount` с личного кошелька пользователя (в этом чате),
     зачисляет его в общий баланс чата и пишет строку в историю вложений.
-    Возвращает новый общий баланс чата. Не проверяет, хватает ли пользователю
-    монет — это должен сделать вызывающий код ДО списания (см. cmd_bcoin
-    в bot.py), иначе баланс кошелька уйдёт в минус."""
+    Возвращает новый общий баланс чата или None, если монет не хватило.
+
+    Проверку «хватает ли» делает сам UPDATE: раньше она стояла в вызывающем
+    коде отдельным запросом, и между проверкой и списанием пролезала вторая
+    команда — кошелёк уходил в минус."""
     await get_wallet(chat_id, user_id)  # гарантирует наличие строки кошелька
-    await _execute(
-        "UPDATE economy_wallets SET coins = coins - %s WHERE chat_id = %s AND user_id = %s",
-        (amount, chat_id, user_id),
+    spent = await _execute(
+        "UPDATE economy_wallets SET coins = coins - %s "
+        "WHERE chat_id = %s AND user_id = %s AND coins >= %s",
+        (amount, chat_id, user_id, amount),
     )
+    if not spent:
+        return None
     await _execute(
         "INSERT INTO chat_coin_investments (chat_id, user_id, amount) VALUES (%s, %s, %s)",
         (chat_id, user_id, amount),

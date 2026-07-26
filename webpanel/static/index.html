@@ -150,6 +150,7 @@
     <button class="nav-btn owner-only hidden" data-view="tgadmins"><svg class="ic"><use href="#ic-crown"/></svg>Админы чата</button>
     <button class="nav-btn" data-view="stats"><svg class="ic"><use href="#ic-chart"/></svg>Статистика</button>
     <button class="nav-btn" data-view="stock"><svg class="ic"><use href="#ic-chart"/></svg>Биржа</button>
+    <button class="nav-btn" data-view="logs"><svg class="ic"><use href="#ic-file"/></svg>Журнал</button>
     <button class="nav-btn" data-view="actions"><svg class="ic"><use href="#ic-wand"/></svg>Действия</button>
     <button class="nav-btn" data-view="cmdtree"><svg class="ic"><use href="#ic-sliders"/></svg>Дерево команд</button>
     <button class="nav-btn" data-view="settings"><svg class="ic"><use href="#ic-settings"/></svg>Настройки</button>
@@ -222,6 +223,51 @@
             </div>
             <div class="feed-list" id="feed-list"></div>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Журнал действий — отдельный раздел: искать его внутри статистики никто не догадывается. -->
+    <section class="view hidden" id="view-logs">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-file"/></svg>Журнал</h2>
+        <p class="sub">Всё, что делал бот: кто, кому, когда и с какими подробностями.</p>
+      </header>
+      <div class="card">
+        <h3>Журнал действий бота</h3>
+        <div class="row">
+          <label><span>Поиск</span>
+            <input type="text" id="logs-q" placeholder="по деталям, ID участника или чата…" autocomplete="off">
+          </label>
+          <label class="narrow"><span>Событие</span>
+            <select id="logs-type"><option value="">Все</option></select>
+          </label>
+          <label class="narrow"><span>Период</span>
+            <select id="logs-days">
+              <option value="1">Сутки</option>
+              <option value="7" selected>Неделя</option>
+              <option value="30">Месяц</option>
+              <option value="0">За всё время</option>
+            </select>
+          </label>
+          <label class="narrow"><span>Чат</span>
+            <select id="logs-chat"><option value="">Все</option></select>
+          </label>
+        </div>
+        <div class="row">
+          <label class="narrow"><span>ID участника</span>
+            <input type="number" id="logs-user" placeholder="необязательно">
+          </label>
+          <div class="grow-0"><button class="ghost" id="logs-reset">Сбросить фильтры</button></div>
+        </div>
+        <p class="muted" id="logs-count" style="margin:0 0 var(--gap-2); font-size:12px"></p>
+        <div class="table-wrap">
+          <table><thead><tr><th>Когда</th><th>Событие</th><th>Кто / кому</th><th>Детали</th></tr></thead>
+            <tbody id="logs-table"></tbody></table>
+        </div>
+        <div class="row" id="logs-pager" style="margin-top:var(--gap-2)">
+          <div class="grow-0"><button class="ghost" id="logs-prev">← Новее</button></div>
+          <div class="grow-0"><button class="ghost" id="logs-next">Старее →</button></div>
         </div>
       </div>
     </section>
@@ -493,13 +539,6 @@
         <div id="stats-out"></div>
       </div>
 
-      <div class="card">
-        <h3>Журнал действий бота</h3>
-        <div class="table-wrap">
-          <table><thead><tr><th>Когда</th><th>Событие</th><th>Детали</th></tr></thead>
-            <tbody id="logs-table"></tbody></table>
-        </div>
-      </div>
     </section>
 
     <!-- Биржа: курс акций и его настройки -->
