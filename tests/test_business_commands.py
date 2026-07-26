@@ -245,6 +245,11 @@ def world(monkeypatch):
     # Страховка (предмет магазина) проверяется перед каждой поломкой. По
     # умолчанию её нет — поломки происходят как обычно.
     monkeypatch.setattr(bot_module.db, "consume_item_effect", _returns(False), raising=False)
+    # Оснащение бизнеса (охрана, реклама, сейф…) — по умолчанию его нет, все
+    # числа считаются базовыми. Тесты про оснащение подменяют это сами.
+    monkeypatch.setattr(bot_module.db, "list_business_upgrades",
+                        _returns(set()), raising=False)
+    monkeypatch.setattr(bot_module.db, "clear_business_upgrades", _noop, raising=False)
     monkeypatch.setattr(bot_module, "display_name_by_id", _returns("Кто-то"), raising=False)
     monkeypatch.setattr(bot_module, "display_name", _returns("Тестер"), raising=False)
     return state

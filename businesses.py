@@ -127,17 +127,97 @@ def tax_for(amount: int) -> int:
     return int(tax)
 
 
-def accrued_now(level: int, business: Business, stored: int, hours: float) -> int:
+# ----------------------------------------------------------------------------
+# Оснащение бизнеса: разовые покупки, которые остаются с бизнесом навсегда.
+#
+# Отличие от УРОВНЯ: уровень поднимает всё сразу и стоит дорого, оснащение —
+# точечное и покупается в любом порядке. Отличие от предметов магазина: те
+# тратятся, эти стоят на месте.
+#
+# Оснащение НЕ переносится при продаже вместе с бизнесом (см. bot.py): иначе
+# перепродажа прокачанного бизнеса стала бы выгоднее, чем его содержание.
+# ----------------------------------------------------------------------------
+UPGRADE_GUARD = "ohrana"
+UPGRADE_GEAR = "apparatura"
+UPGRADE_ADS = "reklama"
+UPGRADE_SAFE = "seif"
+
+
+@dataclass(frozen=True)
+class Upgrade:
+    key: str
+    name: str
+    emoji: str
+    price_share: float     # доля от цены бизнеса
+    description: str
+
+    def price(self, business: "Business") -> int:
+        return max(1, int(business.price * self.price_share))
+
+
+# Насколько сильно каждое оснащение меняет свою величину.
+GUARD_RAID_PENALTY = 25     # на столько процентных пунктов падает шанс налёта
+GEAR_BREAK_FACTOR = 0.5     # во столько раз реже ломается
+ADS_INCOME_PERCENT = 15     # +% к доходу в час
+SAFE_CAP_PERCENT = 50       # +% к потолку копилки
+
+UPGRADES: tuple[Upgrade, ...] = (
+    Upgrade(UPGRADE_GUARD, "Охрана", "🛡", 0.30,
+            f"Налёт на этот бизнес удаётся на {GUARD_RAID_PENALTY}% реже"),
+    Upgrade(UPGRADE_GEAR, "Хорошая аппаратура", "🔧", 0.30,
+            "Бизнес ломается вдвое реже"),
+    Upgrade(UPGRADE_ADS, "Реклама", "📢", 0.35,
+            f"Доход в час выше на {ADS_INCOME_PERCENT}%"),
+    Upgrade(UPGRADE_SAFE, "Сейф", "🏦", 0.25,
+            f"Копилка вмещает на {SAFE_CAP_PERCENT}% больше"),
+)
+
+UPGRADE_BY_KEY: dict[str, Upgrade] = {u.key: u for u in UPGRADES}
+
+UPGRADE_ALIASES: dict[str, str] = {
+    "охрана": UPGRADE_GUARD, "охранник": UPGRADE_GUARD, "сторож": UPGRADE_GUARD,
+    "аппаратура": UPGRADE_GEAR, "оборудование": UPGRADE_GEAR, "техника": UPGRADE_GEAR,
+    "реклама": UPGRADE_ADS, "маркетинг": UPGRADE_ADS,
+    "сейф": UPGRADE_SAFE, "склад": UPGRADE_SAFE,
+}
+
+
+def resolve_upgrade(raw: str) -> Optional[Upgrade]:
+    if not raw:
+        return None
+    key = raw.strip().casefold()
+    return UPGRADE_BY_KEY.get(UPGRADE_ALIASES.get(key, key))
+
+
+def effective_income(business: Business, level: int, upgrades) -> int:
+    """Доход в час с учётом оснащения."""
+    income = business.income(level)
+    if UPGRADE_ADS in upgrades:
+        income = int(income * (100 + ADS_INCOME_PERCENT) / 100)
+    return max(1, income)
+
+
+def effective_cap(business: Business, level: int, upgrades) -> int:
+    """Потолок копилки с учётом оснащения."""
+    cap = business.cap(level)
+    if UPGRADE_SAFE in upgrades:
+        cap = int(cap * (100 + SAFE_CAP_PERCENT) / 100)
+    return max(1, cap)
+
+
+def accrued_now(level: int, business: Business, stored: int, hours: float,
+                upgrades=()) -> int:
     """Сколько накоплено сейчас: то, что лежало, плюс доход за прошедшее время,
     но не выше потолка уровня.
 
     hours — сколько часов прошло с последнего пересчёта (дробные допустимы:
-    полчаса дают половину часового дохода).
+    полчаса дают половину часового дохода). upgrades — оснащение бизнеса:
+    реклама поднимает доход, сейф — потолок.
     """
     if hours < 0:
         hours = 0.0
-    grown = stored + business.income(level) * hours
-    return max(0, min(int(grown), business.cap(level)))
+    grown = stored + effective_income(business, level, upgrades) * hours
+    return max(0, min(int(grown), effective_cap(business, level, upgrades)))
 
 
 def hours_to_full(level: int, business: Business, current: int) -> float:
@@ -207,6 +287,7 @@ def accrued_with_boost(
     stored: int,
     normal_hours: float,
     boosted_hours: float,
+    upgrades=(),
 ) -> int:
     """То же, что accrued_now, но часть времени доход шёл с надбавкой.
 
@@ -218,7 +299,7 @@ def accrued_with_boost(
     """
     normal_hours = max(0.0, normal_hours)
     boosted_hours = max(0.0, boosted_hours)
-    rate = business.income(level)
+    rate = effective_income(business, level, upgrades)
     boosted_rate = rate * (100 + OFFER_BONUS_PERCENT) / 100
     grown = stored + rate * normal_hours + boosted_rate * boosted_hours
-    return max(0, min(int(grown), business.cap(level)))
+    return max(0, min(int(grown), effective_cap(business, level, upgrades)))

@@ -1042,7 +1042,7 @@ async def ensure_profile_cards_table() -> None:
 async def get_profile_card(chat_id: int, user_id: int) -> Optional[dict]:
     return await _fetchone(
         "SELECT title, motto, is_citizen, gender, city, about_text, anketa_visible, "
-        "pinned_item, active_title, pinned_achievement, pinned_business "
+        "pinned_item, active_title, pinned_achievement, pinned_business, pinned_pet "
         "FROM profile_cards WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
@@ -1330,6 +1330,21 @@ async def add_warn(
         (chat_id, user_id, warned_by, reason, expires_at, message_id),
     )
     return await count_warns(chat_id, user_id)
+
+
+async def update_last_warn_message_id(chat_id: int, user_id: int, message_id: int) -> None:
+    """Переставляет ссылку последнего варна на другое сообщение.
+
+    Нужно потому, что сообщение с командой «варн» удаляется сразу после
+    выдачи (чтобы «&варн» не выдавал себя амперсандом). Если варн выдали не
+    ответом, а по @username, то ссылаться было бы не на что — ставим карточку
+    бота: она остаётся в чате и показывает ровно то же самое.
+    """
+    await _execute(
+        "UPDATE warns SET message_id = %s WHERE chat_id = %s AND user_id = %s "
+        "ORDER BY id DESC LIMIT 1",
+        (message_id, chat_id, user_id),
+    )
 
 
 async def count_warns(chat_id: int, user_id: int) -> int:
@@ -1954,9 +1969,18 @@ async def list_new_members_since(chat_id: int, since: datetime, limit: int = 200
 async def list_inactive(chat_id: int, before: datetime, limit: int = 30) -> list[dict]:
     """Участники, не проявлявшие актив (не писавшие сообщений) с указанного
     момента. Те, у кого сейчас активный одобренный рест, в список не попадают —
-    они не считаются неактивными, пока рест действует."""
+    они не считаются неактивными, пока рест действует.
+
+    Считаются ТОЛЬКО те, кто сейчас в чате. known_users — это все, кого бот
+    когда-либо видел, и оттуда никто не удаляется; ростер вышедших чистит
+    handle_member_left, но только в current_users. Без соединения с ростером
+    список неактивных возглавляли вышедшие: у них last_seen_at самый старый,
+    а сортировка идёт по возрастанию — то есть первыми шли как раз те, кого
+    в чате давно нет.
+    """
     return await _fetchall(
         "SELECT ku.user_id, ku.full_name, ku.username, ku.last_seen_at FROM known_users ku "
+        "JOIN current_users cu ON cu.chat_id = ku.chat_id AND cu.user_id = ku.user_id "
         "WHERE ku.chat_id = %s AND ku.last_seen_at < %s "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM rest_requests r WHERE r.chat_id = ku.chat_id AND r.user_id = ku.user_id "
@@ -1969,9 +1993,14 @@ async def list_inactive(chat_id: int, before: datetime, limit: int = 30) -> list
 
 async def list_silent(chat_id: int, before: datetime, limit: int = 30) -> list[dict]:
     """Участники, вступившие раньше указанного момента и не написавшие ни
-    одного сообщения (молчуны)."""
+    одного сообщения (молчуны).
+
+    Как и у list_inactive — только те, кто сейчас в чате: вышедшие остаются
+    в known_users навсегда и иначе висели бы в списке молчунов вечно.
+    """
     return await _fetchall(
         "SELECT ku.user_id, ku.full_name, ku.username, ku.first_seen_at FROM known_users ku "
+        "JOIN current_users cu ON cu.chat_id = ku.chat_id AND cu.user_id = ku.user_id "
         "LEFT JOIN message_stats ms ON ms.chat_id = ku.chat_id AND ms.user_id = ku.user_id "
         "WHERE ku.chat_id = %s AND ku.first_seen_at < %s "
         "AND (ms.message_count IS NULL OR ms.message_count = 0) "
@@ -2078,6 +2107,33 @@ async def list_top_messages(chat_id: int, limit: int = 10, offset: int = 0) -> t
 
 async def reset_message_stats(chat_id: int) -> None:
     await _execute("DELETE FROM message_stats WHERE chat_id = %s", (chat_id,))
+
+
+async def sum_messages_period(chat_id: int, since_day) -> int:
+    """Сколько всего сообщений в чате за период — итог под списком топа.
+
+    since_day=None — за всё время: тогда считаем по message_stats, потому что
+    message_daily хранит только посуточную нарезку и за всю историю её может
+    не быть (счётчики появились раньше, чем посуточные).
+    """
+    if since_day is None:
+        return await get_chat_total_messages(chat_id)
+    row = await _fetchone(
+        "SELECT SUM(message_count) AS total FROM message_daily "
+        "WHERE chat_id = %s AND day >= %s",
+        (chat_id, since_day),
+    )
+    return int(row["total"]) if row and row.get("total") else 0
+
+
+async def list_citizens(chat_id: int) -> set[int]:
+    """Кто получил гражданство чата — одним запросом на весь список топа,
+    а не по строке на каждого участника."""
+    rows = await _fetchall(
+        "SELECT user_id FROM profile_cards WHERE chat_id = %s AND is_citizen = TRUE",
+        (chat_id,),
+    )
+    return {int(r["user_id"]) for r in rows}
 
 
 async def get_chat_total_messages(chat_id: int) -> int:
@@ -7647,6 +7703,247 @@ async def ensure_businesses_table() -> None:
     await _add_column_if_missing("businesses", "broken_kind", "VARCHAR(64) NULL")
     await _add_column_if_missing("businesses", "broken_at", "DATETIME NULL")
     await _add_column_if_missing("businesses", "boost_until", "DATETIME NULL")
+    # Оснащение (охрана, аппаратура, реклама, сейф) — отдельной таблицей, а не
+    # колонками: список оснащения будет расти, и каждый раз менять схему
+    # businesses ради ещё одного флага не хочется.
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS business_upgrades ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "business_key VARCHAR(32) NOT NULL, "
+        "upgrade_key VARCHAR(32) NOT NULL, "
+        "bought_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, user_id, business_key, upgrade_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def ensure_pets_table() -> None:
+    """Личные питомцы (см. pets.py). Не путать с питомцами пары из
+    «Отношений 2.0» — те живут в своей таблице и принадлежат двоим."""
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS user_pets ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "pet_key VARCHAR(32) NOT NULL, "
+        "pet_name VARCHAR(64) NULL, "
+        "hunger INT NOT NULL DEFAULT 100, "
+        "mood INT NOT NULL DEFAULT 100, "
+        "last_tick_at DATETIME NOT NULL, "
+        "last_fed_at DATETIME NULL, "
+        "last_care_at DATETIME NULL, "
+        "bought_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, user_id, pet_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    await _add_column_if_missing("profile_cards", "pinned_pet", "VARCHAR(32) DEFAULT NULL")
+
+
+async def ensure_pet_catalog(chat_id: int, defaults) -> int:
+    """Каталог питомцев чата. Встроенные из pets.py досеиваются, свои —
+    добавляются админом через панель и живут только здесь.
+
+    Дозасев, а не «только если пусто»: иначе новые встроенные питомцы не
+    доехали бы в чаты, где каталог уже создан (та же история, что с товарами
+    магазина — см. seed_extra_shop_items)."""
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS pet_catalog ("
+        "chat_id BIGINT NOT NULL, "
+        "pet_key VARCHAR(32) NOT NULL, "
+        "name VARCHAR(64) NOT NULL, "
+        "emoji VARCHAR(16) NOT NULL DEFAULT '🐾', "
+        "price INT NOT NULL, "
+        "sound VARCHAR(64) NOT NULL DEFAULT 'радуется', "
+        "ability VARCHAR(32) NOT NULL DEFAULT 'none', "
+        "PRIMARY KEY (chat_id, pet_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    await _add_column_if_missing("pet_catalog", "ability", "VARCHAR(32) NOT NULL DEFAULT 'none'")
+    # Временное выключение и потолок численности — правятся из панели.
+    await _add_column_if_missing("pet_catalog", "is_active", "BOOL NOT NULL DEFAULT TRUE")
+    await _add_column_if_missing("pet_catalog", "max_count", "INT NULL")
+    added = 0
+    for spec in defaults:
+        changed = await _execute(
+            "INSERT IGNORE INTO pet_catalog "
+            "(chat_id, pet_key, name, emoji, price, sound, ability) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (chat_id, spec.key, spec.name, spec.emoji, spec.price, spec.sound,
+             spec.ability),
+        )
+        added += bool(changed)
+    return added
+
+
+async def list_pet_catalog(chat_id: int) -> list[dict]:
+    return await _fetchall(
+        "SELECT pet_key, name, emoji, price, sound, ability, is_active, max_count "
+        "FROM pet_catalog "
+        "WHERE chat_id = %s ORDER BY price ASC, pet_key ASC",
+        (chat_id,),
+    )
+
+
+async def get_pet_spec(chat_id: int, key: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT pet_key, name, emoji, price, sound, ability, is_active, max_count "
+        "FROM pet_catalog "
+        "WHERE chat_id = %s AND pet_key = %s",
+        (chat_id, key),
+    )
+
+
+async def add_pet_spec(chat_id: int, key: str, name: str, emoji: str,
+                       price: int, sound: str, ability: str = "none") -> bool:
+    changed = await _execute(
+        "INSERT IGNORE INTO pet_catalog "
+        "(chat_id, pet_key, name, emoji, price, sound, ability) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (chat_id, key, name, emoji, price, sound, ability),
+    )
+    return bool(changed)
+
+
+async def update_pet_spec(chat_id: int, key: str, **fields) -> bool:
+    """Меняет отдельные поля вида питомца. Пустой набор — ничего не делаем.
+
+    Названия колонок берутся из белого списка, а не из ключей вызова: сюда
+    приходят данные из панели, и подстановка произвольного имени в SQL была
+    бы дырой.
+    """
+    allowed = {"name", "emoji", "price", "sound", "ability", "is_active", "max_count"}
+    sets, args = [], []
+    for column, value in fields.items():
+        if column not in allowed:
+            continue
+        sets.append(f"{column} = %s")
+        args.append(value)
+    if not sets:
+        return False
+    args += [chat_id, key]
+    return bool(await _execute(
+        f"UPDATE pet_catalog SET {', '.join(sets)} "
+        "WHERE chat_id = %s AND pet_key = %s",
+        tuple(args),
+    ))
+
+
+async def count_pet_owners(chat_id: int, key: str) -> int:
+    """Сколько людей в чате уже завели такого питомца — под потолок численности."""
+    row = await _fetchone(
+        "SELECT COUNT(*) AS total FROM user_pets WHERE chat_id = %s AND pet_key = %s",
+        (chat_id, key),
+    )
+    return int(row["total"]) if row else 0
+
+
+async def delete_pet_spec(chat_id: int, key: str) -> bool:
+    return bool(await _execute(
+        "DELETE FROM pet_catalog WHERE chat_id = %s AND pet_key = %s", (chat_id, key)
+    ))
+
+
+async def list_pets(chat_id: int, user_id: int) -> list[dict]:
+    return await _fetchall(
+        "SELECT pet_key, pet_name, hunger, mood, last_tick_at, last_fed_at, "
+        "last_care_at, bought_at FROM user_pets "
+        "WHERE chat_id = %s AND user_id = %s ORDER BY bought_at",
+        (chat_id, user_id),
+    )
+
+
+async def get_pet(chat_id: int, user_id: int, key: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT pet_key, pet_name, hunger, mood, last_tick_at, last_fed_at, "
+        "last_care_at, bought_at FROM user_pets "
+        "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
+        (chat_id, user_id, key),
+    )
+
+
+async def add_pet(chat_id: int, user_id: int, key: str, now) -> bool:
+    """Заводит питомца. False — такой у человека уже есть."""
+    changed = await _execute(
+        "INSERT IGNORE INTO user_pets "
+        "(chat_id, user_id, pet_key, hunger, mood, last_tick_at, bought_at) "
+        "VALUES (%s, %s, %s, 100, 100, %s, %s)",
+        (chat_id, user_id, key, now, now),
+    )
+    return bool(changed)
+
+
+async def set_pet_stats(chat_id: int, user_id: int, key: str,
+                        hunger: int, mood: int, now,
+                        fed_at=None, care_at=None) -> None:
+    """Фиксирует сытость и настроение на момент now.
+
+    Отметки о кормлении и ласке ставятся только если переданы: одно действие
+    не должно сбрасывать откат другого.
+    """
+    sets = ["hunger = %s", "mood = %s", "last_tick_at = %s"]
+    args: list = [max(0, int(hunger)), max(0, int(mood)), now]
+    if fed_at is not None:
+        sets.append("last_fed_at = %s")
+        args.append(fed_at)
+    if care_at is not None:
+        sets.append("last_care_at = %s")
+        args.append(care_at)
+    args += [chat_id, user_id, key]
+    await _execute(
+        f"UPDATE user_pets SET {', '.join(sets)} "
+        "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
+        tuple(args),
+    )
+
+
+async def rename_pet(chat_id: int, user_id: int, key: str, name: Optional[str]) -> None:
+    await _execute(
+        "UPDATE user_pets SET pet_name = %s "
+        "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
+        (name, chat_id, user_id, key),
+    )
+
+
+async def set_pinned_pet(chat_id: int, user_id: int, key: Optional[str]) -> None:
+    await _execute(
+        "INSERT INTO profile_cards (chat_id, user_id, pinned_pet) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE pinned_pet = VALUES(pinned_pet)",
+        (chat_id, user_id, key),
+    )
+
+
+async def list_business_upgrades(chat_id: int, user_id: int, key: str) -> set[str]:
+    rows = await _fetchall(
+        "SELECT upgrade_key FROM business_upgrades "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (chat_id, user_id, key),
+    )
+    return {r["upgrade_key"] for r in rows}
+
+
+async def add_business_upgrade(chat_id: int, user_id: int, key: str,
+                               upgrade: str, now) -> bool:
+    """Ставит оснащение. False — оно уже стоит (второй раз платить не за что)."""
+    changed = await _execute(
+        "INSERT IGNORE INTO business_upgrades "
+        "(chat_id, user_id, business_key, upgrade_key, bought_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (chat_id, user_id, key, upgrade, now),
+    )
+    return bool(changed)
+
+
+async def clear_business_upgrades(chat_id: int, user_id: int, key: str) -> None:
+    """Снимает всё оснащение с бизнеса — при смене владельца и при продаже.
+
+    Оснащение намеренно НЕ переезжает к новому хозяину: иначе перепродажа
+    прокачанного бизнеса стала бы выгоднее, чем его содержание.
+    """
+    await _execute(
+        "DELETE FROM business_upgrades "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (chat_id, user_id, key),
+    )
 
 
 async def set_business_broken(chat_id: int, user_id: int, key: str,
@@ -9130,6 +9427,38 @@ async def try_decrement_shop_item_stock(chat_id: int, item_key: str) -> bool:
         (chat_id, item_key),
     )
     return bool(rowcount)
+
+
+async def try_take_shop_stock(chat_id: int, item_key: str, amount: int) -> bool:
+    """Атомарно списывает amount штук остатка. False — столько нет.
+
+    Проверка и списание одним запросом, как в try_spend_coins: иначе две
+    покупки подряд обе увидели бы «хватает» и увели остаток в минус.
+    """
+    if amount <= 0:
+        return False
+    row = await get_shop_item(chat_id, item_key)
+    if row is None:
+        return False
+    if row.get("stock") is None:
+        return True                      # безлимитный товар
+    rowcount = await _execute(
+        "UPDATE shop_items SET stock = stock - %s "
+        "WHERE chat_id = %s AND item_key = %s AND stock >= %s",
+        (amount, chat_id, item_key, amount),
+    )
+    return bool(rowcount)
+
+
+async def return_shop_stock(chat_id: int, item_key: str, amount: int) -> None:
+    """Возвращает остаток на полку — когда покупка сорвалась после списания."""
+    if amount <= 0:
+        return
+    await _execute(
+        "UPDATE shop_items SET stock = stock + %s "
+        "WHERE chat_id = %s AND item_key = %s AND stock IS NOT NULL",
+        (amount, chat_id, item_key),
+    )
 
 
 async def list_shop_items_for_restock(chat_id: int) -> list[dict]:

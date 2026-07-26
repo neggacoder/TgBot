@@ -105,7 +105,10 @@ def test_трофеи_и_полезные_предметы_не_пересека
 def test_все_новые_вещи_попадают_в_засев():
     rows = SE.shop_rows()
     keys = {row[0] for row in rows}
-    assert keys == set(SE.BY_KEY) | set(SE.REWARD_BY_KEY) | set(SE.ACHIEVEMENT_BY_KEY)
+    # Медалей за «наградить» тут нет: их перестали выдавать, и заводить
+    # витрину предметов, которые никому не достанутся, незачем.
+    assert keys == set(SE.BY_KEY) | set(SE.ACHIEVEMENT_BY_KEY)
+    assert not (keys & set(SE.REWARD_BY_KEY))
     for _key, name, price, description, emoji in rows:
         assert name and description and emoji
         assert price > 0
@@ -117,6 +120,25 @@ def test_трофей_нельзя_купить_даже_случайно():
     for item in SE.REWARD_ITEMS:
         _key, _name, price, _desc, _emoji = item.as_shop_row()
         assert price > 100_000_000
+
+
+def test_медали_за_наградить_больше_не_выдаются():
+    """Сама награда видна в профиле и в списке наград — предмет рядом с ней
+    ничего не добавлял."""
+    import inspect
+    src = inspect.getsource(bot_module.cmd_reward)
+    assert "trophy_for_degree" not in src
+    assert "add_inventory_item" not in src
+
+
+def test_медали_остались_неторгуемыми():
+    """Не забытый код, а защита. У медалей стоит цена-заглушка 999 999 999 —
+    просто чтобы их нельзя было купить. Продажа отдаёт 80% цены магазина,
+    так что снятие запрета превратило бы одну старую медаль, если она у
+    кого-то осталась, примерно в 800 миллионов монет.
+    """
+    for key in SE.REWARD_BY_KEY:
+        assert SE.is_reward(key), key
 
 
 @pytest.mark.parametrize("degree, key", [
