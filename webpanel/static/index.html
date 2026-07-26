@@ -372,7 +372,7 @@
         <!-- Список подставляет сюда user_id; поле остаётся на случай, когда
              человека ещё нет в known_users (бот его не видел) и ID известен
              из другого места. -->
-        <details id="mod-manual">
+        <details class="fold fold-quiet" id="mod-manual">
           <summary>Указать ID вручную</summary>
           <label><span>ID участника</span><input type="number" id="mod-user" placeholder="123456789"></label>
         </details>
@@ -538,7 +538,7 @@
             <b>Азартная</b><span>±30% в час</span><small>дивиденды 10%</small></button>
         </div>
 
-        <details class="tune" id="stock-tune">
+        <details class="fold fold-quiet tune" id="stock-tune">
           <summary>Настроить вручную</summary>
           <div class="row">
             <label class="narrow"><span>Макс. падение, %</span>
@@ -565,13 +565,20 @@
         <p class="sub">Все команды бота по категориям — со словом-триггером и требуемым уровнем.
           Владелец может менять уровень прямо здесь: бот подхватит через несколько секунд.</p>
       </header>
-      <input type="text" id="cmdtree-q" class="cmdtree-search" placeholder="Поиск по команде или триггеру…" autocomplete="off">
+      <div class="row" style="margin-bottom: var(--gap-2)">
+        <input type="text" id="cmdtree-q" class="cmdtree-search" placeholder="Поиск по команде или триггеру…" autocomplete="off">
+        <div class="grow-0">
+          <button class="ghost" id="cmdtree-toggle-all" data-open="0">Раскрыть все</button>
+        </div>
+      </div>
+      <p class="muted" id="cmdtree-count" style="margin: 0 0 var(--gap-2); font-size: 12px"></p>
       <div id="cmdtree-body"></div>
-      <header class="page-head" style="margin-top: var(--gap-4)">
-        <h2>🎖 Пороги наград</h2>
-        <p class="sub">Кто может выдавать награду какой степени. Правки применяются в чатах через несколько секунд.</p>
-      </header>
-      <div id="reward-levels-body"></div>
+
+      <details class="card fold" style="margin-top: var(--gap-4)">
+        <summary><h3>🎖 Пороги наград</h3><span class="fold-note">кто может выдавать награду какой степени</span></summary>
+        <p class="sub">Правки применяются в чатах через несколько секунд.</p>
+        <div id="reward-levels-body"></div>
+      </details>
     </section>
 
     <section class="view hidden" id="view-actions">
@@ -587,8 +594,8 @@
         <button class="chip" data-kind="self">Себяшки</button>
       </div>
 
-      <div class="card">
-        <h3>Новое действие</h3>
+      <details class="card fold" open>
+        <summary><h3>Новое действие</h3></summary>
         <form class="row" id="action-add">
           <label class="narrow"><span>Ключ</span>
             <input type="text" id="action-key" maxlength="64" placeholder="например: обнять" required>
@@ -598,12 +605,12 @@
           </label>
           <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
         </form>
-      </div>
+      </details>
 
       <div id="actions-list"></div>
 
-      <div class="card hidden" id="synonyms-card">
-        <h3>Синонимы <span class="muted">(альтернативные слова для РП-команд)</span></h3>
+      <details class="card fold hidden" id="synonyms-card">
+        <summary><h3>Синонимы</h3><span class="fold-note">альтернативные слова для РП-команд</span></summary>
         <form class="row" id="synonym-add">
           <label class="narrow"><span>Слово</span>
             <input type="text" id="synonym-word" maxlength="64" placeholder="обнимашки" required>
@@ -614,11 +621,10 @@
           <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
         </form>
         <div id="synonyms-list"></div>
-      </div>
+      </details>
 
-      <div class="card" style="margin-top: var(--gap-4)" id="propose-actions-card">
-        <h3><svg class="ic"><use href="#ic-wand"/></svg>Предложения
-          <span class="muted">(команды «предложить …» — с кнопками Да/Нет)</span></h3>
+      <details class="card fold" style="margin-top: var(--gap-4)" id="propose-actions-card">
+        <summary><h3><svg class="ic"><use href="#ic-wand"/></svg>Предложения</h3><span class="fold-note">команды «предложить …» — с кнопками Да/Нет</span></summary>
         <p class="sub">У каждого действия — 3 набора фраз (предложение / согласие / отказ, бот берёт
           случайную) и свои кулдаун/таймаут в секундах. Правки применяются в чатах через несколько секунд.</p>
         <form class="row" id="propose-action-add">
@@ -642,13 +648,12 @@
           <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить</button>
         </form>
         <div id="propose-synonyms-list"></div>
-      </div>
+      </details>
 
       <!-- Отн-жесты (обнять/поцеловать/…): у них, в отличие от РП-действий, есть
            название, слова-триггеры, шаблон ответной реакции и фото по полу пары. -->
-      <div class="card" style="margin-top: var(--gap-4)">
-        <h3><svg class="ic"><use href="#ic-mask"/></svg>Отн-жесты
-          <span class="muted">(команды «отн …», фразы и фото)</span></h3>
+      <details class="card fold" style="margin-top: var(--gap-4)">
+        <summary><h3><svg class="ic"><use href="#ic-mask"/></svg>Отн-жесты</h3><span class="fold-note">команды «отн …», фразы и фото</span></summary>
         <p class="sub">Фото кладутся в папки по полу пары (парень+девушка / парень+парень /
           девушка+девушка). Правки применяются в чатах за несколько секунд.</p>
         <form class="row" id="gesture-add">
@@ -660,7 +665,7 @@
           </label>
           <button class="primary" type="submit"><svg class="ic"><use href="#ic-plus"/></svg>Добавить жест</button>
         </form>
-      </div>
+      </details>
       <div id="gestures-list"></div>
     </section>
 

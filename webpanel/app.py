@@ -3976,8 +3976,9 @@ ALLOWED_SETTING_KEYS = {
     "rest_cleanup_block_days": "Рест: за сколько дней до чистки закрыт, дней (0 — выключить)",
     "fake_warns_in_list": "Шуточные варны («&варн») в списке «варны»: 1 — показывать, 0 — копить отдельно",
     "timezone": (
-        "Часовой пояс показа времени: Europe/Moscow, Москва, +3 (пусто — UTC). "
-        "Влияет только на то, каким время видят люди; хранится и считается всё в UTC"
+        "Часовой пояс: GMT+3, Москва, Europe/Moscow (пусто — UTC). "
+        "Задаёт, каким время видят люди и где проходит граница суток у ежедневных "
+        "начислений. Статистика по дням хранится в UTC и не смещается"
     ),
     "command_cleanup_minutes": (
         "Автоочистка команд в чате жалоб, минут (0 — выключить, пусто — 15). "
@@ -4043,6 +4044,22 @@ def validate_setting(key: str, value: Optional[str]) -> None:
                 )
 
 
+def _timezone_choices() -> list[dict]:
+    """Варианты для выпадающего списка: сначала смещения GMT-12…+14,
+    затем именованные зоны (у них есть переход на летнее время, поэтому
+    для тех, кто хочет «как в Москве», это точнее фиксированного сдвига)."""
+    choices = []
+    for hour in range(-12, 15):
+        raw = f"{hour:+d}"
+        value = tz_settings.parse_timezone(raw) or "UTC"
+        choices.append({"value": value, "label": f"GMT{hour:+d}" if hour else "GMT+0 (UTC)"})
+    for zone, label in tz_settings.TIMEZONE_LABELS.items():
+        if zone == "UTC":
+            continue
+        choices.append({"value": zone, "label": f"{label} — {zone}"})
+    return choices
+
+
 @app.get("/api/settings")
 async def api_settings(user: PanelUser = Depends(auth.require_user)):
     settings = await db.fetch_settings() or {}
@@ -4056,12 +4073,20 @@ async def api_settings(user: PanelUser = Depends(auth.require_user)):
             "kind": (
                 "bool" if key in BOOLEAN_SETTING_KEYS
                 else "number" if key in NUMERIC_SETTING_KEYS
+                else "timezone" if key == "timezone"
                 else "text"
             ),
         }
         for key, title in ALLOWED_SETTING_KEYS.items()
     }
-    return {"settings": editable, "command_levels": await db.list_command_levels()}
+    return {
+        "settings": editable,
+        "command_levels": await db.list_command_levels(),
+        # Готовый список для выпадающего меню часового пояса: смещения GMT
+        # плюс именованные зоны из общего модуля — панель не выдумывает
+        # свой список, иначе он разошёлся бы с тем, что принимает бот.
+        "timezones": _timezone_choices(),
+    }
 
 
 class SettingBody(BaseModel):

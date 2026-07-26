@@ -1114,6 +1114,9 @@ $$(".member-tab").forEach((btn) =>
 
 // ===== Дерево команд (админ) ===============================================
 let _cmdTree = null;  // кэш ответа для клиентского поиска/локального обновления
+// Раскрытые категории — по названию. Живут отдельно от DOM, потому что
+// renderCommandTree() пересобирает разметку целиком.
+const _cmdtreeOpen = new Set();
 
 async function loadCommandTree() {
   const body = $("#cmdtree-body");
@@ -1136,11 +1139,19 @@ function renderCommandTree() {
   const options = (sel) => [0, 1, 2, 3].map((l) =>
     `<option value="${l}"${l === sel ? " selected" : ""}>${lvlName(l)}</option>`).join("");
   let out = "";
+  let shown = 0;
   for (const cat of _cmdTree.categories) {
     const cmds = cat.commands.filter((c) =>
       !q || c.key.toLowerCase().includes(q) || c.phrase.toLowerCase().includes(q));
     if (!cmds.length) continue;
-    out += `<div class="cmdtree-cat"><h3>${escapeHtml(cat.category)} <span class="muted">${cmds.length}</span></h3>`;
+    shown += cmds.length;
+    // Во время поиска категории с совпадениями раскрыты принудительно, иначе
+    // результат поиска был бы списком закрытых заголовков. Ручные раскрытия
+    // при этом не теряются: они живут в _cmdtreeOpen и вернутся, когда строку
+    // поиска очистят.
+    const open = q || _cmdtreeOpen.has(cat.category);
+    out += `<details class="cmdtree-cat fold" data-cat="${escapeHtml(cat.category)}"${open ? " open" : ""}>
+      <summary><h3>${escapeHtml(cat.category)}</h3><span class="fold-note">${cmds.length}</span></summary>`;
     for (const c of cmds) {
       const ctl = (canEdit && c.overridable)
         ? `<select class="cmd-level" data-key="${escapeHtml(c.key)}">${options(c.level)}</select>`
@@ -1151,13 +1162,39 @@ function renderCommandTree() {
         <div class="cmdtree-cmd"><code>${escapeHtml(c.key)}</code><span class="cmdtree-phrase">${escapeHtml(c.phrase)}</span></div>
         <div class="cmdtree-ctl">${ctl}${reset}</div></div>`;
     }
-    out += `</div>`;
+    out += `</details>`;
   }
   body.innerHTML = out || `<div class="empty">${icon("empty")}<span>Ничего не найдено</span></div>`;
   if (canEdit) {
     $$(".cmd-level").forEach((sel) => sel.addEventListener("change", () => cmdSetLevel(sel.dataset.key, Number(sel.value))));
     $$(".cmd-reset").forEach((btn) => btn.addEventListener("click", () => cmdSetLevel(btn.dataset.key, null)));
   }
+  // Запоминаем раскрытые категории: renderCommandTree() пересобирает разметку
+  // целиком (после правки уровня, при поиске), и без этого блок захлопывался
+  // бы прямо под руками.
+  $$("#cmdtree-body .cmdtree-cat").forEach((el) => {
+    el.addEventListener("toggle", () => {
+      if (el.open) _cmdtreeOpen.add(el.dataset.cat);
+      else _cmdtreeOpen.delete(el.dataset.cat);
+      syncCmdtreeToggleAll();
+    });
+  });
+  $("#cmdtree-count").textContent = q
+    ? `Найдено команд: ${shown}`
+    : `Команд всего: ${shown}`;
+  syncCmdtreeToggleAll();
+}
+
+// Кнопка «Раскрыть все» / «Свернуть все» — её надпись должна отражать то, что
+// произойдёт по нажатию, поэтому считаем текущее состояние после каждой смены.
+function syncCmdtreeToggleAll() {
+  const btn = $("#cmdtree-toggle-all");
+  if (!btn) return;
+  const cats = $$("#cmdtree-body .cmdtree-cat");
+  const allOpen = cats.length > 0 && cats.every((el) => el.open);
+  btn.dataset.open = allOpen ? "1" : "0";
+  btn.textContent = allOpen ? "Свернуть все" : "Раскрыть все";
+  btn.disabled = !cats.length;
 }
 
 async function cmdSetLevel(key, level) {
@@ -1174,6 +1211,19 @@ async function cmdSetLevel(key, level) {
 
 const _cmdtreeSearch = $("#cmdtree-q");
 if (_cmdtreeSearch) _cmdtreeSearch.addEventListener("input", renderCommandTree);
+
+const _cmdtreeToggleAll = $("#cmdtree-toggle-all");
+if (_cmdtreeToggleAll) {
+  _cmdtreeToggleAll.addEventListener("click", () => {
+    const open = _cmdtreeToggleAll.dataset.open !== "1";
+    _cmdtreeOpen.clear();
+    if (open) for (const cat of (_cmdTree?.categories || [])) _cmdtreeOpen.add(cat.category);
+    // Переключаем прямо в DOM, не перерисовывая: перерисовка сбросила бы
+    // позицию прокрутки и открытые <select> с уровнями.
+    $$("#cmdtree-body .cmdtree-cat").forEach((el) => { el.open = open; });
+    syncCmdtreeToggleAll();
+  });
+}
 
 // ===== Пороги наград (владелец) ============================================
 let _rewardLevels = null;
@@ -3438,6 +3488,35 @@ function settingCard(key, item, canEdit) {
         </div>
       </div>`;
   }
+  if (item.kind === "timezone") {
+    // Выпадающий список вместо свободного ввода: пояс — это выбор из конечного
+    // набора, и опечатка «Europe/Moskow» иначе всплыла бы только при сохранении.
+    // Поле ручного ввода оставляем: там принимаются и «мск», и «+3», и любая
+    // зона IANA, которой нет в списке.
+    const cur = String(item.value || "");
+    const known = _timezones.some((t) => t.value === cur);
+    const opts = [`<option value=""${cur ? "" : " selected"}>GMT+0 (UTC) — по умолчанию</option>`]
+      .concat(_timezones.map((t) =>
+        `<option value="${escapeHtml(t.value)}"${t.value === cur ? " selected" : ""}>${escapeHtml(t.label)}</option>`))
+      .join("");
+    return `
+      <div class="card setting-card">
+        <div class="action-head">
+          <h3>${icon("clock")}${escapeHtml(item.title)}</h3>
+        </div>
+        <div class="row">
+          <label><span>Часовой пояс</span>
+            <select data-tz-select ${canEdit ? "" : "disabled"}>${opts}</select>
+          </label>
+          <label><span>Или впишите свой</span>
+            <input type="text" data-setting="${key}" ${canEdit ? "" : "disabled"}
+              value="${escapeHtml(cur)}" placeholder="мск / GMT+3 / Europe/Moscow">
+          </label>
+          ${canEdit ? `<div class="grow-0"><button class="ghost" data-save="${key}">${icon("check")}Сохранить</button></div>` : ""}
+        </div>
+        ${cur && !known ? `<div class="muted" style="font-size:12px">Своё значение: <code>${escapeHtml(cur)}</code></div>` : ""}
+      </div>`;
+  }
   const placeholder = item.kind === "number"
     ? "Число (0 — выключить правило)"
     : "Пусто — бот использует текст по умолчанию";
@@ -3458,9 +3537,14 @@ function settingCard(key, item, canEdit) {
     </div>`;
 }
 
+// Список зон приходит с сервера (общий модуль tz_settings), а не хранится
+// в панели: свой список рано или поздно разошёлся бы с тем, что принимает бот.
+let _timezones = [];
+
 async function loadSettings() {
   try {
     const data = await api("/api/settings");
+    _timezones = data.timezones || [];
     const canEdit = me.role === "owner";
     $("#settings-list").innerHTML =
       Object.entries(data.settings).map(([key, item]) => settingCard(key, item, canEdit)).join("")
@@ -3472,6 +3556,15 @@ async function loadSettings() {
         const body = btn.closest(".setting-card").querySelector(".setting-body");
         const nowCollapsed = body.classList.toggle("collapsed");
         btn.setAttribute("aria-expanded", nowCollapsed ? "false" : "true");
+      });
+    });
+
+    // Выбор в списке подставляем в поле ручного ввода — сохраняет всегда
+    // одна кнопка, читающая именно это поле.
+    $$("[data-tz-select]").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const input = sel.closest(".setting-card").querySelector('[data-setting="timezone"]');
+        if (input) input.value = sel.value;
       });
     });
 

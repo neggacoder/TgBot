@@ -7254,11 +7254,20 @@ async def add_casino_balance(chat_id: int, user_id: int, amount: int) -> int:
     return int(row["balance"]) if row else 0
 
 
-async def claim_daily_bonus(chat_id: int, user_id: int, bonus_amount: int) -> tuple[bool, int]:
+async def claim_daily_bonus(
+    chat_id: int, user_id: int, bonus_amount: int, today=None,
+) -> tuple[bool, int]:
     """Начисляет ежедневный бонус, если он ещё не получен сегодня.
-    Возвращает (был ли начислен бонус, баланс после)."""
+    Возвращает (был ли начислен бонус, баланс после).
+
+    today передаёт вызывающий код: «сегодня» здесь — местные сутки по
+    настройке «часовой пояс», а модуль про эту настройку не знает. Раньше
+    тут стоял date.today(), то есть зона ОПЕРАЦИОННОЙ СИСТЕМЫ, — бонус
+    обновлялся в полночь сервера, а не в полночь чата."""
     wallet = await get_casino_wallet(chat_id, user_id)
-    today = date.today()
+    # Запасное значение — UTC, а не date.today(): зона операционной системы
+    # не должна влиять на бота вообще нигде.
+    today = today or datetime.utcnow().date()
     if wallet.get("last_bonus_date") == today:
         return False, int(wallet["balance"])
     new_balance = await add_casino_balance(chat_id, user_id, bonus_amount)
@@ -8076,6 +8085,85 @@ async def add_chat_coins(chat_id: int, amount: int) -> int:
     return await get_chat_coins(chat_id)
 
 
+# ----------------------------------------------------------------------------
+# Помощники для случайных событий чата (см. chat_events.py). Все они массовые:
+# событие касается сразу всех, и делать это по одному запросу на человека
+# было бы и медленно, и не атомарно.
+# ----------------------------------------------------------------------------
+async def list_wallet_holders(chat_id: int, min_coins: int = 1, limit: int = 500) -> list[dict]:
+    """Кошельки чата, где есть что взять, — от самых полных."""
+    return await _fetchall(
+        "SELECT user_id, coins FROM economy_wallets "
+        "WHERE chat_id = %s AND coins >= %s ORDER BY coins DESC LIMIT %s",
+        (chat_id, min_coins, limit),
+    )
+
+
+async def tax_all_wallets(chat_id: int, percent: float) -> int:
+    """Списывает percent% с каждого кошелька чата. Возвращает, сколько всего
+    списано, — эта сумма уходит в казну чата вызывающим кодом.
+
+    Считаем и списываем одним запросом: между SELECT и UPDATE человек мог бы
+    успеть потратить монеты, и налог ушёл бы в минус."""
+    row = await _fetchone(
+        "SELECT COALESCE(SUM(FLOOR(coins * %s / 100)), 0) AS total FROM economy_wallets "
+        "WHERE chat_id = %s AND coins > 0",
+        (percent, chat_id),
+    )
+    total = int(row["total"] or 0) if row else 0
+    if total <= 0:
+        return 0
+    await _execute(
+        "UPDATE economy_wallets SET coins = coins - FLOOR(coins * %s / 100) "
+        "WHERE chat_id = %s AND coins > 0",
+        (percent, chat_id),
+    )
+    return total
+
+
+async def add_coins_to_users(chat_id: int, user_ids: list[int], amount: int) -> int:
+    """Начисляет amount каждому из user_ids. Возвращает число получивших."""
+    if not user_ids or amount == 0:
+        return 0
+    placeholders = ", ".join(["%s"] * len(user_ids))
+    # Строка кошелька может ещё не существовать — заводим недостающие.
+    for uid in user_ids:
+        await get_wallet(chat_id, uid)
+    await _execute(
+        f"UPDATE economy_wallets SET coins = GREATEST(coins + %s, 0) "
+        f"WHERE chat_id = %s AND user_id IN ({placeholders})",
+        (amount, chat_id, *user_ids),
+    )
+    return len(user_ids)
+
+
+async def clear_all_surveillance(chat_id: int) -> int:
+    """Амнистия: снимает надзор со всех в чате. Возвращает число помилованных."""
+    row = await _fetchone(
+        "SELECT COUNT(*) AS n FROM robbery_stats WHERE chat_id = %s AND under_surveillance = 1",
+        (chat_id,),
+    )
+    freed = int(row["n"] or 0) if row else 0
+    if freed:
+        await _execute(
+            "UPDATE robbery_stats SET under_surveillance = 0, surveillance_strikes = 0 "
+            "WHERE chat_id = %s AND under_surveillance = 1",
+            (chat_id,),
+        )
+    return freed
+
+
+async def restock_shop_items(chat_id: int, add: int = 3) -> int:
+    """Завоз товара: пополняет остатки у позиций с ограниченным запасом,
+    не выше restock_max. Возвращает число затронутых позиций."""
+    return await _execute(
+        "UPDATE shop_items SET stock = LEAST(COALESCE(stock, 0) + %s, COALESCE(restock_max, 10)) "
+        "WHERE chat_id = %s AND stock IS NOT NULL AND is_active = 1 "
+        "AND stock < COALESCE(restock_max, 10)",
+        (add, chat_id),
+    )
+
+
 async def record_chat_investment(chat_id: int, user_id: int, amount: int) -> int:
     """Списывает `amount` с личного кошелька пользователя (в этом чате),
     зачисляет его в общий баланс чата и пишет строку в историю вложений.
@@ -8642,8 +8730,13 @@ async def list_recent_active_users(chat_id: int, limit: int = 300) -> list[dict]
     """Известные боту участники чата, писавшие сегодня или вчера (по
     message_daily) — кандидаты для подсчёта стрика (см. compute_streak() в
     bot.py). У всех остальных участников стрик гарантированно равен 0 —
-    полный перебор всех известных пользователей чата не нужен."""
-    today = date.today()
+    полный перебор всех известных пользователей чата не нужен.
+
+    Сутки здесь ОБЯЗАНЫ быть по UTC: message_daily.day пишется из
+    datetime.utcnow() (см. increment_daily_count), и раньше стоявший
+    date.today() брал зону ОС — на не-UTC сервере стрики читались бы
+    не за те дни, что записаны."""
+    today = datetime.utcnow().date()
     yesterday = today - timedelta(days=1)
     return await _fetchall(
         "SELECT DISTINCT ku.user_id, ku.full_name, ku.username FROM message_daily md "

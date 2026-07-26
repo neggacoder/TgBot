@@ -63,6 +63,7 @@ import call_commands
 import rp_photos
 import tz_settings
 import db
+import chat_events
 import fake_warns
 import relationships_v2
 import rest_rules
@@ -299,6 +300,7 @@ class MessageCounterMiddleware(BaseMiddleware):
             and complaint_chat_id
             and event.chat.id == complaint_chat_id
             and is_command_like(event.text or event.caption)
+            and not is_cleanup_exempt(event.text or event.caption)
         ):
             minutes = cmd_cleanup_minutes()
             if minutes > 0:
@@ -987,7 +989,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "mod_themes":      {"phrase": "!темы / названия рангов / +иконка модераторов", "category": "Настройка", "level": LEVEL_SENIOR},
     "cmd_cleanup_set": {"phrase": "чистка команд {минуты} (0 — выкл.)", "category": "Настройка", "level": LEVEL_SENIOR},
     "webapp":         {"phrase": "приложение (в личке боту) — мини-приложение Telegram: профиль, пара, семья, клан кнопками", "category": "Разное", "level": 0},
-    "timezone_set":   {"phrase": "часовой пояс {Москва | Europe/Moscow | +3} — пояс показа времени; «время» / «часовой пояс» — посмотреть", "category": "Настройка", "level": LEVEL_SENIOR},
+    "timezone_set":   {"phrase": "часовой пояс {GMT+3 | Москва | Europe/Moscow | +3} — пояс чата; «время» / «часовой пояс» — посмотреть", "category": "Настройка", "level": LEVEL_SENIOR},
     "call_all":        {"phrase": "созыв / хуйланы_сюда / хуйланысюда / калл [текст] ", "category": "Созывы", "level": LEVEL_MODERATOR},
     "call_admins":     {"phrase": "калладминс / созыв админов [текст]", "category": "Созывы", "level": LEVEL_MODERATOR},
     "call_stop":       {"phrase": "стоп / стой / отмена", "category": "Созывы", "level": LEVEL_MODERATOR},
@@ -1158,6 +1160,8 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "race_play":       {"phrase": "!гонки {ставка} — гонки лошадей (казино), лошадь выбирается кнопкой", "category": "Экономика", "level": 0},
     "achievement_pin": {"phrase": "закрепить ачивку {код} / открепить ачивку", "category": "Разное", "level": 0},
     "stock_settings":  {"phrase": "биржа настройки / биржа настройки рост|падение|дивиденды {число} / биржа настройки спокойная|обычная|азартная", "category": "Экономика", "level": LEVEL_ADMIN},
+    "chat_events":     {"phrase": "события — что сейчас происходит в чате", "category": "Экономика", "level": 0},
+    "chat_events_toggle": {"phrase": "+события / -события / событие запустить {ключ}", "category": "Экономика", "level": LEVEL_ADMIN},
 }
 
 
@@ -1205,6 +1209,18 @@ DEFAULT_CMD_CLEANUP_MINUTES = 15
 # Потолок настройки: Telegram не позволяет боту удалять сообщения старше 48
 # часов, и всё, что дольше, просто тихо не удалялось бы.
 CMD_CLEANUP_MAX_MINUTES = 48 * 60
+
+# Команды, которые автоочистка НЕ трогает. Перевод монет — это расписка:
+# и отправитель, и получатель должны иметь возможность вернуться к нему через
+# час и убедиться, что деньги ушли и кому именно. Удалять такое вместе с
+# обычным командным шумом нельзя — спор о переводе восстановить будет нечем.
+# Сюда же добавляйте всё, у чего ответ бота имеет ценность как запись.
+_CLEANUP_KEEP_RE = re.compile(r"(?i)^\s*(?:перевод|перевести)\b")
+
+
+def is_cleanup_exempt(text: Optional[str]) -> bool:
+    """Нужно ли оставить это сообщение (и ответ бота на него) в чате навсегда."""
+    return bool(text) and bool(_CLEANUP_KEEP_RE.match(text))
 
 
 def cmd_cleanup_minutes() -> int:
@@ -1277,6 +1293,65 @@ def fmt_date(dt: Optional[datetime]) -> str:
 def local_now() -> datetime:
     """«Сейчас» в настроенной зоне — для показа, не для расчётов."""
     return datetime.now(bot_tzinfo())
+
+
+# ----------------------------------------------------------------------------
+# Границы суток. Здесь легко ошибиться в обе стороны, поэтому правило простое:
+#
+#   * Всё, что ЧИТАЕТ message_daily, обязано считать сутки по UTC — потому что
+#     пишутся эти строки по UTC (см. increment_daily_count в мидлвари) и в
+#     таблице уже лежит история. Стоит начать читать её по местным суткам —
+#     и «стата за неделю» молча смешает две разные разметки дня навсегда.
+#   * Всё, у чего своя колонка-отметка (ежедневный бонус казино, дедуп
+#     ежедневной награды, дивиденды), можно и НУЖНО считать по настроенной
+#     зоне: там нет чужой истории, а человек ждёт смены суток в свою полночь.
+#
+# utc_today() существует отдельно от datetime.utcnow().date() не ради красоты:
+# по имени сразу видно, что UTC здесь выбран осознанно, а не потому что так
+# получилось. Раньше в этих местах стоял date.today(), который берёт зону
+# ОПЕРАЦИОННОЙ СИСТЕМЫ, — на UTC-сервере это совпадало с UTC случайно, и
+# переезд на сервер в другой зоне тихо сдвинул бы стрики и нормы.
+# ----------------------------------------------------------------------------
+def utc_today() -> date:
+    """Сегодняшняя дата по UTC — для всего, что связано с message_daily."""
+    return datetime.utcnow().date()
+
+
+def local_today() -> date:
+    """Сегодняшняя дата в настроенной зоне — для суток «как у людей»."""
+    return local_now().date()
+
+
+def local_hour() -> int:
+    """Текущий час в настроенной зоне — для суточных задач по расписанию."""
+    return local_now().hour
+
+
+def utc_offset_hours() -> int:
+    """Смещение настроенной зоны от UTC в целых часах.
+
+    Округляем до часа: почасовая статистика хранится в целочасовых корзинах,
+    и для зон с половинным смещением (например, UTC+5:30) точнее показать
+    ближайший час, чем не показывать ничего.
+    """
+    offset = local_now().utcoffset() or timedelta()
+    return int(round(offset.total_seconds() / 3600))
+
+
+def hours_to_local(rows: list[dict]) -> list[dict]:
+    """Переносит почасовые счётчики из UTC-корзин в местные.
+
+    Без этого чат, живущий по МСК, видел «пик активности в 18:00», когда на
+    самом деле люди писали в 21:00: в БД час берётся из UTC-времени сообщения.
+    """
+    shift = utc_offset_hours()
+    if not shift:
+        return rows
+    merged: dict[int, int] = {}
+    for row in rows:
+        hour = (int(row["hour"]) + shift) % 24
+        merged[hour] = merged.get(hour, 0) + int(row["message_count"])
+    return [{"hour": h, "message_count": merged[h]} for h in sorted(merged)]
 
 
 _cleanup_context: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar(
@@ -12877,6 +12952,10 @@ async def _farm_execute(chat_id: int, user_id: int) -> str:
     star_bonus = 1 + star_level * FARM_STAR_BONUS_PER_LEVEL
     luck = random.uniform(FARM_LUCK_MIN, FARM_LUCK_MAX)
     multiplier = (yield_percent / 100) * star_bonus * luck
+    # Событие чата (золотая лихорадка и т.п.) домножает поверх всего
+    # остального — см. chat_events.py.
+    event_mult = await event_multiplier(chat_id, chat_events.T_FARM)
+    multiplier *= event_mult
     base = random.randint(FARM_BASE_MIN, FARM_BASE_MAX)
     amount = max(1, round(base * multiplier))
 
@@ -13010,6 +13089,7 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
             )
 
     emoji, name, amount = roll_catch()
+    amount = max(1, round(amount * await event_multiplier(chat_id, chat_events.T_FISHING)))
     previous_best = int(stats.get("best_catch") or 0)
     # Сначала кулдаун (record_catch пишет last_fish_at), только потом монеты:
     # упади запись — человек останется без начисления, но не с возможностью
@@ -13139,6 +13219,8 @@ async def _treasure_execute(chat_id: int, user_id: int) -> str:
         await db.record_dig(chat_id, user_id, now, found=False)
         return "⛏ Вы разрыли пустую яму — клад успели забрать буквально только что!"
 
+    # Карта сокровищ (событие чата) увеличивает саму находку.
+    won = max(1, round(won * await event_multiplier(chat_id, chat_events.T_TREASURE)))
     # Кулдаун раньше начисления — по той же причине, что и в рыбалке.
     await db.record_dig(chat_id, user_id, now, found=True)
     await db.add_coins(chat_id, user_id, won)
@@ -13551,6 +13633,9 @@ async def cmd_robbery(message: Message):
     if not _check_misc_access(message.from_user.id, "robbery_run"):
         return
     chat_id, user_id = message.chat.id, message.from_user.id
+    if await event_flag(chat_id, chat_events.F_NO_ROBBERY):
+        await message.reply("🚓 Комендантский час — на улицах патрули. Пока не грабим.")
+        return
     stats = await db.get_robbery_stats(chat_id, user_id)
     if await db.is_under_surveillance(chat_id, user_id):
         await message.reply(
@@ -13635,6 +13720,12 @@ async def cmd_robbery(message: Message):
 
     if success:
         amount = robbery.compute_steal_amount(victim_balance, has_gold_pig)
+        # Налёт на банк (событие чата) удваивает добычу, но не больше того,
+        # что у жертвы реально есть, — иначе кража ушла бы ей в минус.
+        amount = min(
+            max(1, round(amount * await event_multiplier(chat_id, chat_events.T_ROBBERY))),
+            int(victim_balance),
+        )
         if has_gold_pig:
             await db.remove_inventory_item(chat_id, user_id, "gold_pig", 1)
         await db.apply_robbery_success(chat_id, user_id, victim_id, amount)
@@ -13653,7 +13744,10 @@ async def cmd_robbery(message: Message):
 
         has_pass = inv_qty.get(robbery.SURVEILLANCE_PASS_ITEM_KEY, 0) > 0
         surveillance_line = ""
-        if has_pass:
+        if await event_flag(chat_id, chat_events.F_NO_SURVEILLANCE):
+            # Налёт на банк: полиции не до вас, провал не идёт в счёт надзора.
+            surveillance_line = "\n🚨 Полиции сейчас не до вас — провал не пошёл в счёт надзора."
+        elif has_pass:
             await db.remove_inventory_item(chat_id, user_id, robbery.SURVEILLANCE_PASS_ITEM_KEY, 1)
             surveillance_line = "\n🕶️ Отмазка сработала — этот провал не пошёл в счёт «под надзором»."
         else:
@@ -13810,6 +13904,9 @@ async def cmd_casino_roulette(message: Message):
         multiplier = 14 if color == "green" else 2
         winnings = bet_amount * multiplier
         delta = winnings - bet_amount  # ставка не сгорает, засчитывается в выигрыш
+        # Фартовый час / крупье не в духе — событие чата множит только
+        # выигрыш, ставка не трогается (см. chat_events.py).
+        delta = max(1, round(delta * await event_multiplier(chat_id, chat_events.T_CASINO)))
         await db.add_coins(chat_id, user_id, delta)
         outcome_text = f"✅ <b>Выигрыш!</b> +{delta} i¢ (x{multiplier})"
     else:
@@ -13890,7 +13987,11 @@ async def cmd_casino_balance(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_balance"):
         return
     chat_id, user_id = message.chat.id, message.from_user.id
-    bonus_given, balance = await db.claim_daily_bonus(chat_id, user_id, CASINO_DAILY_BONUS)
+    # Бонус обновляется в местную полночь — своя колонка last_bonus_date,
+    # чужой истории по UTC-суткам здесь нет.
+    bonus_given, balance = await db.claim_daily_bonus(
+        chat_id, user_id, CASINO_DAILY_BONUS, today=local_today()
+    )
     lines = ["🎰 <b>Казино: баланс</b>", DIVIDER, f"💰 {balance} i¢"]
     if bonus_given:
         lines.append(f"\n🎁 Начислен ежедневный бонус: +{CASINO_DAILY_BONUS} i¢!")
@@ -13981,6 +14082,9 @@ async def cmd_casino_dice(message: Message):
     roll = random.randint(1, 6)
     if roll == guess:
         delta = bet * 6 - bet
+        # Фартовый час / крупье не в духе — событие чата множит только
+        # выигрыш, ставка не трогается (см. chat_events.py).
+        delta = max(1, round(delta * await event_multiplier(chat_id, chat_events.T_CASINO)))
         new_balance = await db.add_casino_balance(chat_id, user_id, delta)
         outcome = f"✅ <b>Выигрыш!</b> +{delta} i¢ (x6)"
     else:
@@ -14032,8 +14136,10 @@ async def cmd_casino_coin(message: Message):
 
     result = random.choice(["орёл", "решка"])
     if result == guess:
-        new_balance = await db.add_casino_balance(chat_id, user_id, bet)
-        outcome = f"✅ <b>Выигрыш!</b> +{bet} i¢ (x2)"
+        # Событие чата множит только выигрыш, ставка не трогается.
+        win = max(1, round(bet * await event_multiplier(chat_id, chat_events.T_CASINO)))
+        new_balance = await db.add_casino_balance(chat_id, user_id, win)
+        outcome = f"✅ <b>Выигрыш!</b> +{win} i¢ (x2)"
     else:
         new_balance =  await db.add_casino_balance(chat_id, user_id, -bet)
         outcome = f"❌ <b>Проигрыш.</b> -{bet} i¢"
@@ -14084,6 +14190,9 @@ async def cmd_casino_poker(message: Message):
     multiplier, combo_name = _evaluate_poker_hand(hand)
     if multiplier > 0:
         delta = bet * multiplier - bet
+        # Фартовый час / крупье не в духе — событие чата множит только
+        # выигрыш, ставка не трогается (см. chat_events.py).
+        delta = max(1, round(delta * await event_multiplier(chat_id, chat_events.T_CASINO)))
         new_balance = await db.add_casino_balance(chat_id, user_id, delta)
         outcome = f"✅ <b>Выигрыш!</b> +{delta} i¢ (x{multiplier}, «{combo_name}»)"
     else:
@@ -15074,6 +15183,10 @@ async def bank_penalty_loop() -> None:
             rows = await db.list_overdue_bank_credits()
             for row in rows:
                 chat_id, user_id = row["chat_id"], row["user_id"]
+                # Кредитные каникулы (событие чата) — пеню в этот проход
+                # просто пропускаем, долг остаётся как есть.
+                if await event_flag(chat_id, chat_events.F_NO_BANK_PENALTY):
+                    continue
                 penalty_percent = float(row["credit_penalty_percent"])
                 new_debt = int(round(int(row["credit_debt"]) * (1 + penalty_percent / 100)))
                 principal = row.get("credit_amount")
@@ -15442,7 +15555,8 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
         xp_gain += 10
 
     event_text = ""
-    energy_delta = -energy_cost
+    # День профсоюза (событие чата) — смена не тратит энергию.
+    energy_delta = 0 if await event_flag(chat_id, chat_events.F_NO_ENERGY) else -energy_cost
     mood_delta = -random.randint(0, 5)
     health_delta = 0
     if random.random() < 0.15:
@@ -15467,6 +15581,8 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
             final_income += 50
             event_text = "📈 Курс вырос: +50 i¢ бонус."
 
+    # Аврал на производстве (событие чата) множит заработок смены.
+    final_income = int(final_income * await event_multiplier(chat_id, chat_events.T_WORK))
     await db.add_coins(chat_id, user_id, final_income)
     stats = await db.update_profession_after_shift(
         chat_id, user_id, xp_gain, final_income, energy_delta, mood_delta,
@@ -16113,14 +16229,20 @@ async def cmd_shop_buy(message: Message):
     if not await db.try_decrement_shop_item_stock(message.chat.id, item_key):
         await message.reply(f"⚠️ Товар «{html.escape(item['name'])}» только что раскупили — попробуйте другой.")
         return
-    if not await spend_coins(message.chat.id, message.from_user.id, item["price"]):
-        await message.reply(f"Недостаточно монет: нужно {item['price']} i¢.")
+    # Распродажа (событие чата) снижает цену только в момент покупки —
+    # ценники в самом магазине не переписываем.
+    price = max(1, round(int(item["price"]) * await event_multiplier(message.chat.id, chat_events.T_SHOP)))
+    if not await spend_coins(message.chat.id, message.from_user.id, price):
+        await message.reply(f"Недостаточно монет: нужно {price} i¢.")
         return
     await db.add_inventory_item(message.chat.id, message.from_user.id, item_key)
     await db.add_log("shop_purchase", chat_id=message.chat.id, actor_id=message.from_user.id, details=item_key)
     updated_item = await db.get_shop_item(message.chat.id, item_key)
     left_text = f" (осталось: {updated_item['stock']})" if updated_item and updated_item.get("stock") is not None else ""
-    await message.reply(f"✅ Куплено: {item['emoji']} <b>{html.escape(item['name'])}</b> за {item['price']} i¢.{left_text}")
+    sale_text = f" <s>{item['price']}</s> — распродажа!" if price < int(item["price"]) else ""
+    await message.reply(
+        f"✅ Куплено: {item['emoji']} <b>{html.escape(item['name'])}</b> за {price} i¢.{sale_text}{left_text}"
+    )
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -16399,7 +16521,9 @@ async def cmd_lootbox(message: Message):
         if len(parts) > 3 and parts[3].isdigit():
             count = max(1, min(int(parts[3]), LOOTBOX_MAX_PER_COMMAND))
         info = LOOTBOX_TYPES[rarity]
-        total_price = info["price"] * count
+        # Чёрная пятница (событие чата) — скидка на лутбоксы.
+        total_price = max(1, round(info["price"] * count
+                                   * await event_multiplier(chat_id, chat_events.T_LOOTBOX)))
         if not await spend_coins(chat_id, user_id, total_price):
             total_text = f"{total_price:,}".replace(",", " ")
             await message.reply(f"Недостаточно монет: нужно {total_text}.")
@@ -19216,7 +19340,7 @@ async def _render_profile_chart(chat_id: int, user_id: int) -> Optional[BytesIO]
     схлопывался в один-два столбца)."""
     if not await is_stat_chart_enabled(chat_id):
         return None
-    today = date.today()
+    today = utc_today()      # график строится по message_daily — только UTC
     stats = await db.get_message_stats(chat_id, user_id)
     first_seen = stats["first_seen_at"].date() if stats and stats.get("first_seen_at") else today
     days_since_first_seen = (today - first_seen).days + 1
@@ -19797,7 +19921,7 @@ def compute_streak(days: list) -> int:
     не успел написать сегодня."""
     if not days:
         return 0
-    today = date.today()
+    today = utc_today()      # days пришли из message_daily — сравниваем по UTC
     days_set = set(days)
     if today in days_set:
         cursor = today
@@ -20115,7 +20239,7 @@ async def _render_chat_chart(chat_id: int, days: int, title: str = "Статис
     ACTIVITY_CHART_DAYS), и «Чат стата [дни]» (произвольный период)."""
     if not await is_stat_chart_enabled(chat_id):
         return None
-    today = date.today()
+    today = utc_today()      # окно выборки из message_daily
     since_day = today - timedelta(days=days - 1)
     rows = await db.list_daily_counts_for_chat(chat_id, since_day)
     if not rows:
@@ -20214,14 +20338,15 @@ async def cmd_user_hourly_stat(message: Message):
         await message.reply("У ботов почасовой статистики нет 🤖")
         return
 
-    since_day = date.today() - timedelta(days=ACTIVITY_CHART_DAYS - 1)
+    since_day = utc_today() - timedelta(days=ACTIVITY_CHART_DAYS - 1)
     rows = await db.list_hourly_pattern_for_user(message.chat.id, target.id, since_day)
     if not rows:
         await message.reply("Пока нет данных для графика — напишите что-нибудь!")
         return
 
     name = await display_name_by_id(message.chat.id, target.id)
-    current_hour = datetime.utcnow().hour
+    rows = hours_to_local(rows)
+    current_hour = local_hour()
     try:
         png_buf = await asyncio.to_thread(
             render_hourly_chart, rows, "Активность по часам", current_hour
@@ -20257,10 +20382,10 @@ async def cmd_chat_hourly_stat(message: Message):
     merged: dict[int, int] = {}
     for row in raw_rows:
         merged[row["hour"]] = merged.get(row["hour"], 0) + int(row["message_count"])
-    rows = [{"hour": h, "message_count": c} for h, c in merged.items()]
+    rows = hours_to_local([{"hour": h, "message_count": c} for h, c in merged.items()])
     total = sum(merged.values())
 
-    current_hour = datetime.utcnow().hour
+    current_hour = local_hour()
     try:
         png_buf = await asyncio.to_thread(
             render_hourly_chart, rows, "Статистика чата по часам", current_hour
@@ -21542,20 +21667,42 @@ async def cmd_random_sticker_toggle(message: Message):
         await db.delete_data(_rstick_key(message.chat.id))
         await message.reply("🎲 Случайные стикеры выключены.")
 
-STOCK_LOOP_CHECK_INTERVAL = 3600  # проверяем раз в час, срабатывает раз в сутки
+STOCK_MIN_SECONDS_BETWEEN = 3300  # предохранитель от двойного шага в один час
+
+
+def _seconds_until_next_hour() -> float:
+    """Сколько спать до ближайшего ровного часа по настроенной зоне.
+
+    Раньше цикл просто спал 3600 секунд подряд, а отсчёт шёл от МОМЕНТА
+    ЗАПУСКА бота: стартовали в 12:37 — курс менялся в 13:37, 14:37 и так
+    далее, да ещё и уползал вперёд на время обработки каждого прохода.
+    Теперь спим ровно до следующего :00.
+
+    Полсекунды сверху — чтобы просыпаться гарантированно ПОСЛЕ границы:
+    asyncio.sleep может вернуть управление на доли миллисекунды раньше срока,
+    и тогда следующий расчёт дал бы сон длиной почти в ноль и второй шаг
+    курса в тот же час.
+
+    Зона берётся настроенная, а не UTC: у зон с получасовым смещением
+    (например, UTC+5:30) ровный час на часах у людей — это UTC :30.
+    """
+    now = local_now()
+    nxt = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return max(1.0, (nxt - now).total_seconds() + 0.5)
 
 
 async def stock_market_loop() -> None:
-    """Раз в час: меняет курс акций каждого чата на случайный процент в
-    пределах, заданных для этого чата (по умолчанию -10%..+50%, настраивается
-    в веб-панели), пишет точку в историю курса и начисляет дивиденды.
+    """Ровно в :00 каждого часа: меняет курс акций каждого чата на случайный
+    процент в пределах, заданных для этого чата (настраивается в веб-панели
+    и командой «биржа настройки»), пишет точку в историю курса и начисляет
+    дивиденды.
 
-    Дивиденды именно суточные: сам цикл крутится раз в час, но
+    Дивиденды именно суточные: сам цикл просыпается ежечасно, но
     list_stock_holdings_due_for_dividend отсекает тех, кому уже начисляли
     сегодня."""
     while True:
         try:
-            await asyncio.sleep(STOCK_LOOP_CHECK_INTERVAL)
+            await asyncio.sleep(_seconds_until_next_hour())
 
             # Используем текущее время (желательно UTC с timezone для надежности)
             now = datetime.utcnow()
@@ -21574,7 +21721,7 @@ async def stock_market_loop() -> None:
 
                 # Если с момента последнего изменения прошло меньше 55 минут, пропускаем
                 # (небольшой запас в 5 минут защитит от микро-сдвигов asyncio.sleep)
-                if last_change and (now - last_change).total_seconds() < 3300:
+                if last_change and (now - last_change).total_seconds() < STOCK_MIN_SECONDS_BETWEEN:
                     continue
 
                 settings = await db.get_stock_settings(chat_id)
@@ -21593,10 +21740,14 @@ async def stock_market_loop() -> None:
                 await db.add_stock_price_point(chat_id, new_price, change_percent * 100, now, "auto")
 
                 # Передаем 'now' для фиксации времени начисления дивидендов
-                due = await db.list_stock_holdings_due_for_dividend(chat_id, now)
+                # Сутки дивидендов — местные: last_accrual_date своя колонка,
+                # с UTC-разметкой message_daily она никак не связана.
+                dividend_day = local_today()
+                due = await db.list_stock_holdings_due_for_dividend(chat_id, dividend_day)
                 for holder in due:
                     dividend = float(holder["invested"]) * dividend_rate
-                    await db.accrue_dividend(chat_id, holder["user_id"], dividend, now)
+                    dividend *= await event_multiplier(chat_id, chat_events.T_DIVIDENDS)
+                    await db.accrue_dividend(chat_id, holder["user_id"], dividend, dividend_day)
 
                 try:
                     sign = "📈" if change_percent >= 0 else "📉"
@@ -21659,6 +21810,10 @@ async def weekly_digest_loop() -> None:
 # 5 самых активных по сообщениям ЗА ЭТОТ ДЕНЬ получают i¢ из расчёта
 # 5 монет за каждое своё сообщение.
 # ============================================================================
+# Час намеренно по UTC, а не по настройке «часовой пояс»: награда считает
+# топ по message_daily, а он размечен UTC-сутками. Сработай она в местные
+# 23:00, при МСК это 20:00 UTC — итог подводился бы за неполный день, и
+# сообщения последних четырёх часов не попадали бы ни в один расчёт.
 DAILY_TOP_REWARD_HOUR_UTC = 23
 DAILY_TOP_REWARD_COUNT = 10
 DAILY_TOP_REWARD_PER_MESSAGE = 5
@@ -21960,7 +22115,322 @@ async def cmd_stock_usage(message: Message):
 
 
 
-SHOP_RESTOCK_HOUR_UTC = 15
+# ============================================================================
+# Случайные события чата (каталог и правила — chat_events.py).
+#
+# Активное событие лежит одной JSON-строкой в bot_data: срок жизни у него
+# минуты, отдельная таблица ради этого не нужна, а перезапуск бота посреди
+# «золотой лихорадки» не должен её отменять — поэтому не память, а БД.
+# ============================================================================
+CHAT_EVENTS_TICK = 600  # как часто цикл заглядывает в каждый чат, сек
+
+
+def _events_state_key(chat_id: int) -> str:
+    return f"chat_event:{chat_id}"
+
+
+def _events_off_key(chat_id: int) -> str:
+    return f"chat_events_off:{chat_id}"
+
+
+async def events_enabled(chat_id: int) -> bool:
+    return (await db.get_data(_events_off_key(chat_id))) is None
+
+
+async def get_active_event(chat_id: int) -> Optional[dict]:
+    """Активное событие чата или None. Истёкшие подчищает на месте, поэтому
+    вызывающему коду не нужно самому сверяться с часами."""
+    row = await db.get_data(_events_state_key(chat_id))
+    if not row:
+        return None
+    try:
+        state = json.loads(row["data_value"])
+    except (ValueError, TypeError):
+        await db.delete_data(_events_state_key(chat_id))
+        return None
+    until = state.get("until")
+    if until:
+        try:
+            if datetime.utcnow() >= datetime.fromisoformat(until):
+                return None
+        except ValueError:
+            return None
+    return state
+
+
+async def event_multiplier(chat_id: int, tag: str) -> float:
+    """Во сколько раз активное событие меняет награду с этим тегом."""
+    return chat_events.multiplier(await get_active_event(chat_id), tag)
+
+
+async def event_flag(chat_id: int, name: str) -> bool:
+    return chat_events.flag(await get_active_event(chat_id), name)
+
+
+async def _apply_moment_event(chat_id: int, event: chat_events.Event) -> Optional[str]:
+    """Мгновенное событие: делает всё прямо здесь и возвращает готовый текст
+    объявления. None — событие не к месту (некого награждать, нечего пополнять),
+    тогда цикл просто промолчит и попробует в следующий раз."""
+    key = event.key
+
+    if key in ("stock_crash", "stock_rally"):
+        old = await db.get_stock_price(chat_id)
+        new_price = max(old * (1 + event.amount / 100), 0.01)
+        now = datetime.utcnow()
+        await db.set_stock_price(chat_id, new_price, now)
+        await db.add_stock_price_point(chat_id, new_price, event.amount, now, "event")
+        return chat_events.describe(event, amount=abs(event.amount), price=f"{new_price:.2f}")
+
+    if key in ("meteor", "lottery", "inheritance", "bank_error"):
+        holders = await db.list_wallet_holders(chat_id, min_coins=0, limit=200)
+        if not holders:
+            return None
+        winner = random.choice(holders)
+        await db.add_coins(chat_id, int(winner["user_id"]), int(event.amount))
+        name = await display_name_by_id(chat_id, int(winner["user_id"]))
+        return chat_events.describe(event, name=html.escape(name), amount=int(event.amount))
+
+    if key == "pickpocket":
+        holders = await db.list_wallet_holders(chat_id, min_coins=100, limit=200)
+        if not holders:
+            return None
+        victim = random.choice(holders)
+        stolen = max(1, int(int(victim["coins"]) * event.amount / 100))
+        await db.add_coins(chat_id, int(victim["user_id"]), -stolen)
+        name = await display_name_by_id(chat_id, int(victim["user_id"]))
+        return chat_events.describe(event, name=html.escape(name), amount=stolen)
+
+    if key == "handout":
+        treasury = await db.get_chat_coins(chat_id)
+        recent = await db.list_recent_active_users(chat_id, limit=300)
+        if not recent:
+            return None
+        per_head = int(event.amount)
+        need = per_head * len(recent)
+        if treasury < need:                       # в казне пусто — не выдумываем деньги
+            return None
+        await db.add_chat_coins(chat_id, -need)
+        got = await db.add_coins_to_users(chat_id, [int(u["user_id"]) for u in recent], per_head)
+        return chat_events.describe(event, amount=per_head, count=got)
+
+    if key == "tax":
+        total = await db.tax_all_wallets(chat_id, event.amount)
+        if total <= 0:
+            return None
+        await db.add_chat_coins(chat_id, total)
+        return chat_events.describe(event, amount=f"{event.amount:.0f}", total=total)
+
+    if key == "chat_bonus":
+        await db.add_chat_coins(chat_id, int(event.amount))
+        return chat_events.describe(event, amount=int(event.amount))
+
+    if key == "amnesty":
+        freed = await db.clear_all_surveillance(chat_id)
+        if not freed:
+            return None
+        return chat_events.describe(event, count=freed)
+
+    if key == "shop_restock":
+        touched = await db.restock_shop_items(chat_id)
+        if not touched:
+            return None
+        return chat_events.describe(event, count=touched)
+
+    logger.warning("Мгновенное событие «%s» не имеет обработчика", key)
+    return None
+
+
+async def _announce_event_end(chat_id: int, key: str) -> None:
+    event = chat_events.EVENTS_BY_KEY.get(key)
+    if not event or not event.ends_text:
+        return
+    try:
+        await bot.send_message(chat_id, event.ends_text)
+    except Exception:
+        pass
+
+
+async def fire_chat_event(chat_id: int, event: chat_events.Event) -> bool:
+    """Запускает конкретное событие в чате. True — получилось и объявлено."""
+    if event.kind == chat_events.MOMENT:
+        text = await _apply_moment_event(chat_id, event)
+        if text is None:
+            return False
+        state = {"key": event.key, "until": None}
+    else:
+        until = datetime.utcnow() + timedelta(minutes=event.minutes)
+        state = {"key": event.key, "until": until.isoformat()}
+        text = chat_events.describe(event)
+
+    # История нужна, чтобы pick() не гонял одно и то же по кругу.
+    history = state.get("history") or []
+    prev = await db.get_data(_events_state_key(chat_id))
+    if prev:
+        try:
+            history = (json.loads(prev["data_value"]).get("history") or [])
+        except (ValueError, TypeError):
+            history = []
+    state["history"] = (history + [event.key])[-chat_events.NO_REPEAT_LAST:]
+    state["started"] = datetime.utcnow().isoformat()
+
+    await db.set_data(_events_state_key(chat_id), json.dumps(state, ensure_ascii=False))
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception:
+        logger.exception("Не удалось объявить событие «%s» в чате %s", event.key, chat_id)
+        return False
+    await db.add_log("chat_event", chat_id=chat_id, details=event.key)
+
+    if event.kind == chat_events.BUFF:
+        asyncio.create_task(_schedule_event_end(chat_id, event))
+    return True
+
+
+async def _schedule_event_end(chat_id: int, event: chat_events.Event) -> None:
+    """Объявляет конец баффа. Отдельной задачей, а не в цикле, чтобы «кончилось»
+    приходило вовремя, а не с точностью до тика в 10 минут."""
+    try:
+        await asyncio.sleep(event.minutes * 60)
+        current = await db.get_data(_events_state_key(chat_id))
+        if not current:
+            return
+        try:
+            if json.loads(current["data_value"]).get("key") != event.key:
+                return          # за это время успело начаться другое событие
+        except (ValueError, TypeError):
+            return
+        await _announce_event_end(chat_id, event.key)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Сбой при объявлении конца события «%s»", event.key)
+
+
+async def chat_events_loop() -> None:
+    """Раз в CHAT_EVENTS_TICK заглядывает в каждый чат и с некоторой
+    вероятностью запускает событие. Пропускает чаты, где события выключены,
+    где уже что-то идёт и где недавно уже было."""
+    while True:
+        try:
+            await asyncio.sleep(CHAT_EVENTS_TICK)
+            now = datetime.utcnow()
+            for chat_id in await db.list_active_chat_ids():
+                try:
+                    if not await events_enabled(chat_id):
+                        continue
+                    row = await db.get_data(_events_state_key(chat_id))
+                    history: list[str] = []
+                    if row:
+                        try:
+                            state = json.loads(row["data_value"])
+                        except (ValueError, TypeError):
+                            state = {}
+                        history = state.get("history") or []
+                        until = state.get("until")
+                        if until:
+                            try:
+                                if now < datetime.fromisoformat(until):
+                                    continue          # бафф ещё идёт
+                            except ValueError:
+                                pass
+                        started = state.get("started")
+                        if started:
+                            try:
+                                if (now - datetime.fromisoformat(started)).total_seconds() \
+                                        < chat_events.MIN_MINUTES_BETWEEN * 60:
+                                    continue          # слишком рано для следующего
+                            except ValueError:
+                                pass
+                    if not chat_events.should_fire():
+                        continue
+                    event = chat_events.pick(history)
+                    if event is not None:
+                        await fire_chat_event(chat_id, event)
+                except Exception:
+                    logger.exception("Сбой события в чате %s", chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой в цикле событий чата")
+
+
+def _event_status_lines(state: Optional[dict]) -> list[str]:
+    event = chat_events.EVENTS_BY_KEY.get((state or {}).get("key") or "")
+    if event is None or event.kind != chat_events.BUFF:
+        return ["🎲 <b>События чата</b>", DIVIDER, "Сейчас ничего не происходит — ждите."]
+    left = ""
+    until = (state or {}).get("until")
+    if until:
+        try:
+            remaining = datetime.fromisoformat(until) - datetime.utcnow()
+            if remaining.total_seconds() > 0:
+                left = f"\nОсталось: {format_duration_ru(remaining)}."
+        except ValueError:
+            pass
+    return ["🎲 <b>Сейчас в чате</b>", DIVIDER, chat_events.describe(event) + left]
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!события", "события", "событие")),
+)
+async def cmd_chat_event_status(message: Message):
+    if not _check_misc_access(message.from_user.id, "chat_events"):
+        return
+    lines = _event_status_lines(await get_active_event(message.chat.id))
+    if not await events_enabled(message.chat.id):
+        lines.append("\n⚠️ События в этом чате выключены (<code>+события</code> — включить).")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+события", "-события")),
+)
+async def cmd_chat_events_toggle(message: Message):
+    min_level = required_level("chat_events_toggle")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Включать и выключать события может «{level_name(min_level)}» и выше.")
+        return
+    on = message.text.strip().startswith("+")
+    if on:
+        await db.delete_data(_events_off_key(message.chat.id))
+        await message.reply("🎲 Случайные события включены. Ждите сюрпризов.")
+    else:
+        await db.set_data(_events_off_key(message.chat.id), "1", updated_by=message.from_user.id)
+        await message.reply("🎲 Случайные события выключены.")
+
+
+EVENT_FORCE_RE = re.compile(r"(?i)^!?событие\s+запустить\s+(\S+)$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(EVENT_FORCE_RE.match(t.strip()))),
+)
+async def cmd_chat_event_force(message: Message):
+    min_level = required_level("chat_events_toggle")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Запускать события вручную может «{level_name(min_level)}» и выше.")
+        return
+    key = EVENT_FORCE_RE.match(message.text.strip()).group(1).casefold()
+    event = chat_events.EVENTS_BY_KEY.get(key)
+    if event is None:
+        keys = ", ".join(f"<code>{e.key}</code>" for e in chat_events.EVENTS)
+        await message.reply(f"Нет такого события. Доступные:\n{keys}")
+        return
+    if not await fire_chat_event(message.chat.id, event):
+        await message.reply(
+            "Событие не подошло к текущему состоянию чата "
+            "(например, пустая казна или некого награждать). Попробуйте другое."
+        )
+
+
+# Час завоза — по настроенной зоне: с message_daily завоз никак не связан,
+# а «магазин обновляется в 15:00» человек читает как своё местное время.
+SHOP_RESTOCK_HOUR_LOCAL = 15
 SHOP_RESTOCK_CHECK_INTERVAL = 300
 _SHOP_RESTOCK_LAST_KEY_PREFIX = "shop_restock_last:"
 
@@ -21969,8 +22439,8 @@ async def shop_restock_loop() -> None:
     while True:
         try:
             await asyncio.sleep(SHOP_RESTOCK_CHECK_INTERVAL)
-            now = datetime.utcnow()
-            if now.hour != SHOP_RESTOCK_HOUR_UTC:
+            now = local_now()
+            if now.hour != SHOP_RESTOCK_HOUR_LOCAL:
                 continue
             today_str = now.date().isoformat()
             chat_ids = await db.list_shop_chat_ids()
@@ -22163,10 +22633,15 @@ async def _apply_reputation(message: Message, sign: int, amount: int, quiet: boo
             )
         return
 
-    total = await db.change_reputation(chat_id, actor_id, target_user.id, sign * amount)
+    # «Час признания» удваивает только плюсы: удваивать минусы — это уже
+    # не праздник, а травля.
+    granted = amount
+    if sign > 0:
+        granted = max(1, round(amount * await event_multiplier(chat_id, chat_events.T_REPUTATION)))
+    total = await db.change_reputation(chat_id, actor_id, target_user.id, sign * granted)
     await db.add_log(
         "reputation", chat_id=chat_id, actor_id=actor_id,
-        target_id=target_user.id, details=str(sign * amount),
+        target_id=target_user.id, details=str(sign * granted),
     )
 
     if quiet:
@@ -24822,7 +25297,9 @@ LOG_LABELS = {
 
 
 def format_log_entry(e: dict) -> str:
-    ts: datetime = e["created_at"]
+    # created_at приходит из БД наивным UTC — без перевода журнал показывал
+    # время на несколько часов назад независимо от настройки «часовой пояс».
+    ts: datetime = to_local(e["created_at"])
     label = LOG_LABELS.get(e["event_type"], e["event_type"])
     parts = [f"<code>{ts.strftime('%d.%m %H:%M')}</code> {label}"]
     if e.get("actor_id"):
@@ -28491,6 +28968,7 @@ async def main():
     asyncio.create_task(daily_top_reward_loop())
     asyncio.create_task(shop_restock_loop())
     asyncio.create_task(stock_market_loop())
+    asyncio.create_task(chat_events_loop())
     asyncio.create_task(bank_penalty_loop())
     asyncio.create_task(warn_expiry_loop())
     asyncio.create_task(marriage_expiry_loop())

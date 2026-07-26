@@ -1,7 +1,16 @@
 """Часовой пояс показа времени — общий разбор для бота и веб-панели.
 
-Внутри бот хранит и считает ВСЁ в UTC, и так остаётся: настройка влияет только
-на то, каким человек видит время в сообщениях («14:30 UTC» → «17:30 МСК»).
+Внутри бот ХРАНИТ всё в UTC, и так остаётся. Настройка влияет на две вещи:
+
+  * как человек видит время в сообщениях («14:30 UTC» → «17:30 МСК»);
+  * где проходит граница суток у того, что считается «раз в день» и имеет
+    собственную отметку, — ежедневный бонус казино, дивиденды, час завоза
+    в магазин (см. local_today()/local_hour() в bot.py).
+
+Чего настройка НЕ трогает — разметку message_daily: там сутки были и остаются
+UTC-шными, потому что таблица уже набита историей. Всё, что её читает (стата
+за период, стрики, нормы, графики), обязано считать сутки по UTC — иначе одна
+и та же колонка молча смешает две разные разметки дня.
 
 Модуль намеренно чистый: ни aiogram, ни базы. Панель — отдельный процесс, и
 импортировать из неё bot.py нельзя (он поднимает Bot и тянет матплотлиб), а
@@ -54,10 +63,13 @@ TIMEZONE_ALIASES = {
     "якутск": "Asia/Yakutsk", "владивосток": "Asia/Vladivostok",
     "алматы": "Asia/Almaty", "астана": "Asia/Almaty", "ташкент": "Asia/Tashkent",
     "тбилиси": "Asia/Tbilisi", "ереван": "Asia/Yerevan", "баку": "Asia/Baku",
-    "utc": "UTC", "гринвич": "UTC",
+    "utc": "UTC", "гринвич": "UTC", "gmt": "UTC", "гмт": "UTC",
 }
 
-_FIXED_OFFSET_RE = re.compile(r"^(?:utc|gmt)?([+-])(\d{1,2})(?::?(\d{2}))?$")
+# Знак необязателен: «gmt3», «гмт 3» и просто «3» люди пишут не реже, чем
+# «+3», и отвергать их было бы придиркой — без знака считаем восток (плюс),
+# как принято в разговоре про GMT.
+_FIXED_OFFSET_RE = re.compile(r"^(?:utc|gmt|гмт)?([+-]?)(\d{1,2})(?::?(\d{2}))?$")
 
 
 def parse_timezone(raw: Optional[str]) -> Optional[str]:
@@ -76,7 +88,8 @@ def parse_timezone(raw: Optional[str]) -> Optional[str]:
 
     fixed = _FIXED_OFFSET_RE.match(low.replace(" ", ""))
     if fixed:
-        sign, hours, minutes = fixed.group(1), int(fixed.group(2)), int(fixed.group(3) or 0)
+        sign = fixed.group(1) or "+"
+        hours, minutes = int(fixed.group(2)), int(fixed.group(3) or 0)
         if hours > 14 or minutes > 59:
             return None
         if hours == 0 and minutes == 0:
@@ -96,7 +109,8 @@ def tzinfo_from_name(name: Optional[str]):
     name = name or DEFAULT_TIMEZONE
     fixed = _FIXED_OFFSET_RE.match(name.casefold().replace(" ", ""))
     if fixed:
-        sign, hours, minutes = fixed.group(1), int(fixed.group(2)), int(fixed.group(3) or 0)
+        sign = fixed.group(1) or "+"
+        hours, minutes = int(fixed.group(2)), int(fixed.group(3) or 0)
         delta = timedelta(hours=hours, minutes=minutes)
         return dt_timezone(-delta if sign == "-" else delta)
     try:

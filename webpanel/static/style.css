@@ -400,13 +400,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .suggest-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .suggest-empty { padding: 12px; color: var(--muted); font-size: 13px; }
 
+/* Оформление — общее из .fold/.fold-quiet, здесь только отбивки. */
 details#mod-manual { margin-bottom: var(--gap-3); }
-details#mod-manual summary {
-  cursor: pointer; color: var(--muted); font-size: 13px;
-  padding: 4px 0; user-select: none;
-}
-details#mod-manual summary:hover { color: var(--text); }
-details#mod-manual[open] summary { margin-bottom: var(--gap-2); }
+details#mod-manual[open] > summary { margin-bottom: var(--gap-2); }
 
 /* --- лента последних сообщений -------------------------------------------- */
 /* Лента — сама себе карточка, а не рамка внутри рамки: вложенные бордеры
@@ -722,6 +718,53 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
 }
 .chart-empty { padding: var(--gap-4); text-align: center; color: var(--muted); font-size: 13px; }
 
+/* --- Сворачиваемый блок ---------------------------------------------------
+   Общий компонент для длинных разделов: <details class="fold"> + <summary>.
+   Берём именно <details>, а не свою кнопку с классом, потому что браузер сам
+   даёт клавиатуру, фокус и правильную семантику для скринридеров, а поиск
+   по странице (Ctrl+F) в современных браузерах раскрывает закрытый блок.
+
+   Треугольник рисуем бордюрами, а не иконкой из спрайта: тогда одна строчка
+   CSS работает и в статической разметке, и в блоках, собранных в JS. */
+.fold > summary {
+  display: flex; align-items: center; gap: var(--gap-2);
+  cursor: pointer; list-style: none;
+  user-select: none;
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before {
+  content: ""; flex: 0 0 auto;
+  width: 7px; height: 7px; margin-left: 2px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);      /* закрыт — смотрит вправо */
+  color: var(--muted);
+}
+.fold[open] > summary::before { transform: rotate(45deg); }  /* открыт — вниз */
+@media (prefers-reduced-motion: no-preference) {
+  .fold > summary::before { transition: transform .18s ease; }
+}
+.fold > summary:hover::before { color: var(--accent); }
+.fold > summary:focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--radius-xs); }
+/* Карточка-гармошка. У обычного .card h3 снизу разделительная линия, но
+   внутри flex-строки <summary> она подчеркнула бы только сам заголовок, а не
+   всю ширину карточки. Поэтому линию переносим на summary — и показываем её
+   только в раскрытом виде: у свёрнутой карточки отделять нечего. */
+.fold > summary > h3 {
+  margin: 0; padding-bottom: 0; border-bottom: 0;
+}
+.fold.card > summary { padding-bottom: var(--gap-2); }
+.fold.card[open] > summary {
+  margin-bottom: var(--gap-3);
+  border-bottom: 1px solid var(--line-soft);
+}
+/* Счётчик/подпись справа от названия. */
+.fold-note { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 400; }
+
+/* Тихий вариант — подраздел внутри карточки («Настроить вручную»). */
+.fold-quiet > summary { font-size: 13px; color: var(--muted); padding: 4px 0; }
+.fold-quiet > summary:hover { color: var(--text); }
+
 /* Режимы биржи: три крупные кнопки вместо трёх полей ввода — выбрать режим
    можно, не считая проценты в уме. Ручные поля прячутся в <details>. */
 .preset-grid {
@@ -744,14 +787,6 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
 .preset small { display: block; margin-top: 2px; font-size: 11.5px; color: var(--muted); }
 
 .tune { margin-bottom: var(--gap-2); }
-.tune > summary {
-  cursor: pointer; font-size: 13px; color: var(--muted);
-  padding: 4px 0; list-style: none;
-}
-.tune > summary::-webkit-details-marker { display: none; }
-.tune > summary::before { content: "▸ "; }
-.tune[open] > summary::before { content: "▾ "; }
-.tune > summary:hover { color: var(--text); }
 
 /* Линейный график курса биржи. SVG растягивается по ширине карточки
    (preserveAspectRatio="none"), поэтому все штрихи — non-scaling-stroke,
@@ -963,8 +998,10 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
   padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--panel); color: var(--text);
 }
-.cmdtree-cat { margin-bottom: var(--gap-4); }
-.cmdtree-cat > h3 { margin: 0 0 var(--gap-1); font-size: 14px; }
+.cmdtree-cat { margin-bottom: var(--gap-2); }
+.cmdtree-cat > summary > h3 { font-size: 14px; }
+/* Строки команд отбиваем от заголовка категории только когда он раскрыт. */
+.cmdtree-cat[open] > summary { margin-bottom: var(--gap-1); }
 .cmdtree-row {
   display: flex; align-items: center; justify-content: space-between; gap: var(--gap-3);
   padding: 7px 10px; margin-bottom: 4px;
