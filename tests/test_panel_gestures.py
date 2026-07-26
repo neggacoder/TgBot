@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import db
+import rp_photos
 from webpanel.auth import PanelUser
 
 panel = importlib.import_module("webpanel.app")
@@ -32,6 +33,9 @@ def client(monkeypatch):
 
 
 def test_список_жестов_с_фото(client, monkeypatch, tmp_path):
+    # Корень хранилища теперь один и живёт в rp_photos — панель только
+    # ссылается на него, поэтому подменять надо именно там.
+    monkeypatch.setattr(rp_photos, "MEDIA_ROOT", str(tmp_path))
     monkeypatch.setattr(panel, "RP_MEDIA_ROOT", str(tmp_path))
 
     async def list_g(active_only=False):
@@ -68,6 +72,9 @@ def test_добавление_жеста_ок_и_дубль(client, monkeypatch)
 
 
 def test_загрузка_фото_кладёт_файл(client, monkeypatch, tmp_path):
+    # Корень хранилища теперь один и живёт в rp_photos — панель только
+    # ссылается на него, поэтому подменять надо именно там.
+    monkeypatch.setattr(rp_photos, "MEDIA_ROOT", str(tmp_path))
     monkeypatch.setattr(panel, "RP_MEDIA_ROOT", str(tmp_path))
 
     async def get_g(key):
@@ -84,6 +91,9 @@ def test_загрузка_фото_кладёт_файл(client, monkeypatch, tm
 
 
 def test_загрузка_фото_плохое_расширение(client, monkeypatch, tmp_path):
+    # Корень хранилища теперь один и живёт в rp_photos — панель только
+    # ссылается на него, поэтому подменять надо именно там.
+    monkeypatch.setattr(rp_photos, "MEDIA_ROOT", str(tmp_path))
     monkeypatch.setattr(panel, "RP_MEDIA_ROOT", str(tmp_path))
 
     async def get_g(key):
@@ -96,6 +106,9 @@ def test_загрузка_фото_плохое_расширение(client, mon
 
 
 def test_загрузка_фото_неверная_пара(client, monkeypatch, tmp_path):
+    # Корень хранилища теперь один и живёт в rp_photos — панель только
+    # ссылается на него, поэтому подменять надо именно там.
+    monkeypatch.setattr(rp_photos, "MEDIA_ROOT", str(tmp_path))
     monkeypatch.setattr(panel, "RP_MEDIA_ROOT", str(tmp_path))
 
     async def get_g(key):

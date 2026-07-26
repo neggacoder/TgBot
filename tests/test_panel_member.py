@@ -21,8 +21,14 @@ def client(monkeypatch):
     async def _noop(*args, **kwargs):
         return None
 
+    async def _no_fails(*args, **kwargs):
+        return 0
+
     monkeypatch.setattr(db, "add_log", _noop, raising=False)
     monkeypatch.setattr(db, "touch_panel_login", _noop, raising=False)
+    # вход по коду теперь считает попытки перебора (см. api_member_login)
+    monkeypatch.setattr(db, "add_panel_login_attempt", _noop, raising=False)
+    monkeypatch.setattr(db, "count_failed_logins_by_ip", _no_fails, raising=False)
     c = TestClient(panel.app)
     yield c
     panel.app.dependency_overrides.clear()
@@ -67,6 +73,37 @@ def test_вход_по_неверному_коду_отклонён(client, monk
 
 def test_пустой_код_400(client):
     assert client.post("/api/member/login", json={"code": "   "}).status_code == 400
+
+
+def test_перебор_кода_упирается_в_порог(client, monkeypatch):
+    """Код входа — 8 символов; без ограничения попыток его перебирали бы
+    бесконечно, а это единственная дверь в аккаунт участника."""
+    async def many_fails(username, ip, minutes):
+        assert username == panel.MEMBER_LOGIN_MARKER
+        return auth.LOGIN_FAIL_LIMIT
+
+    async def consume(code):  # до кода дойти не должно
+        raise AssertionError("после порога код проверять уже нельзя")
+
+    monkeypatch.setattr(db, "count_failed_logins_by_ip", many_fails)
+    monkeypatch.setattr(db, "consume_panel_link_code", consume)
+    assert client.post("/api/member/login", json={"code": "ABCD2345"}).status_code == 429
+
+
+def test_неверный_код_записывается_в_счётчик(client, monkeypatch):
+    """Иначе порог никогда не наберётся и ограничение бесполезно."""
+    logged = []
+
+    async def consume(code):
+        return None
+
+    async def attempt(username, ip, success):
+        logged.append((username, success))
+
+    monkeypatch.setattr(db, "consume_panel_link_code", consume)
+    monkeypatch.setattr(db, "add_panel_login_attempt", attempt)
+    assert client.post("/api/member/login", json={"code": "BADCODE1"}).status_code == 401
+    assert logged == [(panel.MEMBER_LOGIN_MARKER, False)]
 
 
 # --- безопасность: участник не персонал -----------------------------------
@@ -550,7 +587,10 @@ def test_фарм_действие_пишет_в_чат(client, monkeypatch):
     monkeypatch.setattr(panel, "get_bot", lambda: FakeBot())
     res = client.post("/api/member/rp-action", json={"chat_id": -100, "key": "flowers"})
     assert res.status_code == 200, res.text
-    assert sent["chat"] == -100 and "Подарить цветы" in sent["text"]
+    # название действия попадает в текст в нижнем регистре («… подарить цветы
+    # своей половинке …») — сверяем без учёта регистра, а не по точной строке
+    assert sent["chat"] == -100
+    assert "подарить цветы" in sent["text"].casefold(), sent["text"]
 
 
 # --- кланы участника -------------------------------------------------------

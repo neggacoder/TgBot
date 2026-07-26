@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -174,6 +175,13 @@ def test_участники_без_ролей_читает_current_users(monkeyp
         return [{"user_id": 42, "full_name": "Тест", "username": None}], 1
 
     monkeypatch.setattr(bot_module.db, "list_current_users_without_role", list_current_users_without_role)
+
+    # Команда сверяет каждого через get_chat_member. Без подмены тест уходил бы
+    # в настоящий api.telegram.org с тестовым токеном и падал Unauthorized.
+    async def get_chat_member(chat_id, user_id):
+        return SimpleNamespace(status="member")
+
+    monkeypatch.setattr(bot_module.bot, "get_chat_member", get_chat_member)
 
     message, sent = _make("участники без ролей")
     asyncio.run(bot_module.cmd_members_without_role(message))

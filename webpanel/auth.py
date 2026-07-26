@@ -9,6 +9,8 @@ CSRF-токен.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import logging
 import os
 import secrets
@@ -74,7 +76,13 @@ def hash_password(password: str) -> str:
     return _hasher.hash(password)
 
 
-def verify_password(password_hash: str, password: str) -> bool:
+def verify_password(password_hash: Optional[str], password: str) -> bool:
+    # У аккаунтов-участников (вход по коду от бота) password_hash = NULL: пароля
+    # у них нет вовсе. Без этой проверки argon2 получал бы None и падал уже
+    # TypeError'ом — а разный ответ на «нет такого логина» (401) и «логин есть,
+    # но без пароля» (500) выдавал бы наружу, какие аккаунты существуют.
+    if not password_hash:
+        return False
     try:
         _hasher.verify(password_hash, password)
         return True
@@ -130,14 +138,28 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(_session_secret(), salt="botpanel-session")
 
 
-def issue_session(user_id: int) -> str:
-    return _serializer().dumps({"uid": user_id})
+def session_fingerprint(password_hash: Optional[str]) -> str:
+    """Отпечаток учётных данных, вшиваемый в сессию.
+
+    Смена пароля меняет argon2-хеш, а значит и отпечаток — и все ранее выданные
+    куки перестают подходить. Без этого угнанная сессия переживала бы смену
+    пароля: сам токен подписан и живёт до 12 часов, отозвать его было нечем.
+    У аккаунтов-участников пароля нет, отпечаток пустой — отзывать нечего.
+    """
+    if not password_hash:
+        return ""
+    return hashlib.sha256(password_hash.encode("utf-8")).hexdigest()[:16]
 
 
-def read_session(token: str) -> Optional[int]:
+def issue_session(user_id: int, password_hash: Optional[str] = None) -> str:
+    return _serializer().dumps({"uid": user_id, "fp": session_fingerprint(password_hash)})
+
+
+def read_session(token: str) -> Optional[tuple[int, str]]:
+    """(id аккаунта, отпечаток) либо None, если кука не наша/протухла."""
     try:
         data = _serializer().loads(token, max_age=SESSION_TTL_SECONDS)
-        return int(data["uid"])
+        return int(data["uid"]), str(data.get("fp") or "")
     except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
         return None
 
@@ -148,12 +170,49 @@ def new_csrf_token() -> str:
 
 # --- защита от перебора ---------------------------------------------------
 
+def _trusted_proxies() -> list:
+    """Сети, чьему X-Forwarded-For можно верить.
+
+    По умолчанию — только локальные адреса: Tailscale Funnel ходит в панель
+    через loopback. Переопределяется PANEL_TRUSTED_PROXIES (список сетей через
+    запятую), если панель поставят за другой прокси.
+    """
+    raw = os.getenv("PANEL_TRUSTED_PROXIES", "127.0.0.0/8,::1/128")
+    nets = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(chunk, strict=False))
+        except ValueError:
+            logger.warning("PANEL_TRUSTED_PROXIES: не разобрал сеть %r — пропускаю", chunk)
+    return nets
+
+
 def client_ip(request: Request) -> Optional[str]:
-    """IP клиента с учётом обратного прокси Tailscale."""
+    """IP клиента с учётом обратного прокси Tailscale.
+
+    X-Forwarded-For слушаем ТОЛЬКО если запрос пришёл от доверенного прокси:
+    заголовок подделывается одной строкой, а по нему считаются неудачные входы
+    (см. login_is_blocked). Раньше любой желающий менял его на каждый запрос и
+    тем самым обнулял счётчик перебора по адресу.
+
+    Берём последний элемент списка, а не первый: его дописал наш собственный
+    прокси, а всё, что левее, мог прислать сам клиент.
+    """
+    peer = request.client.host if request.client else None
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()[:64]
-    return request.client.host[:64] if request.client else None
+    if forwarded and peer:
+        try:
+            peer_addr = ipaddress.ip_address(peer)
+        except ValueError:
+            peer_addr = None
+        if peer_addr is not None and any(peer_addr in net for net in _trusted_proxies()):
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            if parts:
+                return parts[-1][:64]
+    return peer[:64] if peer else None
 
 
 async def login_is_blocked(username: str, ip: Optional[str]) -> bool:
@@ -167,11 +226,15 @@ async def current_user(request: Request) -> Optional[PanelUser]:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None
-    user_id = read_session(token)
-    if user_id is None:
+    parsed = read_session(token)
+    if parsed is None:
         return None
+    user_id, fingerprint = parsed
     row = await db.get_panel_user_by_id(user_id)
     if not row or row.get("disabled"):
+        return None
+    # Пароль сменили (или сбросили) — старые куки больше не годятся.
+    if not secrets.compare_digest(fingerprint, session_fingerprint(row.get("password_hash"))):
         return None
     return PanelUser(
         id=row["id"], username=row["username"], role=row["role"],

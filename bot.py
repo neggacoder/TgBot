@@ -59,6 +59,8 @@ except ImportError:
 
 import admin_holds
 import call_commands
+import rp_photos
+import tz_settings
 import db
 import fake_warns
 import relationships_v2
@@ -907,9 +909,21 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "nick_set":        {"phrase": "сетник [@username] Ник (ответом или @username) — задать ник другому", "category": "РП", "level": LEVEL_MODERATOR},
     "marriage":        {"phrase": "брак (ответом или @username/ID)", "category": "РП", "level": 0},
     "marry_pair":      {"phrase": "поженить пару @ @ (или ответом + @) — поженить двух других", "category": "РП", "level": LEVEL_MODERATOR},
-    "divorce":         {"phrase": ".развод",        "category": "РП", "level": 0},
+    "divorce":         {"phrase": ".развод / !развод", "category": "РП", "level": 0},
     "couple":          {"phrase": ".отн",           "category": "РП", "level": 0},
-    "marriages":       {"phrase": "браки",          "category": "РП", "level": 0},
+    "marriages":       {"phrase": "браки / браки {номер страницы}", "category": "РП", "level": 0},
+
+    # 20-й модуль «Браки» (см. блок в разделе браков ниже)
+    "my_marriage":     {"phrase": "мой брак",       "category": "РП", "level": 0},
+    "their_marriage":  {"phrase": "твой брак {ссылка/ответом}", "category": "РП", "level": 0},
+    "marriage_top":    {"phrase": "топ браков",     "category": "РП", "level": 0},
+    "marriage_extend": {"phrase": "брак продлить {кол-во дней} — за монеты, цену задаёт чат", "category": "РП", "level": 0},
+    "divorce_pair":    {"phrase": "развести пару @ @ (или ответом) — развести двух других", "category": "РП", "level": LEVEL_MODERATOR},
+    "divorce_departed": {"phrase": "развести вышедших — расторгнуть браки покинувших чат", "category": "РП", "level": LEVEL_MODERATOR},
+    "marriage_price_set": {"phrase": "брак цена продления {число}", "category": "РП", "level": LEVEL_ADMIN},
+    "marriage_mode_set": {"phrase": "брак режим развода {авто|выкл}", "category": "РП", "level": LEVEL_ADMIN},
+    "marriage_rating_toggle": {"phrase": "+брак рейтинг / -брак рейтинг", "category": "РП", "level": LEVEL_ADMIN},
+    "marriages_reset": {"phrase": "!сброс браков — обнулить все браки чата (с подтверждением)", "category": "РП", "level": LEVEL_SENIOR},
     "bot_infa":        {"phrase": "бот инфа",       "category": "РП", "level": 0},
 
     "relationship_propose":  {"phrase": "отн запрос {ссылка/ответом}", "category": "РП", "level": 0},
@@ -971,6 +985,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "complaints":      {"phrase": "жалоба (в личке) / раздел «🚨 Жалобы» в админке", "category": "Модерация", "level": LEVEL_MODERATOR},
     "mod_themes":      {"phrase": "!темы / названия рангов / +иконка модераторов", "category": "Настройка", "level": LEVEL_SENIOR},
     "cmd_cleanup_set": {"phrase": "чистка команд {минуты} (0 — выкл.)", "category": "Настройка", "level": LEVEL_SENIOR},
+    "timezone_set":   {"phrase": "часовой пояс {Москва | Europe/Moscow | +3} — пояс показа времени; «время» / «часовой пояс» — посмотреть", "category": "Настройка", "level": LEVEL_SENIOR},
     "call_all":        {"phrase": "созыв / хуйланы_сюда / хуйланысюда / калл [текст] ", "category": "Созывы", "level": LEVEL_MODERATOR},
     "call_admins":     {"phrase": "калладминс / созыв админов [текст]", "category": "Созывы", "level": LEVEL_MODERATOR},
     "call_stop":       {"phrase": "стоп / стой / отмена", "category": "Созывы", "level": LEVEL_MODERATOR},
@@ -1030,6 +1045,10 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "ship_reset":      {"phrase": "!сбросить пейринг", "category": "РП", "level": 0},
 
     "farm_run":        {"phrase": "ферма (синонимы: !бизнес, фарма, фармить", "category": "Экономика", "level": 0},
+    "fishing_run":     {"phrase": "рыбалка (синонимы: рыбачить, рыбка, удочка) — раз в 2 часа", "category": "Экономика", "level": 0},
+    "fishing_top":     {"phrase": "топ уловов — рекорды рыбалки чата", "category": "Экономика", "level": 0},
+    "treasure_dig":    {"phrase": "клад / копать — общий клад чата, кто нашёл тот и забрал", "category": "Экономика", "level": 0},
+    "treasure_info":   {"phrase": "клад инфа — сколько накопилось и шанс находки", "category": "Экономика", "level": 0},
     "farm_balance":    {"phrase": "монеты / баланс", "category": "Экономика", "level": 0},
     "casino_roulette":  {"phrase": ".рулетка {ставка} {цвет} — красное/чёрное/зелёное (как в казино)", "category": "Экономика", "level": 0},
     "casino_balance": {"phrase": "!казино баланс — баланс в казино + бонус", "category": "Экономика", "level": 0},
@@ -1172,13 +1191,16 @@ COMMAND_TRIGGER_WORDS |= {
 def is_command_like(text: Optional[str]) -> bool:
     if not text or not text.strip():
         return False
-    first_word = text.strip().split()[0].casefold()
+    first_word = (text.strip().split() or [""])[0].casefold()
     if first_word.startswith(("!", ".", "+", "-", "&", "[")):
         return True
     return first_word in COMMAND_TRIGGER_WORDS
 
 
 DEFAULT_CMD_CLEANUP_MINUTES = 15
+# Потолок настройки: Telegram не позволяет боту удалять сообщения старше 48
+# часов, и всё, что дольше, просто тихо не удалялось бы.
+CMD_CLEANUP_MAX_MINUTES = 48 * 60
 
 
 def cmd_cleanup_minutes() -> int:
@@ -1187,9 +1209,70 @@ def cmd_cleanup_minutes() -> int:
     if raw is None:
         return DEFAULT_CMD_CLEANUP_MINUTES
     try:
-        return int(raw)
+        value = int(raw)
     except (TypeError, ValueError):
         return DEFAULT_CMD_CLEANUP_MINUTES
+    # Подрезаем и на чтении: в базе могло остаться значение, записанное до
+    # появления потолка, — иначе оно продолжало бы тихо не работать.
+    return max(0, min(value, CMD_CLEANUP_MAX_MINUTES))
+
+
+# ----------------------------------------------------------------------------
+# ЧАСОВОЙ ПОЯС ПОКАЗА
+#
+# Внутри бот живёт и хранит ВСЁ в UTC — так и остаётся: сравнения сроков,
+# кулдауны и фоновые задачи не должны зависеть от того, что кто-то переключил
+# отображение. Настройка влияет только на то, каким человек видит время в
+# сообщениях: было «14:30 UTC», станет «17:30 МСК».
+#
+# Настройка глобальная (строка settings id=1), как chat_id жалоб и приветствия:
+# бот обслуживает одну команду чатов, отдельный пояс на каждый чат только
+# путал бы модераторов, читающих одни и те же логи.
+# ----------------------------------------------------------------------------
+DEFAULT_TIMEZONE = tz_settings.DEFAULT_TIMEZONE
+
+
+def timezone_name() -> str:
+    """Канонический ключ настроенной зоны (NULL в базе = UTC)."""
+    return settings.get("timezone") or DEFAULT_TIMEZONE
+
+
+def bot_tzinfo():
+    return tz_settings.tzinfo_from_name(timezone_name())
+
+
+def parse_timezone(raw: str) -> Optional[str]:
+    """См. tz_settings.parse_timezone — разбор общий с веб-панелью."""
+    return tz_settings.parse_timezone(raw)
+
+
+def timezone_label(name: Optional[str] = None) -> str:
+    """Короткая подпись зоны для текста: «МСК», «UTC», «UTC+5»."""
+    return tz_settings.timezone_label(name or timezone_name())
+
+
+def to_local(dt: datetime) -> datetime:
+    """Наивное UTC-время из БД → время в настроенной зоне."""
+    return tz_settings.to_zone(dt, timezone_name())
+
+
+def fmt_dt(dt: Optional[datetime]) -> str:
+    """Дата и время с подписью зоны: «25.07.2026 17:30 МСК»."""
+    if dt is None:
+        return "—"
+    return f"{to_local(dt).strftime('%d.%m.%Y %H:%M')} {timezone_label()}"
+
+
+def fmt_date(dt: Optional[datetime]) -> str:
+    """Только дата, но уже в настроенной зоне: около полуночи это разные дни."""
+    if dt is None:
+        return "—"
+    return to_local(dt).strftime("%d.%m.%Y")
+
+
+def local_now() -> datetime:
+    """«Сейчас» в настроенной зоне — для показа, не для расчётов."""
+    return datetime.now(bot_tzinfo())
 
 
 _cleanup_context: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar(
@@ -1197,16 +1280,41 @@ _cleanup_context: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextV
 )
 
 
+# Живые ссылки на фоновые задачи постановки в очередь. asyncio держит только
+# слабую ссылку на задачу: без этого множества сборщик мусора может убить
+# задачу до того, как она успеет записать строку, и сообщение молча останется
+# в чате навсегда — ровно то, что выглядит как «очистка работает через раз».
+_cleanup_pending_tasks: set = set()
+
+
+def _queue_cleanup(chat_id: int, message_id: int, delete_at: datetime) -> None:
+    task = asyncio.create_task(db.add_cleanup_entry(chat_id, message_id, delete_at))
+    _cleanup_pending_tasks.add(task)
+    task.add_done_callback(_cleanup_pending_tasks.discard)
+
+
 @bot.session.middleware()
 async def cleanup_tracking_middleware(make_request, bot_obj, method):
     """Ловит все исходящие вызовы Bot API. Пока для текущего апдейта установлен
     _cleanup_context (см. MessageCounterMiddleware), любое сообщение, которое
     бот отправляет в ТОТ ЖЕ чат, тоже ставится в очередь на удаление вместе
-    с исходной командой."""
+    с исходной командой.
+
+    ВАЖНО про «протухший» контекст. asyncio.create_task копирует текущий
+    контекст, а reset() в middleware до уже созданных задач не достаёт.
+    Поэтому таймер, заведённый командой в чате жалоб (_fire_timer), через
+    несколько часов отправлял своё напоминание с delete_at из ТОГО ЖЕ апдейта —
+    то есть с моментом в прошлом, — и напоминание исчезало в ближайшую минуту
+    после появления. Отсюда и ощущение, что очистка «криво работает по
+    времени». Лечится проверкой ниже: срок в прошлом — контекст чужой и
+    протухший, ставить в очередь нечего.
+    """
     response = await make_request(bot_obj, method)
     ctx = _cleanup_context.get()
     if ctx:
         chat_id, delete_at = ctx
+        if delete_at <= datetime.utcnow():
+            return response
         result = response
         message_id = None
         if hasattr(result, "message_id"):
@@ -1215,7 +1323,7 @@ async def cleanup_tracking_middleware(make_request, bot_obj, method):
             message_id = result[0].message_id
         method_chat_id = getattr(method, "chat_id", None)
         if message_id is not None and method_chat_id is not None and int(method_chat_id) == int(chat_id):
-            asyncio.create_task(db.add_cleanup_entry(chat_id, message_id, delete_at))
+            _queue_cleanup(chat_id, message_id, delete_at)
     return response
 
 PERMISSION_LEVEL_WORDS = {
@@ -2129,7 +2237,7 @@ def _search_help_sections(query: str) -> list:
 
 
 @router.message(
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] in ("помощь", "хелп")
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] in ("помощь", "хелп")
                 and len(t.strip().split()) > 1)
 )
 async def cmd_help_search(message: Message):
@@ -2280,7 +2388,10 @@ async def _show_main_menu(message: Message, state: FSMContext) -> None:
 # ----------------------------------------------------------------------------
 PANEL_LINK_CODE_TTL_MIN = 10
 _PANEL_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих 0/O/1/I
-PANEL_SITE_URL = "https://nurasyl-aspire-a315-59.tail0a2432.ts.net/"
+# Адрес панели снаружи. Берётся из PANEL_PUBLIC_URL (см. rp_photos) — тем же
+# значением бот собирает ссылки на картинки-реакции, так что переезд на
+# другой домен правится в одном месте, а не в двух.
+PANEL_SITE_URL = rp_photos.public_base_url() + "/"
 
 # Дублирует webpanel/auth.py: MIN_PASSWORD_LENGTH/_hasher/validate_password/
 # validate_username/hash_password — панель отдельный процесс, импортировать
@@ -3824,7 +3935,20 @@ async def panel_action_reload_loop() -> None:
                 reward_degree_level_overrides.clear()
                 reward_degree_level_overrides.update(await db.list_reward_degree_levels())
                 await refresh_propose_caches()
-                logger.info("РП/себяшки/жесты отн/фильтр слов/права команд/предложения перечитаны по сигналу из панели")
+                # Настройки строки settings (часовой пояс показа, автоочистка
+                # команд, тексты) панель правит своим процессом — без этой
+                # перечитки бот жил бы со старым значением до перезапуска, и
+                # владелец, сменивший пояс на сайте, не увидел бы разницы.
+                # Обновляем СОДЕРЖИМОЕ существующего dict, а не заменяем сам
+                # объект: на него уже держат ссылки замыкания.
+                fresh_settings = await db.fetch_settings()
+                if fresh_settings is not None:
+                    settings.clear()
+                    settings.update(fresh_settings)
+                logger.info(
+                    "РП/себяшки/жесты отн/фильтр слов/права команд/предложения/настройки "
+                    "перечитаны по сигналу из панели"
+                )
         except Exception:
             # База могла моргнуть — не роняем цикл, попробуем на следующей итерации.
             logger.exception("panel_action_reload_loop: ошибка перечитки")
@@ -4339,7 +4463,7 @@ def complaint_detail_text(target_id: int, rows: list[dict]) -> str:
     lines = []
     for c in rows:
         who = "Аноним" if c["anonymous"] else mention_id(c["reporter_id"])
-        when = c["created_at"].strftime("%d.%m.%Y %H:%M")
+        when = fmt_dt(c["created_at"])
         reason = html.escape(c["reason"])
         lines.append(f"{status_icon[c['status']]} <b>№{c['id']}</b> · от {who} · {when}\n{reason}")
     return f"🚨 <b>Жалобы на {mention_id(target_id)}</b>\n{DIVIDER}\n\n" + "\n\n".join(lines)
@@ -5352,10 +5476,21 @@ async def cmd_set_cleanup_minutes(message: Message):
         await message.reply(
             f"Текущая автоочистка команд: {status}.\n"
             "Использование: <code>чистка команд {минуты}</code> (0 — выключить).\n"
-            "Например: <code>чистка команд 15</code>"
+            "Например: <code>чистка команд 15</code>\n"
+            f"Максимум — {CMD_CLEANUP_MAX_MINUTES} мин. (48 часов): сообщения старше "
+            "Telegram удалять не даёт."
         )
         return
     minutes = int(parts[2])
+    if minutes > CMD_CLEANUP_MAX_MINUTES:
+        # Telegram запрещает ботам удалять сообщения старше 48 часов. Раньше
+        # такое значение молча принималось, а очистка просто переставала
+        # работать — без единого следа в чате.
+        await message.reply(
+            f"Слишком долго: Telegram не даёт ботам удалять сообщения старше 48 часов, "
+            f"поэтому максимум — <b>{CMD_CLEANUP_MAX_MINUTES}</b> мин."
+        )
+        return
     await db.save_setting("command_cleanup_minutes", str(minutes))
     settings["command_cleanup_minutes"] = str(minutes)
     await db.add_log("cmd_cleanup_set", chat_id=message.chat.id, actor_id=message.from_user.id, details=str(minutes))
@@ -5366,6 +5501,78 @@ async def cmd_set_cleanup_minutes(message: Message):
             f"🧹 Автоочистка включена: команды (и ответы бота на них) в этом чате "
             f"будут удаляться через {minutes} мин. после отправки. Обычные сообщения не трогаются."
         )
+
+
+def _is_timezone_command(t: Optional[str]) -> bool:
+    if not t:
+        return False
+    words = t.strip().casefold().split()
+    return words[:2] == ["часовой", "пояс"] or words[:1] == ["время"] and len(words) == 1
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(_is_timezone_command),
+)
+async def cmd_timezone(message: Message):
+    """«часовой пояс» — показать, «часовой пояс Москва» — задать. «время» —
+    просто посмотреть, который сейчас час по настройке бота."""
+    text = message.text.strip()
+    words = text.split()
+    current = timezone_name()
+
+    if words[0].casefold() == "время" or len(words) < 3:
+        note = ""
+        if words[0].casefold() != "время":
+            note = (
+                "\n\nЗадать: <code>часовой пояс Москва</code>, "
+                "<code>часовой пояс Europe/Moscow</code> или <code>часовой пояс +3</code>.\n"
+                "Пояс общий для всего бота и меняет только ПОКАЗ времени — "
+                "сроки, кулдауны и отсчёты внутри как считались, так и считаются."
+            )
+        await message.reply(
+            f"🕒 Сейчас <b>{local_now().strftime('%d.%m.%Y %H:%M')}</b> "
+            f"({timezone_label()}, <code>{current}</code>).{note}"
+        )
+        return
+
+    if not has_level(message.from_user.id, required_level("timezone_set")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Менять часовой пояс может только «{level_name(required_level('timezone_set'))}» и выше."
+            )
+        return
+
+    parsed = parse_timezone(" ".join(words[2:]))
+    if parsed is None:
+        await message.reply(
+            "Не понял часовой пояс. Подойдёт название зоны "
+            "(<code>Europe/Moscow</code>), город (<code>Москва</code>, <code>Алматы</code>) "
+            "или смещение (<code>+3</code>, <code>UTC-5</code>)."
+        )
+        return
+
+    if not tz_settings.timezone_available(parsed):
+        # Зона существует в стандарте, но на этой машине базы зон нет
+        # (образ без tzdata). Молча сохранить — значит показывать UTC и
+        # оставить владельца в уверенности, что всё настроено.
+        await message.reply(
+            f"Зона <code>{html.escape(parsed)}</code> известна, но на сервере нет базы "
+            "часовых поясов — время всё равно показывалось бы в UTC.\n"
+            "Поставьте пакет <code>tzdata</code> (он есть в requirements.txt) "
+            "или задайте пояс смещением: <code>часовой пояс +3</code>."
+        )
+        return
+
+    await db.save_setting("timezone", parsed)
+    settings["timezone"] = parsed
+    await db.add_log("timezone_set", chat_id=message.chat.id, actor_id=message.from_user.id, details=parsed)
+    await message.reply(
+        f"🕒 Часовой пояс бота: <b>{timezone_label(parsed)}</b> (<code>{parsed}</code>).\n"
+        f"Сейчас по нему <b>{local_now().strftime('%d.%m.%Y %H:%M')}</b>.\n"
+        "Так теперь показывается время во всех сообщениях бота — от сроков мутов "
+        "до истории варнов. Хранится и считается всё по-прежнему в UTC."
+    )
 
 
 @router.message(
@@ -5414,7 +5621,7 @@ REST_NO_TARGET_TEXT = (
     StateFilter(None),
     F.text.func(
         lambda t: bool(t)
-        and t.strip().casefold().split()[0] == "рест"
+        and (t.strip().casefold().split() or [""])[0] == "рест"
         and t.strip().casefold() not in REST_CANCEL_TRIGGERS
         and not _is_rest_list_cmd(t)
     ),
@@ -5482,7 +5689,7 @@ async def cmd_rest_button(message: Message, state: FSMContext):
     existing_active = await db.get_active_rest(target_chat_id, message.from_user.id)
     if existing_active:
         until: datetime = existing_active["expires_at"]
-        await message.answer(f"Вы уже в ресте до <b>{until.strftime('%d.%m.%Y %H:%M')}</b> UTC.")
+        await message.answer(f"Вы уже в ресте до <b>{fmt_dt(until)}</b>.")
         return
     existing_pending = await db.get_pending_rest_request(target_chat_id, message.from_user.id)
     if existing_pending:
@@ -5753,7 +5960,19 @@ async def cmd_members_without_role(message: Message):
         try:
             member = await bot.get_chat_member(chat_id, r["user_id"])
         except (TelegramBadRequest, TelegramForbiddenError):
+            # Telegram сказал «такого тут нет» — чистим запись.
             await db.delete_current_user(chat_id, r["user_id"])
+            continue
+        except Exception:
+            # Сеть моргнула, лимит, 5xx. Это НЕ повод считать человека
+            # вышедшим и уж тем более не повод ронять всю команду: раньше
+            # любая такая ошибка обрывала список целиком, и админ не получал
+            # ответа вовсе. Оставляем строку как есть и идём дальше.
+            logger.warning(
+                "Не удалось проверить участника %s в чате %s — оставляю в списке",
+                r["user_id"], chat_id,
+            )
+            alive_rows.append(r)
             continue
         if member.status in ("left", "kicked"):
             await db.delete_current_user(chat_id, r["user_id"])
@@ -7252,9 +7471,10 @@ _RP_ACTIONS_DEFAULT: dict[str, list[str]] = {
         "🎶 {actor} исполняет для {target} душевную серенаду",
         "{actor} берёт гитару и поёт серенаду для {target}",
     ],
-    "трахнуть": [
-        "🍆🍑 | {actor} принудил к интиму {target}",
-    ],
+    # «трахнуть» и «осеменить» были объявлены в этом словаре ДВАЖДЫ. Python
+    # оставляет последнее значение, поэтому фразы из первого объявления в чат
+    # не попадали никогда. Обе фразы перенесены в единственное объявление ниже
+    # по файлу — списком вариантов, как и у остальных действий.
     "выебать": [
         "🔞 | {actor} выебал(а) {target} до полного изнеможения",
     ],
@@ -7288,9 +7508,7 @@ _RP_ACTIONS_DEFAULT: dict[str, list[str]] = {
     "поиздеватся":[
         "😨 | {actor} Вывернул органы {target} наизнанку",
     ],
-    "осеменить":[
-        "🥳 | {actor} Успешно осеменил(-а) {target}. Поздравляем!",
-    ],
+    # (см. комментарий выше — фраза переехала в единственное объявление ниже)
     "расстрелять":[
         "🔫 | {actor} расстрелял {target}",
     ],
@@ -7302,10 +7520,12 @@ _RP_ACTIONS_DEFAULT: dict[str, list[str]] = {
     ],
     "трахнуть":[
         "🍆🍑 |  {actor} жёстко трахнул(а)  {target} во все дырочки",
+        "🍆🍑 | {actor} принудил к интиму {target}",
     ],
     "осеменить":[
         "{actor} Осеменил  {target}!",
         "{actor} Влил всю свою сперму прямо в  {target}.  Вкуснота~",
+        "🥳 | {actor} Успешно осеменил(-а) {target}. Поздравляем!",
     ],
     "футжоб":[
         "{actor} отполировал жезл {target} ножками,Сладость!",
@@ -8129,7 +8349,7 @@ PROPOSE_ADMIN_HELP = (
 
 @router.message(
     F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "предложения"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "предложения"),
 )
 async def propose_admin_command(message: Message):
     # Важно: и «нет сообщения об отказе» (обычный пользователь — не спалить
@@ -8341,7 +8561,7 @@ def _rp_admin_denied(user_id: int) -> Optional[str]:
 
 @router.message(
     F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "рп"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "рп"),
 )
 async def rp_admin_command(message: Message):
     denied = _rp_admin_denied(message.from_user.id)
@@ -8816,7 +9036,7 @@ async def _auto_unlock_chat(chat_id: int, delay_seconds: float, expected_until: 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-чат"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-чат"),
 )
 async def cmd_chat_off(message: Message):
     if not has_level(message.from_user.id, required_level("chat_lock")):
@@ -8847,7 +9067,7 @@ async def cmd_chat_off(message: Message):
     actor_name = await display_name(message.chat.id, message.from_user)
     until_line = (
         f"\n⏳ Откроется автоматически через {format_duration_ru(duration)} "
-        f"({until.strftime('%d.%m.%Y %H:%M')} UTC)"
+        f"({fmt_dt(until)})"
         if until else ""
     )
     await message.answer(
@@ -9164,7 +9384,7 @@ def relative_time_ru(dt: Optional[datetime]) -> str:
     days = hours // 24
     if days < 14:
         return f"{days} {_plural_ru(days, 'день', 'дня', 'дней')} назад"
-    return dt.strftime("%d.%m.%Y")
+    return fmt_date(dt)
 
 
 # Полный запрет писать/отправлять что-либо
@@ -9242,7 +9462,7 @@ async def _enforce_slowmode(event: "Message") -> bool:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "+медленный"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "+медленный"),
 )
 async def cmd_slowmode_on(message: Message):
     min_level = required_level("slowmode")
@@ -9282,7 +9502,7 @@ async def cmd_slowmode_off(message: Message):
     await db.add_log("slowmode_off", chat_id=message.chat.id, actor_id=message.from_user.id)
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "+автоудаление"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "+автоудаление"),
 )
 async def cmd_auto_delete_add(message: Message):
     if not has_level(message.from_user.id, required_level("auto_delete_add")):
@@ -9318,7 +9538,7 @@ async def cmd_auto_delete_add(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-автоудаление"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-автоудаление"),
 )
 async def cmd_auto_delete_remove(message: Message):
     if not has_level(message.from_user.id, required_level("auto_delete_remove")):
@@ -9519,7 +9739,7 @@ async def _require_moderation_target(
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "мут"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "мут"),
 )
 async def cmd_mute(message: Message):
     target, remaining = await _require_moderation_target(message, command_key="mute")
@@ -9563,7 +9783,7 @@ async def cmd_mute(message: Message):
     actor_name = await display_name(message.chat.id, message.from_user)
     target_name = await display_name(message.chat.id, target)
     if until:
-        until_text = f"{format_duration_ru(duration)} (до {until.strftime('%d.%m.%Y %H:%M')} UTC)"
+        until_text = f"{format_duration_ru(duration)} (до {fmt_dt(until)})"
     else:
         until_text = "навсегда"
     reason_text = html.escape(reason) if reason else "не указана"
@@ -9594,7 +9814,7 @@ async def reschedule_user_mutes() -> None:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-мут"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-мут"),
 )
 async def cmd_unmute(message: Message):
     target, _remaining = await _require_moderation_target(message, command_key="unmute")
@@ -9632,7 +9852,7 @@ async def cmd_unmute(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "бан"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "бан"),
 )
 async def cmd_ban(message: Message):
     target, remaining = await _require_moderation_target(message, command_key="ban")
@@ -9748,7 +9968,7 @@ async def cancel_ban(callback: CallbackQuery):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-бан"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-бан"),
 )
 async def cmd_unban(message: Message):
     # Раньше здесь была своя копия проверки "нужен reply" — по сути баг:
@@ -9874,7 +10094,7 @@ NUKE_DELETE_MAX_MESSAGES = 20000  # предохранитель, чтобы н�
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].split("@")[0].casefold() == NUKE_COMMAND),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].split("@")[0].casefold() == NUKE_COMMAND),
 )
 async def cmd_nuke(message: Message):
     if not is_owner(message.from_user.id):
@@ -10104,7 +10324,7 @@ async def cmd_freeze_account(message: Message):
         )
         return
 
-    freeze = message.text.strip().casefold().split()[0] == "заморозить"
+    freeze = (message.text.strip().casefold().split() or [""])[0] == "заморозить"
     key = _frozen_key(message.chat.id, target.id)
     name = await display_name(message.chat.id, target)
     if freeze:
@@ -10122,7 +10342,7 @@ async def cmd_freeze_account(message: Message):
 def _is_confiscate_command(text: Optional[str]) -> bool:
     if not text:
         return False
-    return text.strip().casefold().split()[0] == "конфисковать"
+    return (text.strip().casefold().split() or [""])[0] == "конфисковать"
 
 
 @router.message(
@@ -10170,7 +10390,7 @@ async def cmd_confiscate(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "кик"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "кик"),
 )
 async def cmd_kick(message: Message):
     """Исключает участника из группы без постоянного бана — он может зайти
@@ -10210,12 +10430,10 @@ async def cmd_kick(message: Message):
 RED_ROULETTE_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
 
-def roulette_number_color(n: int) -> str:
-    RED_ROULETTE_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
-
-    if n == 0:
-        return "green"
-    return "red" if n in RED_ROULETTE_NUMBERS else "black"
+# Ниже по файлу эта же функция объявлена второй раз — работала именно та копия,
+# а эта была мёртвой (и ещё раз перечисляла те же числа локальной переменной).
+# Удалена, чтобы правка «красных» чисел не уходила в никуда: менять надо
+# RED_ROULETTE_NUMBERS выше.
 
 
 # ============================================================================
@@ -11100,7 +11318,7 @@ async def cmd_my_article(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] in ("!инфа", ".инфа")),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] in ("!инфа", ".инфа")),
 )
 async def cmd_misc_info(message: Message):
     if not _check_misc_access(message.from_user.id, "misc_info"):
@@ -11250,7 +11468,7 @@ def _render_sdb_certificate(name: str, avatar_bytes: Optional[bytes], reason: st
     footer = f"Профпригодность к долбоёбству: {percent}%"
     draw.text(((W - draw.textlength(footer, font=small_font)) / 2, H - 90), footer, font=small_font, fill=(70, 60, 40))
 
-    date_text = f"Дата выдачи: {datetime.utcnow().strftime('%d.%m.%Y')}"
+    date_text = f"Дата выдачи: {local_now().strftime('%d.%m.%Y')}"
     draw.text((60, H - 60), date_text, font=small_font, fill=(70, 60, 40))
 
     scx, scy, sr = W - 130, H - 110, 55
@@ -11511,7 +11729,7 @@ def _render_quote_card_image(name: str, text: str, avatar_bytes: Optional[bytes]
     draw.text((pad_left, name_y), f"— {name}", font=name_font, fill=(185, 195, 255))
 
     # подпись снизу слева: ник автора цитаты + дата
-    today = date.today().strftime("%d.%m.%Y")
+    today = local_now().strftime("%d.%m.%Y")
     draw.text((pad_left, H - 46), f"© {name}", font=meta_font, fill=(215, 215, 215))
     draw.text((pad_left, H - 26), f"@ {today}", font=meta_font, fill=(215, 215, 215))
 
@@ -11990,7 +12208,7 @@ async def _tts_to_ogg_opus(text: str) -> bytes:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == ".скажи"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == ".скажи"),
 )
 async def cmd_tts_say(message: Message):
     if not _check_misc_access(message.from_user.id, "tts_say"):
@@ -12420,7 +12638,7 @@ async def _send_ship_result(message: Message, target_a: SimpleNamespace, target_
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "шипперим"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "шипперим"),
 )
 async def cmd_ship(message: Message):
     text = message.text.strip()
@@ -12662,6 +12880,243 @@ async def cmd_farm_top(message: Message):
     await message.answer(await _farm_top_text(message.chat.id))
 
 
+# ============================================================================
+# 🎣 РЫБАЛКА — второй способ заработка i¢ рядом с фермой.
+#
+# Отличие от фермы намеренное: ферма даёт предсказуемые 40-120 i¢ раз в 4 часа,
+# рыбалка — раз в 2 часа, но с огромным разбросом (от «старый ботинок» за
+# бесценок до легендарной рыбы в сотни монет). Проиграть нельзя: минимальный
+# улов всё равно что-то стоит, азарт создаёт таблица редкостей и личный
+# РЕКОРД, который видно всему чату в «топ уловов».
+#
+# РЕШЕНО (баланс): матожидание одного заброса ≈ 65 i¢, то есть ≈33 i¢ в час —
+# примерно вровень с фермой (40-120 за 4 часа ≈ 20 i¢/ч) с поправкой на то,
+# что рыбалка требует вдвое чаще заходить в чат. Веса заданы в самой таблице:
+# чтобы поменять баланс, достаточно поправить числа ниже.
+# ============================================================================
+FISHING_COOLDOWN = timedelta(hours=2)
+FISHING_TRIGGERS = {"рыбалка", "рыбачить", "рыбка", "удочка"}
+
+# (вес, эмодзи, название, мин. i¢, макс. i¢)
+FISHING_CATCHES: list[tuple[int, str, str, int, int]] = [
+    (18, "🥾", "старый ботинок",        1,    8),
+    (14, "🗑", "пучок водорослей",       3,   12),
+    (20, "🐟", "мелкая рыбёшка",        20,   45),
+    (16, "🐠", "полосатый окунь",       45,   80),
+    (12, "🐡", "надутый фугу",          70,  120),
+    (8,  "🦑", "кальмар",              110,  180),
+    (5,  "🦞", "лобстер",              170,  280),
+    (4,  "🐙", "осьминог",             250,  400),
+    (2,  "🦈", "акулёнок",             400,  700),
+    (1,  "🏆", "золотая рыбка",        900, 1500),
+    (1,  "📦", "затонувший сундук",   1200, 2000),
+]
+_FISHING_WEIGHTS = [row[0] for row in FISHING_CATCHES]
+
+
+def roll_catch() -> tuple[str, str, int]:
+    """Случайный улов: (эмодзи, название, сколько i¢)."""
+    _weight, emoji, name, low, high = random.choices(FISHING_CATCHES, weights=_FISHING_WEIGHTS)[0]
+    return emoji, name, random.randint(low, high)
+
+
+async def _fishing_execute(chat_id: int, user_id: int) -> str:
+    if await is_account_frozen(chat_id, user_id):
+        return "🧊 Ваш счёт заморожен администрацией — рыбалка недоступна."
+
+    stats = await db.get_fishing_stats(chat_id, user_id)
+    now = datetime.utcnow()
+    last = stats.get("last_fish_at")
+    if last:
+        elapsed = now - last
+        if elapsed < FISHING_COOLDOWN:
+            return (
+                f"🎣 Клёва не будет — рыба ещё не вернулась. "
+                f"Следующий заброс через {format_duration_ru(FISHING_COOLDOWN - elapsed)}"
+            )
+
+    emoji, name, amount = roll_catch()
+    previous_best = int(stats.get("best_catch") or 0)
+    # Сначала кулдаун (record_catch пишет last_fish_at), только потом монеты:
+    # упади запись — человек останется без начисления, но не с возможностью
+    # забрасывать удочку в цикле.
+    updated = await db.record_catch(chat_id, user_id, amount, name, now)
+    await db.add_coins(chat_id, user_id, amount)
+    await db.add_log("fishing", chat_id=chat_id, actor_id=user_id, details=f"{name}:{amount}")
+    await _check_coin_achievements(chat_id, user_id)
+
+    lines = [
+        f"🎣 Заброс… {emoji} <b>{name}</b>!",
+        f"☢️ +{amount} i¢",
+    ]
+    if amount > previous_best:
+        lines.append(f"🏅 Новый личный рекорд! (прошлый — {previous_best} i¢)")
+    else:
+        lines.append(f"🏅 Ваш рекорд: {int(updated.get('best_catch') or 0)} i¢")
+    lines.append(f"🐟 Уловов всего: {int(updated.get('total_catches') or 0)}")
+    return "\n".join(lines)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in FISHING_TRIGGERS),
+)
+async def cmd_fishing(message: Message):
+    if not _check_misc_access(message.from_user.id, "fishing_run"):
+        return
+    await message.answer(await _fishing_execute(message.chat.id, message.from_user.id))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ уловов", "топ рыбалки")),
+)
+async def cmd_fishing_top(message: Message):
+    if not _check_misc_access(message.from_user.id, "fishing_top"):
+        return
+    rows = await db.list_fishing_top(message.chat.id, limit=10)
+    if not rows:
+        await message.answer("Здесь ещё никто не рыбачил — забросьте удочку первым: «рыбалка» 🎣")
+        return
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    lines = ["🎣 <b>Топ уловов чата</b>", DIVIDER]
+    for i, row in enumerate(rows):
+        who = await display_name_by_id(message.chat.id, row["user_id"])
+        place = medals.get(i, f"{i + 1}.")
+        catch = row.get("best_catch_name") or "улов"
+        lines.append(
+            f"{place} {who} — <b>{row['best_catch']}</b> i¢ ({html.escape(catch)}), "
+            f"забросов: {row['total_catches']}"
+        )
+    await message.answer("\n".join(lines))
+
+
+# ============================================================================
+# 💎 КЛАД — общий на чат «джекпот», третий способ заработка.
+#
+# Смысл в том, что это НЕ одиночная механика: клад один на весь чат, каждая
+# неудачная попытка подкидывает в него монет, а нашедший забирает всё. Чем
+# дольше чат не может найти клад — тем он жирнее, и тем обиднее опоздать.
+#
+# РЕШЕНО:
+#  * Копать БЕСПЛАТНО. Это способ заработка, а не казино: ставки, которые можно
+#    проиграть, в боте уже есть отдельно («!рулетка», «!кости» и прочее).
+#  * Шанс растёт с каждой неудачной попыткой (TREASURE_CHANCE_BASE +
+#    TREASURE_CHANCE_STEP за попытку, потолок TREASURE_CHANCE_MAX) — клад не
+#    может прятаться вечно, а ожидание находки ≈ 8-10 попыток чата.
+#  * Личный кулдаун 3 часа: иначе один активный человек выкапывал бы все клады
+#    чата в одиночку.
+# ============================================================================
+TREASURE_COOLDOWN = timedelta(hours=3)
+TREASURE_TRIGGERS = {"клад", "копать", "искать клад"}
+TREASURE_SEED_MIN, TREASURE_SEED_MAX = 200, 500      # с чего начинается новый клад
+TREASURE_GROWTH_MIN, TREASURE_GROWTH_MAX = 25, 90    # сколько добавляет промах
+TREASURE_CHANCE_BASE = 0.08
+TREASURE_CHANCE_STEP = 0.04
+TREASURE_CHANCE_MAX = 0.75
+
+# Что «находит» неудачник — чисто для текста, на монеты не влияет.
+TREASURE_MISSES = [
+    "🪨 только камни и корни",
+    "🥫 ржавая консервная банка",
+    "🦴 чья-то потерянная кость",
+    "🧦 одинокий носок (как он сюда попал?)",
+    "🪱 очень недовольный червяк",
+    "🔩 горсть болтов",
+    "📎 скрепка. Просто скрепка.",
+]
+
+
+async def _treasure_execute(chat_id: int, user_id: int) -> str:
+    if await is_account_frozen(chat_id, user_id):
+        return "🧊 Ваш счёт заморожен администрацией — копать бесполезно."
+
+    now = datetime.utcnow()
+    digger = await db.get_digger(chat_id, user_id)
+    last = digger.get("last_dig_at")
+    if last:
+        elapsed = now - last
+        if elapsed < TREASURE_COOLDOWN:
+            return (
+                "⛏ Лопата затупилась, руки в мозолях. "
+                f"Копать снова можно через {format_duration_ru(TREASURE_COOLDOWN - elapsed)}"
+            )
+
+    seed = random.randint(TREASURE_SEED_MIN, TREASURE_SEED_MAX)
+    treasure = await db.get_treasure(chat_id, seed, now)
+    attempts = int(treasure.get("attempts") or 0)
+    chance = min(TREASURE_CHANCE_BASE + attempts * TREASURE_CHANCE_STEP, TREASURE_CHANCE_MAX)
+
+    if random.random() >= chance:
+        growth = random.randint(TREASURE_GROWTH_MIN, TREASURE_GROWTH_MAX)
+        await db.grow_treasure(chat_id, growth)
+        await db.record_dig(chat_id, user_id, now, found=False)
+        pot = int(treasure.get("pot") or 0) + growth
+        return "\n".join([
+            f"⛏ Копаем… {random.choice(TREASURE_MISSES)}.",
+            f"💎 Клад чата подрос до <b>{pot}</b> i¢ (попыток: {attempts + 1}).",
+            f"🎲 Шанс найти на следующей попытке: {round(min(chance + TREASURE_CHANCE_STEP, TREASURE_CHANCE_MAX) * 100)}%",
+        ])
+
+    won = await db.claim_treasure(chat_id, random.randint(TREASURE_SEED_MIN, TREASURE_SEED_MAX), now)
+    if won is None:
+        # Кто-то выкопал клад на долю секунды раньше — считаем попытку промахом,
+        # но кулдаун ставим честно: лопатой человек всё-таки махал.
+        await db.record_dig(chat_id, user_id, now, found=False)
+        return "⛏ Вы разрыли пустую яму — клад успели забрать буквально только что!"
+
+    # Кулдаун раньше начисления — по той же причине, что и в рыбалке.
+    await db.record_dig(chat_id, user_id, now, found=True)
+    await db.add_coins(chat_id, user_id, won)
+    await db.add_log("treasure_found", chat_id=chat_id, actor_id=user_id, details=str(won))
+    await _check_coin_achievements(chat_id, user_id)
+    finds = int(digger.get("finds") or 0) + 1
+    return "\n".join([
+        "⛏💥 Лопата стукнула обо что-то твёрдое…",
+        f"💎 <b>КЛАД НАЙДЕН!</b> +{won} i¢",
+        f"🏅 Найдено кладов за всё время: {finds}",
+        "🕳 Бот уже закопал новый — ищите дальше!",
+    ])
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in TREASURE_TRIGGERS),
+)
+async def cmd_treasure_dig(message: Message):
+    if not _check_misc_access(message.from_user.id, "treasure_dig"):
+        return
+    await message.answer(await _treasure_execute(message.chat.id, message.from_user.id))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("клад инфа", "клад стата")),
+)
+async def cmd_treasure_info(message: Message):
+    if not _check_misc_access(message.from_user.id, "treasure_info"):
+        return
+    chat_id = message.chat.id
+    now = datetime.utcnow()
+    treasure = await db.get_treasure(chat_id, random.randint(TREASURE_SEED_MIN, TREASURE_SEED_MAX), now)
+    attempts = int(treasure.get("attempts") or 0)
+    chance = min(TREASURE_CHANCE_BASE + attempts * TREASURE_CHANCE_STEP, TREASURE_CHANCE_MAX)
+    lines = [
+        "💎 <b>Клад чата</b>",
+        DIVIDER,
+        f"💰 В кладе: <b>{int(treasure.get('pot') or 0)}</b> i¢",
+        f"⛏ Попыток с прошлой находки: {attempts}",
+        f"🎲 Шанс найти сейчас: {round(chance * 100)}%",
+    ]
+    finders = await db.list_treasure_finders(chat_id, limit=5)
+    if finders:
+        lines += ["", "🏆 <b>Кладоискатели</b>"]
+        for i, row in enumerate(finders, start=1):
+            who = await display_name_by_id(chat_id, row["user_id"])
+            lines.append(f"{i}. {who} — кладов: {row['finds']}")
+    await message.answer("\n".join(lines))
+
+
 BCOIN_RE = re.compile(r"(?i)^бкоин\s+(\S+)$")
 
 
@@ -12730,7 +13185,7 @@ async def cmd_bcoin_history(message: Message):
         lines.append("🕓 <b>Последние вложения</b>")
         for row in history:
             name = await display_name_by_id(chat_id, row["user_id"])
-            when = row["created_at"].strftime("%d.%m.%Y %H:%M")
+            when = fmt_dt(row["created_at"])
             lines.append(f"{name} — {int(row['amount'])} i¢ ({when})")
     else:
         lines.append("Пока ещё никто не вкладывал монеты — начните с «Бкоин {число}».")
@@ -12985,7 +13440,7 @@ async def cmd_farm_set_yield(message: Message):
 def _is_robbery_command(text: Optional[str]) -> bool:
     if not text or not text.strip():
         return False
-    first = text.strip().casefold().split()[0]
+    first = (text.strip().casefold().split() or [""])[0]
     return first in ("!ограбить", "ограбить")
 
 
@@ -13833,7 +14288,7 @@ async def cmd_stock_market(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "!купить"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "!купить"),
 )
 async def cmd_stock_buy(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
@@ -13872,7 +14327,7 @@ async def cmd_stock_buy(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "!продать"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "!продать"),
 )
 async def cmd_stock_sell(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
@@ -13993,7 +14448,7 @@ async def cmd_bank_status(message: Message):
     if account["credit_debt"]:
         due: datetime = account["credit_due_at"]
         overdue = datetime.utcnow() >= due
-        status = "⚠️ просрочен, начисляется пеня" if overdue else f"до {due.strftime('%d.%m.%Y %H:%M')} UTC"
+        status = "⚠️ просрочен, начисляется пеня" if overdue else f"до {fmt_dt(due)}"
         lines.append(
             f"💳 Долг по кредиту: {account['credit_debt']} i¢ ({status})\n"
             "Погасить: «!банк погасить {сумма}»"
@@ -14076,7 +14531,7 @@ async def cmd_bank_withdraw(message: Message):
         remaining = matures - datetime.utcnow()
         await message.reply(
             f"⏳ Вклад ещё заморожен — созреет через {format_duration_ru(remaining)} "
-            f"({matures.strftime('%d.%m.%Y %H:%M')} UTC). Досрочно снять нельзя."
+            f"({fmt_dt(matures)}). Досрочно снять нельзя."
         )
         return
 
@@ -15717,7 +16172,7 @@ async def lootbox_list_text(chat_id: int, user_id: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "!лутбокс"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "!лутбокс"),
 )
 async def cmd_lootbox(message: Message):
     if not _check_misc_access(message.from_user.id, "lootbox_info"):
@@ -15899,7 +16354,7 @@ def _warn_card(
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "варн"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "варн"),
 )
 async def cmd_warn(message: Message):
     target, remaining = await _require_moderation_target(message, command_key="warn")
@@ -15928,7 +16383,7 @@ async def cmd_warn(message: Message):
     actor_name = await display_name(message.chat.id, message.from_user)
     target_name = await display_name(message.chat.id, target)
     reason_text = html.escape(reason) if reason else "не указана"
-    expiry_text = f"{format_duration_ru(duration)} (до {expires_at.strftime('%d.%m.%Y %H:%M')} UTC)"
+    expiry_text = f"{format_duration_ru(duration)} (до {fmt_dt(expires_at)})"
 
     if count >= WARN_LIMIT:
         await db.clear_warns(message.chat.id, target.id)
@@ -15962,7 +16417,7 @@ async def cmd_warn(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-варн"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-варн"),
 )
 async def cmd_unwarn(message: Message):
     target, _remaining = await _require_moderation_target(message, command_key="unwarn")
@@ -16003,7 +16458,7 @@ def fake_warns_in_list() -> bool:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "&варн"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "&варн"),
 )
 async def cmd_fake_warn(message: Message):
     # Права те же, что у настоящего варна, и отдельной записи в COMMAND_REGISTRY
@@ -16052,7 +16507,7 @@ async def cmd_fake_warn(message: Message):
         actor_name=actor_name,
         target_name=target_name,
         reason_text=html.escape(reason) if reason else "не указана",
-        expiry_text=f"{format_duration_ru(duration)} (до {expires_at.strftime('%d.%m.%Y %H:%M')} UTC)",
+        expiry_text=f"{format_duration_ru(duration)} (до {fmt_dt(expires_at)})",
         count=count,
         footer=footer,
     ))
@@ -16065,7 +16520,7 @@ async def cmd_fake_warn(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() in ("&-варн", "&варн-")),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("&-варн", "&варн-")),
 )
 async def cmd_fake_unwarn(message: Message):
     """Снять обманный варн — вернуть разыгранного в исходное состояние.
@@ -16107,9 +16562,9 @@ async def cmd_list_fake_warns(message: Message):
         lines = []
         for row in rows:
             reason_text = f" — {html.escape(row['reason'])}" if row["reason"] else ""
-            when = row["created_at"].strftime("%d.%m.%Y %H:%M")
+            when = fmt_dt(row["created_at"])
             expires = row["expires_at"]
-            expiry_text = f" · сгорит {expires.strftime('%d.%m.%Y %H:%M')} UTC" if expires else " · бессрочный"
+            expiry_text = f" · сгорит {fmt_dt(expires)}" if expires else " · бессрочный"
             lines.append(f"• {when}{reason_text}{expiry_text}")
         text = (
             f"🃏 <b>Обманные варны {target_name}: {len(rows)}/{WARN_LIMIT}</b>\n"
@@ -16166,13 +16621,13 @@ async def cmd_list_warns(message: Message):
     lines = []
     for row in rows:
         reason_text = f" — {html.escape(row['reason'])}" if row["reason"] else ""
-        when = row["created_at"].strftime("%d.%m.%Y %H:%M")
+        when = fmt_dt(row["created_at"])
         # Дата — ссылка на сообщение, где варн выдали (если id сохранён и это
         # супергруппа). У обманных варнов message_id нет — они просто без ссылки.
         link = chat_message_link(message.chat.id, row.get("message_id"))
         when_text = f'<a href="{link}">{when}</a>' if link else when
         expires = row.get("expires_at")
-        expiry_text = f" · сгорит {expires.strftime('%d.%m.%Y %H:%M')} UTC" if expires else " · бессрочный"
+        expiry_text = f" · сгорит {fmt_dt(expires)}" if expires else " · бессрочный"
         lines.append(f"• {when_text}{reason_text}{expiry_text}")
     await message.reply(
         f"⚠️ <b>Варны {target_name}: {len(rows)}/{WARN_LIMIT}</b>\n\n" + "\n".join(lines)
@@ -16196,7 +16651,7 @@ async def cmd_rules(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-правила"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-правила"),
 )
 async def cmd_set_rules(message: Message):
     if not has_level(message.from_user.id, required_level("set_rules")):
@@ -16214,7 +16669,7 @@ async def cmd_set_rules(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-смс"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-смс"),
 )
 async def cmd_delete_message(message: Message):
     if not has_level(message.from_user.id, required_level("delete_message")):
@@ -16300,7 +16755,7 @@ async def cmd_list_mutes(message: Message):
         if until:
             remaining = until - datetime.utcnow()
             remaining_text = f", осталось {format_duration_ru(remaining)}" if remaining.total_seconds() > 0 else ", истекает"
-            until_text = f"до {until.strftime('%d.%m.%Y %H:%M')} UTC{remaining_text}"
+            until_text = f"до {fmt_dt(until)}{remaining_text}"
         else:
             until_text = "навсегда"
         reason_text = f" — {html.escape(row['reason'])}" if row["reason"] else ""
@@ -16444,7 +16899,7 @@ async def _create_timer(message: Message, fire_at: datetime, text: str) -> None:
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"🆔 Номер: <code>{timer_id}</code>\n"
         f"📅 Сработает через: {format_duration_ru(fire_at - datetime.utcnow())} "
-        f"({fire_at.strftime('%d.%m.%Y %H:%M')} UTC)\n"
+        f"({fmt_dt(fire_at)})\n"
         f"{action_line}"
     )
     await db.add_log(
@@ -16534,7 +16989,7 @@ async def cmd_list_timers(message: Message):
         is_runnable = _timer_runnable_command(row["text"]) is not None
         preview = f"⚙️ выполнит «{html.escape(row['text'][:60])}»" if is_runnable else html.escape(row["text"][:60])
         lines.append(
-            f"• #{row['id']} — через {remaining_text} ({fire_at.strftime('%d.%m.%Y %H:%M')} UTC)\n"
+            f"• #{row['id']} — через {remaining_text} ({fmt_dt(fire_at)})\n"
             f"   👤 {author} — {preview}"
         )
     await message.reply(
@@ -16544,7 +16999,7 @@ async def cmd_list_timers(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-таймер"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-таймер"),
 )
 async def cmd_delete_timer(message: Message):
     if not has_level(message.from_user.id, required_level("timer")):
@@ -16734,7 +17189,7 @@ async def cmd_grant_level(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() in ("-админ","снять")),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("-админ","снять")),
 )
 async def cmd_revoke_admin(message: Message):
     actor_id = message.from_user.id
@@ -16786,7 +17241,7 @@ PROMOTE_LEVEL_WORDS = {"0": 0, "1": LEVEL_MODERATOR, "2": LEVEL_ADMIN, "3": LEVE
 def _is_promote_demote_command(t: Optional[str]) -> bool:
     if not t or not t.strip():
         return False
-    return t.strip().casefold().split()[0] in ("повысить", "понизить")
+    return (t.strip().casefold().split() or [""])[0] in ("повысить", "понизить")
 
 
 @router.message(
@@ -16801,7 +17256,7 @@ async def cmd_promote_demote(message: Message):
             await message.reply("⛔ Повышать/понижать права может только старший администратор или владелец.")
         return
 
-    direction = message.text.strip().casefold().split()[0]
+    direction = (message.text.strip().casefold().split() or [""])[0]
     is_promote = direction == "повысить"
 
     # allow_bare_id=False: голое число после команды означает УРОВЕНЬ
@@ -17321,7 +17776,7 @@ async def confirm_admin_action(callback: CallbackQuery):
     reason_text = html.escape(reason) if reason else "не указана"
     if action_type == "mute":
         until_text = (
-            f"{format_duration_ru(timedelta(seconds=duration_seconds))} (до {until.strftime('%d.%m.%Y %H:%M')} UTC)"
+            f"{format_duration_ru(timedelta(seconds=duration_seconds))} (до {fmt_dt(until)})"
             if until else "навсегда"
         )
         card = (
@@ -17893,7 +18348,7 @@ async def cmd_tree_show_category(callback: CallbackQuery):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] in ("право", "дк")),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] in ("право", "дк")),
 )
 async def cmd_set_permission(message: Message):
     if not has_level(message.from_user.id, LEVEL_SENIOR):
@@ -18055,7 +18510,7 @@ async def _handle_reward_degree_permission(message: Message, args: list[str]) ->
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() in ("наградить", "!наградить")),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("наградить", "!наградить")),
 )
 async def cmd_reward(message: Message):
     # allow_bare_id=False: число сразу после триггера — это степень награды
@@ -18174,7 +18629,7 @@ async def reward_list_page(
     lines = [f"🏅 <b>Награды {name} — {total}</b>", DIVIDER]
     for index, row in enumerate(page_rows, start=start + 1):
         awarded_name = await display_name_by_id(chat_id, row["awarded_by"])
-        when = row["created_at"].strftime("%d.%m.%Y")
+        when = fmt_date(row["created_at"])
         reason_text = f" — {html.escape(row['reason'])}" if row["reason"] else ""
         lines.append(
             f"{index}. {reward_degree_emoji(row['degree'])} степень {row['degree']}{reason_text}\n"
@@ -18754,7 +19209,7 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
 
     if stats and stats.get("first_seen_at"):
         first_seen = stats["first_seen_at"]
-        lines.append(f"Первое появление: {first_seen.strftime('%d.%m.%Y')} ({compact_elapsed_ru(first_seen)})")
+        lines.append(f"Первое появление: {fmt_date(first_seen)} ({compact_elapsed_ru(first_seen)})")
     last_active = stats.get("last_message_at") if stats else None
     lines.append(f"Последний актив: {relative_time_ru(last_active)}")
     lines.append(
@@ -18795,7 +19250,7 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     if marriage:
         partner_name = await display_name_by_id(chat_id, marriage["partner_id"])
         married_at: datetime = marriage["married_at"]
-        extra.append(f"💍 В браке с {partner_name} · с {married_at.strftime('%d.%m.%Y')}")
+        extra.append(f"💍 В браке с {partner_name} · с {fmt_date(married_at)}")
     if relationship:
         rel_partner_name = await display_name_by_id(chat_id, relationship["partner_id"])
         rel_level_name = relationships_v2.level_name(relationship["level_index"])
@@ -18805,7 +19260,7 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
         if until:
             remaining = until - datetime.utcnow()
             remaining_text = f" (осталось {format_duration_ru(remaining)})" if remaining.total_seconds() > 0 else ""
-            until_text = f"{until.strftime('%d.%m.%Y %H:%M')} UTC{remaining_text}"
+            until_text = f"{fmt_dt(until)}{remaining_text}"
         else:
             until_text = "навсегда"
         extra.append(f"🔇 Замучен(а) до {until_text}")
@@ -18834,7 +19289,7 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
             if created and (datetime.utcnow() - created).total_seconds() >= 0:
                 when_text = f", {compact_elapsed_ru(created)}"
             elif created:
-                when_text = f", {created.strftime('%d.%m.%Y')}"
+                when_text = f", {fmt_date(created)}"
             else:
                 when_text = ""
             award_lines.append(f"{emoji} {reason}{when_text}")
@@ -19405,16 +19860,36 @@ async def stat_period_page(chat_id: int, period: str, page: int) -> tuple[str, O
     return text, InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
+# Второе слово команды, которое означает СОВСЕМ другой отчёт и должно уйти
+# своему обработчику: «топ кланов», «топ браков», «стата по часам» и т.п.
+_STAT_FOREIGN_SECOND_WORDS = (
+    "кланов", "монет", "ачивок", "репутации", "браков", "уловов", "рыбалки", "по",
+)
+
+
+def _is_stat_period_command(t: Optional[str]) -> bool:
+    """«стата за неделю», «топ 20» и подобное.
+
+    Раньше это был лямбда-фильтр, который брал split()[1] БЕЗ проверки длины:
+    на однословном «стата» он падал IndexError прямо в проверке фильтра —
+    то есть обычное слово в чате роняло обработку апдейта.
+    """
+    if not t or not t.strip():
+        return False
+    low = t.strip().casefold()
+    words = low.split()
+    if words[0] not in ("стата", "топ"):
+        return False
+    if low in ("топ", "актив"):
+        return False  # эти два случая уже обрабатывает cmd_top
+    if len(words) < 2:
+        return False  # голое «стата» — без периода показывать нечего
+    return words[1] not in _STAT_FOREIGN_SECOND_WORDS
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(
-        lambda t: bool(t)
-        and bool(t.strip())
-        and t.strip().casefold().split()[0] in ("стата", "топ")
-        and t.strip().casefold().split()[1] not in ("кланов","монет","ачивок","репутации")
-        and t.strip().casefold() not in ("топ", "актив")  # эти два случая уже обрабатывает cmd_top
-        and t.strip().casefold().split()[1:2] != ["по"]  # «стата по часам» — отдельный хендлер (почасовая статистика)
-    ),
+    F.text.func(_is_stat_period_command),
 )
 async def cmd_stat_period(message: Message):
     tokens = message.text.strip().split()[1:]
@@ -19647,7 +20122,7 @@ async def _oldtimers_newcomers_text(chat_id: int, rows: list[dict], title: str, 
             last_message_at = row.get("last_message_at")
             if last_message_at and (now - last_message_at) <= OLDTIMER_ACTIVE_WINDOW:
                 fire = " 🔥"
-        lines.append(f"{i}. {name}{fire} — с {seen.strftime('%d.%m.%Y')}")
+        lines.append(f"{i}. {name}{fire} — с {fmt_date(seen)}")
     return "\n".join(lines)
 
 
@@ -19676,7 +20151,7 @@ NEW_MEMBERS_MAX_ROWS = 100  # предохранитель от гигантск
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "нью"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "нью"),
 )
 async def cmd_new_members(message: Message):
     """«нью {период}» — кто вступил в чат за последние {период} (по first_seen_at).
@@ -19710,7 +20185,7 @@ async def cmd_new_members(message: Message):
     for i, row in enumerate(rows, start=1):
         name = mention_id(row["user_id"], full_name=row.get("full_name"), username=row.get("username"))
         seen: datetime = row["first_seen_at"]
-        lines.append(f"{i}. {name} — {seen.strftime('%d.%m.%Y %H:%M')}")
+        lines.append(f"{i}. {name} — {fmt_dt(seen)}")
     if len(rows) >= NEW_MEMBERS_MAX_ROWS:
         lines.append(f"\n… показаны первые {NEW_MEMBERS_MAX_ROWS}, возможно вступивших больше.")
     await message.reply("\n".join(lines))
@@ -19722,7 +20197,7 @@ NICK_PAGE_SIZE = 20
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "ники"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "ники"),
 )
 async def cmd_nick_list(message: Message):
     parts = message.text.strip().split()
@@ -19748,7 +20223,7 @@ async def cmd_nick_list(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split(maxsplit=1)[0].casefold() == "сетник"),
+    F.text.func(lambda t: bool(t) and (t.strip().split(maxsplit=1) or [""])[0].casefold() == "сетник"),
 )
 async def cmd_setnick(message: Message):
     """«сетник @username Ник» / «сетник Ник» (ответом на сообщение) —
@@ -19874,7 +20349,7 @@ async def _inactive_silent_text(rows: list[dict], title: str, date_field: str) -
     for i, row in enumerate(rows, start=1):
         name = mention_id(row["user_id"], full_name=row.get("full_name"), username=row.get("username"))
         ts: datetime = row[date_field]
-        lines.append(f"{i}. {name} — {ts.strftime('%d.%m.%Y')}")
+        lines.append(f"{i}. {name} — {fmt_date(ts)}")
     return "\n".join(lines)
 
 
@@ -19882,7 +20357,7 @@ async def _inactive_silent_text(rows: list[dict], title: str, date_field: str) -
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(
         lambda t: bool(t)
-        and t.strip().casefold().split(maxsplit=1)[0] in ("неактив", "кто", "список")
+        and (t.strip().casefold().split(maxsplit=1) or [""])[0] in ("неактив", "кто", "список")
         and "неактив" in t.strip().casefold()
     ),
 )
@@ -19899,14 +20374,14 @@ async def cmd_inactive_list(message: Message):
         duration = timedelta(days=7)
     cutoff = datetime.utcnow() - duration
     rows = await db.list_inactive(message.chat.id, cutoff, limit=30)
-    await message.reply(await _inactive_silent_text(rows, f"😴 <b>Неактивные с {cutoff.strftime('%d.%m.%Y')}</b>", "last_seen_at"))
+    await message.reply(await _inactive_silent_text(rows, f"😴 <b>Неактивные с {fmt_date(cutoff)}</b>", "last_seen_at"))
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(
         lambda t: bool(t)
-        and t.strip().casefold().split(maxsplit=1)[0] in ("молчун", "молчуны", "кто", "список")
+        and (t.strip().casefold().split(maxsplit=1) or [""])[0] in ("молчун", "молчуны", "кто", "список")
         and "молчун" in t.strip().casefold()
     ),
 )
@@ -19923,7 +20398,7 @@ async def cmd_silent_list(message: Message):
     cutoff = datetime.utcnow() - duration
     rows = await db.list_silent(message.chat.id, cutoff, limit=30)
     await message.reply(
-        await _inactive_silent_text(rows, f"🤐 <b>Молчуны, вступившие до {cutoff.strftime('%d.%m.%Y')}</b>", "first_seen_at")
+        await _inactive_silent_text(rows, f"🤐 <b>Молчуны, вступившие до {fmt_date(cutoff)}</b>", "first_seen_at")
     )
 
 
@@ -19963,7 +20438,7 @@ def _current_week_start():
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "+норма"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "+норма"),
 )
 async def cmd_set_norm(message: Message):
     if not has_level(message.from_user.id, required_level("set_norm")):
@@ -20019,10 +20494,10 @@ async def cmd_norm_check(message: Message):
     week_start = _current_week_start()
     rows = await db.list_below_norm(message.chat.id, week_start, norm, limit=200)
     if not rows:
-        await message.reply(f"🎉 Все набрали норму ({norm} сообщ./неделю, с {week_start.strftime('%d.%m.%Y')}).")
+        await message.reply(f"🎉 Все набрали норму ({norm} сообщ./неделю, с {fmt_date(week_start)}).")
         return
     lines = [
-        f"📉 <b>Не в норме / Вне нормы</b> — норма {norm} сообщ./неделю, с {week_start.strftime('%d.%m.%Y')}",
+        f"📉 <b>Не в норме / Вне нормы</b> — норма {norm} сообщ./неделю, с {fmt_date(week_start)}",
         DIVIDER,
     ]
     for i, row in enumerate(rows, start=1):
@@ -20049,7 +20524,7 @@ CLEANUP_PREVIEW_LIMIT = 20
 def _is_clear_users_command(text: Optional[str]) -> bool:
     if not text:
         return False
-    first = text.strip().split()[0].casefold()
+    first = (text.strip().split() or [""])[0].casefold()
     return first.split("@")[0] == "/clearusers"
 
 
@@ -20099,7 +20574,7 @@ async def cmd_clear_users(message: Message):
         InlineKeyboardButton(text="Отмена", callback_data="clearusers_cancel"),
     ]])
     await message.reply(
-        f"🧹 <b>Чистка по норме</b> — {norm} сообщ./неделю, с {week_start.strftime('%d.%m.%Y')}.\n"
+        f"🧹 <b>Чистка по норме</b> — {norm} сообщ./неделю, с {fmt_date(week_start)}.\n"
         f"Будет <b>перманентно забанено: {len(candidates)}</b> "
         "(админы, рестующие и новички не в счёт).\n"
         f"{DIVIDER}\n" + "\n".join(preview) + "\n\n"
@@ -20225,7 +20700,7 @@ def _resolve_participants_period(text: str):
     if calendar_period is not None:
         since_day = _participants_period_start(calendar_period)
         label_word = "неделю" if calendar_period == "week" else "месяц"
-        label = f"за {label_word} (с {since_day.strftime('%d.%m.%Y')})"
+        label = f"за {label_word} (с {fmt_date(since_day)})"
         return since_day, label, 1
 
     duration, _rest = _extract_leading_duration(text, skip_words=2)
@@ -20233,13 +20708,13 @@ def _resolve_participants_period(text: str):
         return None
     consumed = 1 if parse_duration(tokens[0]) is not None else 2
     since_day = (datetime.utcnow() - duration).date()
-    label = f"за последние {format_duration_ru(duration)} (с {since_day.strftime('%d.%m.%Y')})"
+    label = f"за последние {format_duration_ru(duration)} (с {fmt_date(since_day)})"
     return since_day, label, consumed
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[0] == "участники"),
+    F.text.func(lambda t: bool(t) and (t.strip().casefold().split() or [""])[0] == "участники"),
 )
 async def cmd_participants(message: Message):
     if not has_level(message.from_user.id, required_level("participants")):
@@ -20457,7 +20932,7 @@ async def _rest_list_text(rows: list[dict]) -> str:
         name = mention_id(row["user_id"], full_name=row.get("full_name"), username=row.get("username"))
         until: datetime = row["expires_at"]
         reason = f" — {html.escape(row['reason'])}" if row.get("reason") else ""
-        lines.append(f"{i}. {name} — до {until.strftime('%d.%m.%Y %H:%M')} UTC{reason}")
+        lines.append(f"{i}. {name} — до {fmt_dt(until)}{reason}")
     return "\n".join(lines)
 
 
@@ -20478,7 +20953,7 @@ async def cmd_rest_list(message: Message):
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(
         lambda t: bool(t)
-        and t.strip().casefold().split()[0] == "рест"
+        and (t.strip().casefold().split() or [""])[0] == "рест"
         and t.strip().casefold() not in REST_CANCEL_TRIGGERS
         and not _is_rest_list_cmd(t)
     ),
@@ -20533,7 +21008,7 @@ async def _process_rest_request(
     existing_active = await db.get_active_rest(target_chat_id, user.id)
     if existing_active:
         until: datetime = existing_active["expires_at"]
-        await reply(f"Вы уже в ресте до <b>{until.strftime('%d.%m.%Y %H:%M')}</b> UTC.")
+        await reply(f"Вы уже в ресте до <b>{fmt_dt(until)}</b>.")
         return
     existing_pending = await db.get_pending_rest_request(target_chat_id, user.id)
     if existing_pending:
@@ -20629,7 +21104,7 @@ async def confirm_rest(callback: CallbackQuery):
         member=mention_id(row["user_id"]),
         duration=timedelta(seconds=int(row["duration_seconds"])),
     )
-    approved_line = f"\n\n✅ Одобрено ({admin_label}) до {until.strftime('%d.%m.%Y %H:%M')} UTC"
+    approved_line = f"\n\n✅ Одобрено ({admin_label}) до {fmt_dt(until)}"
     card_text = (callback.message.html_text or callback.message.text or "") + approved_line
     try:
         await callback.message.edit_text(f"{card_text}\n{DIVIDER}\n{memo}")
@@ -20648,13 +21123,13 @@ async def confirm_rest(callback: CallbackQuery):
     try:
         await bot.send_message(
             row["chat_id"],
-            f"🌴 {mention_id(row['user_id'])} теперь в ресте до <b>{until.strftime('%d.%m.%Y %H:%M')}</b> UTC "
+            f"🌴 {mention_id(row['user_id'])} теперь в ресте до <b>{fmt_dt(until)}</b> "
             "— не считается неактивным.",
         )
     except Exception:
         pass
     try:
-        await bot.send_message(row["user_id"], f"✅ Ваша заявка на рест одобрена, до {until.strftime('%d.%m.%Y %H:%M')} UTC.")
+        await bot.send_message(row["user_id"], f"✅ Ваша заявка на рест одобрена, до {fmt_dt(until)}.")
     except TelegramForbiddenError:
         pass
     except Exception:
@@ -21012,11 +21487,16 @@ async def _pay_daily_top_reward(chat_id: int) -> Optional[str]:
 
 
 async def daily_top_reward_loop() -> None:
-    """Каждый день в 12:00 UTC начисляет i¢ топ-5 активным участникам каждого
-    чата за сегодняшние сообщения (5 i¢ за сообщение). Дедупликация — по
-    каждому чату отдельно (ключ включает chat_id), поэтому ручной запуск
-    команды «!выдать топ активности» в конкретном чате не приводит к
-    повторному начислению этому же чату при плановом срабатывании в 12:00."""
+    """Раз в сутки начисляет i¢ активным участникам каждого чата за сегодняшние
+    сообщения: DAILY_TOP_REWARD_PER_MESSAGE i¢ за сообщение, первым
+    DAILY_TOP_REWARD_COUNT участникам топа. Час запуска — в
+    DAILY_TOP_REWARD_HOUR_UTC (по UTC, не по настройке «часовой пояс»: она
+    отвечает только за показ времени).
+
+    Дедупликация — по каждому чату отдельно (ключ включает chat_id), поэтому
+    ручной запуск «!выдать топ активности» в конкретном чате не приводит к
+    повторному начислению этому же чату при плановом срабатывании.
+    """
     while True:
         try:
             await asyncio.sleep(DAILY_TOP_REWARD_CHECK_INTERVAL)
@@ -21039,6 +21519,11 @@ async def daily_top_reward_loop() -> None:
                 except Exception:
                     logger.exception("daily_top_reward_loop: ошибка в чате %s", chat_id)
 
+                # Метку ставим ДАЖЕ при ошибке — и это намеренно. Начисление
+                # (add_coins) внутри _pay_daily_top_reward уже могло пройти, а
+                # упасть могла только отправка сообщения; повтор через 5 минут
+                # начислил бы монеты второй раз. Потерять объявление в чате
+                # менее вредно, чем раздать двойную награду.
                 await db.set_data(last_key, today_str)
         except asyncio.CancelledError:
             raise
@@ -21074,8 +21559,12 @@ async def cmd_daily_top_manual(message: Message):
     await db.add_log("daily_top_reward_manual", chat_id=chat_id, actor_id=message.from_user.id)
 
 
-
-    STOCK_SET_PRICE_RE = re.compile(r"(?i)^!биржа\s+цена\s+(\S+)$")
+# Отступ здесь критичен: строка ниже когда-то оказалась ВНУТРИ тела функции
+# выше, то есть была локальной переменной, — а фильтр обработчика ссылается на
+# неё как на глобальную. В итоге проверка фильтра падала с NameError на КАЖДОМ
+# сообщении, доходившем до этого места роутера, и все команды, объявленные
+# ниже по файлу, переставали работать.
+STOCK_SET_PRICE_RE = re.compile(r"(?i)^!биржа\s+цена\s+(\S+)$")
 
 
 @router.message(
@@ -21149,25 +21638,10 @@ async def shop_restock_loop() -> None:
             logger.exception("Сбой в цикле пополнения магазина")
 
 
-async def birthday_congrats_loop() -> None:
-    while True:
-        try:
-            now = datetime.utcnow()  # или с поправкой на часовой пояс проекта
-            rows = await db.list_birthdays_for_day(now.day, now.month)
-            for row in rows:
-                chats = await db.list_user_chats(row["user_id"])
-                for chat_id in chats:
-                    try:
-                        await bot.send_message(chat_id, f"🎉 Сегодня день рождения у {mention/имя}! Поздравляем! 🎂")
-                    except Exception:
-                        pass
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Сбой в цикле поздравлений с ДР")
-        await asyncio.sleep(86400)  # раз в сутки
-    
-
+# Здесь лежал недописанный черновик birthday_congrats_loop: он подставлял в
+# текст несуществующее имя (`{mention/имя}`) и всё равно никогда не выполнялся —
+# рабочая версия ниже объявлена под тем же именем и перекрывала его. Удалён,
+# чтобы при следующей правке никто не «починил» и не запустил именно его.
 
 BIRTHDAY_CHECK_INTERVAL = 3600  # проверяем раз в час, шлём раз в сутки
 
@@ -21792,7 +22266,7 @@ ONLINE_WINDOW_MINUTES = 15     # окно «недавно писал» для �
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() in (
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in (
         "+подписка", "-подписка", "подписаться", "отписаться",
     )),
 )
@@ -21800,7 +22274,7 @@ async def cmd_subscription_toggle(message: Message):
     if not _check_misc_access(message.from_user.id, "subscriptions"):
         return
 
-    word = message.text.strip().split()[0].casefold()
+    word = (message.text.strip().split() or [""])[0].casefold()
     subscribe = word in ("+подписка", "подписаться")
 
     target, _ = await resolve_command_target(message)
@@ -21941,7 +22415,7 @@ async def cmd_who_online(message: Message):
 # ---------- Ники (персональные для каждого чата, как у Iris) ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split(maxsplit=1)[0].casefold() in ("+ник", "ник", "-ник")),
+    F.text.func(lambda t: bool(t) and (t.strip().split(maxsplit=1) or [""])[0].casefold() in ("+ник", "ник", "-ник")),
 )
 async def cmd_nick(message: Message):
     parts = (message.text or "").strip().split(maxsplit=1)
@@ -21999,7 +22473,7 @@ async def cmd_nick(message: Message):
 # ---------- Звание (как в анкете Iris — отображается под именем в /профиль) ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split(maxsplit=1)[0].casefold() in ("+звание", "звание", "-звание")),
+    F.text.func(lambda t: bool(t) and (t.strip().split(maxsplit=1) or [""])[0].casefold() in ("+звание", "звание", "-звание")),
 )
 async def cmd_title(message: Message):
     parts = (message.text or "").strip().split(maxsplit=1)
@@ -22037,7 +22511,7 @@ async def cmd_title(message: Message):
 # ---------- Девиз (как в анкете Iris) ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split(maxsplit=1)[0].casefold() in ("+девиз", "девиз", "-девиз")),
+    F.text.func(lambda t: bool(t) and (t.strip().split(maxsplit=1) or [""])[0].casefold() in ("+девиз", "девиз", "-девиз")),
 )
 async def cmd_motto(message: Message):
     parts = (message.text or "").strip().split(maxsplit=1)
@@ -22159,7 +22633,7 @@ async def cmd_gender_clear(message: Message):
 def _is_gender_compact_command(text: str | None) -> bool:
     if not text:
         return False
-    first = text.strip().casefold().split(maxsplit=1)[0]
+    first = (text.strip().casefold().split(maxsplit=1) or [""])[0]
     return first in (".мойпол", "мойпол")
 
 
@@ -22338,9 +22812,54 @@ async def cmd_anketa(message: Message):
 
 
 # ---------- Браки ----------
+# У слова «Брак» есть подкоманды (20-й модуль Iris): «брак да», «брак нет»,
+# «брак продлить …», «брак цена продления …», «брак режим развода …». Все они
+# обрабатываются отдельными хендлерами ниже, поэтому предложение руки и сердца
+# обязано их пропускать — иначе «Брак да» уходило бы в предложение самому себе.
+MARRIAGE_SUBCOMMANDS = ("да", "нет", "продлить", "цена", "режим")
+
+
+def _is_marriage_proposal(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    parts = text.strip().casefold().split()
+    if not parts or parts[0] != "брак":
+        return False
+    return len(parts) < 2 or parts[1] not in MARRIAGE_SUBCOMMANDS
+
+
+# Ожидающие ответа предложения: (chat_id, кому предложили) → (кто предложил,
+# когда). Нужны только для текстовых ответов «Брак да» / «Брак нет» — у кнопок
+# всё необходимое лежит прямо в callback_data. В памяти, а не в БД: живёт
+# предложение час, и переживать перезапуск ему незачем (кнопки после
+# перезапуска продолжат работать, а текстовый ответ можно повторить).
+_marriage_proposals: dict[tuple[int, int], tuple[int, datetime]] = {}
+MARRIAGE_PROPOSAL_TTL = timedelta(hours=1)
+
+
+def _remember_proposal(chat_id: int, target_id: int, proposer_id: int) -> None:
+    now = datetime.utcnow()
+    # Заодно подчищаем протухшие, чтобы словарь не рос вечно в шумном чате.
+    for key, (_, created) in list(_marriage_proposals.items()):
+        if now - created > MARRIAGE_PROPOSAL_TTL:
+            _marriage_proposals.pop(key, None)
+    _marriage_proposals[(chat_id, target_id)] = (proposer_id, now)
+
+
+def _take_proposal(chat_id: int, target_id: int) -> Optional[int]:
+    """Забирает (и удаляет) ожидающее предложение. None — если его нет/протухло."""
+    found = _marriage_proposals.pop((chat_id, target_id), None)
+    if not found:
+        return None
+    proposer_id, created = found
+    if datetime.utcnow() - created > MARRIAGE_PROPOSAL_TTL:
+        return None
+    return proposer_id
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda text: bool(text) and text.strip().split()[0].casefold() == "брак"),
+    F.text.func(_is_marriage_proposal),
 )
 async def propose_marriage(message: Message):
     proposer = message.from_user
@@ -22387,12 +22906,35 @@ async def propose_marriage(message: Message):
             InlineKeyboardButton(text="💔 Отказать", callback_data=f"marriage_decline:{proposer.id}:{target.id}"),
         ]]
     )
+    _remember_proposal(message.chat.id, target.id, proposer.id)
     await message.reply(
         "💌 <b>Предложение руки и сердца</b>\n\n"
         f"{actor_name} предлагает {target_name} вступить в брак! 💍\n\n"
-        f"{target_name}, выберите свой ответ:",
+        f"{target_name}, выберите свой ответ — кнопкой или словами "
+        "<b>Брак да</b> / <b>Брак нет</b>:",
         reply_markup=kb,
     )
+
+
+async def _seal_marriage(chat_id: int, proposer_id: int, target_id: int) -> tuple[bool, str]:
+    """Заключает брак и выдаёт готовый текст-ответ.
+
+    Общая для кнопки «💍 Принять» и текстового «Брак да» — иначе два пути
+    заключения брака разъезжались бы по проверкам и по ачивкам.
+    """
+    if await db.get_marriage(chat_id, proposer_id) or await db.get_marriage(chat_id, target_id):
+        return False, "Похоже, один из вас уже успел вступить в брак 💍"
+    if not await db.create_marriage(chat_id, proposer_id, target_id):
+        return False, "Один из вас уже успел вступить в брак 💍"
+
+    _marriage_proposals.pop((chat_id, target_id), None)
+    await db.add_log("marriage_created", chat_id=chat_id, actor_id=proposer_id, target_id=target_id)
+    for spouse_id in (proposer_id, target_id):
+        await grant_achievement(chat_id, spouse_id, "married")
+
+    actor_name = await display_name_by_id(chat_id, proposer_id)
+    target_name = await display_name_by_id(chat_id, target_id)
+    return True, f"💍🎉 {actor_name} и {target_name} теперь официально в браке! Поздравляем!"
 
 
 @router.callback_query(F.data.startswith("marriage_accept:"))
@@ -22409,30 +22951,18 @@ async def accept_marriage(callback: CallbackQuery):
         return
 
     chat_id = callback.message.chat.id
-    if await db.get_marriage(chat_id, proposer_id) or await db.get_marriage(chat_id, target_id):
-        await callback.answer("Похоже, один из вас уже успел вступить в брак 💍", show_alert=True)
+    ok, text = await _seal_marriage(chat_id, proposer_id, target_id)
+    if not ok:
+        await callback.answer(text, show_alert=True)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
         return
-
-    if not await db.create_marriage(chat_id, proposer_id, target_id):
-        await callback.answer("Один из вас уже успел вступить в брак 💍", show_alert=True)
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        return
-    actor_name = await display_name_by_id(chat_id, proposer_id)
-    target_name = await display_name_by_id(chat_id, target_id)
     try:
-        await callback.message.edit_text(f"💍🎉 {actor_name} и {target_name} теперь официально в браке! Поздравляем!")
+        await callback.message.edit_text(text)
     except TelegramBadRequest:
         pass
-    await db.add_log("marriage_created", chat_id=chat_id, actor_id=proposer_id, target_id=target_id)
-    for spouse_id in (proposer_id, target_id):
-        await grant_achievement(chat_id, spouse_id, "married")
     await callback.answer("Поздравляем с браком! 🎉")
 
 
@@ -22450,6 +22980,7 @@ async def decline_marriage(callback: CallbackQuery):
         return
 
     chat_id = callback.message.chat.id
+    _marriage_proposals.pop((chat_id, target_id), None)
     actor_name = await display_name_by_id(chat_id, proposer_id)
     target_name = await display_name_by_id(chat_id, target_id)
     try:
@@ -22573,7 +23104,9 @@ async def cmd_marry_pair(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == ".развод"),
+    # «!Развод» — написание из 20-го модуля Iris; «.развод» работал раньше и
+    # остаётся, чтобы не переучивать чат.
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in (".развод", "!развод")),
 )
 async def cmd_divorce(message: Message):
     marriage = await db.get_marriage(message.chat.id, message.from_user.id)
@@ -22703,7 +23236,7 @@ async def cmd_couple(message: Message):
         return
     partner_name = await display_name_by_id(message.chat.id, marriage["partner_id"])
     married_at: datetime = marriage["married_at"]
-    await message.reply(f"💍 Вы в браке с {partner_name} с {married_at.strftime('%d.%m.%Y')}")
+    await message.reply(f"💍 Вы в браке с {partner_name} с {fmt_date(married_at)}")
 
 
 MARRIAGES_PAGE_SIZE = 10
@@ -22728,7 +23261,7 @@ async def marriages_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMa
     for index, marriage in enumerate(rows, start=page * MARRIAGES_PAGE_SIZE + 1):
         first = await display_name_by_id(chat_id, marriage["user1_id"])
         second = await display_name_by_id(chat_id, marriage["user2_id"])
-        date = marriage["married_at"].strftime("%d.%m.%Y")
+        date = fmt_date(marriage["married_at"])
         lines.append(f"{index}. {first} ❤️ {second} · <code>{date}</code>")
 
     pages = (total + MARRIAGES_PAGE_SIZE - 1) // MARRIAGES_PAGE_SIZE
@@ -22767,6 +23300,586 @@ async def paginate_marriages(callback: CallbackQuery):
     except TelegramBadRequest:
         pass
     await callback.answer()
+
+
+# ============================================================================
+# 20-й МОДУЛЬ IRIS — «БРАКИ». Достраивает уже работавшую механику (предложение
+# кнопкой, «поженить пару», развод с возвратом в течение 72 ч) до полного
+# набора команд гайда: ответ словами, срок брака и его продление, авторазвод,
+# рейтинг долгих браков, массовые операции модератора.
+#
+# РЕШЕНО — то, чего гайд не задаёт числами и правилами:
+#
+#  * СРОК. Новый брак заключается БЕССРОЧНЫМ (expires_at IS NULL). Иначе
+#    появление модуля разом поставило бы таймер всем существующим парам и
+#    первый же запуск авторазвода развёл бы чат. Срок появляется только после
+#    «Брак продлить», и лишь тогда режим развода получает над парой власть.
+#
+#  * ИСТЁКШИЙ БРАК УДАЛЯЕТСЯ, а не помечается флагом. Так профиль (💍 в
+#    карточке), «итоги», «браки» и «топ браков» читают одну таблицу и не могут
+#    разойтись в ответе на вопрос «женат ли он». Перед удалением снимается тот
+#    же снимок, что и при обычном разводе, — 72 часа на «вернуть брак»
+#    остаются в силе.
+#
+#  * «ТОП БРАКОВ» ранжирует по дате свадьбы (кто раньше — тот выше), то есть по
+#    длительности ЖИВОГО брака: истёкших в таблице уже нет.
+#
+#  * «+/-БРАК РЕЙТИНГ» — настройка ЧАТА: в гайде она стоит в блоке управления,
+#    рядом с «!Сброс браков» и ценой продления, а не среди личных команд.
+#    Выключенный рейтинг прячет «Топ браков» целиком.
+#
+#  * ЦЕНА ПРОДЛЕНИЯ — за СУТКИ, по умолчанию 500 i¢. Неделя выходит в 3500 —
+#    заметно на фоне фермы (40-120 i¢ за сбор раз в 4 часа), но не
+#    заградительно. Платит тот, кто продлевает.
+# ============================================================================
+
+MARRIAGE_DIVORCE_MODES = {
+    "off": "выключен — истёкший брак остаётся в силе",
+    "auto": "автоматический — истёкший брак расторгается сам",
+}
+MARRIAGE_MAX_EXTEND_DAYS = 365
+
+# ВРЕМЯ. married_at и expires_at пишет сама MySQL (CURRENT_TIMESTAMP / NOW()),
+# а не Python. Весь остальной бот кладёт в такие же колонки datetime.utcnow()
+# (см. warns.expires_at рядом с warns.created_at), то есть проект уже исходит
+# из того, что сервер БД живёт в UTC — и здесь мы держимся той же шкалы:
+# арифметика по utcnow(), показ — через fmt_date/fmt_dt, которые переводят UTC
+# в настроенный часовой пояс. Само истечение срока считает сервер БД (см.
+# db.list_expired_marriages), Python здесь нужен только человеку на экран.
+
+
+def _marriage_expiry_line(expires_at: Optional[datetime]) -> str:
+    if expires_at is None:
+        return "♾ Срок: бессрочный"
+    remaining = expires_at - datetime.utcnow()
+    if remaining.total_seconds() <= 0:
+        return f"⌛ Срок истёк {fmt_date(expires_at)}"
+    return (
+        f"⏳ Действует до {fmt_date(expires_at)} "
+        f"(осталось {format_duration_ru(remaining)})"
+    )
+
+
+async def _marriage_card(chat_id: int, user_id: int, whose: str) -> str:
+    """Карточка брака для «Мой брак» / «Твой брак». whose — «Ваш» или имя."""
+    marriage = await db.get_marriage(chat_id, user_id)
+    if not marriage:
+        return (
+            f"{whose} брак не найден — пара не заключена.\n"
+            "Ответьте на сообщение человека словом <b>Брак</b>, чтобы сделать предложение."
+        )
+    partner_name = await display_name_by_id(chat_id, marriage["partner_id"])
+    married_at: datetime = marriage["married_at"]
+    return "\n".join([
+        f"💍 <b>{whose} брак</b>",
+        DIVIDER,
+        f"❤️ Партнёр: {partner_name}",
+        f"📅 В браке с {fmt_date(married_at)} "
+        f"({format_duration_ru(datetime.utcnow() - married_at)})",
+        _marriage_expiry_line(marriage.get("expires_at")),
+    ])
+
+
+# ---------- «Брак да» / «Брак нет» — ответ на предложение словами ----------
+def _is_marriage_answer(text: Optional[str], word: str) -> bool:
+    if not text:
+        return False
+    parts = text.strip().casefold().split()
+    return len(parts) == 2 and parts[0] == "брак" and parts[1] == word
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: _is_marriage_answer(t, "да")),
+)
+async def cmd_marriage_yes(message: Message):
+    proposer_id = _take_proposal(message.chat.id, message.from_user.id)
+    if proposer_id is None:
+        await message.reply(
+            "Вам сейчас никто не делал предложения 🙂 "
+            f"Предложение ждёт ответа {format_duration_ru(MARRIAGE_PROPOSAL_TTL)}."
+        )
+        return
+    _, text = await _seal_marriage(message.chat.id, proposer_id, message.from_user.id)
+    await message.reply(text)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: _is_marriage_answer(t, "нет")),
+)
+async def cmd_marriage_no(message: Message):
+    proposer_id = _take_proposal(message.chat.id, message.from_user.id)
+    if proposer_id is None:
+        await message.reply("Вам сейчас никто не делал предложения 🙂")
+        return
+    actor_name = await display_name_by_id(message.chat.id, proposer_id)
+    target_name = await display_name(message.chat.id, message.from_user)
+    await db.add_log(
+        "marriage_declined", chat_id=message.chat.id,
+        actor_id=proposer_id, target_id=message.from_user.id,
+    )
+    await message.reply(f"💔 {target_name} отказал(а) {actor_name}.")
+
+
+# ---------- «Мой брак» / «Твой брак {ссылка}» ----------
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "мой брак"),
+)
+async def cmd_my_marriage(message: Message):
+    if not _check_misc_access(message.from_user.id, "my_marriage"):
+        return
+    await message.reply(await _marriage_card(message.chat.id, message.from_user.id, "Ваш"))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold().split()[:2] == ["твой", "брак"]),
+)
+async def cmd_their_marriage(message: Message):
+    if not _check_misc_access(message.from_user.id, "their_marriage"):
+        return
+    # trigger_words=2 — «твой брак» занимает два слова, дальше идёт ссылка.
+    target, _remaining = await resolve_command_target(message, trigger_words=2)
+    if target is None and message.reply_to_message:
+        target = message.reply_to_message.from_user
+    if target is None:
+        await message.reply(
+            "Укажите, чей брак смотрим: <code>твой брак @username</code> "
+            "или ответом на сообщение человека."
+        )
+        return
+    if target.id is None:
+        await message.reply(
+            f"Не удалось найти @{html.escape(target.username or '')} — бот его ещё не видел в этом чате."
+        )
+        return
+    whose = await display_name(message.chat.id, target)
+    await message.reply(await _marriage_card(message.chat.id, target.id, whose))
+
+
+# ---------- «Браки {номер страницы}» ----------
+MARRIAGES_PAGE_RE = re.compile(r"(?i)^браки\s+(\d{1,4})$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARRIAGES_PAGE_RE.match(t.strip()))),
+)
+async def cmd_marriages_page(message: Message):
+    # В команде страницы нумеруются с единицы, внутри marriages_page() — с нуля.
+    human_page = int(MARRIAGES_PAGE_RE.match(message.text.strip()).group(1))
+    text, keyboard = await marriages_page(message.chat.id, max(human_page - 1, 0))
+    await message.reply(text, reply_markup=keyboard)
+
+
+# ---------- «Топ браков» ----------
+MARRIAGE_TOP_LIMIT = 10
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "топ браков"),
+)
+async def cmd_marriage_top(message: Message):
+    if not _check_misc_access(message.from_user.id, "marriage_top"):
+        return
+    chat_id = message.chat.id
+    conf = await db.get_marriage_settings(chat_id)
+    if not conf["rating_enabled"]:
+        await message.reply(
+            "🏆 Рейтинг браков в этом чате выключен. Включить: <code>+брак рейтинг</code>."
+        )
+        return
+    rows = await db.list_marriage_top(chat_id, limit=MARRIAGE_TOP_LIMIT)
+    if not rows:
+        await message.reply("Пока ни одной пары — станьте первыми 💍")
+        return
+
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    now = datetime.utcnow()
+    lines = ["🏆 <b>Топ самых долгих браков</b>", DIVIDER]
+    for i, row in enumerate(rows):
+        first = await display_name_by_id(chat_id, row["user1_id"])
+        second = await display_name_by_id(chat_id, row["user2_id"])
+        place = medals.get(i, f"{i + 1}.")
+        duration = format_duration_ru(now - row["married_at"])
+        lines.append(f"{place} {first} ❤️ {second} — {duration}")
+    await message.reply("\n".join(lines))
+
+
+# ---------- «Развести пару {ссылка} {ссылка}» (модератор) ----------
+def _is_divorce_pair_command(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    parts = text.strip().casefold().split()
+    return len(parts) >= 2 and parts[0] == "развести" and parts[1] == "пару"
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(_is_divorce_pair_command),
+)
+async def cmd_divorce_pair(message: Message):
+    """Зеркало «поженить пару»: модератор разводит двух ДРУГИХ людей."""
+    min_level = required_level("divorce_pair")
+    actor_level = get_level(message.from_user.id)
+    if actor_level < min_level:
+        if actor_level > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(min_level)}» и выше.")
+        return
+
+    targets = await _collect_pair_targets(message)
+    unknown = next((t for t in targets if t.id is None), None)
+    if unknown is not None:
+        await message.reply(
+            f"Не удалось найти @{html.escape(unknown.username or '')} — бот его ещё не видел в этом чате. "
+            "Попробуйте ответом на его сообщение или укажите по ID."
+        )
+        return
+    if not targets:
+        await message.reply(
+            "Укажите пару: <code>развести пару @первый @второй</code> — либо ответом на "
+            "сообщение одного из супругов."
+        )
+        return
+
+    # Достаточно одного из двоих: брак и так один на человека. Второго, если
+    # он указан, используем как проверку — чтобы нельзя было развести не ту пару.
+    first = targets[0]
+    marriage = await db.get_marriage(message.chat.id, first.id)
+    if not marriage:
+        who = await display_name_by_id(message.chat.id, first.id)
+        await message.reply(f"{who} ни с кем не в браке 🙂")
+        return
+    if len(targets) >= 2 and targets[1].id != marriage["partner_id"]:
+        who = await display_name_by_id(message.chat.id, first.id)
+        partner = await display_name_by_id(message.chat.id, marriage["partner_id"])
+        await message.reply(f"Эти двое не женаты друг на друге: {who} состоит в браке с {partner}.")
+        return
+
+    partner_id = marriage["partner_id"]
+    await db.snapshot_dissolution("marriage", message.chat.id, first.id, partner_id, "{}")
+    await db.delete_marriage(message.chat.id, first.id)
+    await db.add_log(
+        "marriage_dissolved_by_admin", chat_id=message.chat.id,
+        actor_id=message.from_user.id, target_id=first.id, details=str(partner_id),
+    )
+    a = await display_name_by_id(message.chat.id, first.id)
+    b = await display_name_by_id(message.chat.id, partner_id)
+    await message.reply(
+        f"💔 {a} и {b} разведены модератором.\n"
+        "Передумали? Вернуть брак можно 72 часа командой «вернуть брак»."
+    )
+
+
+# ---------- «Развести вышедших» (модератор) ----------
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "развести вышедших"),
+)
+async def cmd_divorce_departed(message: Message):
+    min_level = required_level("divorce_departed")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(min_level)}» и выше.")
+        return
+
+    rows = await db.list_marriages_with_departed(message.chat.id)
+    if not rows:
+        await message.reply("✅ Все супруги на месте — разводить некого.")
+        return
+
+    # Снимки для «вернуть брак» — по одному на пару, до удаления.
+    for row in rows:
+        await db.snapshot_dissolution(
+            "marriage", message.chat.id, row["user1_id"], row["user2_id"], "{}"
+        )
+    removed = await db.delete_marriages_by_ids([row["id"] for row in rows])
+    await db.add_log(
+        "marriages_departed_cleanup", chat_id=message.chat.id,
+        actor_id=message.from_user.id, details=str(removed),
+    )
+    await message.reply(
+        f"💔 Расторгнуто браков, где один из супругов уже покинул чат: <b>{removed}</b>.\n"
+        "Если человек вернётся — брак можно вернуть 72 часа командой «вернуть брак»."
+    )
+
+
+# ---------- «!Сброс браков» (старший админ, с подтверждением) ----------
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!сброс браков", "сброс браков")),
+)
+async def cmd_marriages_reset(message: Message):
+    min_level = required_level("marriages_reset")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(min_level)}» и выше.")
+        return
+
+    _rows, total = await db.list_marriages(message.chat.id, limit=1)
+    if not total:
+        await message.reply("В чате и так нет ни одного брака 🙂")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💔 Да, обнулить", callback_data=f"marriages_reset:{message.from_user.id}"
+        ),
+        InlineKeyboardButton(text="Отмена", callback_data=f"marriages_reset_no:{message.from_user.id}"),
+    ]])
+    await message.reply(
+        f"⚠️ Обнулить <b>все</b> браки чата — сейчас их {total}?\n"
+        "Действие необратимо: снимков для «вернуть брак» не будет.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("marriages_reset_no:"))
+async def cb_marriages_reset_no(callback: CallbackQuery):
+    try:
+        initiator = int((callback.data or "").split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    if callback.from_user.id != initiator:
+        await callback.answer("Это не ваше подтверждение 🙂", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        await callback.message.edit_text("Сброс браков отменён 🙂")
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("marriages_reset:"))
+async def cb_marriages_reset_yes(callback: CallbackQuery):
+    try:
+        initiator = int((callback.data or "").split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    if callback.from_user.id != initiator:
+        await callback.answer("Это не ваше подтверждение 🙂", show_alert=True)
+        return
+    # Уровень проверяем ещё раз: между командой и нажатием права могли снять.
+    if not has_level(initiator, required_level("marriages_reset")):
+        await callback.answer("Прав на это уже нет.", show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id
+    removed = await db.reset_marriages(chat_id)
+    await db.add_log("marriages_reset", chat_id=chat_id, actor_id=initiator, details=str(removed))
+    await callback.answer()
+    try:
+        await callback.message.edit_text(f"💔 Все браки чата обнулены. Расторгнуто: <b>{removed}</b>.")
+    except TelegramBadRequest:
+        pass
+
+
+# ---------- «Брак цена продления {число}» (админ) ----------
+MARRIAGE_PRICE_RE = re.compile(r"(?i)^брак\s+цена\s+продления(?:\s+(\S+))?$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARRIAGE_PRICE_RE.match(t.strip()))),
+)
+async def cmd_marriage_renew_price(message: Message):
+    chat_id = message.chat.id
+    raw = MARRIAGE_PRICE_RE.match(message.text.strip()).group(1)
+    if raw is None:  # без числа — показываем текущую цену, это не правка
+        conf = await db.get_marriage_settings(chat_id)
+        await message.reply(
+            f"💰 Продление брака стоит <b>{conf['renew_price']}</b> i¢ за сутки.\n"
+            "Изменить: <code>брак цена продления 500</code>"
+        )
+        return
+
+    min_level = required_level("marriage_price_set")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(min_level)}» и выше.")
+        return
+    price = parse_amount(raw)
+    if price is None or price < 0:
+        await message.reply("Не понял цену. Можно так: 500, 10к, 0 (бесплатно).")
+        return
+    if price > 10_000_000:
+        await message.reply("Слишком много — не больше 10 000 000 i¢ за сутки.")
+        return
+    await db.set_marriage_setting(chat_id, "renew_price", price)
+    await db.add_log("marriage_price_set", chat_id=chat_id, actor_id=message.from_user.id, details=str(price))
+    await message.reply(f"💰 Цена продления брака: <b>{price}</b> i¢ за сутки.")
+
+
+# ---------- «Брак продлить {кол-во дней}» ----------
+MARRIAGE_EXTEND_RE = re.compile(r"(?i)^брак\s+продлить(?:\s+(\d{1,4}))?$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARRIAGE_EXTEND_RE.match(t.strip()))),
+)
+async def cmd_marriage_extend(message: Message):
+    if not _check_misc_access(message.from_user.id, "marriage_extend"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    conf = await db.get_marriage_settings(chat_id)
+
+    raw_days = MARRIAGE_EXTEND_RE.match(message.text.strip()).group(1)
+    if raw_days is None:
+        await message.reply(
+            f"⏳ Продление брака: <code>брак продлить 7</code>\n"
+            f"Цена — <b>{conf['renew_price']}</b> i¢ за сутки "
+            f"(не больше {MARRIAGE_MAX_EXTEND_DAYS} суток за раз)."
+        )
+        return
+    days = int(raw_days)
+    if days <= 0:
+        await message.reply("Продлевать нужно хотя бы на сутки.")
+        return
+    if days > MARRIAGE_MAX_EXTEND_DAYS:
+        await message.reply(f"За раз можно продлить не больше чем на {MARRIAGE_MAX_EXTEND_DAYS} суток.")
+        return
+
+    marriage = await db.get_marriage(chat_id, user_id)
+    if not marriage:
+        await message.reply("Вы пока ни с кем не в браке 🙂")
+        return
+
+    cost = conf["renew_price"] * days
+    if cost and not has_infinite_money(user_id):
+        if await is_account_frozen(chat_id, user_id):
+            await message.reply("🧊 Ваш счёт заморожен — продление недоступно.")
+            return
+        wallet = await db.get_wallet(chat_id, user_id)
+        if int(wallet.get("coins", 0)) < cost:
+            await message.reply(
+                f"Недостаточно монет: продление на {days} сут. стоит {cost} i¢, "
+                f"а у вас {wallet.get('coins', 0)} i¢."
+            )
+            return
+        await db.add_coins(chat_id, user_id, -cost)
+
+    new_expiry = await db.extend_marriage(chat_id, user_id, days)
+    if new_expiry is None:
+        await message.reply("Не удалось продлить брак — попробуйте ещё раз.")
+        return
+    await db.add_log(
+        "marriage_extended", chat_id=chat_id, actor_id=user_id,
+        target_id=marriage["partner_id"], details=f"{days}d/{cost}",
+    )
+    partner_name = await display_name_by_id(chat_id, marriage["partner_id"])
+    paid = f" за <b>{cost}</b> i¢" if cost else ""
+    await message.reply(
+        f"💞 Брак с {partner_name} продлён на <b>{days}</b> сут.{paid}\n"
+        f"{_marriage_expiry_line(new_expiry)}"
+    )
+
+
+# ---------- «+Брак рейтинг» / «-Брак рейтинг» (админ) ----------
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+брак рейтинг", "-брак рейтинг")),
+)
+async def cmd_marriage_rating_toggle(message: Message):
+    min_level = required_level("marriage_rating_toggle")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(min_level)}» и выше.")
+        return
+    enabled = message.text.strip().startswith("+")
+    await db.set_marriage_setting(message.chat.id, "rating_enabled", enabled)
+    await db.add_log(
+        "marriage_rating_toggle", chat_id=message.chat.id,
+        actor_id=message.from_user.id, details="on" if enabled else "off",
+    )
+    await message.reply(
+        "🏆 Рейтинг браков включён — смотреть: <code>топ браков</code>." if enabled
+        else "🏆 Рейтинг браков выключен — «топ браков» больше не показывается."
+    )
+
+
+# ---------- «Брак режим развода» (админ) ----------
+MARRIAGE_MODE_RE = re.compile(r"(?i)^брак\s+режим\s+развода(?:\s+(\S+))?$")
+_MARRIAGE_MODE_WORDS = {
+    "авто": "auto", "автоматический": "auto", "вкл": "auto", "auto": "auto",
+    "выкл": "off", "выключен": "off", "нет": "off", "off": "off",
+}
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARRIAGE_MODE_RE.match(t.strip()))),
+)
+async def cmd_marriage_divorce_mode(message: Message):
+    chat_id = message.chat.id
+    raw = MARRIAGE_MODE_RE.match(message.text.strip()).group(1)
+    if raw is None:
+        conf = await db.get_marriage_settings(chat_id)
+        current = MARRIAGE_DIVORCE_MODES.get(conf["divorce_mode"], conf["divorce_mode"])
+        await message.reply(
+            f"⚖️ Режим развода: <b>{current}</b>\n"
+            "Переключить: <code>брак режим развода авто</code> / "
+            "<code>брак режим развода выкл</code>\n"
+            "В режиме «авто» брак с истёкшим сроком расторгается сам "
+            "(вернуть — 72 часа командой «вернуть брак»)."
+        )
+        return
+
+    min_level = required_level("marriage_mode_set")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем «{level_name(min_level)}» и выше.")
+        return
+    mode = _MARRIAGE_MODE_WORDS.get(raw.casefold())
+    if mode is None:
+        await message.reply("Режим бывает <b>авто</b> или <b>выкл</b>.")
+        return
+    await db.set_marriage_setting(chat_id, "divorce_mode", mode)
+    await db.add_log("marriage_mode_set", chat_id=chat_id, actor_id=message.from_user.id, details=mode)
+    await message.reply(f"⚖️ Режим развода: <b>{MARRIAGE_DIVORCE_MODES[mode]}</b>.")
+
+
+# ---------- Фоновый авторазвод по истечении срока ----------
+MARRIAGE_EXPIRY_CHECK_INTERVAL = 600  # раз в 10 минут — срок измеряется сутками
+
+
+async def marriage_expiry_loop(interval_seconds: int = MARRIAGE_EXPIRY_CHECK_INTERVAL) -> None:
+    """Расторгает браки, у которых вышел срок, — но только в чатах с режимом
+    «авто» (выборку фильтрует сам запрос, см. db.list_expired_marriages).
+
+    Снимок для «вернуть брак» снимается и здесь: авторазвод не должен быть
+    жёстче обычного — 72 часа на передумать остаются.
+    """
+    while True:
+        try:
+            expired = await db.list_expired_marriages()
+            for row in expired:
+                chat_id = row["chat_id"]
+                a, b = row["user1_id"], row["user2_id"]
+                await db.snapshot_dissolution("marriage", chat_id, a, b, "{}")
+                if not await db.delete_marriages_by_ids([row["id"]]):
+                    continue
+                await db.add_log("marriage_expired", chat_id=chat_id, actor_id=a, target_id=b)
+                try:
+                    na = await display_name_by_id(chat_id, a)
+                    nb = await display_name_by_id(chat_id, b)
+                    await bot.send_message(
+                        chat_id,
+                        f"⌛ Срок брака {na} и {nb} истёк — брак расторгнут.\n"
+                        "Вернуть можно 72 часа командой «вернуть брак», "
+                        "продлить заранее — «брак продлить {дней}».",
+                    )
+                except Exception:
+                    # Бота могли выгнать или запретить писать — брак всё равно
+                    # расторгнут, молчать об ошибке отправки здесь правильно.
+                    logger.debug("Не удалось сообщить чату %s об истёкшем браке", chat_id)
+        except Exception:
+            logger.exception("Фоновая проверка сроков браков не удалась")
+        await asyncio.sleep(interval_seconds)
 
 
 # ============================================================================
@@ -22906,7 +24019,7 @@ def relationship_status_lines(chat_id_hint: str, rel: dict, partner_name: str) -
         lines.append(f"📈 До уровня «{next_name}»: {remaining} очк.")
     else:
         lines.append("📈 Достигнут максимальный уровень близости")
-    lines.append(f"📅 Отношения начались: {started_at.strftime('%d.%m.%Y')}")
+    lines.append(f"📅 Отношения начались: {fmt_date(started_at)}")
     return lines
 
 
@@ -23246,7 +24359,7 @@ async def award_relationship_points(chat_id: int, actor_id: int, target_id: int,
 # отдельного набора действий нет (см. вместо этого «дом действие», «отн пт
 # действие», «ребенок действие»).
 async def handle_relationship_only_action(message: Message):
-    action = message.text.strip().split()[0].casefold()
+    action = (message.text.strip().split() or [""])[0].casefold()
 
     target_user, _remaining = await resolve_command_target(message)
     if target_user is None and message.reply_to_message:
@@ -23369,7 +24482,7 @@ async def cmd_log(message: Message):
 # Позволяет вписывать в MySQL любые ключ-значение без изменения кода бота
 # (например, хранить произвольные настройки, тексты, флаги и т.п.)
 # ============================================================================
-@router.message(F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "запомни"))
+@router.message(F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "запомни"))
 async def cmd_setval(message: Message):
     if not has_level(message.from_user.id, required_level("setval")):
         if get_level(message.from_user.id) > 0:
@@ -23391,7 +24504,7 @@ async def cmd_setval(message: Message):
     await message.reply(f"✅ Записано в БД:\n<code>{html.escape(key)}</code> = {html.escape(value)}")
 
 
-@router.message(F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "вспомни"))
+@router.message(F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "вспомни"))
 async def cmd_getval(message: Message):
     if not has_level(message.from_user.id, required_level("getval")):
         if get_level(message.from_user.id) > 0:
@@ -23406,14 +24519,14 @@ async def cmd_getval(message: Message):
     if not row:
         await message.reply(f"🔍 Ключ <code>{html.escape(key)}</code> не найден.")
         return
-    updated = row["updated_at"].strftime("%d.%m.%Y %H:%M") if row.get("updated_at") else "—"
+    updated = fmt_dt(row["updated_at"]) if row.get("updated_at") else "—"
     await message.reply(
         f"🗄 <code>{html.escape(row['data_key'])}</code> = {html.escape(str(row['data_value']))}\n"
         f"<i>Обновлено: {updated}</i>"
     )
 
 
-@router.message(F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "забудь"))
+@router.message(F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "забудь"))
 async def cmd_delval(message: Message):
     if not has_level(message.from_user.id, required_level("delval")):
         if get_level(message.from_user.id) > 0:
@@ -23514,7 +24627,7 @@ async def apply_theme(theme: dict, actor_id: int) -> None:
     await db.add_log("themes_changed", actor_id=actor_id, details=theme["title"])
 
 
-@router.message(F.text.func(lambda t: bool(t) and bool(t.strip()) and t.strip().casefold().split()[0].lstrip("!") == "темы"))
+@router.message(F.text.func(lambda t: bool(t) and bool(t.strip()) and (t.strip().casefold().split() or [""])[0].lstrip("!") == "темы"))
 async def cmd_themes(message: Message):
     if not has_level(message.from_user.id, required_level("mod_themes")):
         if get_level(message.from_user.id) > 0:
@@ -23897,7 +25010,7 @@ async def cmd_my_unreg(message: Message):
         await message.reply("Вы сейчас не в анреге.")
         return
     note = f"\n📝 {html.escape(row['message'])}" if row.get("message") else ""
-    await message.reply(f"🙈 Вы в анреге этого чата с {row['created_at'].strftime('%d.%m.%Y %H:%M')}.{note}")
+    await message.reply(f"🙈 Вы в анреге этого чата с {fmt_dt(row['created_at'])}.{note}")
 
 
 async def _call_targets(chat_id: int, only_admins: bool) -> list[dict]:
@@ -25345,7 +26458,7 @@ async def cmd_clan_treasury_withdraw(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "+зам"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "+зам"),
 )
 async def cmd_clan_deputy_add(message: Message):
     membership = await db.get_user_clan(message.chat.id, message.from_user.id)
@@ -25369,7 +26482,7 @@ async def cmd_clan_deputy_add(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "-зам"),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-зам"),
 )
 async def cmd_clan_deputy_remove(message: Message):
     membership = await db.get_user_clan(message.chat.id, message.from_user.id)
@@ -26758,26 +27871,47 @@ async def warn_expiry_loop():
         await asyncio.sleep(3600)
 
 
-CMD_CLEANUP_CHECK_INTERVAL = 60
+# Раз в 15 секунд, а не раз в минуту: настройка задаётся в минутах, и при
+# «чистка команд 1» разброс в целую минуту означал удаление вдвое позже
+# обещанного. Запрос лёгкий (индекс по delete_at), четыре обращения в минуту
+# базу не нагружают.
+CMD_CLEANUP_CHECK_INTERVAL = 15
+CMD_CLEANUP_BATCH = 200
 
 
 async def cmd_cleanup_loop() -> None:
+    """Удаляет просроченные команды и ответы бота.
+
+    Порядок «сначала проверить, потом спать» — намеренный: после перезапуска в
+    очереди уже лежат просроченные записи, и заставлять чат ждать ещё интервал
+    незачем. Внутри одного круга выгребаем очередь до конца (пачками), иначе
+    завал разбирался бы по CMD_CLEANUP_BATCH записей за раз и старые сообщения
+    висели бы часами.
+    """
     while True:
         try:
-            await asyncio.sleep(CMD_CLEANUP_CHECK_INTERVAL)
-            rows = await db.list_due_cleanup_entries(datetime.utcnow())
-            for row in rows:
-                try:
-                    await bot.delete_message(row["chat_id"], row["message_id"])
-                except (TelegramBadRequest, TelegramForbiddenError):
-                    pass
-                except Exception:
-                    logger.exception("Ошибка удаления сообщения при очистке команд")
-                await db.delete_cleanup_entry(row["id"])
+            while True:
+                rows = await db.list_due_cleanup_entries(
+                    datetime.utcnow(), limit=CMD_CLEANUP_BATCH
+                )
+                for row in rows:
+                    try:
+                        await bot.delete_message(row["chat_id"], row["message_id"])
+                    except (TelegramBadRequest, TelegramForbiddenError):
+                        # Сообщение уже удалили руками, либо оно старше 48 часов
+                        # (Telegram такие удалять не даёт) — запись всё равно
+                        # убираем, чтобы очередь не копила мёртвые строки.
+                        pass
+                    except Exception:
+                        logger.exception("Ошибка удаления сообщения при очистке команд")
+                    await db.delete_cleanup_entry(row["id"])
+                if len(rows) < CMD_CLEANUP_BATCH:
+                    break  # очередь разобрана до конца
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Сбой в цикле очистки команд")
+        await asyncio.sleep(CMD_CLEANUP_CHECK_INTERVAL)
 
 
 MUTE_SWEEP_INTERVAL = 300  # 5 минут
@@ -26887,6 +28021,8 @@ async def main():
     await db.ensure_bookmarks_table()
     await db.ensure_ship_tables()
     await db.ensure_economy_tables()
+    await db.ensure_fishing_tables()
+    await db.ensure_treasure_tables()
     await db.ensure_casino_tables()
     await db.ensure_racing_stats_table()
     await db.ensure_profession_tables()
@@ -26909,6 +28045,7 @@ async def main():
     await db.ensure_daily_article_table()
     await db.ensure_cmd_cleanup_table()
     await db.ensure_command_cleanup_column()
+    await db.ensure_timezone_column()
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)
     await db.ensure_rel2_tables()
     await db.ensure_rel2_house_tables()
@@ -26919,6 +28056,7 @@ async def main():
     await db.ensure_rel2_action_counts_table()
     await db.ensure_rel2_gesture_tables()
     await db.ensure_relationship_undo_table()
+    await db.ensure_marriage_module_tables()
     await db.ensure_current_users_table()
     await db.ensure_stock_market_tables()
     await db.ensure_bank_tables()
@@ -26946,6 +28084,9 @@ async def main():
     await db.seed_rel2_gestures_missing(relationships_v2.default_gestures())
     await load_caches()
     await relationships_v2.load_rel2_caches()
+    # Ачивки живут здесь, а relationships_v2 нас импортировать не может (круг):
+    # отдаём ему функцию выдачи явно. Без этого «Многодетный» не выдавался.
+    relationships_v2.set_achievement_granter(grant_achievement)
     await relationships_v2.load_gestures()
     # Зеркалим реестр команд в БД для «дерева команд» в веб-панели (панель не
     # импортирует bot.py). Единый источник — COMMAND_REGISTRY здесь; пишем при
@@ -26979,6 +28120,7 @@ async def main():
     asyncio.create_task(stock_market_loop())
     asyncio.create_task(bank_penalty_loop())
     asyncio.create_task(warn_expiry_loop())
+    asyncio.create_task(marriage_expiry_loop())
     asyncio.create_task(mute_expiry_sweep_loop())
     asyncio.create_task(birthday_congrats_loop())
     asyncio.create_task(relationships_v2.spark_decay_loop(bot))

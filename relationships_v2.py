@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import random
 from datetime import datetime
@@ -99,6 +100,9 @@ from aiogram.types import (
 )
 
 import db
+import rp_photos
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="relationships_v2")
 
@@ -192,6 +196,38 @@ def build_rel2_level_table() -> list[tuple[int, str, int]]:
 # Живой кэш — заполняется в load_rel2_caches() из db.list_rel2_levels() (или
 # из build_rel2_level_table(), пока БД не проинициализирована).
 REL2_LEVELS: list[tuple[int, str, int]] = build_rel2_level_table()
+
+
+# --- выдача ачивок из этого модуля -----------------------------------------
+# Ачивки живут в bot.py (реестр ACHIEVEMENTS + grant_achievement), а bot.py
+# импортирует этот модуль — значит, импортировать его отсюда нельзя, будет
+# круг. Поэтому bot.py на старте кладёт сюда свою функцию (см. set_achievement
+# _granter в main()), а до тех пор выдача просто ничего не делает.
+#
+# Раньше здесь стоял прямой вызов grant_achievement(...) — имени, которого в
+# этом модуле нет. Ачивка «Многодетный» не только никогда не выдавалась: сам
+# NameError ронял обработку кнопки «👶 Принять» у пары с пятью детьми.
+FAMILY_ACHIEVEMENT_CHILDREN = 5
+
+_achievement_granter = None
+
+
+def set_achievement_granter(fn) -> None:
+    """Вызывается из bot.py: fn(chat_id, user_id, code) — корутина."""
+    global _achievement_granter
+    _achievement_granter = fn
+
+
+async def grant_achievement(chat_id: int, user_id: int, code: str) -> None:
+    if _achievement_granter is None:
+        logger.debug("Ачивка %s не выдана: bot.py ещё не подключил выдачу", code)
+        return
+    try:
+        await _achievement_granter(chat_id, user_id, code)
+    except Exception:
+        # Ачивка — приятный бонус, а не суть операции: её падение не должно
+        # отменять уже добавленного ребёнка.
+        logger.exception("Не удалось выдать ачивку %s пользователю %s", code, user_id)
 
 
 async def load_rel2_caches() -> None:
@@ -1658,9 +1694,8 @@ async def cmd_child_propose(message: Message, name_hint: str) -> None:
         return
 
     count = await db.count_rel2_children(pair["id"])
-    if count >= 5:
-        await grant_achievement(pair["chat_id"], user1_id, "family_5kids")
-        await grant_achievement(pair["chat_id"], user2_id, "family_5kids")
+    # Ачивку «Многодетный» здесь не выдаём: это только ПРЕДЛОЖЕНИЕ, ребёнка
+    # ещё нет. Выдача — в child_accept_button, после реального добавления.
     limit = child_limit(True)
     if count >= limit:
         await message.reply(f"Лимит детей исчерпан: {count}/{limit}.")
@@ -1727,9 +1762,6 @@ async def child_accept_button(callback: CallbackQuery):
     ok = False
     if pair:
         count = await db.count_rel2_children(pair["id"])
-        if count >= 5:
-            await grant_achievement(pair["chat_id"], user1_id, "family_5kids")
-            await grant_achievement(pair["chat_id"], user2_id, "family_5kids")
         if count < child_limit(True):
             new_child_id = await db.create_rel2_child(pair["id"], target_id, request["child_name"])
             # 🌟 Таланты (1/премиум до 3) и 🩺 врождённое состояние (шанс при рождении)
@@ -1740,6 +1772,12 @@ async def child_accept_button(callback: CallbackQuery):
                 await db.set_rel2_child_vitality(new_child_id, child_max_vitality({"congenital_key": congenital}))
             if request.get("pregnancy_id"):
                 await db.complete_rel2_pregnancy(request["pregnancy_id"])
+            # Пятый ребёнок — ачивка «👨‍👩‍👧 Многодетный» обоим родителям.
+            # Считаем ПОСЛЕ добавления (count — это сколько было до), иначе
+            # порог срабатывал бы на шестом.
+            if count + 1 >= FAMILY_ACHIEVEMENT_CHILDREN:
+                for parent_id in (proposer_id, pair["partner_id"]):
+                    await grant_achievement(chat_id, parent_id, "family_5kids")
             ok = True
 
     await db.delete_rel2_child_request(chat_id, proposer_id, target_id)
@@ -4178,23 +4216,54 @@ def _rp_pairing(gender_a: Optional[str], gender_b: Optional[str]) -> str:
     return "mf"
 
 
-def _pick_rp_photo_url(folder: Optional[str], gender_a: Optional[str], gender_b: Optional[str]) -> Optional[str]:
-    """Случайная ссылка на картинку для жеста и пары — или None, если для этого
-    жеста ссылок нет (тогда жест выводится без превью). Сначала пробуем точную
-    пару по полу, затем остальные варианты того же жеста."""
-    if not folder or folder not in PHOTOS:
+def _real_photo_urls(urls) -> list:
+    """Только настоящие ссылки из legacy-словаря PHOTOS.
+
+    Часть пар в нём не заполнена — стоят заглушки («link1», «link2», пустая
+    строка). Отдавать их Telegram нельзя, и — что важнее — непустой список
+    заглушек раньше «выигрывал» у пары с настоящими картинками, из-за чего
+    у «оба парня» фото не появлялось никогда.
+    """
+    return [u for u in (urls or []) if isinstance(u, str) and u.startswith(("http://", "https://"))]
+
+
+def _pick_rp_photo_url(folder, gender_a, gender_b):
+    """Ссылка на картинку-реакцию для жеста и пары — или None, если картинок
+    нет (тогда жест уходит обычным текстом).
+
+    ПОРЯДОК ИСТОЧНИКОВ ВАЖЕН.
+    1. Свои файлы из хранилища (rp_photos.MEDIA_ROOT) — ссылкой на публичный
+       эндпоинт панели /rp/…. Это основной путь: картинки лежат у нас, их
+       видно и можно менять через панель, и ссылка не протухнет оттого, что
+       чужой сайт удалил файл.
+    2. Только если своих файлов для жеста нет — старый словарь PHOTOS со
+       ссылками на сторонние хостинги. Оставлен, чтобы жесты, которым ещё не
+       залили картинки, не осиротели разом; по мере загрузки файлов надобность
+       в нём отпадёт.
+
+    В обоих случаях сначала пробуем точную пару по полу, потом остальные.
+    """
+    if not folder:
         return None
-    bucket = PHOTOS[folder]
+
+    own = rp_photos.pick_photo_url(folder, _rp_pairing(gender_a, gender_b))
+    if own:
+        return own
+
+    bucket = PHOTOS.get(folder)
+    if not bucket:
+        return None
     order, seen = [], set()
     for pairing in (_rp_pairing(gender_a, gender_b), "mf", "mm", "ff"):
         if pairing not in seen:
             seen.add(pairing)
             order.append(pairing)
     for pairing in order:
-        urls = bucket.get(pairing)
+        urls = _real_photo_urls(bucket.get(pairing))
         if urls:
             return random.choice(urls)
     return None
+
 
 async def _gender_by_id(chat_id: int, user_id: int) -> Optional[str]:
     card = await db.get_profile_card(chat_id, user_id)
@@ -4227,9 +4296,10 @@ async def cmd_rel2_simple_action(message: Message, action_key: str) -> None:
     # сообщениями (текст, а потом фото отдельным реплаем на него — из-за этого
     # в Telegram получалась громоздкая карточка с задвоенной цитатой и
     # огромным фото). Если фото для жеста ещё не залито (папки пусты) —
-    # уходит обычное текстовое сообщение. Чтобы фото появилось, залейте его в
-    # rp_media/<папка жеста>/<mf|mm|ff>/ (панель → «Действия» → отн-жесты →
-    # «Фото по полу пары»).
+    # уходит обычное текстовое сообщение. Чтобы фото появилось, залейте его
+    # через панель («Действия» → отн-жесты → «Фото по полу пары») — файлы
+    # лягут в rp_photos.MEDIA_ROOT, а в чат уйдёт ссылка на наш публичный
+    # эндпоинт /rp/…, по которой Telegram и нарисует превью.
     gender_actor = await _gender_by_id(message.chat.id, message.from_user.id)
     gender_partner = await _gender_by_id(message.chat.id, pair["partner_id"])
     photo_url = _pick_rp_photo_url(info.get("media_folder"), gender_actor, gender_partner)
@@ -4241,7 +4311,11 @@ async def cmd_rel2_simple_action(message: Message, action_key: str) -> None:
                 link_preview_options=LinkPreviewOptions(
                     url=photo_url,
                     is_disabled=False,
-                    prefer_large_media=True,
+                    # МАЛЕНЬКОЕ превью, а не во всю ширину: жест — это в
+                    # первую очередь фраза, картинка к ней приложение.
+                    # Большое фото раздувало сообщение на пол-экрана и
+                    # выталкивало из виду сам текст действия.
+                    prefer_small_media=True,
                     show_above_text=False,
                 ),
             )

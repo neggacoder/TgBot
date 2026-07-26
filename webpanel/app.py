@@ -20,7 +20,7 @@ import re
 import secrets
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import AsyncIterator, Optional
 
 # Модули бота лежат на уровень выше этого пакета. Дублируем правку путей из
@@ -58,6 +58,8 @@ import admin_holds
 import db
 import relationships_v2
 import rest_rules
+import rp_photos
+import tz_settings
 
 from . import auth, roles
 from .auth import PanelUser
@@ -91,6 +93,10 @@ async def on_startup() -> None:
     # /api/messages падал бы на несуществующей таблице. CREATE IF NOT EXISTS
     # идемпотентен, так что лишним не будет.
     await db.ensure_recent_messages_table()
+    # Панель тоже читает браки (экран участника, /api/member/relationship), и
+    # её могли поднять раньше бота — тогда запрос ушёл бы в колонку expires_at,
+    # которой ещё нет. Миграция идемпотентна.
+    await db.ensure_marriage_module_tables()
 
     if await db.count_panel_users() == 0:
         token = auth.generate_setup_token()
@@ -116,9 +122,17 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # Куки помечены secure — но без HSTS браузер, впервые пришедший по http,
+    # успевает отдать запрос в открытом виде. Funnel всегда https, так что
+    # включаем на год и на поддомены.
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # Панель не должна попадать в чужой browsing context group и не открывает
+    # окон, которым доверяет.
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; "
+        "base-uri 'none'; form-action 'self'; object-src 'none'"
     )
     return response
 
@@ -447,11 +461,19 @@ class PasswordBody(BaseModel):
     password: str
 
 
-def _set_session_cookies(response: Response, user_id: int) -> None:
+def _set_session_cookies(
+    response: Response, user_id: int, password_hash: Optional[str] = None
+) -> None:
+    """Кладёт сессионную и CSRF-куки.
+
+    password_hash — АКТУАЛЬНЫЙ хеш пароля аккаунта: его отпечаток вшивается в
+    сессию, чтобы смена пароля обесценивала все ранее выданные куки (см.
+    auth.session_fingerprint). У аккаунта-участника пароля нет — None.
+    """
     csrf = auth.new_csrf_token()
     # secure=True — Funnel всегда отдаёт https, так что кука не уйдёт по http
     response.set_cookie(
-        auth.SESSION_COOKIE, auth.issue_session(user_id),
+        auth.SESSION_COOKIE, auth.issue_session(user_id, password_hash),
         httponly=True, secure=True, samesite="lax", max_age=auth.SESSION_TTL_SECONDS,
     )
     # CSRF-куку намеренно НЕ делаем httponly: её читает наш же скрипт,
@@ -474,14 +496,15 @@ async def api_setup(body: SetupBody, request: Request):
     if error:
         raise HTTPException(400, error)
 
-    user_id = await db.create_panel_user(
-        body.username, auth.hash_password(body.password), auth.ROLE_OWNER
-    )
+    # Токен гасим ДО создания владельца: иначе два одновременных запроса с одной
+    # ссылкой оба проходили бы проверку и заводили по владельцу.
     auth.clear_setup_token()
+    password_hash = auth.hash_password(body.password)
+    user_id = await db.create_panel_user(body.username, password_hash, auth.ROLE_OWNER)
     await db.add_panel_login_attempt(body.username, auth.client_ip(request), True)
 
     response = JSONResponse({"ok": True, "role": auth.ROLE_OWNER})
-    _set_session_cookies(response, user_id)
+    _set_session_cookies(response, user_id, password_hash)
     return response
 
 
@@ -501,20 +524,26 @@ async def api_login(body: LoginBody, request: Request):
         # иначе панель подсказывала бы, какие логины существуют
         raise HTTPException(401, "Неверный логин или пароль")
 
-    if auth.needs_rehash(row["password_hash"]):
-        await db.set_panel_password(row["id"], auth.hash_password(body.password))
+    password_hash = row["password_hash"]
+    if auth.needs_rehash(password_hash):
+        password_hash = auth.hash_password(body.password)
+        await db.set_panel_password(row["id"], password_hash)
     await db.touch_panel_login(row["id"])
 
     response = JSONResponse({"ok": True, "role": row["role"], "username": row["username"]})
-    _set_session_cookies(response, row["id"])
+    _set_session_cookies(response, row["id"], password_hash)
     return response
 
 
 @app.post("/api/logout")
-async def api_logout():
+async def api_logout(request: Request):
+    # CSRF и на выходе: без него любой сайт мог бы выкидывать вас из панели.
+    auth.verify_csrf(request)
     response = JSONResponse({"ok": True})
-    response.delete_cookie(auth.SESSION_COOKIE)
-    response.delete_cookie(auth.CSRF_COOKIE)
+    # Флаги должны совпадать с теми, с которыми куки ставились, иначе браузер
+    # не сопоставит их с существующими и те останутся жить до истечения срока.
+    response.delete_cookie(auth.SESSION_COOKIE, httponly=True, secure=True, samesite="lax")
+    response.delete_cookie(auth.CSRF_COOKIE, httponly=False, secure=True, samesite="lax")
     return response
 
 
@@ -542,19 +571,38 @@ class MemberLoginBody(BaseModel):
     code: str
 
 
+# Метка входа участника в таблице panel_logins: логина у него нет, а порог
+# перебора считать по чему-то надо. Со скобками — чтобы не столкнуться с
+# настоящим логином (validate_username их не пропускает).
+MEMBER_LOGIN_MARKER = "(код участника)"
+
+
 @app.post("/api/member/login")
 async def api_member_login(body: MemberLoginBody, request: Request):
     """Вход участника по одноразовому коду от бота (см. команду «сайт»). Код
     гасится, аккаунт-участник заводится/находится по Telegram id, выдаётся
-    обычная сессия — дальше участник ходит по member-эндпоинтам (read-only)."""
+    обычная сессия — дальше участник ходит по member-эндпоинтам (read-only).
+
+    Попытки ограничены так же, как обычный вход: код короткий (8 символов) и
+    живёт 10 минут, но без ограничения его перебирали бы сколько угодно раз в
+    секунду — а это единственная дверь в аккаунт участника."""
+    ip = auth.client_ip(request)
+    fails = await db.count_failed_logins_by_ip(
+        MEMBER_LOGIN_MARKER, ip, auth.LOGIN_FAIL_WINDOW_MINUTES
+    )
+    if fails >= auth.LOGIN_FAIL_LIMIT:
+        raise HTTPException(429, "Слишком много попыток. Подождите 15 минут.")
+
     code = (body.code or "").strip().upper()
     if not code:
         raise HTTPException(400, "Введите код")
     link = await db.consume_panel_link_code(code)
     if not link:
+        await db.add_panel_login_attempt(MEMBER_LOGIN_MARKER, ip, False)
         raise HTTPException(
             401, "Код неверный или истёк. Запросите новый: напишите боту в личку «сайт»."
         )
+    await db.add_panel_login_attempt(MEMBER_LOGIN_MARKER, ip, True)
     tg_id = int(link["tg_user_id"])
     full_name = link.get("tg_full_name")
     member = await db.get_panel_member_by_tg(tg_id)
@@ -650,8 +698,14 @@ async def api_change_password(
     error = auth.validate_password(body.password)
     if error:
         raise HTTPException(400, error)
-    await db.set_panel_password(user.id, auth.hash_password(body.password))
-    return {"ok": True}
+    password_hash = auth.hash_password(body.password)
+    await db.set_panel_password(user.id, password_hash)
+    # Смена пароля обесценивает ВСЕ прежние сессии (в том числе чужие, если
+    # куку успели угнать) — поэтому себе тут же выдаём новую, иначе панель
+    # выкинула бы на форму входа сразу после смены пароля.
+    response = JSONResponse({"ok": True})
+    _set_session_cookies(response, user.id, password_hash)
+    return response
 
 
 @app.get("/api/logins")
@@ -1198,6 +1252,10 @@ async def api_word_filter_delete(
 # операции панель поднимает флаг перечитки в bot_data — бот его опрашивает и
 # перечитывает кэши (см. panel_action_reload_loop в bot.py).
 # ---------------------------------------------------------------------------
+
+# Потолок автоочистки команд — тот же, что в боте (CMD_CLEANUP_MAX_MINUTES):
+# Telegram не позволяет боту удалять сообщения старше 48 часов.
+CMD_CLEANUP_MAX_MINUTES = 48 * 60
 
 ACTION_PHRASE_MAX = 512  # длина колонки phrase
 ACTION_KEY_MAX = 64      # длина колонки action_key
@@ -2583,34 +2641,51 @@ async def api_member_propose_marriage(
 # <mf|mm|ff>/ — бот берёт их оттуда (см. relationships_v2._pick_rp_media);
 # менять фото сигнал перечитки не требует (бот читает папку на каждое действие).
 # ---------------------------------------------------------------------------
-RP_MEDIA_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rp_media")
-GESTURE_PAIRINGS = ("mf", "mm", "ff")
+# Хранилище картинок и все пути к нему — в общем модуле rp_photos: раньше
+# панель писала файлы в <репозиторий>/rp_media (папки на диске нет), бот брал
+# ссылки из отдельного словаря, а сами картинки лежали третьим местом. Теперь
+# источник один, и разойтись сторонам нечем.
+RP_MEDIA_ROOT = rp_photos.MEDIA_ROOT
+GESTURE_PAIRINGS = rp_photos.PAIRINGS
 _GESTURE_KEY_RE = re.compile(r"^[a-z0-9_]{1,32}$")
-_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+_PHOTO_EXTS = rp_photos.PHOTO_EXTS
 GESTURE_PHOTO_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _gesture_dir(media_folder: str, pairing: str) -> str:
-    """Каталог фото жеста для пары — с проверкой, что путь не вышел за rp_media
-    (media_folder — наш slug без '/', pairing из белого списка, но проверяем)."""
-    path = os.path.realpath(os.path.join(RP_MEDIA_ROOT, media_folder, pairing))
-    root = os.path.realpath(RP_MEDIA_ROOT)
-    if path != root and not path.startswith(root + os.sep):
+    """Каталог фото жеста для пары; 400, если путь выводит за пределы
+    хранилища (media_folder приходит из БД, доверять ему нельзя)."""
+    path = rp_photos.pairing_dir(media_folder, pairing)
+    if path is None:
         raise HTTPException(400, "Недопустимый путь")
     return path
 
 
 def _gesture_photos(media_folder: str) -> dict:
-    out = {}
-    for pairing in GESTURE_PAIRINGS:
-        directory = os.path.join(RP_MEDIA_ROOT, media_folder, pairing)
-        try:
-            out[pairing] = sorted(
-                f for f in os.listdir(directory) if os.path.splitext(f)[1].lower() in _PHOTO_EXTS
-            )
-        except OSError:
-            out[pairing] = []
-    return out
+    """Имена файлов по парам — для списка жестов в панели."""
+    return {p: rp_photos.list_photos(media_folder, p) for p in GESTURE_PAIRINGS}
+
+
+# ---------------------------------------------------------------------------
+# ПУБЛИЧНАЯ отдача картинок-реакций.
+#
+# Единственная ручка панели без входа — и так и задумано: превью под
+# сообщением рисует сам Telegram, его серверы идут по ссылке из
+# LinkPreviewOptions, и предъявить куку им нечем. Наружу открыто ровно чтение
+# одного файла картинки: имя жеста и пара сверяются с хранилищем, имя файла
+# усекается до basename, расширение — только из белого списка, каталог
+# наружу не перечисляется.
+#
+# Кэш — на год и immutable: имена файлов при загрузке генерируются случайно
+# (secrets.token_hex), поэтому содержимое по конкретной ссылке никогда не
+# меняется, а Telegram и клиенты не ходят за одной картинкой повторно.
+# ---------------------------------------------------------------------------
+@app.get("/rp/{folder}/{pairing}/{filename}")
+async def rp_photo(folder: str, pairing: str, filename: str):
+    path = rp_photos.photo_path(folder, pairing, filename)
+    if path is None:
+        raise HTTPException(404, "Нет такой картинки")
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @app.get("/api/rel-gestures")
@@ -3789,6 +3864,14 @@ ALLOWED_SETTING_KEYS = {
     "rest_cleanup_date": "Рест: дата ближайшей чистки, ДД.ММ.ГГГГ (пусто — не запланирована)",
     "rest_cleanup_block_days": "Рест: за сколько дней до чистки закрыт, дней (0 — выключить)",
     "fake_warns_in_list": "Шуточные варны («&варн») в списке «варны»: 1 — показывать, 0 — копить отдельно",
+    "timezone": (
+        "Часовой пояс показа времени: Europe/Moscow, Москва, +3 (пусто — UTC). "
+        "Влияет только на то, каким время видят люди; хранится и считается всё в UTC"
+    ),
+    "command_cleanup_minutes": (
+        "Автоочистка команд в чате жалоб, минут (0 — выключить, пусто — 15). "
+        f"Максимум {CMD_CLEANUP_MAX_MINUTES}: сообщения старше 48 часов Telegram удалять не даёт"
+    ),
 }
 
 # Настройки-переключатели: принимаем только 1/0, чтобы «да» или «вкл» не легли
@@ -3826,6 +3909,27 @@ def validate_setting(key: str, value: Optional[str]) -> None:
         raw = (value or "").strip()
         if raw and rest_rules.parse_settings_date(raw) is None:
             raise HTTPException(400, "Дата в формате ДД.ММ.ГГГГ, например 01.08.2026. Пусто — чистка не запланирована.")
+    elif key == "timezone":
+        # Разбор общий с чатом (tz_settings), поэтому «Москва» и «+3»
+        # принимаются здесь ровно так же, как командой «часовой пояс».
+        raw = (value or "").strip()
+        if raw and tz_settings.parse_timezone(raw) is None:
+            raise HTTPException(
+                400,
+                "Не понял часовой пояс. Подойдёт название зоны (Europe/Moscow), "
+                "город (Москва, Алматы) или смещение (+3, UTC-5). Пусто — UTC.",
+            )
+    elif key == "command_cleanup_minutes":
+        raw = (value or "").strip()
+        if raw:
+            if not raw.isdigit():
+                raise HTTPException(400, "Нужно целое число минут (0 — выключить, пусто — 15 по умолчанию).")
+            if int(raw) > CMD_CLEANUP_MAX_MINUTES:
+                raise HTTPException(
+                    400,
+                    f"Максимум {CMD_CLEANUP_MAX_MINUTES} мин.: Telegram не даёт ботам "
+                    "удалять сообщения старше 48 часов.",
+                )
 
 
 @app.get("/api/settings")
@@ -3862,8 +3966,21 @@ async def api_set_setting(
     if body.key not in ALLOWED_SETTING_KEYS:
         raise HTTPException(400, "Эту настройку через панель менять нельзя")
     validate_setting(body.key, body.value)
-    await db.save_setting(body.key, body.value)
+
+    value = body.value
+    if body.key == "timezone":
+        # В базу кладём канонический ключ зоны, а не то, что набрал человек:
+        # бот читает колонку напрямую, и «Москва» он бы не понял.
+        raw = (value or "").strip()
+        value = tz_settings.parse_timezone(raw) if raw else None
+
+    await db.save_setting(body.key, value)
     await db.add_log("panel_setting", details=f"{user.username}: {body.key}")
+    # Бот держит настройки в памяти и о правке из другого процесса сам не
+    # узнает — поднимаем тот же флаг перечитки, что и правки РП (см.
+    # panel_action_reload_loop в bot.py). Без него смена часового пояса или
+    # автоочистки применялась бы только после перезапуска бота.
+    await _signal_action_reload()
     return {"ok": True}
 
 

@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 # relationships_v2 поднимает Router на настоящем aiogram (F/Router/FSInputFile).
@@ -35,36 +33,63 @@ def test_папка_пары_по_полу():
     assert rel._rp_pairing(None, None) == "mf"
 
 
-def test_нет_картинок_вернёт_none(monkeypatch, tmp_path):
-    # пустая папка — картинок нет, ожидаем None (тогда жест выводится текстом)
-    monkeypatch.setattr(rel, "RP_MEDIA_ROOT", str(tmp_path))
-    assert rel._pick_rp_media("hugs", "м", "ж") is None
+# Картинки-реакции берутся из ДВУХ источников, и порядок важен: сначала свои
+# файлы из хранилища (rp_photos), и только если их нет — старый словарь PHOTOS
+# со ссылками на сторонние сайты. Тесты ниже про ВТОРОЙ источник, поэтому
+# хранилище им подменяется на заведомо пустую папку.
 
 
-def test_берёт_картинку_из_точной_папки(monkeypatch, tmp_path):
-    monkeypatch.setattr(rel, "RP_MEDIA_ROOT", str(tmp_path))
-    d = tmp_path / "hugs" / "mm"
-    d.mkdir(parents=True)
-    (d / "pic.jpg").write_bytes(b"fake")
-    picked = rel._pick_rp_media("hugs", "м", "м")
-    assert picked is not None and picked.endswith("pic.jpg")
-    assert os.path.dirname(picked).endswith(os.path.join("hugs", "mm"))
+@pytest.fixture(autouse=True)
+def _empty_store(tmp_path, monkeypatch):
+    """Пустое хранилище: иначе сработал бы первый источник (свои файлы), и
+    откат на PHOTOS в этих тестах просто не проверялся бы."""
+    import rp_photos
+    monkeypatch.setattr(rp_photos, "MEDIA_ROOT", str(tmp_path))
 
 
-def test_откат_на_другую_пару(monkeypatch, tmp_path):
-    # для точной пары (mm) картинок нет, но есть в mf — должны взять оттуда
-    monkeypatch.setattr(rel, "RP_MEDIA_ROOT", str(tmp_path))
-    d = tmp_path / "kisses" / "mf"
-    d.mkdir(parents=True)
-    (d / "a.png").write_bytes(b"fake")
-    picked = rel._pick_rp_media("kisses", "м", "м")
-    assert picked is not None and picked.endswith("a.png")
+
+def test_нет_ссылок_вернёт_none(monkeypatch):
+    """Пустой жест → None: тогда фраза уходит без превью, а не с битой ссылкой."""
+    monkeypatch.setitem(rel.PHOTOS, "hugs", {"mf": [], "mm": [], "ff": []})
+    assert rel._pick_rp_photo_url("hugs", "м", "ж") is None
 
 
-def test_несуществующая_папка_вернёт_none(monkeypatch, tmp_path):
-    monkeypatch.setattr(rel, "RP_MEDIA_ROOT", str(tmp_path))
-    assert rel._pick_rp_media("несуществующее", "м", "ж") is None
-    assert rel._pick_rp_media(None, "м", "ж") is None
+def test_берёт_ссылку_из_точной_пары(monkeypatch):
+    monkeypatch.setitem(rel.PHOTOS, "hugs", {
+        "mm": ["https://example.org/mm.jpg"],
+        "mf": ["https://example.org/mf.jpg"],
+    })
+    assert rel._pick_rp_photo_url("hugs", "м", "м") == "https://example.org/mm.jpg"
+
+
+def test_откат_на_другую_пару(monkeypatch):
+    """Для точной пары ссылок нет, но есть у соседней — берём оттуда."""
+    monkeypatch.setitem(rel.PHOTOS, "kisses", {"mf": ["https://example.org/a.png"]})
+    assert rel._pick_rp_photo_url("kisses", "м", "м") == "https://example.org/a.png"
+
+
+def test_незаполненные_заглушки_не_считаются_картинками(monkeypatch):
+    """В PHOTOS часть пар ещё не заполнена: там стоят «link1»/«link2»/«».
+
+    Такую строку нельзя отдавать Telegram как ссылку, и — что важнее — она не
+    должна мешать откату: непустой список из заглушек раньше «выигрывал» у
+    соседней пары с настоящими картинками, и фото не появлялось никогда.
+    """
+    monkeypatch.setitem(rel.PHOTOS, "bites", {
+        "mm": ["link1", "link2", ""],
+        "mf": ["https://example.org/real.jpg"],
+    })
+    assert rel._pick_rp_photo_url("bites", "м", "м") == "https://example.org/real.jpg"
+
+
+def test_только_заглушки_дают_none(monkeypatch):
+    monkeypatch.setitem(rel.PHOTOS, "smacks", {"mf": ["link1"], "mm": [""], "ff": []})
+    assert rel._pick_rp_photo_url("smacks", "м", "ж") is None
+
+
+def test_несуществующий_жест_вернёт_none():
+    assert rel._pick_rp_photo_url("несуществующее", "м", "ж") is None
+    assert rel._pick_rp_photo_url(None, "м", "ж") is None
 
 
 def test_ответные_шаблоны_форматируются():

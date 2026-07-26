@@ -147,6 +147,9 @@ _ALLOWED_SETTING_FIELDS = {
     # разыгранного; колонка добавляется миграцией ensure_fake_warn_column()
     "fake_warns_in_list",
     "command_cleanup_minutes",
+    # Часовой пояс ПОКАЗА времени (внутри всё по-прежнему в UTC), колонка
+    # добавляется миграцией ensure_timezone_column()
+    "timezone",
 }
 
 
@@ -218,6 +221,16 @@ async def ensure_fake_warn_column() -> None:
     настоящие варны, а модератор смотрит обманные командой «&варны».
     """
     await _add_column_if_missing("settings", "fake_warns_in_list", "TINYINT NULL")
+
+async def ensure_timezone_column() -> None:
+    """Колонка settings.timezone — часовой пояс ПОКАЗА времени.
+
+    NULL = UTC, как было до появления настройки. Хранение и все расчёты
+    остаются в UTC: колонка влияет только на то, каким время видит человек
+    (см. fmt_dt/to_local в bot.py).
+    """
+    await _add_column_if_missing("settings", "timezone", "VARCHAR(64) NULL")
+
 
 async def ensure_command_cleanup_column() -> None:
     """Настройка автоочистки команд в чате жалоб/настроек (см. cmd_cleanup_minutes()
@@ -539,16 +552,88 @@ async def mark_request_decided(anchor_message_id: int, status: str, decided_by: 
 # ----------------------------------------------------------------------------
 # Браки (привязаны к чату)
 # ----------------------------------------------------------------------------
+async def ensure_marriage_module_tables() -> None:
+    """20-й модуль «Браки»: срок действия брака и настройки браков в чате.
+
+    Сама таблица marriages есть в schema.sql, но миграция обязана работать и на
+    базе, поднятой раньше этого модуля, — поэтому создаём её здесь тоже
+    (идемпотентно), а затем добираем новую колонку.
+
+    ВРЕМЯ. married_at пишется через CURRENT_TIMESTAMP (часовой пояс сессии
+    MySQL), поэтому и срок брака считается тем же NOW(), а не UTC_TIMESTAMP():
+    смешивать две шкалы в одной таблице — верный способ получить брак, который
+    «истёк» на три часа раньше, чем показан в чате.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS marriages ("
+        "id BIGINT AUTO_INCREMENT PRIMARY KEY, "
+        "chat_id BIGINT NOT NULL, "
+        "user1_id BIGINT NOT NULL, "
+        "user2_id BIGINT NOT NULL, "
+        "married_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "UNIQUE KEY uniq_pair (chat_id, user1_id, user2_id), "
+        "INDEX idx_marriage_user1 (chat_id, user1_id), "
+        "INDEX idx_marriage_user2 (chat_id, user2_id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    # NULL = бессрочный брак. Именно NULL, а не «дата в далёком будущем»: все
+    # уже существующие браки обязаны остаться бессрочными, иначе включение
+    # модуля разом развело бы весь чат.
+    await _add_column_if_missing("marriages", "expires_at", "DATETIME NULL")
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS marriage_settings ("
+        "chat_id BIGINT PRIMARY KEY, "
+        "renew_price INT NOT NULL DEFAULT 500, "
+        "divorce_mode VARCHAR(16) NOT NULL DEFAULT 'off', "
+        "rating_enabled BOOL NOT NULL DEFAULT TRUE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+MARRIAGE_DEFAULT_SETTINGS = {"renew_price": 500, "divorce_mode": "off", "rating_enabled": True}
+
+
+async def get_marriage_settings(chat_id: int) -> dict:
+    """Настройки браков чата; для чата без своей строки — значения по умолчанию."""
+    row = await _fetchone(
+        "SELECT renew_price, divorce_mode, rating_enabled FROM marriage_settings "
+        "WHERE chat_id = %s",
+        (chat_id,),
+    )
+    if not row:
+        return dict(MARRIAGE_DEFAULT_SETTINGS)
+    return {
+        "renew_price": int(row["renew_price"]),
+        "divorce_mode": str(row["divorce_mode"]),
+        "rating_enabled": bool(row["rating_enabled"]),
+    }
+
+
+async def set_marriage_setting(chat_id: int, field: str, value) -> None:
+    if field not in MARRIAGE_DEFAULT_SETTINGS:
+        raise ValueError(f"Недопустимая настройка браков: {field}")
+    await _execute(
+        f"INSERT INTO marriage_settings (chat_id, {field}) VALUES (%s, %s) "
+        f"ON DUPLICATE KEY UPDATE {field} = VALUES({field})",
+        (chat_id, value),
+    )
+
+
 async def get_marriage(chat_id: int, user_id: int) -> Optional[dict]:
     row = await _fetchone(
-        "SELECT id, user1_id, user2_id, married_at FROM marriages "
+        "SELECT id, user1_id, user2_id, married_at, expires_at FROM marriages "
         "WHERE chat_id = %s AND (user1_id = %s OR user2_id = %s) LIMIT 1",
         (chat_id, user_id, user_id),
     )
     if row is None:
         return None
     partner_id = row["user2_id"] if row["user1_id"] == user_id else row["user1_id"]
-    return {"partner_id": partner_id, "married_at": row["married_at"]}
+    return {
+        "id": row["id"],
+        "partner_id": partner_id,
+        "married_at": row["married_at"],
+        "expires_at": row.get("expires_at"),
+    }
 
 
 async def list_marriages(chat_id: int, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
@@ -598,6 +683,81 @@ async def delete_marriage(chat_id: int, user_id: int) -> bool:
         (chat_id, user_id, user_id),
     )
     return rowcount > 0
+
+
+async def extend_marriage(chat_id: int, user_id: int, days: int) -> Optional[datetime]:
+    """Продлевает брак на days суток; возвращает новую дату окончания.
+
+    Считаем от МАКСИМУМА из «сейчас» и текущего срока: продление за день до
+    конца должно прибавлять дни к остатку, а не обнулять его. У бессрочного
+    брака (expires_at IS NULL) срок появляется впервые — от «сейчас».
+    """
+    updated = await _execute(
+        "UPDATE marriages SET expires_at = "
+        "  DATE_ADD(GREATEST(COALESCE(expires_at, NOW()), NOW()), INTERVAL %s DAY) "
+        "WHERE chat_id = %s AND (user1_id = %s OR user2_id = %s)",
+        (days, chat_id, user_id, user_id),
+    )
+    if not updated:
+        return None
+    row = await _fetchone(
+        "SELECT expires_at FROM marriages WHERE chat_id = %s AND (user1_id = %s OR user2_id = %s)",
+        (chat_id, user_id, user_id),
+    )
+    return row["expires_at"] if row else None
+
+
+async def reset_marriages(chat_id: int) -> int:
+    """«!Сброс браков» — снимает ВСЕ браки чата. Возвращает, сколько снято."""
+    return await _execute("DELETE FROM marriages WHERE chat_id = %s", (chat_id,))
+
+
+async def list_marriages_with_departed(chat_id: int) -> list[dict]:
+    """Браки, где хотя бы один из супругов уже не числится в чате.
+
+    «В чате» = есть строка в current_users: её ведёт сам бот по входам/выходам,
+    отдельного запроса в Telegram на каждую пару не требуется.
+    """
+    return await _fetchall(
+        "SELECT m.id, m.user1_id, m.user2_id, m.married_at FROM marriages m "
+        "WHERE m.chat_id = %s AND ("
+        "  NOT EXISTS (SELECT 1 FROM current_users c "
+        "              WHERE c.chat_id = m.chat_id AND c.user_id = m.user1_id) "
+        "  OR NOT EXISTS (SELECT 1 FROM current_users c "
+        "                 WHERE c.chat_id = m.chat_id AND c.user_id = m.user2_id))",
+        (chat_id,),
+    )
+
+
+async def delete_marriages_by_ids(ids: list[int]) -> int:
+    if not ids:
+        return 0
+    placeholders = ", ".join(["%s"] * len(ids))
+    return await _execute(f"DELETE FROM marriages WHERE id IN ({placeholders})", tuple(ids))
+
+
+async def list_marriage_top(chat_id: int, limit: int = 10) -> list[dict]:
+    """Топ самых долгих браков чата: чем раньше поженились, тем выше."""
+    return await _fetchall(
+        "SELECT user1_id, user2_id, married_at, expires_at FROM marriages "
+        "WHERE chat_id = %s ORDER BY married_at ASC, id ASC LIMIT %s",
+        (chat_id, limit),
+    )
+
+
+async def list_expired_marriages(limit: int = 200) -> list[dict]:
+    """Просроченные браки в чатах, где включён авторазвод, — для фоновой задачи.
+
+    Режим хранится в marriage_settings; чат без своей строки живёт с дефолтом
+    'off', поэтому JOIN здесь обычный, а не LEFT: нет строки — нет авторазвода.
+    """
+    return await _fetchall(
+        "SELECT m.id, m.chat_id, m.user1_id, m.user2_id, m.expires_at FROM marriages m "
+        "JOIN marriage_settings s ON s.chat_id = m.chat_id "
+        "WHERE s.divorce_mode = 'auto' AND m.expires_at IS NOT NULL AND m.expires_at <= NOW() "
+        "ORDER BY m.expires_at ASC LIMIT %s",
+        (limit,),
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -1000,27 +1160,12 @@ async def list_birthdays_for_day(day: int, month: int) -> list[dict]:
         (day, month),
     )
 
-async def set_birthday(user_id: int, day: int, month: int, year: Optional[int] = None) -> None:
-    await _execute(
-        "INSERT INTO user_birthdays (user_id, birth_day, birth_month, birth_year) "
-        "VALUES (%s, %s, %s, %s) "
-        "ON DUPLICATE KEY UPDATE birth_day=VALUES(birth_day), birth_month=VALUES(birth_month), birth_year=VALUES(birth_year)",
-        (user_id, day, month, year),
-    )
+# Здесь лежала вторая, дословная копия set_birthday/get_birthday/
+# list_birthdays_for_day. Питон оставлял в модуле только её, а первая (вместе
+# с clear_birthday между ними) была мёртвой — правка «верхней» копии не дала
+# бы никакого эффекта. Копия удалена, рабочими остались функции выше.
 
 
-async def get_birthday(user_id: int) -> Optional[dict]:
-    return await _fetchone(
-        "SELECT birth_day, birth_month, birth_year FROM user_birthdays WHERE user_id = %s",
-        (user_id,),
-    )
-
-
-async def list_birthdays_for_day(day: int, month: int) -> list[dict]:
-    return await _fetchall(
-        "SELECT user_id, birth_year FROM user_birthdays WHERE birth_day = %s AND birth_month = %s",
-        (day, month),
-    )
 # ----------------------------------------------------------------------------
 # Муты (привязаны к чату)
 # ----------------------------------------------------------------------------
@@ -2006,12 +2151,17 @@ async def list_active_chat_ids() -> list[int]:
     """Список всех chat_id, по которым в message_stats вообще есть данные
     (используется, чтобы пройтись циклом ежедневной награды по всем чатам,
     где бот считает статистику)."""
-    pool = await get_pool()  # или как называется у вас доступ к пулу — тот же, что в list_top_messages_period
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT DISTINCT chat_id FROM message_stats")
-            rows = await cur.fetchall()
-            return [r[0] for r in rows]
+    # Раньше здесь стоял `pool = await get_pool()` — функции с таким именем в
+    # модуле нет и никогда не было. Из-за этого list_active_chat_ids падала
+    # NameError, а вместе с ней молча не работала ЕЖЕДНЕВНАЯ НАГРАДА ЗА ТОП:
+    # daily_top_reward_loop получал исключение на первом же шаге, ловил его
+    # своим `except Exception` и просто писал в лог — ни один чат не получал
+    # начислений ни разу.
+    #
+    # Заодно переведено на общий _fetchall вместо ручной работы с курсором:
+    # тот сам берёт пул и DictCursor, как весь остальной модуль.
+    rows = await _fetchall("SELECT DISTINCT chat_id FROM message_stats")
+    return [int(r["chat_id"]) for r in rows]
         
 
 
@@ -2309,8 +2459,16 @@ async def add_cleanup_entry(chat_id: int, message_id: int, delete_at) -> None:
 
 
 async def list_due_cleanup_entries(now, limit: int = 200) -> list[dict]:
+    """Просроченные записи — СТАРЫЕ ПЕРВЫМИ.
+
+    Без ORDER BY сервер отдавал произвольные limit строк: при завале очереди
+    (больше limit просроченных) одни и те же поздние записи могли выбираться
+    круг за кругом, а самые старые сообщения висели в чате часами. Порядок
+    делает выборку честной очередью.
+    """
     return await _fetchall(
-        "SELECT id, chat_id, message_id FROM cmd_cleanup_queue WHERE delete_at <= %s LIMIT %s",
+        "SELECT id, chat_id, message_id FROM cmd_cleanup_queue "
+        "WHERE delete_at <= %s ORDER BY delete_at ASC, id ASC LIMIT %s",
         (now, limit),
     )
 
@@ -6379,6 +6537,158 @@ async def ensure_economy_tables() -> None:
     )
 
 
+async def ensure_fishing_tables() -> None:
+    """🎣 Рыбалка — второй (после фермы) способ заработка i¢.
+
+    Хранит и кулдаун, и рекорд: рекорд нужен для «топ уловов», а без него
+    рыбалка была бы просто фермой с другим текстом.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS fishing_stats ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "last_fish_at DATETIME NULL, "
+        "total_catches INT NOT NULL DEFAULT 0, "
+        "best_catch INT NOT NULL DEFAULT 0, "
+        "best_catch_name VARCHAR(64) NULL, "
+        "PRIMARY KEY (chat_id, user_id), "
+        "INDEX idx_fishing_best (chat_id, best_catch DESC)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def get_fishing_stats(chat_id: int, user_id: int) -> dict:
+    row = await _fetchone(
+        "SELECT last_fish_at, total_catches, best_catch, best_catch_name "
+        "FROM fishing_stats WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    if row:
+        return row
+    return {"last_fish_at": None, "total_catches": 0, "best_catch": 0, "best_catch_name": None}
+
+
+async def record_catch(
+    chat_id: int, user_id: int, amount: int, catch_name: str, now: datetime
+) -> dict:
+    """Записывает улов и возвращает обновлённую статистику.
+
+    Рекорд обновляется через GREATEST/CASE прямо в запросе: два одновременных
+    заброса не должны затирать рекорд друг друга.
+    """
+    await _execute(
+        "INSERT INTO fishing_stats (chat_id, user_id, last_fish_at, total_catches, "
+        "                           best_catch, best_catch_name) "
+        "VALUES (%s, %s, %s, 1, %s, %s) "
+        "ON DUPLICATE KEY UPDATE "
+        "  last_fish_at = VALUES(last_fish_at), "
+        "  total_catches = total_catches + 1, "
+        "  best_catch_name = CASE WHEN VALUES(best_catch) > best_catch "
+        "                         THEN VALUES(best_catch_name) ELSE best_catch_name END, "
+        "  best_catch = GREATEST(best_catch, VALUES(best_catch))",
+        (chat_id, user_id, now, amount, catch_name),
+    )
+    return await get_fishing_stats(chat_id, user_id)
+
+
+async def list_fishing_top(chat_id: int, limit: int = 10) -> list[dict]:
+    return await _fetchall(
+        "SELECT user_id, best_catch, best_catch_name, total_catches FROM fishing_stats "
+        "WHERE chat_id = %s AND best_catch > 0 "
+        "ORDER BY best_catch DESC, total_catches DESC LIMIT %s",
+        (chat_id, limit),
+    )
+
+
+async def ensure_treasure_tables() -> None:
+    """💎 Клад — общий на чат «джекпот»: каждая неудачная попытка его растит,
+    нашедший забирает всё. Строка на чат + личные кулдауны копающих.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS chat_treasure ("
+        "chat_id BIGINT NOT NULL PRIMARY KEY, "
+        "pot BIGINT NOT NULL DEFAULT 0, "
+        "attempts INT NOT NULL DEFAULT 0, "
+        "started_at DATETIME NOT NULL"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS treasure_diggers ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "last_dig_at DATETIME NULL, "
+        "finds INT NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (chat_id, user_id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def get_treasure(chat_id: int, seed_pot: int, now: datetime) -> dict:
+    """Текущий клад чата; если его ещё нет — закапывает новый с seed_pot."""
+    row = await _fetchone(
+        "SELECT pot, attempts, started_at FROM chat_treasure WHERE chat_id = %s", (chat_id,)
+    )
+    if row:
+        return row
+    await _execute(
+        "INSERT IGNORE INTO chat_treasure (chat_id, pot, attempts, started_at) "
+        "VALUES (%s, %s, 0, %s)",
+        (chat_id, seed_pot, now),
+    )
+    return {"pot": seed_pot, "attempts": 0, "started_at": now}
+
+
+async def get_digger(chat_id: int, user_id: int) -> dict:
+    row = await _fetchone(
+        "SELECT last_dig_at, finds FROM treasure_diggers WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    return row or {"last_dig_at": None, "finds": 0}
+
+
+async def record_dig(chat_id: int, user_id: int, now: datetime, found: bool) -> None:
+    await _execute(
+        "INSERT INTO treasure_diggers (chat_id, user_id, last_dig_at, finds) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE last_dig_at = VALUES(last_dig_at), finds = finds + VALUES(finds)",
+        (chat_id, user_id, now, 1 if found else 0),
+    )
+
+
+async def grow_treasure(chat_id: int, amount: int) -> None:
+    await _execute(
+        "UPDATE chat_treasure SET pot = pot + %s, attempts = attempts + 1 WHERE chat_id = %s",
+        (amount, chat_id),
+    )
+
+
+async def claim_treasure(chat_id: int, seed_pot: int, now: datetime) -> Optional[int]:
+    """Отдаёт клад нашедшему и закапывает новый. Возвращает выигранную сумму
+    либо None, если клад уже забрал кто-то другой прямо сейчас.
+
+    Забираем условием «pot = тот же, что мы видели»: без этого два счастливчика
+    в одну секунду получили бы каждый по полному банку.
+    """
+    row = await _fetchone("SELECT pot FROM chat_treasure WHERE chat_id = %s", (chat_id,))
+    if not row:
+        return None
+    pot = int(row["pot"])
+    updated = await _execute(
+        "UPDATE chat_treasure SET pot = %s, attempts = 0, started_at = %s "
+        "WHERE chat_id = %s AND pot = %s",
+        (seed_pot, now, chat_id, pot),
+    )
+    return pot if updated else None
+
+
+async def list_treasure_finders(chat_id: int, limit: int = 10) -> list[dict]:
+    return await _fetchall(
+        "SELECT user_id, finds FROM treasure_diggers WHERE chat_id = %s AND finds > 0 "
+        "ORDER BY finds DESC LIMIT %s",
+        (chat_id, limit),
+    )
+
+
 async def get_wallet(chat_id: int, user_id: int) -> dict:
     row = await _fetchone(
         "SELECT chat_id, user_id, coins, star_level, total_farms, last_farm_at "
@@ -7212,6 +7522,25 @@ async def touch_panel_login(user_id: int) -> None:
     await _execute(
         "UPDATE panel_users SET last_login_at = NOW() WHERE id = %s", (user_id,)
     )
+
+
+async def count_failed_logins_by_ip(username: str, ip: Optional[str], minutes: int) -> int:
+    """Неудачные попытки конкретного вида входа с ОДНОГО адреса.
+
+    Отдельно от count_failed_logins: там условие «логин ИЛИ адрес», и для входа
+    участника (у которого вместо логина одна и та же служебная метка) это
+    означало бы общий счётчик на всех — один перебирающий закрывал бы вход
+    всему чату. Здесь порог считается строго по адресу нарушителя.
+    """
+    if not ip:
+        return 0
+    row = await _fetchone(
+        "SELECT COUNT(*) AS total FROM panel_logins "
+        "WHERE success = FALSE AND username = %s AND ip = %s "
+        "AND created_at >= DATE_SUB(NOW(), INTERVAL %s MINUTE)",
+        (username, ip, minutes),
+    )
+    return int(row["total"]) if row else 0
 
 
 async def add_panel_login_attempt(username: str, ip: Optional[str], success: bool) -> None:

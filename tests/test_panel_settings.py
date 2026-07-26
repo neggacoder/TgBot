@@ -35,6 +35,13 @@ def panel_client(monkeypatch):
     async def list_command_levels():
         return []
 
+    async def set_data(*args, **kwargs):
+        # После сохранения настройки панель поднимает флаг перечитки, чтобы бот
+        # (отдельный процесс) увидел правку без перезапуска — см.
+        # _signal_action_reload в webpanel/app.py.
+        return None
+
+    monkeypatch.setattr(db, "set_data", set_data)
     monkeypatch.setattr(db, "list_command_levels", list_command_levels)
     monkeypatch.setattr(db, "save_setting", save_setting)
     monkeypatch.setattr(db, "fetch_settings", fetch_settings)

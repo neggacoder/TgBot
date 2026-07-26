@@ -457,4 +457,111 @@ def test_наградить_выдаёт_награду(monkeypatch):
 
     assert given.get("uid") == 999 and given.get("degree") == 5
     assert given.get("reason") == "За помощь новичкам"
-    assert any("Награда выдана" in r for r in replies)
+    # текст ответа менялся: сейчас это «<эмодзи><степень> Награда X вручена»
+    assert any("Награда" in r and "вручена" in r for r in replies), replies
+
+
+# ---------------------------------------------------------------------------
+# 20-й модуль «Браки»: подкоманды слова «Брак» не должны съедаться
+# предложением руки и сердца, а сами команды — доходить до своих обработчиков
+# ---------------------------------------------------------------------------
+
+def test_предложение_брака_доходит():
+    assert "propose_marriage" in handlers_for(message(text="брак @someone"))
+
+
+@pytest.mark.parametrize("text,handler", [
+    ("брак да", "cmd_marriage_yes"),
+    ("Брак нет", "cmd_marriage_no"),
+    ("брак продлить 7", "cmd_marriage_extend"),
+    ("брак цена продления 500", "cmd_marriage_renew_price"),
+    ("брак режим развода авто", "cmd_marriage_divorce_mode"),
+])
+def test_подкоманды_брака_идут_в_свои_обработчики(text, handler):
+    taken = handlers_for(message(text=text))
+    assert handler in taken
+    # самое важное: предложение руки и сердца их НЕ перехватывает
+    assert "propose_marriage" not in taken, f"«{text}» ушло в предложение брака"
+
+
+@pytest.mark.parametrize("text,handler", [
+    ("мой брак", "cmd_my_marriage"),
+    ("твой брак @someone", "cmd_their_marriage"),
+    ("браки 3", "cmd_marriages_page"),
+    ("топ браков", "cmd_marriage_top"),
+    ("развести пару @a @b", "cmd_divorce_pair"),
+    ("развести вышедших", "cmd_divorce_departed"),
+    ("!сброс браков", "cmd_marriages_reset"),
+    ("+брак рейтинг", "cmd_marriage_rating_toggle"),
+    ("-брак рейтинг", "cmd_marriage_rating_toggle"),
+])
+def test_команды_модуля_браков_доходят(text, handler):
+    assert handler in handlers_for(message(text=text))
+
+
+def test_развод_принимает_оба_написания():
+    assert "cmd_divorce" in handlers_for(message(text=".развод"))
+    assert "cmd_divorce" in handlers_for(message(text="!развод"))
+
+
+def test_топ_браков_не_перехватывается_статистикой():
+    """«топ …» ловит общий обработчик статистики — «топ браков» обязан быть
+    исключением, иначе рейтинг браков недостижим."""
+    taken = handlers_for(message(text="топ браков"))
+    assert "cmd_stat_period" not in taken
+
+
+def test_браки_без_номера_остаются_на_старом_обработчике():
+    taken = handlers_for(message(text="браки"))
+    assert "cmd_marriages" in taken
+    assert "cmd_marriages_page" not in taken
+
+
+# ---------------------------------------------------------------------------
+# Новые способы заработка: рыбалка и клад
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["рыбалка", "Рыбачить", "удочка", "рыбка"])
+def test_рыбалка_доходит_по_всем_синонимам(text):
+    assert "cmd_fishing" in handlers_for(message(text=text))
+
+
+def test_топ_уловов_не_перехватывается_статистикой():
+    taken = handlers_for(message(text="топ уловов"))
+    assert "cmd_fishing_top" in taken
+    assert "cmd_stat_period" not in taken
+
+
+@pytest.mark.parametrize("text", ["клад", "копать"])
+def test_клад_доходит(text):
+    assert "cmd_treasure_dig" in handlers_for(message(text=text))
+
+
+def test_клад_инфа_отдельная_команда():
+    taken = handlers_for(message(text="клад инфа"))
+    assert "cmd_treasure_info" in taken
+    assert "cmd_treasure_dig" not in taken
+
+
+def test_упоминание_клада_в_разговоре_не_триггерит_команду():
+    assert "cmd_treasure_dig" not in handlers_for(message(text="вчера нашли клад в лесу"))
+
+
+def test_предложить_клад_остаётся_совместным_занятием():
+    """«клад» есть и среди синонимов «предложить …» — новая команда не должна
+    его перехватывать: у них разные первые слова."""
+    taken = handlers_for(message(text="предложить клад @someone"))
+    assert "cmd_treasure_dig" not in taken
+
+
+# ---------------------------------------------------------------------------
+# Часовой пояс
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["время", "часовой пояс", "часовой пояс Москва", "часовой пояс +3"])
+def test_команда_часового_пояса_доходит(text):
+    assert "cmd_timezone" in handlers_for(message(text=text))
+
+
+def test_слово_время_внутри_фразы_не_триггерит():
+    assert "cmd_timezone" not in handlers_for(message(text="сколько сейчас время"))
