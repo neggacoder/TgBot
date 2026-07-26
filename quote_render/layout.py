@@ -38,12 +38,25 @@ def _radii(position: str) -> tuple:
 
 
 def _initials(name: str) -> str:
+    """Одна-две буквы для кружка аватара.
+
+    Берутся именно БУКВЫ: в именах сплошь и рядом стоят эмодзи и значки
+    («🔥Мария», «·Асель·»), а шрифт аватара их не знает и рисует пустой
+    квадрат. Раньше так и выходило — кружок с notdef вместо инициала.
+    Рисовать эмодзи картинкой здесь не стоит: в Telegram аватар-заглушка
+    всегда буквенная.
+    """
     parts = [p for p in name.split() if p]
-    if not parts:
-        return "?"
-    if len(parts) == 1:
-        return parts[0][0].upper()
-    return (parts[0][0] + parts[1][0]).upper()
+    letters = [next((ch for ch in p if ch.isalpha()), "") for p in parts]
+    letters = [ch for ch in letters if ch]
+    if not letters:
+        # Совсем без букв (имя из одних эмодзи/цифр) — берём первый видимый
+        # символ, если он вообще рисуется, иначе честный вопросительный знак.
+        first = next((ch for ch in name if not ch.isspace()), "")
+        return first.upper() if first.isprintable() and first.isalnum() else "?"
+    if len(letters) == 1:
+        return letters[0].upper()
+    return (letters[0] + letters[1]).upper()
 
 
 def _avatar(msg, size: int) -> Image.Image:

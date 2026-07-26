@@ -439,6 +439,10 @@ def test_наградить_выдаёт_награду(monkeypatch):
     monkeypatch.setattr(bot_module.db, "add_reward", add_reward)
     monkeypatch.setattr(bot_module.db, "add_log", _noop)
     monkeypatch.setattr(bot_module, "display_name", display_name)
+    # Вместе с наградой в инвентарь кладётся трофей (см. shop_effects) —
+    # здесь проверяется сама команда, поэтому магазин и инвентарь молчат.
+    monkeypatch.setattr(bot_module.db, "seed_extra_shop_items", _noop, raising=False)
+    monkeypatch.setattr(bot_module.db, "add_inventory_item", _noop, raising=False)
 
     target = User(id=999, is_bot=False, first_name="Цель")
     replied = Message(message_id=2, date=datetime.now(), chat=Chat(id=CHAT_ID, type="supergroup"),
@@ -530,6 +534,27 @@ def test_топ_уловов_не_перехватывается_статист�
     taken = handlers_for(message(text="топ уловов"))
     assert "cmd_fishing_top" in taken
     assert "cmd_stat_period" not in taken
+
+
+# ---------------------------------------------------------------------------
+# Топ по стрикам — листаемый рейтинг, отдельный от общей статистики
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["топ стриков", "топ по стрику", "топ стрик", "ТОП СТРИКОВ"])
+def test_топ_стриков_не_перехватывается_статистикой(text):
+    """«топ стриков» подходил под фильтр и cmd_streak_top, и cmd_stat_period,
+    и доставался тому, кто зарегистрирован раньше в файле. Работало по
+    случайности порядка строк: перенос обработчика молча увёл бы команду
+    в общую статистику, где никакого рейтинга стриков нет."""
+    taken = handlers_for(message(text=text))
+    assert "cmd_streak_top" in taken
+    assert "cmd_stat_period" not in taken
+
+
+@pytest.mark.parametrize("text", ["топ 20", "стата за неделю", "стата неделя"])
+def test_обычная_статистика_за_период_не_задета(text):
+    """Обратная сторона той же правки: исключать надо ровно стрики."""
+    assert "cmd_stat_period" in handlers_for(message(text=text))
 
 
 @pytest.mark.parametrize("text", ["клад", "копать"])

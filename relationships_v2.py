@@ -4164,45 +4164,15 @@ async def load_gestures() -> None:
 # пуста — жест выводится текстом.
 # Ссылки на картинки-реакции к жестам, по папке жеста (media_folder у gesture)
 # и по полу пары: "ff" (обе девушки), "mm" (оба парня), "mf" (смешанная/по
-# умолчанию). Ключи верхнего уровня — те же media_folder, что и раньше у
-# файловых жестов (hugs, kisses, bites, spanks, smacks, minet, kuni).
-PHOTOS: dict[str, dict[str, list[str]]] = {
-    "hugs": {
-        "ff": ["https://i.pinimg.com/736x/e6/b1/33/e6b13302ba093f6dcabc4de9b54afce0.jpg", "https://i.pinimg.com/736x/40/34/49/403449f08ed9101f81f13f03a7ed7338.jpg"],
-        "mf": ["https://i.pinimg.com/736x/a9/2c/28/a92c28b1f7d8d16944bd1e5ded0b8931.jpg","https://i.pinimg.com/originals/03/9d/46/039d46d4805e425d481259c77d183c59.jpg", "https://i.pinimg.com/1200x/4e/69/fc/4e69fc56b54a5a13a740630c5bbfaaf0.jpg"],
-        "mm": ["link1", "link2"],
-    },
-    "kisses": {
-        "ff": ["https://i.pinimg.com/736x/1f/84/ac/1f84ac36990c15125fbb3c03fd4ae198.jpg", "https://i.pinimg.com/736x/1d/3b/96/1d3b96d8f087aaed48912cb2d689436d.jpg"],
-        "mf": ["https://i.pinimg.com/736x/38/44/98/384498e6dd3a1de16b94de2ed9f0851a.jpg", "https://i.pinimg.com/736x/97/d1/61/97d1613d26aa09f86339a4b33a2e576e.jpg",""],
-        "mm": ["link1", "link2"],
-    },
-    "bites": {
-        "ff": ["link1", "link2"],
-        "mf": ["link1", "link2"],
-        "mm": ["link1", "link2"],
-    },
-    "spanks": {
-        "ff": ["link1", "link2"],
-        "mf": ["link1", "link2"],
-        "mm": ["link1", "link2"],
-    },
-    "smacks": {
-        "ff": ["link1", "link2"],
-        "mf": ["link1", "link2"],
-        "mm": ["link1", "link2"],
-    },
-    "minet": {
-        "ff": ["https://i.pinimg.com/736x/fb/10/1d/fb101d67ea7286c09dbed81dc9cd8eca.jpg"],
-        "mf": ["https://i.pinimg.com/736x/fb/10/1d/fb101d67ea7286c09dbed81dc9cd8eca.jpg"],
-        "mm": ["https://i.pinimg.com/736x/fb/10/1d/fb101d67ea7286c09dbed81dc9cd8eca.jpg"],
-    },
-    "kuni": {
-        "ff": ["https://i.pinimg.com/736x/fb/10/1d/fb101d67ea7286c09dbed81dc9cd8eca.jpg"],
-        "mf": ["https://i.pinimg.com/736x/fb/10/1d/fb101d67ea7286c09dbed81dc9cd8eca.jpg"],
-        "mm": ["https://i.pinimg.com/736x/fb/10/1d/fb101d67ea7286c09dbed81dc9cd8eca.jpg"],
-    },
-}
+# умолчанию), плюс общая корзина "all" — файлы прямо в папке жеста.
+#
+# ИСТОЧНИК ТЕПЕРЬ РОВНО ОДИН — наш сайт (rp_photos, папка внутри статики
+# панели; адрес, по которому он виден снаружи, берётся из .env,
+# PANEL_PUBLIC_URL). Раньше рядом жил словарь ссылок на чужие хостинги
+# (pinimg): половина ячеек в нём была заполнена заглушками «link1», а
+# оставшиеся ссылки в любой момент могли протухнуть — чужой сайт не обязан
+# хранить наши картинки. Ссылки удалены; жест без своих файлов уходит текстом,
+# пока картинку не зальют через панель («Действия» → отн-жесты).
 
 
 def _rp_pairing(gender_a: Optional[str], gender_b: Optional[str]) -> str:
@@ -4216,53 +4186,20 @@ def _rp_pairing(gender_a: Optional[str], gender_b: Optional[str]) -> str:
     return "mf"
 
 
-def _real_photo_urls(urls) -> list:
-    """Только настоящие ссылки из legacy-словаря PHOTOS.
-
-    Часть пар в нём не заполнена — стоят заглушки («link1», «link2», пустая
-    строка). Отдавать их Telegram нельзя, и — что важнее — непустой список
-    заглушек раньше «выигрывал» у пары с настоящими картинками, из-за чего
-    у «оба парня» фото не появлялось никогда.
-    """
-    return [u for u in (urls or []) if isinstance(u, str) and u.startswith(("http://", "https://"))]
-
-
 def _pick_rp_photo_url(folder, gender_a, gender_b):
     """Ссылка на картинку-реакцию для жеста и пары — или None, если картинок
     нет (тогда жест уходит обычным текстом).
 
-    ПОРЯДОК ИСТОЧНИКОВ ВАЖЕН.
-    1. Свои файлы из хранилища (rp_photos.MEDIA_ROOT) — ссылкой на публичный
-       эндпоинт панели /rp/…. Это основной путь: картинки лежат у нас, их
-       видно и можно менять через панель, и ссылка не протухнет оттого, что
-       чужой сайт удалил файл.
-    2. Только если своих файлов для жеста нет — старый словарь PHOTOS со
-       ссылками на сторонние хостинги. Оставлен, чтобы жесты, которым ещё не
-       залили картинки, не осиротели разом; по мере загрузки файлов надобность
-       в нём отпадёт.
+    Источник один: наше хранилище (rp_photos.MEDIA_ROOT) — ссылкой на
+    публичный эндпоинт сайта /rp/…, собранной от адреса из .env
+    (PANEL_PUBLIC_URL). Картинки лежат у нас, их видно и можно менять через
+    панель, и ссылка не протухнет оттого, что чужой сайт удалил файл.
 
-    В обоих случаях сначала пробуем точную пару по полу, потом остальные.
+    Сначала пробуем точную пару по полу, потом остальные и общую корзину.
     """
     if not folder:
         return None
-
-    own = rp_photos.pick_photo_url(folder, _rp_pairing(gender_a, gender_b))
-    if own:
-        return own
-
-    bucket = PHOTOS.get(folder)
-    if not bucket:
-        return None
-    order, seen = [], set()
-    for pairing in (_rp_pairing(gender_a, gender_b), "mf", "mm", "ff"):
-        if pairing not in seen:
-            seen.add(pairing)
-            order.append(pairing)
-    for pairing in order:
-        urls = _real_photo_urls(bucket.get(pairing))
-        if urls:
-            return random.choice(urls)
-    return None
+    return rp_photos.pick_photo_url(folder, _rp_pairing(gender_a, gender_b))
 
 
 async def _gender_by_id(chat_id: int, user_id: int) -> Optional[str]:

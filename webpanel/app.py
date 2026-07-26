@@ -107,6 +107,14 @@ async def on_startup() -> None:
     # её могли поднять раньше бота — тогда запрос ушёл бы в колонку expires_at,
     # которой ещё нет. Миграция идемпотентна.
     await db.ensure_marriage_module_tables()
+    # Свои сроки автоочистки команд правит только панель — а создаёт таблицу
+    # бот. Если панель подняли первой, первая же правка упала бы на
+    # несуществующей таблице. Миграция идемпотентна.
+    await db.ensure_command_cleanup_table()
+    # Зеркало реестра команд наполняет бот, но колонку cleanup_targetable мог
+    # не успеть добавить (старая база + панель поднялась первой) — тогда
+    # «Дерево команд» падало бы на SELECT несуществующей колонки.
+    await db.ensure_command_registry_table()
 
     if await db.count_panel_users() == 0:
         token = auth.generate_setup_token()
@@ -1340,6 +1348,25 @@ async def _signal_action_reload() -> None:
 
 
 # --- Дерево команд (зеркало COMMAND_REGISTRY бота в БД) ---------------------
+# Значение по умолчанию для автоочистки, если настройку ни разу не трогали.
+# Дублирует DEFAULT_CMD_CLEANUP_MINUTES из бота: панель не может импортировать
+# bot.py (другой процесс, другие зависимости), а показывать «по умолчанию — ?»
+# на экране, где настраивают именно сроки, бессмысленно.
+DEFAULT_CMD_CLEANUP_MINUTES = 15
+
+
+async def _cleanup_default_minutes() -> int:
+    """Общий срок очистки из настроек — то, по чему живут команды без своего."""
+    row = await db.fetch_settings()
+    raw = (row or {}).get("command_cleanup_minutes")
+    if raw is None:
+        return DEFAULT_CMD_CLEANUP_MINUTES
+    try:
+        return max(0, min(int(raw), CMD_CLEANUP_MAX_MINUTES))
+    except (TypeError, ValueError):
+        return DEFAULT_CMD_CLEANUP_MINUTES
+
+
 @app.get("/api/command-tree")
 async def api_command_tree(user: PanelUser = Depends(auth.require_user)):
     reg = await db.list_command_registry()
@@ -1348,6 +1375,7 @@ async def api_command_tree(user: PanelUser = Depends(auth.require_user)):
     level_names = json.loads(names_row["data_value"]) if names_row else {}
     order_row = await db.get_data("command_category_order")
     cat_order = json.loads(order_row["data_value"]) if order_row else []
+    cleanup = await db.list_command_cleanup()
     by_cat: dict = {}
     for r in reg:
         eff = overrides.get(r["command_key"], r["default_level"])
@@ -1358,11 +1386,19 @@ async def api_command_tree(user: PanelUser = Depends(auth.require_user)):
             "level": eff,
             "overridable": bool(r["overridable"]),
             "overridden": r["command_key"] in overrides,
+            # Свой срок автоочистки. null — команда живёт по общему сроку из
+            # настроек (его показывает cleanup_default). cleanup_targetable —
+            # умеет ли бот отличить эту команду по тексту сообщения; если нет,
+            # поле показывать нельзя: настройка сохранилась бы и не работала.
+            "cleanup_minutes": cleanup.get(r["command_key"]),
+            "cleanup_targetable": bool(r.get("cleanup_targetable", True)),
         })
     ordered = [c for c in cat_order if c in by_cat] + [c for c in by_cat if c not in cat_order]
     categories = [{"category": c, "commands": by_cat[c]} for c in ordered]
     return {"categories": categories, "level_names": level_names,
-            "total": len(reg), "can_edit": user.is_owner}
+            "total": len(reg), "can_edit": user.is_owner,
+            "cleanup_default": await _cleanup_default_minutes(),
+            "cleanup_max": CMD_CLEANUP_MAX_MINUTES}
 
 
 class CmdLevelBody(BaseModel):
@@ -1391,6 +1427,88 @@ async def api_command_tree_set_level(
         result = {"ok": True, "level": body.level, "overridden": True}
     await _signal_action_reload()  # бот перечитает права команд без перезапуска
     return result
+
+
+class CmdCleanupBody(BaseModel):
+    command_key: str
+    minutes: Optional[int] = None  # None — вернуть команду на общий срок
+
+
+@app.post("/api/command-tree/cleanup")
+async def api_command_tree_set_cleanup(
+    body: CmdCleanupBody, request: Request, user: PanelUser = Depends(auth.require_owner)
+):
+    """Свой срок автоочистки для одной команды.
+
+    Работает только в чате жалоб (там же, где и общая автоочистка), и только
+    для сообщений, которые бот опознал как эту команду по её фразе-триггеру.
+    0 — не убирать эту команду вовсе.
+    """
+    auth.verify_csrf(request)
+    reg = {r["command_key"]: r for r in await db.list_command_registry()}
+    entry = reg.get(body.command_key)
+    if entry is None:
+        raise HTTPException(404, "Команда не найдена.")
+    if not entry.get("cleanup_targetable", True):
+        raise HTTPException(
+            409,
+            "Эту команду бот не отличает в чате от соседней с такой же "
+            "фразой — свой срок очистки ей задать нельзя.",
+        )
+    if body.minutes is None:
+        await db.reset_command_cleanup(body.command_key)
+        await db.add_log("cmd_cleanup_reset", actor_id=user.id, details=body.command_key)
+        result = {"ok": True, "cleanup_minutes": None}
+    else:
+        if not 0 <= body.minutes <= CMD_CLEANUP_MAX_MINUTES:
+            raise HTTPException(
+                400,
+                f"Срок должен быть от 0 до {CMD_CLEANUP_MAX_MINUTES} мин.: "
+                "сообщения старше 48 часов Telegram удалять не даёт.",
+            )
+        await db.set_command_cleanup(body.command_key, body.minutes, updated_by=user.id)
+        await db.add_log(
+            "cmd_cleanup_set", actor_id=user.id,
+            details=f"{body.command_key} -> {body.minutes} мин.",
+        )
+        result = {"ok": True, "cleanup_minutes": body.minutes}
+    await _signal_action_reload()  # бот перечитает сроки без перезапуска
+    return result
+
+
+# --- Случайные события чата: выключить/включить целиком ---------------------
+# Ключ и значение обязаны совпадать с тем, что пишет сам бот по «+события» /
+# «-события» (bot._events_off_key): это одна и та же настройка, просто с двумя
+# входами. Сигнал перечитки не нужен — бот смотрит в базу на каждой проверке.
+def _events_off_key(chat_id: int) -> str:
+    return f"chat_events_off:{chat_id}"
+
+
+@app.get("/api/chat-events")
+async def api_chat_events(chat_id: int, user: PanelUser = Depends(auth.require_user)):
+    row = await db.get_data(_events_off_key(chat_id))
+    return {"chat_id": chat_id, "enabled": row is None}
+
+
+class ChatEventsBody(BaseModel):
+    chat_id: int
+    enabled: bool
+
+
+@app.post("/api/chat-events")
+async def api_chat_events_set(
+    body: ChatEventsBody, request: Request, user: PanelUser = Depends(auth.require_user)
+):
+    auth.verify_csrf(request)
+    if body.enabled:
+        await db.delete_data(_events_off_key(body.chat_id))
+    else:
+        await db.set_data(_events_off_key(body.chat_id), "1", updated_by=user.id)
+    await db.add_log(
+        "chat_events_toggle", chat_id=body.chat_id, actor_id=user.id,
+        details="вкл" if body.enabled else "выкл",
+    )
+    return {"ok": True, "enabled": body.enabled}
 
 
 # --- Биржа: график курса и настройки волатильности -------------------------
@@ -2757,7 +2875,12 @@ async def api_member_propose_marriage(
 # ссылки из отдельного словаря, а сами картинки лежали третьим местом. Теперь
 # источник один, и разойтись сторонам нечем.
 RP_MEDIA_ROOT = rp_photos.MEDIA_ROOT
-GESTURE_PAIRINGS = rp_photos.PAIRINGS
+# Корзины фото у жеста: три пары по полу плюс общая («all» — файлы прямо в
+# папке жеста). Общая нужна тем жестам, где картинка одна на всех: заводить
+# ради неё три одинаковые подпапки бессмысленно, а с тех пор как бот берёт
+# фото ТОЛЬКО из хранилища (внешних ссылок больше нет), такому жесту иначе
+# негде взять картинку.
+GESTURE_PAIRINGS = rp_photos.STORAGE_PAIRINGS
 _GESTURE_KEY_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 _PHOTO_EXTS = rp_photos.PHOTO_EXTS
 GESTURE_PHOTO_MAX_BYTES = 8 * 1024 * 1024
@@ -2931,7 +3054,7 @@ async def api_rel_gesture_upload_photo(
 ):
     auth.verify_csrf(request)
     if pairing not in GESTURE_PAIRINGS:
-        raise HTTPException(400, "Пара: mf / mm / ff")
+        raise HTTPException(400, "Пара: mf / mm / ff / all (общая)")
     gesture = await db.get_rel2_gesture(key)
     if not gesture:
         raise HTTPException(404, "Жест не найден")

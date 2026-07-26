@@ -80,9 +80,19 @@ def test_ссылка_абсолютная_и_на_публичный_адрес
 
 
 def test_путь_за_пределы_хранилища_отвергается(media):
-    for folder in ("..", "../..", "hugs/../.."):
-        assert rp_photos.pairing_dir(folder, "mf") is None, folder
+    for pairing in ("mf", "all"):
+        for folder in ("..", "../..", "hugs/../.."):
+            assert rp_photos.pairing_dir(folder, pairing) is None, (folder, pairing)
     assert rp_photos.pairing_dir("hugs", "xx") is None  # пара не из белого списка
+
+
+@pytest.mark.parametrize("folder", [".", "hugs/..", "./."])
+def test_сам_корень_хранилища_не_отдаётся(media, folder):
+    """У общей корзины в пути на один сегмент меньше, и folder вида «.»
+    схлопывал бы её ровно в MEDIA_ROOT — то есть отдавал бы наружу его
+    содержимое через публичную ручку /rp/…. Папка жеста всегда глубже корня."""
+    assert rp_photos.pairing_dir(folder, "all") is None, folder
+    assert rp_photos.photo_path(folder, "all", "one.jpg") is None, folder
 
 
 # --- публичная отдача ------------------------------------------------------

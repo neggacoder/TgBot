@@ -34,6 +34,17 @@ MEDIA_ROOT = os.path.join(
 # Пары по полу: mf — парень+девушка, mm — оба парня, ff — обе девушки.
 PAIRINGS = ("mf", "mm", "ff")
 
+# Общая корзина жеста: файлы, лежащие прямо в папке жеста, без подпапки пары.
+# Нужна по двум причинам. Во-первых, такие файлы уже лежали на диске (папка
+# smacks) и не показывались никому: подбор смотрел только в подпапки пар.
+# Во-вторых, после отказа от внешних ссылок жесту, у которого картинка одна на
+# всех, некуда её положить — заводить три одинаковые подпапки глупо.
+COMMON_PAIRING = "all"
+
+# Всё, что вообще может быть каталогом с картинками жеста. Именно этот набор
+# — белый список для проверки путей; PAIRINGS остаётся «парами по полу».
+STORAGE_PAIRINGS = PAIRINGS + (COMMON_PAIRING,)
+
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 # Публичный путь эндпоинта (см. webpanel/app.py). Держим здесь, чтобы бот
@@ -60,12 +71,19 @@ def pairing_dir(folder: str, pairing: str) -> Optional[str]:
     Проверяем даже то, что сами же и собрали: folder приходит из БД, а имя
     вида «../..» превратило бы выдачу картинок в чтение произвольного файла
     с диска.
+
+    Сам корень хранилища тоже не годится: у общей корзины (COMMON_PAIRING)
+    в пути на один сегмент меньше, и folder вида «.» или «hugs/..» схлопнул бы
+    её ровно в MEDIA_ROOT — то есть отдал бы наружу его содержимое через
+    публичную (без входа) ручку /rp/…. Папка жеста всегда лежит ГЛУБЖЕ корня.
     """
-    if not folder or pairing not in PAIRINGS:
+    if not folder or pairing not in STORAGE_PAIRINGS:
         return None
     root = os.path.realpath(MEDIA_ROOT)
-    path = os.path.realpath(os.path.join(root, folder, pairing))
-    if path != root and not path.startswith(root + os.sep):
+    # COMMON_PAIRING — это сама папка жеста, а не подпапка в ней.
+    parts = (folder,) if pairing == COMMON_PAIRING else (folder, pairing)
+    path = os.path.realpath(os.path.join(root, *parts))
+    if not path.startswith(root + os.sep):
         return None
     return path
 
@@ -103,14 +121,15 @@ def pick_photo_url(
 ) -> Optional[str]:
     """Случайная картинка для жеста и пары — уже готовой ссылкой.
 
-    Сначала пробуем точную пару по полу, затем остальные: у редких сочетаний
-    картинок может не быть, и лучше показать чужую, чем ничего.
+    Сначала пробуем точную пару по полу, затем остальные пары, и последней —
+    общую корзину жеста: у редких сочетаний картинок может не быть, и лучше
+    показать чужую, чем ничего.
     """
     if not folder:
         return None
     order, seen = [], set()
-    for candidate in (pairing, *PAIRINGS):
-        if candidate not in seen and candidate in PAIRINGS:
+    for candidate in (pairing, *STORAGE_PAIRINGS):
+        if candidate not in seen and candidate in STORAGE_PAIRINGS:
             seen.add(candidate)
             order.append(candidate)
     for candidate in order:
@@ -121,5 +140,13 @@ def pick_photo_url(
 
 
 def count_photos(folder: str) -> dict[str, int]:
-    """Сколько картинок у жеста по каждой паре — для панели."""
-    return {pairing: len(list_photos(folder, pairing)) for pairing in PAIRINGS}
+    """Сколько картинок у жеста по каждой корзине — для панели."""
+    return {pairing: len(list_photos(folder, pairing)) for pairing in STORAGE_PAIRINGS}
+
+
+def has_photos(folder: Optional[str]) -> bool:
+    """Есть ли у жеста хоть одна картинка. Панели нужно, чтобы честно
+    показывать «фото не залито», а не молча отправлять жест текстом."""
+    if not folder:
+        return False
+    return any(list_photos(folder, pairing) for pairing in STORAGE_PAIRINGS)

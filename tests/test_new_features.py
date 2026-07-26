@@ -45,6 +45,15 @@ def _quiet_db(monkeypatch):
     monkeypatch.setattr(bot_module, "_check_coin_achievements", _noop, raising=False)
     monkeypatch.setattr(bot_module, "is_account_frozen", _returns(False), raising=False)
     monkeypatch.setattr(bot_module, "display_name_by_id", _returns("Партнёр"), raising=False)
+    # Награды за рыбалку и клад с некоторых пор проходят через множитель
+    # случайного события чата, а тот лезет в БД за активным событием. Здесь
+    # проверяется расчёт награды, а не события, поэтому множитель нейтральный:
+    # без этой заглушки тесты падают на «DB pool is not initialized».
+    # Тесту про события (см. tests/test_chat_events.py) эта фикстура не мешает.
+    monkeypatch.setattr(bot_module, "event_multiplier", _returns(1.0), raising=False)
+    # Талисман удачи (предмет магазина) проверяется на каждом начислении.
+    # Здесь его нет — значит, заряд не тратится и награда не удваивается.
+    monkeypatch.setattr(bot_module.db, "consume_item_effect", _returns(False), raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -78,18 +87,22 @@ def test_продление_брака_списывает_цену_за_кажд
 
     charged = {}
 
-    async def add_coins(chat_id, user_id, amount):
+    # Списание идёт через db.try_spend_coins: одним запросом «проверить и
+    # вычесть», иначе две одновременные команды спишут одни и те же монеты.
+    # Поэтому сумма приходит ПОЛОЖИТЕЛЬНОЙ (это «сколько снять»), а не
+    # отрицательной прибавкой, как было при db.add_coins.
+    async def try_spend_coins(chat_id, user_id, amount):
         charged["amount"] = amount
-        return 0
+        return True
 
     new_expiry = datetime.utcnow() + timedelta(days=7)
-    monkeypatch.setattr(bot_module.db, "add_coins", add_coins)
+    monkeypatch.setattr(bot_module.db, "try_spend_coins", try_spend_coins)
     monkeypatch.setattr(bot_module.db, "extend_marriage", _returns(new_expiry))
 
     msg, replies = _extend_message("брак продлить 7")
     asyncio.run(bot_module.cmd_marriage_extend(msg))
 
-    assert charged["amount"] == -3500, "7 суток по 500 i¢ = 3500, списание отрицательным"
+    assert charged["amount"] == 3500, "7 суток по 500 i¢ = 3500"
     assert replies and "7" in replies[0]
 
 
@@ -102,16 +115,21 @@ def test_продление_без_денег_ничего_не_списывае
     monkeypatch.setattr(bot_module.db, "get_wallet", _returns({"coins": 100}))
     monkeypatch.setattr(bot_module, "has_infinite_money", lambda uid: False)
 
-    touched = []
-    monkeypatch.setattr(bot_module.db, "add_coins",
-                        lambda *a, **k: touched.append(a) or _noop())
+    extended = []
+
+    # Денег не хватает — try_spend_coins отказывает и НИЧЕГО не списывает.
+    # Главное здесь: после отказа брак не должен продлиться.
+    async def try_spend_coins(chat_id, user_id, amount):
+        return False
+
+    monkeypatch.setattr(bot_module.db, "try_spend_coins", try_spend_coins)
     monkeypatch.setattr(bot_module.db, "extend_marriage",
-                        lambda *a, **k: touched.append(a) or _noop())
+                        lambda *a, **k: extended.append(a) or _noop())
 
     msg, replies = _extend_message("брак продлить 7")
     asyncio.run(bot_module.cmd_marriage_extend(msg))
 
-    assert not touched, "при нехватке монет не должно быть ни списания, ни продления"
+    assert not extended, "после отказа в списании брак продлевать нельзя"
     assert replies and "едостаточно" in replies[0]
 
 

@@ -46,14 +46,34 @@ def draw_line(
     x: float,
     baseline: float,
     size: int,
+    *,
+    color_override: Optional[tuple] = None,
+    skip_emoji: bool = False,
+    skip_text: bool = False,
 ) -> None:
-    """Рисует одну готовую строку с форматированием и эмодзи."""
+    """Рисует одну готовую строку с форматированием и эмодзи.
+
+    color_override — красит все текстовые отрезки одним цветом (нужно именам:
+    у них цвет задаёт собеседник, а не разметка).
+    skip_emoji — не рисовать эмодзи-отрезки: ими займётся второй проход,
+    поверх градиента, иначе градиент затрёт их цвет (см. _render_name).
+    skip_text — наоборот, только эмодзи (тот самый второй проход).
+
+    Начертание берётся ИСКЛЮЧИТЕЛЬНО из styles отрезка. Флага «рисовать
+    жирным» здесь намеренно нет: ширину отрезка раскладка измерила заранее
+    тем шрифтом, который следует из styles, и любое расхождение между
+    «чем измерили» и «чем рисуем» срезает хвост строки по краю холста.
+    Имена делаются жирными через _bold_entity() — на этапе раскладки.
+    """
     draw = ImageDraw.Draw(canvas, "RGBA")
     emoji_size = round(size * theme.EMOJI_SCALE)
     cursor = x
 
     for seg in line.segments:
         if seg.is_emoji:
+            if skip_emoji:
+                cursor += seg.width
+                continue
             img = assets.emoji_image(seg.value, emoji_size)
             top = baseline - size * theme.EMOJI_BASELINE_LIFT
             if img is not None:
@@ -66,12 +86,16 @@ def draw_line(
                 font = assets.font(size)
                 if not assets.glyph_missing(font, seg.value[0]):
                     draw.text((cursor, baseline), seg.value, font=font,
-                              fill=theme.TEXT_COLOR, anchor="ls")
+                              fill=color_override or theme.TEXT_COLOR, anchor="ls")
+            cursor += seg.width
+            continue
+
+        if skip_text:
             cursor += seg.width
             continue
 
         font = text_mod._font_for(seg.styles, size)
-        color = _color_for(seg.styles)
+        color = color_override or _color_for(seg.styles)
         alpha = _alpha_for(seg.styles)
         draw.text((cursor, baseline), seg.value, font=font,
                   fill=(*color, alpha), anchor="ls")
@@ -89,22 +113,62 @@ def draw_line(
         cursor += seg.width
 
 
+# Имя в шапку бабла не обрезается по ширине (бабл сам растягивается под него),
+# поэтому раскладке даётся заведомо недостижимый предел — она нужна тут не ради
+# переноса, а ради разбора имени на отрезки: только так в имени работают эмодзи.
+_NAME_NO_LIMIT = 1 << 20
+
+
+def _bold_entity(text: str) -> list:
+    """Разметка «всё имя — полужирное».
+
+    Именно entity, а не флаг при отрисовке: раскладка меряет ширину отрезка
+    тем шрифтом, который следует из его styles. Пометь жирность в обход
+    entity — измерят обычным шрифтом, нарисуют жирным (он шире), и хвост
+    имени срежется по краю. length — в кодовых единицах UTF-16, как в Bot API
+    (у эмодзи вне BMP их два, и раскладка это учитывает).
+    """
+    return [{"type": "bold", "offset": 0,
+             "length": len(text.encode("utf-16-le")) // 2}]
+
+
+def _name_lines(name: str, size: int, max_width: float, max_lines: int) -> list:
+    return text_mod.layout(name, _bold_entity(name), size, max_width, max_lines)
+
+
 def _render_name(name: str, color: tuple, size: int) -> Image.Image:
     """Имя отправителя с лёгким горизонтальным градиентом — как в оригинале
-    (сплошная заливка выглядит заметно площе)."""
-    font = assets.font(size, bold=True)
-    width = max(1, round(font.getlength(name)))
-    ascent, descent = _metrics(font, size)
-    height = ascent + descent
+    (сплошная заливка выглядит заметно площе).
 
+    Рисуется в ДВА прохода. Градиент делается через альфа-маску нарисованного
+    текста, а маска убивает цвет — для букв это и нужно, но эмодзи-картинку
+    так превратило бы в цветное пятно. Поэтому сначала буквы (под градиент),
+    потом поверх готового градиента — эмодзи, в своём цвете.
+
+    Раньше имя рисовалось одним draw.text() шрифтом Noto: эмодзи в имени
+    (а в Telegram они у половины чата) выходило пустым квадратом-notdef.
+    """
+    lines = _name_lines(name, size, _NAME_NO_LIMIT, 1)
+    ascent, descent = _metrics(assets.font(size, bold=True), size)
+    height = ascent + descent
+    if not lines:
+        return Image.new("RGBA", (1, height), (0, 0, 0, 0))
+
+    line = lines[0]
+    width = max(1, round(line.width))
+
+    # проход 1: только буквы, белым — это будущая маска градиента
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    ImageDraw.Draw(layer).text((0, ascent), name, font=font, fill=(255, 255, 255, 255),
-                               anchor="ls")
+    draw_line(layer, line, 0, ascent, size,
+              color_override=(255, 255, 255), skip_emoji=True)
 
     lighter = tuple(min(255, round(c * 1.25)) for c in color)
     gradient = shapes.linear_gradient(width, height, color, lighter)
     gradient = gradient.convert("RGBA")
     gradient.putalpha(layer.getchannel("A"))
+
+    # проход 2: эмодзи поверх градиента, своими цветами
+    draw_line(gradient, line, 0, ascent, size, skip_text=True)
     return gradient
 
 
@@ -145,7 +209,7 @@ def _render_reply(msg, accent: tuple, max_width: int) -> Optional[Image.Image]:
     gap = s(theme.BLOCK_GAP)
 
     inner_max = max_width - pad_l - pad_r
-    name_lines = text_mod.layout(msg.reply_name, None, name_size, inner_max, 1)
+    name_lines = _name_lines(msg.reply_name, name_size, inner_max, 1)
     # Реплай несёт больше информации: до двух строк текста (как в quotly),
     # а не одна обрезанная — так видно, на что именно отвечали.
     text_lines = text_mod.layout(msg.reply_text, None, text_size, inner_max, 2)
@@ -179,9 +243,13 @@ def _render_reply(msg, accent: tuple, max_width: int) -> Optional[Image.Image]:
     block.paste(bar, (0, 0), ImageChops.multiply(bar.getchannel("A"), corners))
 
     if name_lines:
-        draw = ImageDraw.Draw(block, "RGBA")
-        draw.text((pad_l, pad_y + name_asc), msg.reply_name,
-                  font=assets.font(name_size, bold=True), fill=(*accent, 255), anchor="ls")
+        # Именно name_lines, а не сырое msg.reply_name: раскладка уже обрезала
+        # имя по ширине плашки и разобрала его на отрезки. Рисовать здесь
+        # исходную строку одним шрифтом (как было) означало сразу две беды —
+        # длинное имя вылезало за плашку, а эмодзи в имени превращалось в
+        # пустой квадрат.
+        draw_line(block, name_lines[0], pad_l, pad_y + name_asc, name_size,
+                  color_override=accent)
     baseline = pad_y + name_h + gap + text_asc
     for line in text_lines:
         draw_line(block, line, pad_l, baseline, text_size)

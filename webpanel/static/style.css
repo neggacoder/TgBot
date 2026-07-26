@@ -1016,6 +1016,16 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
   background: var(--panel-2); color: var(--text);
 }
 .chip-accent { border-color: var(--accent); color: var(--accent); }
+/* Свой срок автоочистки команды — узкое поле рядом с уровнем доступа. */
+.cmd-cleanup-wrap { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+.cmd-cleanup {
+  width: 62px; padding: 5px 6px; text-align: right;
+  border: 1px solid var(--line); border-radius: var(--radius-xs);
+  background: var(--panel-2); color: var(--text);
+}
+/* Команда, которой свой срок задать нельзя, — прочерк на месте поля, чтобы
+   строки не разъезжались по ширине. */
+.cmd-cleanup-na { display: inline-block; width: 62px; text-align: center; font-size: 12px; }
 
 /* Семья: дом / питомцы / дети */
 .fam-sparks { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: var(--gap-2); }

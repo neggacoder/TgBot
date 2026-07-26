@@ -50,8 +50,9 @@ def test_список_жестов_с_фото(client, monkeypatch, tmp_path):
     assert res.status_code == 200, res.text
     data = res.json()
     assert data["gestures"][0]["gesture_key"] == "hug"
-    assert data["gestures"][0]["photos"] == {"mf": [], "mm": [], "ff": []}
-    assert data["pairings"] == ["mf", "mm", "ff"]
+    assert data["gestures"][0]["photos"] == {"mf": [], "mm": [], "ff": [], "all": []}
+    # «all» — общая корзина жеста (файлы прямо в его папке), см. rp_photos
+    assert data["pairings"] == ["mf", "mm", "ff", "all"]
 
 
 def test_добавление_жеста_плохой_ключ(client):

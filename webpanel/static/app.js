@@ -1096,7 +1096,7 @@ $$(".nav-btn").forEach((btn) => {
     if (view === "users") loadUsers();
     if (view === "stats") loadStatsData();
     if (view === "logs") loadLogs();
-    if (view === "stock") loadStockData();
+    if (view === "stock") { loadStockData(); loadChatEvents(); }
     if (view === "tgadmins") loadTgAdmins();
     if (view === "chatroles") loadChatRoles();
     if (view === "moderation") { loadRestRequests(); loadWordFilter(); }
@@ -1139,6 +1139,26 @@ function renderCommandTree() {
   const lvlName = (l) => escapeHtml(names[String(l)] || ("ур. " + l));
   const options = (sel) => [0, 1, 2, 3].map((l) =>
     `<option value="${l}"${l === sel ? " selected" : ""}>${lvlName(l)}</option>`).join("");
+  // Свой срок автоочистки. Пусто в поле = «как у всех»: показываем общий срок
+  // подсказкой в placeholder, чтобы не приходилось искать его в настройках.
+  const dflt = _cmdTree.cleanup_default;
+  const cleanupCtl = (c) => {
+    // Команду, которую бот не отличает в чате от соседней с такой же фразой,
+    // своим сроком не настроить — поле для неё было бы обманом.
+    if (!c.cleanup_targetable) {
+      return `<span class="muted cmd-cleanup-na"
+        title="Эту команду бот не отличает в чате от соседней с такой же фразой — свой срок ей не задать.">—</span>`;
+    }
+    if (!canEdit) {
+      return `<span class="chip${c.cleanup_minutes != null ? " chip-accent" : ""}">${c.cleanup_minutes != null ? c.cleanup_minutes : dflt} мин</span>`;
+    }
+    return `<span class="cmd-cleanup-wrap">
+      <input type="number" class="cmd-cleanup" data-key="${escapeHtml(c.key)}" min="0"
+        max="${_cmdTree.cleanup_max}" step="1" placeholder="${dflt}"
+        title="Через сколько минут убирать эту команду из чата жалоб. Пусто — общий срок (${dflt} мин.), 0 — не убирать."
+        value="${c.cleanup_minutes === null || c.cleanup_minutes === undefined ? "" : c.cleanup_minutes}">
+      <span class="muted">мин</span></span>`;
+  };
   let out = "";
   let shown = 0;
   for (const cat of _cmdTree.categories) {
@@ -1161,7 +1181,7 @@ function renderCommandTree() {
         ? `<button class="ghost small cmd-reset" data-key="${escapeHtml(c.key)}" title="Сбросить к умолчанию">${icon("undo")}</button>` : "";
       out += `<div class="cmdtree-row">
         <div class="cmdtree-cmd"><code>${escapeHtml(c.key)}</code><span class="cmdtree-phrase">${escapeHtml(c.phrase)}</span></div>
-        <div class="cmdtree-ctl">${ctl}${reset}</div></div>`;
+        <div class="cmdtree-ctl">${cleanupCtl(c)}${ctl}${reset}</div></div>`;
     }
     out += `</details>`;
   }
@@ -1169,6 +1189,12 @@ function renderCommandTree() {
   if (canEdit) {
     $$(".cmd-level").forEach((sel) => sel.addEventListener("change", () => cmdSetLevel(sel.dataset.key, Number(sel.value))));
     $$(".cmd-reset").forEach((btn) => btn.addEventListener("click", () => cmdSetLevel(btn.dataset.key, null)));
+    // change, а не input: сохранять на каждую нажатую цифру — это запрос на
+    // «1», потом на «15», потом на «150».
+    $$(".cmd-cleanup").forEach((inp) => inp.addEventListener("change", () => {
+      const raw = inp.value.trim();
+      cmdSetCleanup(inp.dataset.key, raw === "" ? null : Number(raw));
+    }));
   }
   // Запоминаем раскрытые категории: renderCommandTree() пересобирает разметку
   // целиком (после правки уровня, при поиске), и без этого блок захлопывался
@@ -1207,6 +1233,19 @@ async function cmdSetLevel(key, level) {
     }
     renderCommandTree();
     say("#global-msg", "Уровень команды обновлён");
+  } catch (err) { say("#global-msg", err.message, "err"); renderCommandTree(); }
+}
+
+async function cmdSetCleanup(key, minutes) {
+  try {
+    const d = await api("/api/command-tree/cleanup", { method: "POST", body: { command_key: key, minutes } });
+    for (const cat of _cmdTree.categories) {
+      const c = cat.commands.find((x) => x.key === key);
+      if (c) c.cleanup_minutes = d.cleanup_minutes;
+    }
+    say("#global-msg", d.cleanup_minutes === null
+      ? "Команда снова чистится по общему сроку"
+      : (d.cleanup_minutes === 0 ? "Эта команда больше не удаляется" : `Очистка команды: ${d.cleanup_minutes} мин.`));
   } catch (err) { say("#global-msg", err.message, "err"); renderCommandTree(); }
 }
 
@@ -1289,7 +1328,7 @@ async function loadChats() {
     const options = chats
       .map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`)
       .join("");
-    ["#send-chat", "#members-chat", "#mod-chat", "#stats-chat", "#stock-chat", "#tga-chat", "#chatroles-chat"].forEach((sel) => {
+    ["#send-chat", "#members-chat", "#mod-chat", "#stats-chat", "#stock-chat", "#events-chat", "#tga-chat", "#chatroles-chat"].forEach((sel) => {
       $(sel).innerHTML = options || `<option value="">Чатов пока нет</option>`;
     });
     // В фильтре журнала «все чаты» — вариант по умолчанию, поэтому список
@@ -1829,7 +1868,7 @@ $("#propose-synonym-add").addEventListener("submit", async (e) => {
 
 // --- Отн-жесты (админ): жест + фразы + слова-триггеры + фото ---------------
 
-const GESTURE_PAIR_LABELS = { mf: "♂ + ♀", mm: "♂ + ♂", ff: "♀ + ♀" };
+const GESTURE_PAIR_LABELS = { mf: "♂ + ♀", mm: "♂ + ♂", ff: "♀ + ♀", all: "Общие (любая пара)" };
 
 $("#gesture-add").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -3365,6 +3404,60 @@ $("#stock-save").addEventListener("click", saveStockSettings);
 ["#stock-min", "#stock-max", "#stock-div"].forEach((sel) => {
   $(sel).addEventListener("input", refreshStockForecast);
 });
+
+// --- случайные события чата -----------------------------------------------
+// Тумблер на одну настройку, поэтому без формы: кнопка сразу и показывает
+// текущее состояние, и переключает его.
+let _eventsEnabled = null;
+
+function renderEventsToggle() {
+  const btn = $("#events-toggle");
+  if (!btn) return;
+  if (_eventsEnabled === null) {
+    btn.textContent = "Загрузка…";
+    btn.disabled = true;
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = _eventsEnabled ? "Выключить события" : "Включить события";
+  btn.classList.toggle("primary", !_eventsEnabled);
+  btn.classList.toggle("ghost", _eventsEnabled);
+}
+
+async function loadChatEvents() {
+  const chatId = $("#events-chat")?.value;
+  if (!chatId) return;
+  _eventsEnabled = null;
+  renderEventsToggle();
+  try {
+    const d = await api(`/api/chat-events?chat_id=${chatId}`);
+    _eventsEnabled = d.enabled;
+    renderEventsToggle();
+    say("#events-msg", _eventsEnabled
+      ? "Сейчас события включены — бот сам объявляет их в чате."
+      : "Сейчас события выключены — бот не объявляет их в этом чате.");
+  } catch (err) {
+    say("#events-msg", err.message, "err");
+  }
+}
+
+async function toggleChatEvents() {
+  const chatId = $("#events-chat")?.value;
+  if (!chatId || _eventsEnabled === null) return;
+  try {
+    const d = await api("/api/chat-events", {
+      method: "POST", body: { chat_id: Number(chatId), enabled: !_eventsEnabled },
+    });
+    _eventsEnabled = d.enabled;
+    renderEventsToggle();
+    say("#events-msg", _eventsEnabled ? "События включены." : "События выключены.");
+  } catch (err) {
+    say("#events-msg", err.message, "err");
+  }
+}
+
+if ($("#events-chat")) $("#events-chat").addEventListener("change", loadChatEvents);
+if ($("#events-toggle")) $("#events-toggle").addEventListener("click", toggleChatEvents);
 
 // --- статистика -----------------------------------------------------------
 

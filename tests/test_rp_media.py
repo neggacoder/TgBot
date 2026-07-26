@@ -33,63 +33,68 @@ def test_папка_пары_по_полу():
     assert rel._rp_pairing(None, None) == "mf"
 
 
-# Картинки-реакции берутся из ДВУХ источников, и порядок важен: сначала свои
-# файлы из хранилища (rp_photos), и только если их нет — старый словарь PHOTOS
-# со ссылками на сторонние сайты. Тесты ниже про ВТОРОЙ источник, поэтому
-# хранилище им подменяется на заведомо пустую папку.
+# Источник картинок ровно один — наше хранилище (rp_photos), то есть файлы,
+# залитые через сайт. Раньше рядом жил словарь ссылок на чужие хостинги; его
+# больше нет, и тесты ниже это закрепляют: никакой внешний адрес в чат уйти
+# не может, а жест без своих файлов уходит текстом.
 
 
-@pytest.fixture(autouse=True)
-def _empty_store(tmp_path, monkeypatch):
-    """Пустое хранилище: иначе сработал бы первый источник (свои файлы), и
-    откат на PHOTOS в этих тестах просто не проверялся бы."""
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    """Хранилище во временной папке — настоящие картинки не трогаем."""
     import rp_photos
     monkeypatch.setattr(rp_photos, "MEDIA_ROOT", str(tmp_path))
+    monkeypatch.setenv("PANEL_PUBLIC_URL", "https://example.org/")
+
+    def put(folder: str, pairing: str, name: str) -> None:
+        d = tmp_path / folder / pairing if pairing != "all" else tmp_path / folder
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(b"\xff\xd8\xff")
+
+    return put
 
 
-
-def test_нет_ссылок_вернёт_none(monkeypatch):
-    """Пустой жест → None: тогда фраза уходит без превью, а не с битой ссылкой."""
-    monkeypatch.setitem(rel.PHOTOS, "hugs", {"mf": [], "mm": [], "ff": []})
+def test_пустое_хранилище_даёт_none(store):
+    """Фото не залито → None: фраза уходит без превью, а не с битой ссылкой."""
     assert rel._pick_rp_photo_url("hugs", "м", "ж") is None
 
 
-def test_берёт_ссылку_из_точной_пары(monkeypatch):
-    monkeypatch.setitem(rel.PHOTOS, "hugs", {
-        "mm": ["https://example.org/mm.jpg"],
-        "mf": ["https://example.org/mf.jpg"],
-    })
-    assert rel._pick_rp_photo_url("hugs", "м", "м") == "https://example.org/mm.jpg"
+def test_берёт_файл_из_точной_пары(store):
+    store("hugs", "mm", "mm.jpg")
+    store("hugs", "mf", "mf.jpg")
+    assert rel._pick_rp_photo_url("hugs", "м", "м") == "https://example.org/rp/hugs/mm/mm.jpg"
 
 
-def test_откат_на_другую_пару(monkeypatch):
-    """Для точной пары ссылок нет, но есть у соседней — берём оттуда."""
-    monkeypatch.setitem(rel.PHOTOS, "kisses", {"mf": ["https://example.org/a.png"]})
-    assert rel._pick_rp_photo_url("kisses", "м", "м") == "https://example.org/a.png"
+def test_откат_на_другую_пару(store):
+    """Для точной пары файлов нет, но есть у соседней — берём оттуда."""
+    store("kisses", "mf", "a.png")
+    assert rel._pick_rp_photo_url("kisses", "м", "м") == "https://example.org/rp/kisses/mf/a.png"
 
 
-def test_незаполненные_заглушки_не_считаются_картинками(monkeypatch):
-    """В PHOTOS часть пар ещё не заполнена: там стоят «link1»/«link2»/«».
-
-    Такую строку нельзя отдавать Telegram как ссылку, и — что важнее — она не
-    должна мешать откату: непустой список из заглушек раньше «выигрывал» у
-    соседней пары с настоящими картинками, и фото не появлялось никогда.
-    """
-    monkeypatch.setitem(rel.PHOTOS, "bites", {
-        "mm": ["link1", "link2", ""],
-        "mf": ["https://example.org/real.jpg"],
-    })
-    assert rel._pick_rp_photo_url("bites", "м", "м") == "https://example.org/real.jpg"
+def test_откат_на_общую_корзину(store):
+    """Файл лежит прямо в папке жеста (одна картинка на все пары) — раньше
+    такие файлы не показывались никому."""
+    store("smacks", "all", "one.jpg")
+    assert rel._pick_rp_photo_url("smacks", "м", "ж") == "https://example.org/rp/smacks/all/one.jpg"
 
 
-def test_только_заглушки_дают_none(monkeypatch):
-    monkeypatch.setitem(rel.PHOTOS, "smacks", {"mf": ["link1"], "mm": [""], "ff": []})
-    assert rel._pick_rp_photo_url("smacks", "м", "ж") is None
+def test_ссылка_всегда_на_наш_сайт(store):
+    """Ключевое свойство после отказа от внешних ссылок: что бы ни лежало в
+    хранилище, наружу уходит адрес нашей панели из .env."""
+    store("bites", "mf", "b.jpg")
+    url = rel._pick_rp_photo_url("bites", "м", "ж")
+    assert url.startswith("https://example.org/rp/")
 
 
-def test_несуществующий_жест_вернёт_none():
+def test_несуществующий_жест_вернёт_none(store):
     assert rel._pick_rp_photo_url("несуществующее", "м", "ж") is None
     assert rel._pick_rp_photo_url(None, "м", "ж") is None
+
+
+def test_внешних_ссылок_в_коде_не_осталось():
+    """Словарь PHOTOS со ссылками на pinimg удалён — если он вернётся, жесты
+    снова начнут зависеть от чужого сайта."""
+    assert not hasattr(rel, "PHOTOS")
 
 
 def test_ответные_шаблоны_форматируются():

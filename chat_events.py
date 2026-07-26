@@ -269,9 +269,52 @@ EVENTS: tuple[Event, ...] = (
         text="🚚 <b>Завоз в магазин!</b>\nПрилавки пополнены — "
              "товаров в наличии стало больше ({count} поз.).",
     ),
+    # Единственное событие, которое платит адресно бедным, а не всем подряд.
+    # amount — верхняя граница кошелька, ниже которой человека считают
+    # нуждающимся; сколько именно выдать, решает bot.py по остатку казны.
+    Event(
+        key="charity", kind=MOMENT, weight=9, amount=1000,
+        title="Гуманитарная помощь",
+        text="🤝 <b>Гуманитарная помощь!</b>\nКазна чата скинулась тем, у кого "
+             "в кармане меньше {amount} i¢ — по <b>{per_head} i¢</b> на человека "
+             "({count} чел.). Не благодарите.",
+    ),
 )
 
 EVENTS_BY_KEY: dict[str, Event] = {e.key: e for e in EVENTS}
+
+
+def _normalize(raw: str) -> str:
+    """Слово для поиска: без регистра, лишних пробелов и знаков вокруг."""
+    return " ".join(raw.strip().casefold().replace("ё", "е").split())
+
+
+# Название → ключ. Заголовок события («Золотая лихорадка») человек напишет
+# охотнее, чем ключ (gold_rush), поэтому ищем и по нему, и по первому слову
+# заголовка — «золотая» должно хватить. Собирается один раз при импорте:
+# держать второй, руками выписанный список синонимов значило бы рано или
+# поздно разойтись с каталогом.
+_BY_NAME: dict[str, str] = {}
+for _event in EVENTS:
+    _BY_NAME.setdefault(_normalize(_event.key), _event.key)
+    _title = _normalize(_event.title)
+    _BY_NAME.setdefault(_title, _event.key)
+    _first = _title.split(" ")[0] if _title else ""
+    # Первое слово — только если оно ничьё: у «Биржевого обвала» и «Биржевого
+    # ралли» оно общее, и угадывать за человека, какое из двух он имел в виду,
+    # нельзя.
+    if _first and _first not in _BY_NAME:
+        _BY_NAME[_first] = _event.key
+    elif _first and _BY_NAME.get(_first) != _event.key:
+        _BY_NAME[_first] = ""          # неоднозначно — не принимаем
+
+
+def resolve(raw: Optional[str]) -> Optional[Event]:
+    """Событие по ключу или названию. None — не нашли или название неоднозначное."""
+    if not raw:
+        return None
+    key = _BY_NAME.get(_normalize(raw))
+    return EVENTS_BY_KEY.get(key) if key else None
 
 
 # ----------------------------------------------------------------------------
@@ -332,6 +375,7 @@ def describe(event: Event, **params) -> str:
         "count": "?",
         "total": "?",
         "price": "?",
+        "per_head": "?",
     }
     safe.update({k: v for k, v in params.items() if v is not None})
     try:

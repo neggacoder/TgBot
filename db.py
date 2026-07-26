@@ -342,6 +342,41 @@ async def reset_command_level(command_key: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Свой срок автоочистки у отдельной команды. Общий срок лежит в настройках
+# (settings.command_cleanup_minutes, см. ensure_command_cleanup_column ниже);
+# здесь — только исключения: «топ чистим через час, а баланс через минуту».
+# Нет строки — команда живёт по общему сроку. minutes = 0 — не чистить совсем.
+# ----------------------------------------------------------------------------
+async def ensure_command_cleanup_table() -> None:
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS command_cleanup ("
+        "command_key VARCHAR(64) NOT NULL PRIMARY KEY, "
+        "minutes INT NOT NULL, "
+        "updated_by BIGINT NULL, "
+        "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def list_command_cleanup() -> dict[str, int]:
+    rows = await _fetchall("SELECT command_key, minutes FROM command_cleanup")
+    return {r["command_key"]: int(r["minutes"]) for r in rows}
+
+
+async def set_command_cleanup(command_key: str, minutes: int, updated_by: Optional[int] = None) -> None:
+    await _execute(
+        "INSERT INTO command_cleanup (command_key, minutes, updated_by) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE minutes = VALUES(minutes), updated_by = VALUES(updated_by), "
+        "updated_at = CURRENT_TIMESTAMP",
+        (command_key, minutes, updated_by),
+    )
+
+
+async def reset_command_cleanup(command_key: str) -> None:
+    await _execute("DELETE FROM command_cleanup WHERE command_key = %s", (command_key,))
+
+
+# ----------------------------------------------------------------------------
 # Зеркало реестра команд (COMMAND_REGISTRY в bot.py) в БД — чтобы веб-панель,
 # которая не может импортировать bot.py, могла показать «дерево команд». Бот
 # перезаписывает эту таблицу при каждом старте (единый источник — код бота).
@@ -357,24 +392,32 @@ async def ensure_command_registry_table() -> None:
         "sort_order INT NOT NULL DEFAULT 0"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    # Умеет ли бот отличить эту команду по тексту сообщения (см.
+    # bot.resolve_command_key). Нужно панели: у команды, которую не отличить
+    # от соседней, свой срок автоочистки задать нельзя, и предлагать для неё
+    # поле — значит предлагать неработающую настройку.
+    await _add_column_if_missing("command_registry", "cleanup_targetable", "BOOL NOT NULL DEFAULT TRUE")
 
 
 async def replace_command_registry(entries: list[tuple]) -> None:
     """Полностью перезаписывает зеркало реестра. entries: кортежи
-    (command_key, category, phrase, default_level, overridable, sort_order)."""
+    (command_key, category, phrase, default_level, overridable, sort_order,
+    cleanup_targetable)."""
     await _execute("DELETE FROM command_registry")
     for e in entries:
         await _execute(
             "INSERT INTO command_registry "
-            "(command_key, category, phrase, default_level, overridable, sort_order) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "(command_key, category, phrase, default_level, overridable, sort_order, "
+            "cleanup_targetable) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
             e,
         )
 
 
 async def list_command_registry() -> list[dict]:
     return await _fetchall(
-        "SELECT command_key, category, phrase, default_level, overridable, sort_order "
+        "SELECT command_key, category, phrase, default_level, overridable, sort_order, "
+        "cleanup_targetable "
         "FROM command_registry ORDER BY sort_order, command_key"
     )
 
@@ -991,6 +1034,7 @@ async def ensure_profile_cards_table() -> None:
     )
     await _add_column_if_missing("profile_cards", "pinned_item", "VARCHAR(64) DEFAULT NULL")
     await _add_column_if_missing("profile_cards", "pinned_achievement", "VARCHAR(64) DEFAULT NULL")
+    await _add_column_if_missing("profile_cards", "pinned_business", "VARCHAR(32) DEFAULT NULL")
     # Если таблица уже существовала с gender ENUM — конвертируем в VARCHAR.
     await _execute("ALTER TABLE profile_cards MODIFY gender VARCHAR(8) DEFAULT NULL")
 
@@ -998,7 +1042,7 @@ async def ensure_profile_cards_table() -> None:
 async def get_profile_card(chat_id: int, user_id: int) -> Optional[dict]:
     return await _fetchone(
         "SELECT title, motto, is_citizen, gender, city, about_text, anketa_visible, "
-        "pinned_item, active_title, pinned_achievement "
+        "pinned_item, active_title, pinned_achievement, pinned_business "
         "FROM profile_cards WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
@@ -1106,6 +1150,16 @@ async def set_pinned_achievement(chat_id: int, user_id: int, code: Optional[str]
         "ON DUPLICATE KEY UPDATE pinned_achievement = VALUES(pinned_achievement)",
         (chat_id, user_id, code),
     )
+
+
+async def set_pinned_business(chat_id: int, user_id: int, key: Optional[str]) -> None:
+    """Какой бизнес показывать в карточке профиля. None — не показывать."""
+    await _execute(
+        "INSERT INTO profile_cards (chat_id, user_id, pinned_business) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE pinned_business = VALUES(pinned_business)",
+        (chat_id, user_id, key),
+    )
+
 
 async def set_anketa_visibility(chat_id: int, user_id: int, visible: bool) -> None:
     await _execute(
@@ -6665,6 +6719,61 @@ async def list_fishing_top(chat_id: int, limit: int = 10) -> list[dict]:
     )
 
 
+# ----------------------------------------------------------------------------
+# Новые способы заработка (ежедневный бонус, подработка, шапка по кругу).
+#
+# Одна таблица на все три вместо трёх почти одинаковых: у каждой механики есть
+# только «когда в последний раз» и, у ежедневных, «сколько дней подряд». Заводить
+# ради этого отдельную таблицу на каждую новую команду — это по миграции и по
+# четыре функции db на каждую мелочь.
+#
+# streak/last_day заполняют только ежедневные механики; кулдаунным хватает
+# last_at, и они эти колонки не трогают.
+# ----------------------------------------------------------------------------
+async def ensure_earning_activity_table() -> None:
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS earning_activity ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "activity_key VARCHAR(32) NOT NULL, "
+        "last_at DATETIME NOT NULL, "
+        "streak INT NOT NULL DEFAULT 0, "
+        "last_day DATE NULL, "
+        "total_earned BIGINT NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (chat_id, user_id, activity_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    # Сколько раз занятие вообще выполнялось — под ачивки вида «50 подработок».
+    # total_earned для счёта не годится: он в монетах, а шкала менялась.
+    await _add_column_if_missing("earning_activity", "times", "INT NOT NULL DEFAULT 0")
+
+
+async def get_earning_activity(chat_id: int, user_id: int, activity_key: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT last_at, streak, last_day, total_earned, times FROM earning_activity "
+        "WHERE chat_id = %s AND user_id = %s AND activity_key = %s",
+        (chat_id, user_id, activity_key),
+    )
+
+
+async def touch_earning_activity(
+    chat_id: int, user_id: int, activity_key: str, now: datetime,
+    streak: Optional[int] = None, day=None, earned: int = 0,
+) -> None:
+    """Отмечает, что механика только что сработала. Пишется ДО начисления
+    монет: упади запись — человек останется без денег, но не с возможностью
+    жать команду в цикле."""
+    await _execute(
+        "INSERT INTO earning_activity "
+        "(chat_id, user_id, activity_key, last_at, streak, last_day, total_earned, times) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, 1) "
+        "ON DUPLICATE KEY UPDATE last_at = VALUES(last_at), streak = VALUES(streak), "
+        "last_day = VALUES(last_day), total_earned = total_earned + VALUES(total_earned), "
+        "times = times + 1",
+        (chat_id, user_id, activity_key, now, streak or 0, day, max(0, earned)),
+    )
+
+
 async def ensure_treasure_tables() -> None:
     """💎 Клад — общий на чат «джекпот»: каждая неудачная попытка его растит,
     нашедший забирает всё. Строка на чат + личные кулдауны копающих.
@@ -7374,6 +7483,29 @@ async def add_casino_balance(chat_id: int, user_id: int, amount: int) -> int:
     return int(row["balance"]) if row else 0
 
 
+async def try_spend_casino_balance(chat_id: int, user_id: int, amount: int) -> bool:
+    """Атомарно снимает ставку с казино-баланса. True — сняли, False — не хватило.
+
+    То же самое и по той же причине, что try_spend_coins выше: проверка и
+    списание одним запросом. Читать баланс, сравнивать и потом вычитать
+    нельзя — aiogram обрабатывает апдейты параллельно, и две ставки, посланные
+    подряд, обе проходят проверку с одними и теми же деньгами.
+
+    Именно на этом месте add_casino_balance() не выручает: он подрезает баланс
+    нулём (GREATEST(...,0)), то есть в минус не пустит, но вторую ставку молча
+    ПРОСТИТ — сыграть можно будет дважды, заплатив один раз.
+    """
+    if amount <= 0:
+        return True
+    await get_casino_wallet(chat_id, user_id)   # гарантирует наличие строки
+    changed = await _execute(
+        "UPDATE casino_wallets SET balance = balance - %s "
+        "WHERE chat_id = %s AND user_id = %s AND balance >= %s",
+        (amount, chat_id, user_id, amount),
+    )
+    return bool(changed)
+
+
 async def claim_daily_bonus(
     chat_id: int, user_id: int, bonus_amount: int, today=None,
 ) -> tuple[bool, int]:
@@ -7459,12 +7591,192 @@ async def set_farm_yield(chat_id: int, percent: float) -> None:
     )
 
 
-async def list_coins_top(chat_id: int, limit: int = 10) -> list[dict]:
-    return await _fetchall(
-        "SELECT user_id, coins, star_level FROM economy_wallets WHERE chat_id = %s "
-        "ORDER BY coins DESC LIMIT %s",
-        (chat_id, limit),
+async def list_coins_top(
+    chat_id: int, limit: int = 10, offset: int = 0
+) -> tuple[list[dict], int]:
+    """Страница топа по монетам и ОБЩЕЕ число участников в нём (как
+    list_top_messages выше — по этой паре строится листание).
+
+    Пустые кошельки отсекаются намеренно: строка в economy_wallets заводится
+    при первом же обращении к экономике, поэтому нулевых записей в чате
+    обычно больше, чем ненулевых. Раньше это было не видно — топ отдавал
+    только первую десятку, — но при листании нули растянулись бы на страницы
+    одинаковых «0 i¢» после реального топа.
+    """
+    count_row = await _fetchone(
+        "SELECT COUNT(*) AS total FROM economy_wallets WHERE chat_id = %s AND coins > 0",
+        (chat_id,),
     )
+    rows = await _fetchall(
+        "SELECT user_id, coins, star_level FROM economy_wallets "
+        "WHERE chat_id = %s AND coins > 0 "
+        "ORDER BY coins DESC LIMIT %s OFFSET %s",
+        (chat_id, limit, offset),
+    )
+    return rows, int(count_row["total"] if count_row else 0)
+
+
+# ----------------------------------------------------------------------------
+# Бизнесы: пассивный доход (см. businesses.py — там весь баланс и налог).
+#
+# Фонового цикла у бизнесов НЕТ и не нужно: в строке лежит «сколько уже
+# накоплено» (accrued) и «с какого момента копим» (last_tick_at), а текущая
+# сумма считается на лету по прошедшему времени. Так бот может простоять
+# выключенным сутки и ничего не потеряет — при первом же обращении досчитает.
+#
+# Первичный ключ включает business_key: одному человеку положено по одному
+# бизнесу каждого типа, и это ограничение держит сама база, а не проверка
+# в коде — второй «Аэропорт» просто не вставится.
+# ----------------------------------------------------------------------------
+async def ensure_businesses_table() -> None:
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS businesses ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "business_key VARCHAR(32) NOT NULL, "
+        "level TINYINT NOT NULL DEFAULT 1, "
+        "accrued INT NOT NULL DEFAULT 0, "
+        "last_tick_at DATETIME NOT NULL, "
+        "bought_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, user_id, business_key), "
+        "INDEX idx_businesses_owner (chat_id, user_id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    # Поломки и срочные предложения приехали позже самой таблицы — добавляем
+    # колонки отдельно, чтобы у тех, кто уже играет, ничего не пересоздавалось.
+    await _add_column_if_missing("businesses", "broken_kind", "VARCHAR(64) NULL")
+    await _add_column_if_missing("businesses", "broken_at", "DATETIME NULL")
+    await _add_column_if_missing("businesses", "boost_until", "DATETIME NULL")
+
+
+async def set_business_broken(chat_id: int, user_id: int, key: str,
+                              kind: str, accrued: int, now) -> bool:
+    """Ломает бизнес и тут же фиксирует накопленное: сломанный не копит, и
+    момент остановки должен быть записан ровно тот, когда он сломался.
+
+    Условие broken_kind IS NULL — защита от повторной поломки уже сломанного:
+    иначе тик цикла, наложившийся на предыдущий, обнулил бы счётчик простоя.
+    """
+    changed = await _execute(
+        "UPDATE businesses SET broken_kind = %s, broken_at = %s, accrued = %s, "
+        "last_tick_at = %s WHERE chat_id = %s AND user_id = %s AND business_key = %s "
+        "AND broken_kind IS NULL",
+        (kind, now, max(0, int(accrued)), now, chat_id, user_id, key),
+    )
+    return bool(changed)
+
+
+async def repair_business(chat_id: int, user_id: int, key: str, now) -> bool:
+    """Чинит бизнес. False — он и не был сломан (значит, деньги брать не за что)."""
+    changed = await _execute(
+        "UPDATE businesses SET broken_kind = NULL, broken_at = NULL, last_tick_at = %s "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s "
+        "AND broken_kind IS NOT NULL",
+        (now, chat_id, user_id, key),
+    )
+    return bool(changed)
+
+
+async def set_business_boost(chat_id: int, user_id: int, key: str,
+                             until, accrued: int, now) -> None:
+    """Включает надбавку к доходу до момента until, зафиксировав накопленное:
+    дальше копилка считается уже по новой ставке."""
+    await _execute(
+        "UPDATE businesses SET boost_until = %s, accrued = %s, last_tick_at = %s "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (until, max(0, int(accrued)), now, chat_id, user_id, key),
+    )
+
+
+async def list_chat_businesses(chat_id: int) -> list[dict]:
+    """Все бизнесы чата — нужно циклу поломок."""
+    return await _fetchall(
+        "SELECT user_id, business_key, level, accrued, last_tick_at, broken_kind, boost_until "
+        "FROM businesses WHERE chat_id = %s",
+        (chat_id,),
+    )
+
+
+_BUSINESS_FIELDS = ("business_key, level, accrued, last_tick_at, bought_at, "
+                    "broken_kind, broken_at, boost_until")
+
+
+async def list_user_businesses(chat_id: int, user_id: int) -> list[dict]:
+    return await _fetchall(
+        f"SELECT {_BUSINESS_FIELDS} "
+        "FROM businesses WHERE chat_id = %s AND user_id = %s ORDER BY bought_at",
+        (chat_id, user_id),
+    )
+
+
+async def get_user_business(chat_id: int, user_id: int, key: str) -> Optional[dict]:
+    return await _fetchone(
+        f"SELECT {_BUSINESS_FIELDS} "
+        "FROM businesses WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (chat_id, user_id, key),
+    )
+
+
+async def add_business(chat_id: int, user_id: int, key: str, now) -> bool:
+    """Заводит бизнес. False — такой у человека уже есть (второй не положен)."""
+    changed = await _execute(
+        "INSERT IGNORE INTO businesses "
+        "(chat_id, user_id, business_key, level, accrued, last_tick_at, bought_at) "
+        "VALUES (%s, %s, %s, 1, 0, %s, %s)",
+        (chat_id, user_id, key, now, now),
+    )
+    return bool(changed)
+
+
+async def set_business_accrual(chat_id: int, user_id: int, key: str, accrued: int, now) -> None:
+    """Фиксирует накопленное на момент now — «пересчитали и запомнили»."""
+    await _execute(
+        "UPDATE businesses SET accrued = %s, last_tick_at = %s "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (max(0, int(accrued)), now, chat_id, user_id, key),
+    )
+
+
+async def set_business_level(chat_id: int, user_id: int, key: str, level: int,
+                             accrued: int, now) -> None:
+    """Поднимает уровень и одновременно фиксирует накопленное: у нового уровня
+    свой потолок, и пересчитывать копилку нужно ровно в этот момент."""
+    await _execute(
+        "UPDATE businesses SET level = %s, accrued = %s, last_tick_at = %s "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (int(level), max(0, int(accrued)), now, chat_id, user_id, key),
+    )
+
+
+async def delete_business(chat_id: int, user_id: int, key: str) -> bool:
+    changed = await _execute(
+        "DELETE FROM businesses WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (chat_id, user_id, key),
+    )
+    return bool(changed)
+
+
+async def move_business(chat_id: int, from_id: int, to_id: int, key: str, now) -> bool:
+    """Передаёт бизнес другому человеку, обнуляя копилку.
+
+    False — либо у отдающего такого бизнеса нет, либо у получателя такой УЖЕ
+    есть (по одному каждого типа на человека). Проверка и перенос идут одним
+    запросом: между отдельными SELECT и UPDATE получатель успел бы купить
+    такой же сам, и перенос затёр бы его бизнес вместе с накопленным.
+    """
+    changed = await _execute(
+        "UPDATE IGNORE businesses SET user_id = %s, accrued = 0, last_tick_at = %s "
+        "WHERE chat_id = %s AND user_id = %s AND business_key = %s",
+        (to_id, now, chat_id, from_id, key),
+    )
+    return bool(changed)
+
+
+async def count_businesses(chat_id: int) -> int:
+    row = await _fetchone(
+        "SELECT COUNT(*) AS total FROM businesses WHERE chat_id = %s", (chat_id,)
+    )
+    return int(row["total"]) if row else 0
 
 
 # ----------------------------------------------------------------------------
@@ -8219,6 +8531,19 @@ async def list_wallet_holders(chat_id: int, min_coins: int = 1, limit: int = 500
     )
 
 
+async def list_poor_wallets(chat_id: int, max_coins: int, limit: int = 200) -> list[dict]:
+    """Кошельки беднее max_coins — от самых пустых.
+
+    Сортировка обратная list_wallet_holders намеренно: там нужны те, у кого
+    есть что взять, здесь — те, кому нужнее, и при упоре в limit отсечь надо
+    именно тех, кто к порогу ближе всех."""
+    return await _fetchall(
+        "SELECT user_id, coins FROM economy_wallets "
+        "WHERE chat_id = %s AND coins < %s ORDER BY coins ASC LIMIT %s",
+        (chat_id, max_coins, limit),
+    )
+
+
 async def tax_all_wallets(chat_id: int, percent: float) -> int:
     """Списывает percent% с каждого кошелька чата. Возвращает, сколько всего
     списано, — эта сумма уходит в казну чата вызывающим кодом.
@@ -8346,6 +8671,18 @@ async def ensure_shop_tables() -> None:
     )
     await _add_column_if_missing("shop_items", "stock", "INT NULL")
     await _add_column_if_missing("shop_items", "restock_max", "INT NULL DEFAULT 10")
+    # Отложенные эффекты предметов: талисман и страховка не срабатывают сразу,
+    # а ждут своего случая (следующего заработка, следующей поломки). Живут
+    # зарядами, а не временем: купил — лежит, пока не пригодится.
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS user_item_effects ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "effect VARCHAR(32) NOT NULL, "
+        "charges INT NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (chat_id, user_id, effect)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
     await _execute(
         "CREATE TABLE IF NOT EXISTS user_inventory ("
         "chat_id BIGINT NOT NULL, "
@@ -8447,6 +8784,9 @@ async def ensure_profession_tables() -> None:
         "PRIMARY KEY (chat_id, user_id)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    # Счётчик смен — под ачивку «Работяга». total_earned для этого не годится:
+    # он в монетах, а шкала заработков со временем менялась.
+    await _add_column_if_missing("profession_stats", "total_shifts", "INT NOT NULL DEFAULT 0")
     await _execute(
         "CREATE TABLE IF NOT EXISTS profession_upgrades ("
         "chat_id BIGINT NOT NULL, "
@@ -8508,7 +8848,7 @@ async def update_profession_after_shift(
         "mood = GREATEST(0, LEAST(100, mood + %s)), "
         "health = GREATEST(0, LEAST(100, health + %s)), "
         "work_streak = %s, last_work_at = UTC_TIMESTAMP(), last_shift_day = %s, "
-        "total_earned = total_earned + %s "
+        "total_earned = total_earned + %s, total_shifts = total_shifts + 1 "
         "WHERE chat_id = %s AND user_id = %s",
         (xp_gain, energy_delta, mood_delta, health_delta, new_streak, shift_day,
          coins_earned, chat_id, user_id),
@@ -8671,6 +9011,82 @@ async def add_shop_item(
     )
     return True
 
+
+
+async def reset_work_cooldown(chat_id: int, user_id: int) -> None:
+    """Смену можно взять сразу (предмет «Кофе бригадира»)."""
+    await _execute(
+        "UPDATE profession_stats SET last_work_at = NULL "
+        "WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+
+
+async def restore_profession_state(chat_id: int, user_id: int) -> None:
+    """Энергия, настроение и здоровье — обратно в 100 (предмет «Аптечка»)."""
+    await _execute(
+        "UPDATE profession_stats SET energy = 100, mood = 100, health = 100 "
+        "WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+
+
+async def reset_earning_cooldowns(chat_id: int, user_id: int) -> None:
+    """Обнуляет отметки «когда в последний раз» у фермы, рыбалки и клада —
+    все три занятия становятся доступны сразу (предмет «Энергетик»).
+
+    Строк может не быть вовсе (человек ещё не фармил) — UPDATE тогда просто
+    никого не тронет, и это правильный исход: кулдауна и так нет.
+    """
+    await _execute(
+        "UPDATE economy_wallets SET last_farm_at = NULL "
+        "WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    await _execute(
+        "UPDATE fishing_stats SET last_fish_at = NULL "
+        "WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    await _execute(
+        "UPDATE treasure_diggers SET last_dig_at = NULL "
+        "WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+
+
+async def add_item_effect(chat_id: int, user_id: int, effect: str, charges: int = 1) -> None:
+    """Кладёт заряд отложенного эффекта (талисман, страховка)."""
+    await _execute(
+        "INSERT INTO user_item_effects (chat_id, user_id, effect, charges) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE charges = charges + VALUES(charges)",
+        (chat_id, user_id, effect, max(1, int(charges))),
+    )
+
+
+async def consume_item_effect(chat_id: int, user_id: int, effect: str) -> bool:
+    """Тратит один заряд. True — заряд был и списан, False — эффекта нет.
+
+    Проверка и списание одним запросом: этот вызов стоит на пути начисления
+    награды, и «прочитать, потом вычесть» дало бы двойное срабатывание при
+    двух командах подряд — талисман удвоил бы и ферму, и рыбалку.
+    """
+    changed = await _execute(
+        "UPDATE user_item_effects SET charges = charges - 1 "
+        "WHERE chat_id = %s AND user_id = %s AND effect = %s AND charges > 0",
+        (chat_id, user_id, effect),
+    )
+    return bool(changed)
+
+
+async def list_item_effects(chat_id: int, user_id: int) -> dict[str, int]:
+    rows = await _fetchall(
+        "SELECT effect, charges FROM user_item_effects "
+        "WHERE chat_id = %s AND user_id = %s AND charges > 0",
+        (chat_id, user_id),
+    )
+    return {r["effect"]: int(r["charges"]) for r in rows}
 
 
 async def delete_shop_item(chat_id: int, item_key: str) -> bool:
@@ -9302,12 +9718,22 @@ async def pick_random_robbery_victim(chat_id: int, exclude_user_id: int, min_bal
     )
 
 
-async def seed_robbery_items(chat_id: int, items: list[tuple[str, str, int, str, str]]) -> int:
-    """Как seed_default_shop_items, но не требует пустого магазина — можно
-    дозасеять новые товары в уже работающий (add_shop_item сам пропускает
-    те item_key, что уже есть)."""
+async def seed_extra_shop_items(chat_id: int, items: list[tuple[str, str, int, str, str]]) -> int:
+    """Дозасев: в отличие от seed_default_shop_items не требует пустого
+    магазина, поэтому новые товары появляются и в уже работающих чатах.
+
+    Ровно это и нужно при добавлении товаров в существующего бота:
+    seed_default_shop_items() у непустого магазина возвращает 0 и новинки
+    не доедут никогда. add_shop_item() сам пропускает уже существующие
+    ключи, так что повторные вызовы безвредны.
+    """
     count = 0
     for item_key, name, price, description, emoji in items:
         if await add_shop_item(chat_id, item_key, name, price, description, emoji):
             count += 1
     return count
+
+
+# Старое имя: функция изначально досеивала только предметы для ограблений,
+# потом понадобилась всем. Оставлено, чтобы не ломать вызовы на стороне.
+seed_robbery_items = seed_extra_shop_items

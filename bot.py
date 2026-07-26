@@ -76,6 +76,12 @@ from activity_chart import (
     render_hourly_chart,
 )
 from help_texts import build_help_sections
+# Каталог бизнесов под псевдонимом: слово «businesses» слишком просится
+# в локальные переменные («businesses = await db.list_user_businesses(...)»),
+# и модуль бы там затенился.
+import bosses as boss_catalog
+import businesses as business_catalog
+import shop_effects
 from quote_render import QuoteMessage, render_quote
 from quote_render import assets as quote_assets
 
@@ -318,7 +324,7 @@ class MessageCounterMiddleware(BaseMiddleware):
             and is_command_like(event.text or event.caption)
             and not is_cleanup_exempt(event.text or event.caption)
         ):
-            minutes = cmd_cleanup_minutes()
+            minutes = cmd_cleanup_minutes_for(event.text or event.caption)
             if minutes > 0:
                 delete_at = datetime.utcnow() + timedelta(minutes=minutes)
                 try:
@@ -540,6 +546,9 @@ custom_responses: dict[int, str] = {}
 # тег (@username) или имя со ссылкой на профиль — см. mention_id().
 user_registry: dict[int, dict] = {}
 command_level_overrides: dict[str, int] = {}  # command_key -> уровень, из command_permissions
+# command_key -> свой срок автоочистки в минутах (таблица command_cleanup).
+# Пусто в норме: команда без строки живёт по общему сроку из настроек.
+command_cleanup_overrides: dict[str, int] = {}
 reward_degree_level_overrides: dict[int, int] = {}  # степень награды -> уровень, из reward_degree_levels
 pending_complaints_count: int = 0  # кэш числа новых (нерассмотренных) жалоб, для бейджа в меню
 
@@ -747,6 +756,8 @@ async def load_caches() -> None:
 
     custom_responses = {r["user_id"]: r["message"] for r in await db.list_custom_responses()}
     command_level_overrides = await db.list_command_levels()
+    command_cleanup_overrides.clear()
+    command_cleanup_overrides.update(await db.list_command_cleanup())
     reward_degree_level_overrides = await db.list_reward_degree_levels()
     pending_complaints_count = await db.count_pending_complaints()
     user_registry = {
@@ -1070,7 +1081,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "treasure_dig":    {"phrase": "клад / копать — общий клад чата, кто нашёл тот и забрал", "category": "Экономика", "level": 0},
     "treasure_info":   {"phrase": "клад инфа — сколько накопилось и шанс находки", "category": "Экономика", "level": 0},
     "farm_balance":    {"phrase": "монеты / баланс", "category": "Экономика", "level": 0},
-    "casino_roulette":  {"phrase": ".рулетка {ставка} {цвет} — красное/чёрное/зелёное (как в казино)", "category": "Экономика", "level": 0},
+    "casino_roulette":  {"phrase": "рулетка {ставка} {цвет} — казино: красное/чёрное x2, зелёное x14", "category": "Экономика", "level": 0},
     "casino_balance": {"phrase": "!казино баланс — баланс в казино + бонус", "category": "Экономика", "level": 0},
     "casino_topup":   {"phrase": "!казино пополнить {сумма} — пополнить баланс казино из кошелька i¢", "category": "Экономика", "level": 0},
     "casino_withdraw": {"phrase": "!казино вывести {сумма} — вывести деньги из казино в кошелёк i¢", "category": "Экономика", "level": 0},
@@ -1176,8 +1187,31 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "race_play":       {"phrase": "!гонки {ставка} — гонки лошадей (казино), лошадь выбирается кнопкой", "category": "Экономика", "level": 0},
     "achievement_pin": {"phrase": "закрепить ачивку {код} / открепить ачивку", "category": "Разное", "level": 0},
     "stock_settings":  {"phrase": "биржа настройки / биржа настройки рост|падение|дивиденды {число} / биржа настройки спокойная|обычная|азартная", "category": "Экономика", "level": LEVEL_ADMIN},
-    "chat_events":     {"phrase": "события — что сейчас происходит в чате", "category": "Экономика", "level": 0},
-    "chat_events_toggle": {"phrase": "+события / -события / событие запустить {ключ}", "category": "Экономика", "level": LEVEL_ADMIN},
+    # Во фразе перечислены ВСЕ рабочие формы, а не только удобные: по ним бот
+    # опознаёт команду для автоочистки и прав, и форма, забытая здесь, эту
+    # привязку теряет молча.
+    "chat_events":     {"phrase": "ивенты / события / событие — что идёт сейчас и какие бывают", "category": "Экономика", "level": 0},
+    "chat_events_toggle": {"phrase": "+ивент / -ивент / +события / -события / ивент {название} {время} / событие запустить {ключ}", "category": "Экономика", "level": LEVEL_ADMIN},
+    # Новые команды — строго в конец реестра (см. COMMAND_IDS выше): номера
+    # уже существующих команд сдвигать нельзя, по ним раздают права («дк 181»).
+    "titles_my":       {"phrase": "мои титулы — только свои титулы, с листанием", "category": "Экономика", "level": 0},
+    "prof_catalog":    {"phrase": "профессии — каталог: доход, требования, расход", "category": "Экономика", "level": 0},
+    "daily_bonus":     {"phrase": "бонус — ежедневный бонус, растёт за дни подряд", "category": "Экономика", "level": 0},
+    "side_job":        {"phrase": "подработка — мелкая работа раз в 45 минут", "category": "Экономика", "level": 0},
+    "hat_round":       {"phrase": "шапка — пустить шапку по чату, скидываются кнопкой", "category": "Экономика", "level": 0},
+    "business_catalog": {"phrase": "бизнесы / бизнес каталог — цены, доход, потолки, апгрейды", "category": "Экономика", "level": 0},
+    "business_mine":   {"phrase": "бизнес / бизнес мой — свои бизнесы и что в копилках", "category": "Экономика", "level": 0},
+    "business_buy":    {"phrase": "бизнес купить {ключ}", "category": "Экономика", "level": 0},
+    "business_collect": {"phrase": "бизнес собрать [ключ] — забрать доход, с налогом", "category": "Экономика", "level": 0},
+    "business_upgrade": {"phrase": "бизнес улучшить {ключ}", "category": "Экономика", "level": 0},
+    "business_sell":   {"phrase": "бизнес продать {ключ} [цена @кому] — боту или игроку", "category": "Экономика", "level": 0},
+    "business_transfer": {"phrase": "бизнес передать {ключ} @кому", "category": "Экономика", "level": 0},
+    "business_repair": {"phrase": "бизнес починить {ключ} — после поломки", "category": "Экономика", "level": 0},
+    "business_pin":    {"phrase": "бизнес закрепить {ключ} / бизнес открепить — показывать в профиле", "category": "Экономика", "level": 0},
+    # Во фразе перечислены ВСЕ рабочие формы: по ним команду опознают
+    # автоочистка и права, и форма, забытая здесь, эту привязку теряет молча.
+    "boss_status":     {"phrase": "босс / боссы — кто сейчас в чате и какие бывают", "category": "Экономика", "level": 0},
+    "boss_toggle":     {"phrase": "+босс / -босс / босс призвать {название}", "category": "Экономика", "level": LEVEL_ADMIN},
 }
 
 
@@ -1231,7 +1265,23 @@ CMD_CLEANUP_MAX_MINUTES = 48 * 60
 # час и убедиться, что деньги ушли и кому именно. Удалять такое вместе с
 # обычным командным шумом нельзя — спор о переводе восстановить будет нечем.
 # Сюда же добавляйте всё, у чего ответ бота имеет ценность как запись.
-_CLEANUP_KEEP_RE = re.compile(r"(?i)^\s*(?:перевод|перевести)\b")
+#
+# Наказания — из той же породы: варн, мут и бан (и их снятие) должны остаться
+# в чате как след. Через час после чистки нечем будет подтвердить, за что
+# человека наказали и наказывали ли вообще.
+#
+# «&варн» и «&-варн» стоят в этом же списке НЕ по недосмотру: розыгрыш обязан
+# вести себя в чате ровно как настоящий варн. Оставь чистку только настоящим —
+# и обманные начнут исчезать через 15 минут, а настоящие оставаться. Это
+# выдавало бы шутку вернее любого амперсанда.
+_CLEANUP_KEEP_RE = re.compile(
+    r"(?i)^\s*!?(?:"
+    r"перевод|перевести"
+    r"|&?-?варн-?|&?варн"
+    r"|-?мут|размут"
+    r"|-?бан|разбан"
+    r")\b"
+)
 
 
 def is_cleanup_exempt(text: Optional[str]) -> bool:
@@ -1251,6 +1301,101 @@ def cmd_cleanup_minutes() -> int:
     # Подрезаем и на чтении: в базе могло остаться значение, записанное до
     # появления потолка, — иначе оно продолжало бы тихо не работать.
     return max(0, min(value, CMD_CLEANUP_MAX_MINUTES))
+
+
+# ----------------------------------------------------------------------------
+# СВОЙ СРОК ОЧИСТКИ У ОТДЕЛЬНОЙ КОМАНДЫ (панель → «Дерево команд»)
+#
+# Решение принимает MessageCounterMiddleware — ДО того, как aiogram выберет
+# обработчик, то есть в момент, когда «какая это команда» ещё никто не знает.
+# Единственное, что о команде известно наверняка, — её текст, поэтому ключ
+# команды восстанавливаем из него же, по фразам-триггерам из COMMAND_REGISTRY.
+#
+# Фраза в реестре — не шаблон, а человеческое описание («титул — список
+# титулов»), поэтому берём из неё только ВЕДУЩИЕ буквальные слова: до первого
+# плейсхолдера ({ключ}), скобки или тире, за которыми начинается проза.
+# Получается «титул», «титул купить», «титул надеть» — ровно то, по чему
+# команду и отличают в чате. Совпадением считается только полный префикс
+# сообщения; из нескольких подходящих выигрывает самая длинная (то есть самая
+# конкретная) фраза, при равенстве — та, что объявлена в реестре раньше.
+#
+# Не угадали — не беда: команда просто живёт по общему сроку. Поэтому здесь
+# сознательно нет ни эвристик «похожести», ни разбора аргументов.
+# ----------------------------------------------------------------------------
+# Здесь начинается описание, а не команда. Длинное тире — да; обычный дефис
+# НЕТ: с него начинаются сами команды («-мут», «-чат», «-варн»), и, приняв его
+# за прозу, разбор терял бы их целиком (см. is_command_like — там дефис тоже
+# признак команды).
+_PHRASE_STOP_PREFIXES = ("{", "[", "(", "«", "—", "…")
+
+
+def _phrase_prefixes(phrase: str) -> list[tuple[str, ...]]:
+    """Ведущие буквальные слова каждой формы команды из её фразы в реестре."""
+    out: list[tuple[str, ...]] = []
+    # Делим по « / » с пробелами: без них «@username/ID» внутри пояснения
+    # развалилось бы на две мнимые формы команды.
+    for alt in re.split(r"\s+/\s+", phrase):
+        words: list[str] = []
+        for word in alt.strip().split():
+            token = word.casefold()
+            if not token or token.startswith(_PHRASE_STOP_PREFIXES):
+                break
+            words.append(token)
+        if words:
+            out.append(tuple(words))
+    return out
+
+
+# Первое слово формы -> список (порядок в реестре, ключ команды, слова формы).
+_COMMAND_PREFIX_INDEX: dict[str, list[tuple[int, str, tuple[str, ...]]]] = {}
+for _order, (_key, _entry) in enumerate(COMMAND_REGISTRY.items()):
+    for _prefix in _phrase_prefixes(_entry["phrase"]):
+        _COMMAND_PREFIX_INDEX.setdefault(_prefix[0], []).append((_order, _key, _prefix))
+
+
+def resolve_command_key(text: Optional[str]) -> Optional[str]:
+    """Ключ команды по тексту сообщения — или None, если опознать не удалось."""
+    if not text:
+        return None
+    words = [w.casefold() for w in text.strip().split()]
+    if not words:
+        return None
+    best: Optional[tuple[int, int, str]] = None   # (-длина, порядок, ключ)
+    for order, key, prefix in _COMMAND_PREFIX_INDEX.get(words[0], ()):
+        if len(prefix) > len(words) or tuple(words[: len(prefix)]) != prefix:
+            continue
+        candidate = (-len(prefix), order, key)
+        if best is None or candidate < best:
+            best = candidate
+    return best[2] if best else None
+
+
+def is_cleanup_targetable(command_key: str) -> bool:
+    """Отличит ли бот эту команду по тексту сообщения.
+
+    Нет — если у команды вообще нет фразы-триггера (её вызывают кнопкой в
+    панели) или если её фраза начинается ровно так же, как у соседней команды
+    («удалить кружок {номер}» у своей и у модераторской). Таким командам свой
+    срок автоочистки задать нельзя, и панель не должна показывать для них поле:
+    настройка сохранилась бы и молча ничего не делала.
+    """
+    entry = COMMAND_REGISTRY.get(command_key)
+    if entry is None:
+        return False
+    prefixes = _phrase_prefixes(entry["phrase"])
+    if not prefixes:
+        return False
+    return resolve_command_key(" ".join(prefixes[0])) == command_key
+
+
+def cmd_cleanup_minutes_for(text: Optional[str]) -> int:
+    """Через сколько минут убирать это сообщение. Свой срок команды, если он
+    задан в панели, иначе общий. Подрезка потолком — общая для обоих."""
+    if command_cleanup_overrides:
+        key = resolve_command_key(text)
+        if key is not None and key in command_cleanup_overrides:
+            return max(0, min(command_cleanup_overrides[key], CMD_CLEANUP_MAX_MINUTES))
+    return cmd_cleanup_minutes()
 
 
 # ----------------------------------------------------------------------------
@@ -4095,6 +4240,9 @@ async def panel_action_reload_loop() -> None:
                 # без перезапуска бота.
                 command_level_overrides.clear()
                 command_level_overrides.update(await db.list_command_levels())
+                # Свои сроки автоочистки команд — оттуда же, из «дерева команд».
+                command_cleanup_overrides.clear()
+                command_cleanup_overrides.update(await db.list_command_cleanup())
                 reward_degree_level_overrides.clear()
                 reward_degree_level_overrides.update(await db.list_reward_degree_levels())
                 await refresh_propose_caches()
@@ -9407,6 +9555,21 @@ async def spend_coins(chat_id: int, user_id: int, amount: int) -> bool:
     return await db.try_spend_coins(chat_id, user_id, amount)
 
 
+async def try_spend_casino(chat_id: int, user_id: int, amount: int) -> bool:
+    """То же, что spend_coins, но с БАЛАНСА КАЗИНО (см. «казино пополнить»).
+
+    Отдельный кошелёк на то и заведён, чтобы проигрыш в казино не утаскивал
+    основные i¢: играют только тем, что туда занесли.
+    """
+    if amount <= 0:
+        return True
+    if has_infinite_money(user_id):
+        return True
+    if await is_account_frozen(chat_id, user_id):
+        return False
+    return await db.try_spend_casino_balance(chat_id, user_id, amount)
+
+
 
 # Отдельное слово-число ("3") и отдельное слово-единица ("часа") нужно
 # уметь распознавать вместе, даже когда после команды они разбиты пробелом,
@@ -12182,6 +12345,28 @@ async def _fetch_message_media(msg: Message) -> Optional[bytes]:
         return None
 
 
+async def _attach_reply_plate(quote, chat_id: int, src: Message) -> None:
+    """Если процитированное сообщение само было ответом на другое — дорисовать
+    сверху маленькую плашку-реплай, как в настоящем Telegram.
+
+    Плашка ставится ТОЛЬКО когда Telegram реально приложил сообщение, на
+    которое отвечали, и в нём есть что показать: выдумывать реплай нельзя.
+    """
+    quoted = src.reply_to_message
+    if quoted is None or quoted.from_user is None:
+        return
+    quoted_text = _fallback_text_for(quoted)
+    if not quoted_text:
+        return
+    nick = await db.get_nickname(chat_id, quoted.from_user.id)
+    quote.reply_name = nick or quoted.from_user.full_name or (
+        f"@{quoted.from_user.username}" if quoted.from_user.username
+        else str(quoted.from_user.id)
+    )
+    quote.reply_chat_id = quoted.from_user.id
+    quote.reply_text = quoted_text
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and bool(STICKER_CMD_RE.match(t.strip()))),
@@ -12237,22 +12422,7 @@ async def cmd_text_sticker(message: Message):
             media_bytes=media_bytes,
         )
 
-        # если процитированное сообщение само было ответом на другое —
-        # рисуем сверху маленькую плашку-реплай, как настоящий Telegram. Но
-        # ТОЛЬКО когда у нас есть реальное сообщение, на которое отвечали, и в
-        # нём есть что показать: если Telegram не приложил его содержимого (или
-        # там нечего показать) — реплай не выдумываем и плашку не рисуем.
-        quoted = src.reply_to_message
-        if quoted is not None and quoted.from_user is not None:
-            quoted_text = _fallback_text_for(quoted)
-            if quoted_text:
-                q_nick = await db.get_nickname(message.chat.id, quoted.from_user.id)
-                quote.reply_name = q_nick or quoted.from_user.full_name or (
-                    f"@{quoted.from_user.username}" if quoted.from_user.username else str(quoted.from_user.id)
-                )
-                quote.reply_chat_id = quoted.from_user.id
-                quote.reply_text = quoted_text
-
+        await _attach_reply_plate(quote, message.chat.id, src)
         entries.append(quote)
     else:
         # склеиваем это сообщение с несколькими предыдущими из кольцевого
@@ -12295,12 +12465,19 @@ async def cmd_text_sticker(message: Message):
             name = nickname or item.get("full_name") or (
                 f"@{item['username']}" if item.get("username") else str(uid)
             )
-            entries.append(QuoteMessage(
+            quote = QuoteMessage(
                 user_id=uid,
                 name=name,
                 text=text,
                 avatar_bytes=await _avatar_for(uid),
-            ))
+            )
+            # Реплай известен только у того сообщения, на которое ответили
+            # командой: у остальных в склейке это соседи из кольцевого буфера,
+            # а он содержимого их реплаев не хранит. Выдумывать нечего —
+            # плашку получает ровно src, как и при «.стикер» без числа.
+            if item.get("message_id") == src.message_id:
+                await _attach_reply_plate(quote, message.chat.id, src)
+            entries.append(quote)
 
     if not entries:
         await message.reply("В этих сообщениях нет текста, чтобы сделать стикер.")
@@ -12934,8 +13111,15 @@ STOCK_MAX_INVEST = 100_000       # максимум вложений на чел
 # веб-панели, раздел «Биржа». Констант здесь намеренно нет: дублирующая
 # копия умолчаний рано или поздно разошлась бы со схемой.
 FARM_TRIGGERS = {"ферма", "!бизнес", "фарма", "фармить"}
-FARM_BASE_MIN = 40
-FARM_BASE_MAX = 120
+# Шкала заработков поднята в EARNINGS_SCALE раз относительно первоначальной,
+# чтобы активная игра не потерялась на фоне бизнесов (те дают 250–4250 i¢/час
+# пассивно). Константа здесь не используется в расчётах — она документирует,
+# на сколько уже умножены числа ниже, чтобы следующая правка баланса не
+# гадала, «это исходное значение или уже поднятое».
+EARNINGS_SCALE = 10
+
+FARM_BASE_MIN = 400
+FARM_BASE_MAX = 1200
 FARM_STAR_CAP = 10
 FARM_FARMS_PER_STAR = 20
 FARM_STAR_BONUS_PER_LEVEL = 0.05  # +5% к множителю за каждую звезду
@@ -12978,11 +13162,15 @@ async def _farm_execute(chat_id: int, user_id: int) -> str:
     multiplier *= event_mult
     base = random.randint(FARM_BASE_MIN, FARM_BASE_MAX)
     amount = max(1, round(base * multiplier))
+    amount, passive = await _with_passive(chat_id, user_id, shop_effects.ACTIVITY_FARM, amount)
+    amount, lucky = await _apply_lucky(chat_id, user_id, amount)
 
     updated = await db.record_farm(chat_id, user_id, amount, now, star_cap=FARM_STAR_CAP, farms_per_star=FARM_FARMS_PER_STAR)
     luck_percent = round(luck * 100)
     multiplier_str = _ru_decimal(multiplier)
     await _check_coin_achievements(chat_id, user_id)
+    if int((updated or {}).get("total_farms") or 0) >= 100:
+        await grant_achievement(chat_id, user_id, "farm_100")
     return (
         f"✅ ЗАЧЁТ! ☢️ +{amount} i¢ = {base}×{multiplier_str} ({luck_percent}%)\n"
         f"✨ Сила звёздности: {int(updated.get('star_level') or 0)}\n"
@@ -13031,16 +13219,49 @@ async def cmd_farm_balance(message: Message):
     await message.answer(await _farm_balance_text(message.chat.id, message.from_user.id))
 
 
-async def _farm_top_text(chat_id: int) -> str:
-    rows = await db.list_coins_top(chat_id, limit=10)
+FARM_TOP_PAGE_SIZE = 10
+
+
+async def farm_top_page(chat_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Страница топа по монетам — как «топ» и «топ стриков»: нумерация сквозная,
+    внизу стрелки со счётчиком страниц."""
+    page = max(page, 0)
+    rows, total = await db.list_coins_top(chat_id, limit=FARM_TOP_PAGE_SIZE,
+                                          offset=page * FARM_TOP_PAGE_SIZE)
+    if not rows and page:
+        # Страницу могло смыть, пока человек листал (кто-то потратил монеты и
+        # выпал из топа) — не показываем пустоту, откатываемся на первую.
+        page = 0
+        rows, total = await db.list_coins_top(chat_id, limit=FARM_TOP_PAGE_SIZE)
     if not rows:
-        return "Пока ни у кого нет i¢ — начните с «ферма» 🌾"
-    lines = ["🏆 <b>Топ по коинам</b>", DIVIDER]
-    for i, row in enumerate(rows, start=1):
+        return "Пока ни у кого нет i¢ — начните с «ферма» 🌾", None
+
+    lines = [f"🏆 <b>Топ по коинам</b> — {total} участников", DIVIDER]
+    for index, row in enumerate(rows, start=page * FARM_TOP_PAGE_SIZE + 1):
         name = await display_name_by_id(chat_id, row["user_id"])
         stars = "⭐" * int(row.get("star_level") or 0)
-        lines.append(f"{i}. {name} — {row['coins']} i¢ {stars}")
-    return "\n".join(lines)
+        lines.append(f"{index}. {name} — {row['coins']} i¢ {stars}")
+    text = "\n".join(lines)
+
+    pages = max((total + FARM_TOP_PAGE_SIZE - 1) // FARM_TOP_PAGE_SIZE, 1)
+    if pages == 1:
+        return text, None
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"farmtop_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"farmtop_page:{page + 1}"))
+    return text, InlineKeyboardMarkup(inline_keyboard=[nav])
+
+
+async def _farm_top_text(chat_id: int) -> str:
+    """Только текст первой страницы, без кнопок. Нужен таймерам: они умеют
+    ВЫПОЛНЯТЬ «топ монет» (см. TIMER_RUNNABLE_COMMANDS) и ждут от исполнителя
+    строку, а клавиатуру приложить некуда."""
+    text, _ = await farm_top_page(chat_id, 0)
+    return text
 
 
 @router.message(
@@ -13050,7 +13271,26 @@ async def _farm_top_text(chat_id: int) -> str:
 async def cmd_farm_top(message: Message):
     if not _check_misc_access(message.from_user.id, "farm_top"):
         return
-    await message.answer(await _farm_top_text(message.chat.id))
+    text, kb = await farm_top_page(message.chat.id, 0)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("farmtop_page:"))
+async def paginate_farm_top(callback: CallbackQuery):
+    if not _check_misc_access(callback.from_user.id, "farm_top"):
+        await callback.answer()
+        return
+    try:
+        page = int((callback.data or "").split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Не удалось открыть эту страницу.", show_alert=True)
+        return
+    text, kb = await farm_top_page(callback.message.chat.id, page)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
 
 
 # ============================================================================
@@ -13072,17 +13312,17 @@ FISHING_TRIGGERS = {"рыбалка", "рыбачить", "рыбка", "удо�
 
 # (вес, эмодзи, название, мин. i¢, макс. i¢)
 FISHING_CATCHES: list[tuple[int, str, str, int, int]] = [
-    (18, "🥾", "старый ботинок",        1,    8),
-    (14, "🗑", "пучок водорослей",       3,   12),
-    (20, "🐟", "мелкая рыбёшка",        20,   45),
-    (16, "🐠", "полосатый окунь",       45,   80),
-    (12, "🐡", "надутый фугу",          70,  120),
-    (8,  "🦑", "кальмар",              110,  180),
-    (5,  "🦞", "лобстер",              170,  280),
-    (4,  "🐙", "осьминог",             250,  400),
-    (2,  "🦈", "акулёнок",             400,  700),
-    (1,  "🏆", "золотая рыбка",        900, 1500),
-    (1,  "📦", "затонувший сундук",   1200, 2000),
+    (18, "🥾", "старый ботинок",            10,     80),
+    (14, "🗑", "пучок водорослей",           30,    120),
+    (20, "🐟", "мелкая рыбёшка",           200,    450),
+    (16, "🐠", "полосатый окунь",          450,    800),
+    (12, "🐡", "надутый фугу",             700,   1200),
+    (8,  "🦑", "кальмар",                1100,   1800),
+    (5,  "🦞", "лобстер",                1700,   2800),
+    (4,  "🐙", "осьминог",               2500,   4000),
+    (2,  "🦈", "акулёнок",               4000,   7000),
+    (1,  "🏆", "золотая рыбка",          9000,  15000),
+    (1,  "📦", "затонувший сундук",    12000,  20000),
 ]
 _FISHING_WEIGHTS = [row[0] for row in FISHING_CATCHES]
 
@@ -13110,6 +13350,8 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
 
     emoji, name, amount = roll_catch()
     amount = max(1, round(amount * await event_multiplier(chat_id, chat_events.T_FISHING)))
+    amount, passive = await _with_passive(chat_id, user_id, shop_effects.ACTIVITY_FISHING, amount)
+    amount, lucky = await _apply_lucky(chat_id, user_id, amount)
     previous_best = int(stats.get("best_catch") or 0)
     # Сначала кулдаун (record_catch пишет last_fish_at), только потом монеты:
     # упади запись — человек останется без начисления, но не с возможностью
@@ -13118,6 +13360,8 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
     await db.add_coins(chat_id, user_id, amount)
     await db.add_log("fishing", chat_id=chat_id, actor_id=user_id, details=f"{name}:{amount}")
     await _check_coin_achievements(chat_id, user_id)
+    if int((updated or {}).get("total_catches") or 0) >= 100:
+        await grant_achievement(chat_id, user_id, "fish_100")
 
     lines = [
         f"🎣 Заброс… {emoji} <b>{name}</b>!",
@@ -13183,8 +13427,8 @@ async def cmd_fishing_top(message: Message):
 # ============================================================================
 TREASURE_COOLDOWN = timedelta(hours=3)
 TREASURE_TRIGGERS = {"клад", "копать", "искать клад"}
-TREASURE_SEED_MIN, TREASURE_SEED_MAX = 200, 500      # с чего начинается новый клад
-TREASURE_GROWTH_MIN, TREASURE_GROWTH_MAX = 25, 90    # сколько добавляет промах
+TREASURE_SEED_MIN, TREASURE_SEED_MAX = 2_000, 5_000   # с чего начинается новый клад
+TREASURE_GROWTH_MIN, TREASURE_GROWTH_MAX = 250, 900   # сколько добавляет промах
 TREASURE_CHANCE_BASE = 0.08
 TREASURE_CHANCE_STEP = 0.04
 TREASURE_CHANCE_MAX = 0.75
@@ -13241,12 +13485,16 @@ async def _treasure_execute(chat_id: int, user_id: int) -> str:
 
     # Карта сокровищ (событие чата) увеличивает саму находку.
     won = max(1, round(won * await event_multiplier(chat_id, chat_events.T_TREASURE)))
+    won, passive = await _with_passive(chat_id, user_id, shop_effects.ACTIVITY_TREASURE, won)
+    won, lucky = await _apply_lucky(chat_id, user_id, won)
     # Кулдаун раньше начисления — по той же причине, что и в рыбалке.
     await db.record_dig(chat_id, user_id, now, found=True)
     await db.add_coins(chat_id, user_id, won)
     await db.add_log("treasure_found", chat_id=chat_id, actor_id=user_id, details=str(won))
     await _check_coin_achievements(chat_id, user_id)
     finds = int(digger.get("finds") or 0) + 1
+    if finds >= 10:
+        await grant_achievement(chat_id, user_id, "treasure_10")
     return "\n".join([
         "⛏💥 Лопата стукнула обо что-то твёрдое…",
         f"💎 <b>КЛАД НАЙДЕН!</b> +{won} i¢",
@@ -13291,6 +13539,1723 @@ async def cmd_treasure_info(message: Message):
             who = await display_name_by_id(chat_id, row["user_id"])
             lines.append(f"{i}. {who} — кладов: {row['finds']}")
     await message.answer("\n".join(lines))
+
+
+# ============================================================================
+# 💰 ЕЩЁ ТРИ СПОСОБА ЗАРАБОТКА, каждый закрывает свою дыру в экономике.
+#
+# Что уже было: ферма (4 ч), рыбалка (2 ч), клад (3 ч), смена по профессии
+# (1 ч), казино, ограбление, биржа, банк. Общего у всех одно — это одиночные
+# механики с длинным откатом, и человеку, который зашёл в чат на пять минут,
+# делать нечего.
+#
+#  * «бонус» — ежедневный, растёт за дни подряд. Единственная механика, которая
+#    награждает за ВОЗВРАЩЕНИЕ, а не за активность в моменте.
+#  * «подработка» — 45 минут отката и маленькие деньги: то, чем занять эти пять
+#    минут, не ломая баланс длинных механик.
+#  * «шапка» — сбор с чата: деньги не появляются из воздуха, их скидывают живые
+#    люди. Единственный способ заработка, где участвует не один человек.
+#
+# Хранение общее — таблица earning_activity (см. db.ensure_earning_activity_table).
+# ============================================================================
+EARN_DAILY_BONUS = "daily_bonus"
+EARN_SIDE_JOB = "side_job"
+EARN_HAT = "hat"
+
+# Ежедневный бонус. Первый день — BASE, каждый следующий подряд добавляет STEP,
+# и так до MAX_DAYS; дальше сумма не растёт, иначе через полгода бонус обгонит
+# все остальные механики вместе взятые. Каждый седьмой день — двойной.
+DAILY_BONUS_BASE = 1_500
+DAILY_BONUS_STEP = 500
+DAILY_BONUS_MAX_DAYS = 30
+DAILY_BONUS_WEEK_MULTIPLIER = 2
+
+DAILY_BONUS_TRIGGERS = {"бонус", "!бонус", "ежедневный бонус", "дейлик"}
+
+
+def daily_bonus_amount(streak: int) -> int:
+    """Сколько даёт бонус на N-й день подряд."""
+    capped = min(max(streak, 1), DAILY_BONUS_MAX_DAYS)
+    amount = DAILY_BONUS_BASE + DAILY_BONUS_STEP * (capped - 1)
+    if streak % 7 == 0:
+        amount *= DAILY_BONUS_WEEK_MULTIPLIER
+    return amount
+
+
+async def _daily_bonus_execute(chat_id: int, user_id: int) -> str:
+    if await is_account_frozen(chat_id, user_id):
+        return "🧊 Ваш счёт заморожен администрацией — бонус недоступен."
+
+    now = datetime.utcnow()
+    today = utc_today()          # тот же отсчёт суток, что и у стрика активности
+    row = await db.get_earning_activity(chat_id, user_id, EARN_DAILY_BONUS)
+    last_day = row.get("last_day") if row else None
+    if last_day == today:
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time())
+        return (
+            "🎁 Сегодняшний бонус вы уже забрали.\n"
+            f"Следующий — через {format_duration_ru(tomorrow - now)}."
+        )
+
+    if last_day == today - timedelta(days=1):
+        streak = int(row.get("streak") or 0) + 1
+    else:
+        streak = 1
+
+    amount = daily_bonus_amount(streak)
+    amount, _passive = await _with_passive(
+        chat_id, user_id, shop_effects.ACTIVITY_DAILY_BONUS, amount)
+    await db.touch_earning_activity(
+        chat_id, user_id, EARN_DAILY_BONUS, now, streak=streak, day=today, earned=amount,
+    )
+    await db.add_coins(chat_id, user_id, amount)
+    await db.add_log("daily_bonus", chat_id=chat_id, actor_id=user_id, details=f"{streak}:{amount}")
+    await _check_coin_achievements(chat_id, user_id)
+
+    lines = [f"🎁 <b>Ежедневный бонус:</b> +{amount} i¢"]
+    if streak % 7 == 0:
+        lines.append(f"🎉 Каждый седьмой день — <b>двойной</b>! Дней подряд: {streak}")
+    elif streak == 1:
+        lines.append("🔥 Серия начата. Заходите завтра — бонус будет больше.")
+    else:
+        lines.append(f"🔥 Дней подряд: <b>{streak}</b>")
+    if streak < DAILY_BONUS_MAX_DAYS:
+        lines.append(f"Завтра: {daily_bonus_amount(streak + 1)} i¢")
+    return "\n".join(lines)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in DAILY_BONUS_TRIGGERS),
+)
+async def cmd_daily_bonus(message: Message):
+    if not _check_misc_access(message.from_user.id, "daily_bonus"):
+        return
+    await message.answer(await _daily_bonus_execute(message.chat.id, message.from_user.id))
+
+
+# --- Подработка ------------------------------------------------------------
+# Деньги маленькие и гарантированные: это «занять пять минут», а не источник
+# состояния. Профессия при этом не нужна и не мешает — подработка специально
+# доступна тем, кто ещё никуда не устроился.
+SIDE_JOB_COOLDOWN = timedelta(minutes=45)
+SIDE_JOB_TRIGGERS = {"подработка", "!подработка", "халтура", "шабашка"}
+
+# (эмодзи, что делали, мин. i¢, макс. i¢)
+SIDE_JOBS: list[tuple[str, str, int, int]] = [
+    ("📦", "разгрузили фуру",                      400,   900),
+    ("🧹", "подмели двор",                         300,   700),
+    ("🚗", "помыли соседу машину",                 500,  1100),
+    ("🐕", "выгуляли чужую собаку",                350,   800),
+    ("💻", "починили кому-то роутер",              600,  1300),
+    ("🍕", "развезли пиццу",                       550,  1200),
+    ("📢", "раздали листовки у метро",             250,   600),
+    ("🪴", "полили цветы, пока хозяева в отпуске",   450,  1000),
+    ("🧊", "постояли в очереди за кого-то",        300,   750),
+    ("🎮", "прошли за кого-то сложный уровень",    700,  1400),
+    ("📸", "поснимали чужую свадьбу",              800,  1600),
+    ("🔧", "собрали шкаф (почти без лишних деталей)",   650,  1350),
+]
+
+SIDE_JOB_TIP_CHANCE = 0.12      # чаевые: +50% к оплате
+SIDE_JOB_SCAM_CHANCE = 0.06     # заказчик пропал: смена впустую
+
+
+async def _side_job_execute(chat_id: int, user_id: int) -> str:
+    if await is_account_frozen(chat_id, user_id):
+        return "🧊 Ваш счёт заморожен администрацией — подработка недоступна."
+
+    now = datetime.utcnow()
+    row = await db.get_earning_activity(chat_id, user_id, EARN_SIDE_JOB)
+    last = row.get("last_at") if row else None
+    if last and now - last < SIDE_JOB_COOLDOWN:
+        return (
+            "😮‍💨 Вы ещё не отдышались после прошлой подработки.\n"
+            f"Следующая — через {format_duration_ru(SIDE_JOB_COOLDOWN - (now - last))}."
+        )
+
+    emoji, what, low, high = random.choice(SIDE_JOBS)
+    amount = random.randint(low, high)
+    # Аврал на производстве (событие чата) поднимает и подработку: это тоже
+    # работа за деньги, и объяснять человеку, почему её обошли, нечем.
+    amount = max(1, round(amount * await event_multiplier(chat_id, chat_events.T_WORK)))
+
+    note = ""
+    roll = random.random()
+    if roll < SIDE_JOB_SCAM_CHANCE:
+        amount = 0
+        note = "\n💨 Заказчик пропал вместе с деньгами. Бывает."
+    elif roll < SIDE_JOB_SCAM_CHANCE + SIDE_JOB_TIP_CHANCE:
+        amount = int(amount * 1.5)
+        note = "\n💝 Вам оставили чаевые: +50%."
+
+    # «Ящик инструментов» (предмет за ачивку) поднимает оплату, пока лежит
+    # в инвентаре. Кидалово он не отменяет: там сумма и так ноль.
+    if amount:
+        amount, _passive = await _with_passive(
+            chat_id, user_id, shop_effects.ACTIVITY_SIDE_JOB, amount)
+    # Сначала кулдаун, потом деньги — как в рыбалке и кладе.
+    await db.touch_earning_activity(chat_id, user_id, EARN_SIDE_JOB, now, earned=amount)
+    if amount:
+        await db.add_coins(chat_id, user_id, amount)
+        await db.add_log("side_job", chat_id=chat_id, actor_id=user_id, details=str(amount))
+        await _check_coin_achievements(chat_id, user_id)
+    # Ачивка «Мастер на все руки» — за 50 подработок. Считаем и неудачные:
+    # смену человек отработал, а что заказчик пропал — не его вина.
+    done = await db.get_earning_activity(chat_id, user_id, EARN_SIDE_JOB)
+    if int((done or {}).get("times") or 0) >= 50:
+        await grant_achievement(chat_id, user_id, "sidejob_50")
+
+    payout = f"☢️ +{amount} i¢" if amount else "☢️ +0 i¢"
+    return f"{emoji} Вы {what} — {payout}{note}"
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in SIDE_JOB_TRIGGERS),
+)
+async def cmd_side_job(message: Message):
+    if not _check_misc_access(message.from_user.id, "side_job"):
+        return
+    await message.answer(await _side_job_execute(message.chat.id, message.from_user.id))
+
+
+# --- Шапка по кругу --------------------------------------------------------
+# Единственный «социальный» заработок: монеты не берутся из воздуха, их
+# скидывают живые люди из своих кошельков, по одному разу каждый. Чат сверху
+# добавляет HAT_CHAT_MATCH_PCT из общей казны — но только если в ней есть
+# деньги, выдумывать их нельзя.
+#
+# Состояние сбора живёт в памяти и намеренно НЕ в базе: сбор длится минуты,
+# после перезапуска бота кнопка честно ответит «сбор закрыт», и это ровно то,
+# что и должно случиться, — деньги при этом ни у кого не зависают.
+HAT_COOLDOWN = timedelta(hours=6)
+HAT_OPEN_FOR = timedelta(minutes=10)
+HAT_DONATION = 1_000            # сколько списывается с каждого нажавшего
+HAT_CHAT_MATCH_PCT = 25         # сколько сверху добавляет казна чата, %
+HAT_TRIGGERS = {"шапка", "!шапка", "шапка по кругу", "скинемся"}
+
+_hat_rounds: dict[tuple[int, int], dict] = {}   # (chat_id, message_id) -> сбор
+
+
+def _hat_text(owner_name: str, total: int, donors: int) -> str:
+    return (
+        f"🎩 <b>Шапка по кругу!</b>\n{DIVIDER}\n"
+        f"{owner_name} пустил(а) шапку по чату.\n"
+        f"Каждый может кинуть <b>{HAT_DONATION}</b> i¢ — по одному разу.\n\n"
+        f"💰 Собрано: <b>{total}</b> i¢ · скинулись: {donors} чел.\n"
+        f"⏳ Сбор открыт {int(HAT_OPEN_FOR.total_seconds() // 60)} мин."
+    )
+
+
+def _hat_kb(closed: bool = False) -> InlineKeyboardMarkup:
+    text = "🎩 Сбор закрыт" if closed else f"🪙 Кинуть {HAT_DONATION} i¢"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="hat_drop")
+    ]])
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in HAT_TRIGGERS),
+)
+async def cmd_hat(message: Message):
+    if not _check_misc_access(message.from_user.id, "hat_round"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+
+    now = datetime.utcnow()
+    row = await db.get_earning_activity(chat_id, user_id, EARN_HAT)
+    last = row.get("last_at") if row else None
+    if last and now - last < HAT_COOLDOWN:
+        await message.reply(
+            "🎩 Вы недавно уже пускали шапку — дайте чату отдохнуть.\n"
+            f"Следующий раз — через {format_duration_ru(HAT_COOLDOWN - (now - last))}."
+        )
+        return
+
+    await db.touch_earning_activity(chat_id, user_id, EARN_HAT, now)
+    owner_name = await display_name(chat_id, message.from_user)
+    sent = await message.answer(_hat_text(owner_name, 0, 0), reply_markup=_hat_kb())
+    _hat_rounds[(chat_id, sent.message_id)] = {
+        "owner_id": user_id,
+        "owner_name": owner_name,
+        "donors": set(),
+        "total": 0,
+        "expires_at": now + HAT_OPEN_FOR,
+    }
+    asyncio.create_task(_close_hat_later(chat_id, sent.message_id))
+
+
+async def _close_hat_later(chat_id: int, message_id: int) -> None:
+    """Закрывает сбор по таймеру и дописывает итог в то же сообщение."""
+    try:
+        await asyncio.sleep(HAT_OPEN_FOR.total_seconds())
+        round_ = _hat_rounds.pop((chat_id, message_id), None)
+        if round_ is None:
+            return
+        total = round_["total"]
+        bonus = 0
+        if total:
+            # Доплата из казны чата — только в пределах того, что там есть.
+            treasury = await db.get_chat_coins(chat_id)
+            bonus = min(total * HAT_CHAT_MATCH_PCT // 100, max(int(treasury), 0))
+            if bonus:
+                await db.add_chat_coins(chat_id, -bonus)
+                await db.add_coins(chat_id, round_["owner_id"], bonus)
+
+        lines = [
+            f"🎩 <b>Шапка закрыта.</b>",
+            DIVIDER,
+            f"{round_['owner_name']} собрал(а) <b>{total}</b> i¢ "
+            f"с {len(round_['donors'])} чел.",
+        ]
+        if bonus:
+            lines.append(f"🏛 Казна чата добавила сверху: <b>+{bonus}</b> i¢")
+        elif total:
+            lines.append("🏛 В казне чата пусто — доплаты не будет.")
+        else:
+            lines.append("Никто не скинулся. Неловко вышло.")
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text="\n".join(lines), reply_markup=_hat_kb(closed=True),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log_suppressed("_close_hat_later", exc)
+
+
+@router.callback_query(F.data == "hat_drop")
+async def cb_hat_drop(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    round_ = _hat_rounds.get((chat_id, callback.message.message_id))
+    if round_ is None or datetime.utcnow() >= round_["expires_at"]:
+        await callback.answer("Этот сбор уже закрыт.", show_alert=True)
+        return
+
+    donor = callback.from_user.id
+    if donor == round_["owner_id"]:
+        await callback.answer("В свою же шапку? Так нельзя.", show_alert=True)
+        return
+    if donor in round_["donors"]:
+        await callback.answer("Вы уже скинулись — по одному разу с человека.", show_alert=True)
+        return
+    if await is_account_frozen(chat_id, donor):
+        await callback.answer("Ваш счёт заморожен администрацией.", show_alert=True)
+        return
+
+    # Помечаем ДО списания: два быстрых нажатия подряд иначе прошли бы оба.
+    round_["donors"].add(donor)
+    if not await spend_coins(chat_id, donor, HAT_DONATION):
+        round_["donors"].discard(donor)
+        await callback.answer(f"Нужно {HAT_DONATION} i¢, а у вас меньше.", show_alert=True)
+        return
+
+    await db.add_coins(chat_id, round_["owner_id"], HAT_DONATION)
+    round_["total"] += HAT_DONATION
+    await db.add_log("hat_drop", chat_id=chat_id, actor_id=donor, details=str(HAT_DONATION))
+
+    try:
+        await callback.message.edit_text(
+            _hat_text(round_["owner_name"], round_["total"], len(round_["donors"])),
+            reply_markup=_hat_kb(),
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer(f"Кинули {HAT_DONATION} i¢. Щедро!")
+
+
+# ============================================================================
+# 🏢 БИЗНЕСЫ — единственный ПАССИВНЫЙ доход в экономике.
+#
+# Всё про баланс (цены, доход, потолки, ступени налога) вынесено в
+# businesses.py: числа правятся и проверяются тестами без запуска бота.
+# Здесь — только команды, деньги и владение.
+#
+# Три правила, которые стоит держать в голове:
+#
+#  * Копилка считается ЛЕНИВО. Фонового цикла нет: в базе лежит «сколько
+#    накоплено» и «с какого момента», текущая сумма выводится из прошедшего
+#    времени. Бот может простоять сутки — при первом обращении досчитает.
+#
+#  * Снятие облагается налогом ПО ЧАСТЯМ (см. businesses.tax_for). Налог
+#    уходит в казну чата, а не сгорает: деньги остаются в игре, и казна ими
+#    же платит за «шапку» и гуманитарную помощь.
+#
+#  * ЛЮБАЯ смена владельца сначала принудительно инкассирует копилку прежнему
+#    хозяину — с налогом, — и только потом передаёт бизнес пустым. Иначе
+#    получилась бы дыра: накопить до потолка, «продать» своему второму
+#    аккаунту и забрать накопленное уже без налога.
+# ============================================================================
+BUSINESS_MAX_OWNED = len(business_catalog.BUSINESSES)   # по одному каждого типа
+
+# Предложения о продаже игроку живут в памяти: сделка длится минуты, а после
+# перезапуска бота кнопка честно скажет «предложение устарело» — это лучше,
+# чем воскресшая через сутки сделка по забытой цене.
+BUSINESS_OFFER_TTL = timedelta(minutes=10)
+_business_offers: dict[tuple[int, int], dict] = {}      # (chat_id, message_id) -> сделка
+# Подтверждения продажи БОТУ — отдельно от сделок между игроками: там
+# подтверждает покупатель, здесь сам владелец, и путать их нельзя.
+_business_bot_sales: dict[tuple[int, int], dict] = {}
+
+
+def _business_hours_since(last_tick) -> float:
+    if not last_tick:
+        return 0.0
+    return max(0.0, (datetime.utcnow() - last_tick).total_seconds() / 3600)
+
+
+def _business_pending(row: dict) -> int:
+    """Сколько в копилке этого бизнеса ПРЯМО СЕЙЧАС.
+
+    Сломанный не копит вообще: накопленное до поломки сохраняется (оно уже
+    зафиксировано в accrued в момент поломки), но не растёт.
+
+    Если действовала надбавка от срочного предложения, интервал делится на
+    два куска — под надбавкой и без неё. Так приходится делать потому, что
+    копилка считается лениво: между двумя обращениями надбавка могла успеть
+    и начаться, и кончиться.
+    """
+    item = business_catalog.BY_KEY.get(row["business_key"])
+    if item is None:
+        return 0
+    level = int(row["level"])
+    stored = int(row["accrued"] or 0)
+    if row.get("broken_kind"):
+        return max(0, min(stored, item.cap(level)))
+
+    last_tick = row.get("last_tick_at")
+    total_hours = _business_hours_since(last_tick)
+    boost_until = row.get("boost_until")
+    if not boost_until or not last_tick or boost_until <= last_tick:
+        return business_catalog.accrued_now(level, item, stored, total_hours)
+
+    # Надбавка кончается где-то внутри интервала (или ещё идёт).
+    boosted_end = min(datetime.utcnow(), boost_until)
+    boosted_hours = max(0.0, (boosted_end - last_tick).total_seconds() / 3600)
+    return business_catalog.accrued_with_boost(
+        level, item, stored,
+        normal_hours=max(0.0, total_hours - boosted_hours),
+        boosted_hours=boosted_hours,
+    )
+
+
+async def _business_cash_out(chat_id: int, user_id: int, row: dict) -> tuple[int, int]:
+    """Инкассирует копилку одного бизнеса: начисляет владельцу за вычетом
+    налога, налог отправляет в казну чата, копилку обнуляет.
+
+    Возвращает (на руки, налог). (0, 0) — забирать было нечего.
+    """
+    gross = _business_pending(row)
+    now = datetime.utcnow()
+    if gross <= 0:
+        await db.set_business_accrual(chat_id, user_id, row["business_key"], 0, now)
+        return 0, 0
+
+    tax = business_catalog.tax_for(gross)
+    net = gross - tax
+    # Сначала обнуляем копилку, потом платим: если начисление упадёт, человек
+    # останется без денег, но не с возможностью инкассировать одно и то же
+    # дважды подряд (тот же порядок, что у рыбалки и клада).
+    await db.set_business_accrual(chat_id, user_id, row["business_key"], 0, now)
+    if net > 0:
+        await db.add_coins(chat_id, user_id, net)
+    if tax > 0:
+        await db.add_chat_coins(chat_id, tax)
+    await db.add_log("business_collect", chat_id=chat_id, actor_id=user_id,
+                     details=f"{row['business_key']}:{gross}:{tax}")
+    return net, tax
+
+
+def _business_tax_hint() -> str:
+    parts = []
+    lower = 0
+    for upper, percent in business_catalog.TAX_BRACKETS:
+        if upper is None:
+            parts.append(f"свыше {lower} — {percent}%")
+        else:
+            parts.append(f"до {upper} — {percent}%")
+            lower = upper
+    return "Налог по частям: " + ", ".join(parts) + "."
+
+
+async def _business_catalog_text(chat_id: int, user_id: int) -> str:
+    owned = {r["business_key"]: r for r in await db.list_user_businesses(chat_id, user_id)}
+    lines = ["🏢 <b>Бизнесы</b> — пассивный доход", DIVIDER]
+    for item in business_catalog.BUSINESSES:
+        mine = owned.get(item.key)
+        mark = f" ✅ ваш, {mine['level']} ур." if mine else ""
+        lines.append(f"{item.name} (<code>{item.key}</code>) — <b>{item.price}</b> i¢{mark}")
+        for level in (1, 2, 3):
+            up = item.upgrade_cost(level)
+            cost = f", апгрейд {up} i¢" if up else ""
+            lines.append(
+                f"   {level} ур.: {item.income(level)} i¢/час, копилка до "
+                f"{item.cap(level)} i¢{cost}"
+            )
+    lines += [
+        "",
+        f"Копилка переполняется примерно за {business_catalog.BUSINESSES[0].cap(1) // business_catalog.BUSINESSES[0].income(1)} ч — "
+        "заходите забирать.",
+        _business_tax_hint(),
+        f"Бот выкупает бизнес за {int(business_catalog.BUYBACK_SHARE * 100)}% цены.",
+        "",
+        "Купить: <code>бизнес купить {ключ}</code> · свои: <code>бизнес</code>",
+    ]
+    return "\n".join(lines)
+
+
+async def _my_businesses_text(chat_id: int, user_id: int) -> str:
+    rows = await db.list_user_businesses(chat_id, user_id)
+    if not rows:
+        return (
+            "🏢 <b>Мои бизнесы</b>\n\nУ вас пока ни одного.\n"
+            "Каталог — <code>бизнесы</code>, купить — <code>бизнес купить {ключ}</code>."
+        )
+
+    lines = [f"🏢 <b>Мои бизнесы</b> — {len(rows)} из {BUSINESS_MAX_OWNED}", DIVIDER]
+    total_ready = 0
+    total_income = 0
+    for row in rows:
+        item = business_catalog.BY_KEY.get(row["business_key"])
+        if item is None:
+            continue          # бизнес убрали из каталога — строку просто не показываем
+        level = int(row["level"])
+        pending = _business_pending(row)
+        total_ready += pending
+        total_income += item.income(level)
+        full_in = business_catalog.hours_to_full(level, item, pending)
+        boost_until = row.get("boost_until")
+        boosted = bool(boost_until and boost_until > datetime.utcnow())
+        if row.get("broken_kind"):
+            # Про поломку сообщают в личку, но лс у половины чата закрыты —
+            # поэтому здесь она тоже видна, и это основной канал, а не запасной.
+            state = f"🛠 СЛОМАН: {row['broken_kind']} — доход стоит"
+        elif pending >= item.cap(level):
+            state = "🔴 копилка полна — доход стоит"
+        else:
+            state = f"⏳ полная через {format_duration_ru(timedelta(hours=full_in))}"
+        income_note = f"{item.income(level)} i¢/час"
+        if boosted:
+            boosted_rate = int(item.income(level)
+                               * (100 + business_catalog.OFFER_BONUS_PERCENT) / 100)
+            income_note = (f"<b>{boosted_rate}</b> i¢/час "
+                           f"(+{business_catalog.OFFER_BONUS_PERCENT}% ещё "
+                           f"{format_duration_ru(boost_until - datetime.utcnow())})")
+        lines.append(
+            f"{item.name} · {level} ур. · {income_note}\n"
+            f"   в копилке: <b>{pending}</b> / {item.cap(level)} i¢ · {state}"
+        )
+        if row.get("broken_kind"):
+            lines.append(
+                f"   починить: <code>бизнес починить {item.key}</code> — "
+                f"{business_catalog.repair_cost(item, level)} i¢"
+            )
+        up_cost = item.upgrade_cost(level + 1)
+        if up_cost:
+            lines.append(
+                f"   апгрейд до {level + 1} ур.: {up_cost} i¢ → "
+                f"{item.income(level + 1)} i¢/час"
+            )
+
+    if total_ready:
+        tax = business_catalog.tax_for(total_ready)
+        lines += ["", f"💰 Забрать всё: <b>{total_ready}</b> i¢, налог {tax} → "
+                      f"на руки <b>{total_ready - tax}</b> i¢"]
+    else:
+        lines += ["", "Пока забирать нечего."]
+    lines.append(f"📈 Суммарно: {total_income} i¢/час")
+    lines += ["", "<code>бизнес собрать</code> · <code>бизнес улучшить {ключ}</code> · "
+                  "<code>бизнес продать {ключ}</code>",
+              "<code>бизнес закрепить {ключ}</code> — показывать в профиле"]
+    return "\n".join(lines)
+
+
+# ВСЕ команды раздела начинаются со слова «бизнес» — включая эти две, у
+# которых естественнее звучали бы «мой бизнес» и «каталог бизнесов».
+# Единый префикс нужен не для красоты: по ведущим словам фразы бот отличает
+# команду в MessageCounterMiddleware (см. resolve_command_key) ещё ДО выбора
+# обработчика — так работают и свой срок автоочистки, и выдача прав по дереву
+# команд. Форма, выпадающая из префикса, в этой связке опознаётся хуже и
+# может утащить настройку не туда.
+BUSINESS_LIST_TRIGGERS = {"бизнесы", "бизнес каталог", "бизнес список"}
+BUSINESS_MINE_TRIGGERS = {"бизнес", "бизнес мой", "бизнес мои"}
+BUSINESS_BUY_RE = re.compile(r"(?i)^бизнес\s+купить\s+(\S+)$")
+BUSINESS_UPGRADE_RE = re.compile(r"(?i)^бизнес\s+(?:улучшить|апгрейд)\s+(\S+)$")
+BUSINESS_COLLECT_RE = re.compile(r"(?i)^бизнес\s+(?:собрать|забрать)(?:\s+(\S+))?$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in BUSINESS_LIST_TRIGGERS),
+)
+async def cmd_business_catalog(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_catalog"):
+        return
+    await message.reply(await _business_catalog_text(message.chat.id, message.from_user.id))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in BUSINESS_MINE_TRIGGERS),
+)
+async def cmd_business_mine(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_mine"):
+        return
+    await message.reply(await _my_businesses_text(message.chat.id, message.from_user.id))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_BUY_RE.match(t.strip()))),
+)
+async def cmd_business_buy(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_buy"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    item = business_catalog.resolve(BUSINESS_BUY_RE.match(message.text.strip()).group(1))
+    if item is None:
+        await message.reply("Такого бизнеса нет — посмотрите <code>бизнесы</code>.")
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией — покупка недоступна.")
+        return
+    if await db.get_user_business(chat_id, user_id, item.key):
+        await message.reply(f"{item.name} у вас уже есть — второй такой не положен.")
+        return
+
+    if not await spend_coins(chat_id, user_id, item.price):
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Недостаточно монет: {item.name} стоит <b>{item.price}</b> i¢, "
+            f"а у вас {wallet.get('coins', 0)} i¢."
+        )
+        return
+
+    now = datetime.utcnow()
+    if not await db.add_business(chat_id, user_id, item.key, now):
+        # Гонка: такой же бизнес успели завести между проверкой и вставкой.
+        # Деньги уже списаны — возвращаем, иначе человек заплатил за воздух.
+        await db.add_coins(chat_id, user_id, item.price)
+        await message.reply("Не удалось оформить покупку — попробуйте ещё раз.")
+        return
+
+    await db.add_log("business_buy", chat_id=chat_id, actor_id=user_id,
+                     details=f"{item.key}:{item.price}")
+    await message.reply(
+        f"🏢 Поздравляем с покупкой!\n{item.name} теперь ваш — "
+        f"<b>{item.income(1)}</b> i¢/час, копилка до {item.cap(1)} i¢.\n"
+        f"Забирать: <code>бизнес собрать</code>."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_COLLECT_RE.match(t.strip()))),
+)
+async def cmd_business_collect(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_collect"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией — доход недоступен.")
+        return
+
+    raw = BUSINESS_COLLECT_RE.match(message.text.strip()).group(1)
+    rows = await db.list_user_businesses(chat_id, user_id)
+    if not rows:
+        await message.reply("У вас нет ни одного бизнеса — каталог: <code>бизнесы</code>.")
+        return
+
+    if raw:
+        item = business_catalog.resolve(raw)
+        if item is None:
+            await message.reply("Такого бизнеса нет — посмотрите <code>бизнесы</code>.")
+            return
+        rows = [r for r in rows if r["business_key"] == item.key]
+        if not rows:
+            await message.reply(f"{item.name} вам не принадлежит.")
+            return
+
+    # Налог считается ОТ ВСЕЙ снимаемой суммы разом, а не с каждого бизнеса
+    # по отдельности: иначе владелец пяти бизнесов платил бы по нижней ставке
+    # пять раз и в сумме меньше, чем владелец одного крупного.
+    gross = sum(_business_pending(r) for r in rows)
+    if gross <= 0:
+        await message.reply("Копилки пусты — зайдите позже.")
+        return
+
+    tax = business_catalog.tax_for(gross)
+    net = gross - tax
+    now = datetime.utcnow()
+    for row in rows:
+        await db.set_business_accrual(chat_id, user_id, row["business_key"], 0, now)
+    if net > 0:
+        await db.add_coins(chat_id, user_id, net)
+    if tax > 0:
+        await db.add_chat_coins(chat_id, tax)
+    await db.add_log("business_collect", chat_id=chat_id, actor_id=user_id,
+                     details=f"{len(rows)}:{gross}:{tax}")
+    await _check_coin_achievements(chat_id, user_id)
+
+    await message.reply(
+        f"💰 Забрали <b>{gross}</b> i¢ с {len(rows)} бизнес(-ов).\n"
+        f"🧾 Налог: {tax} i¢ ({tax * 100 // gross}%) — ушёл в казну чата.\n"
+        f"На руки: <b>{net}</b> i¢"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_UPGRADE_RE.match(t.strip()))),
+)
+async def cmd_business_upgrade(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_upgrade"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    item = business_catalog.resolve(BUSINESS_UPGRADE_RE.match(message.text.strip()).group(1))
+    if item is None:
+        await message.reply("Такого бизнеса нет — посмотрите <code>бизнесы</code>.")
+        return
+    row = await db.get_user_business(chat_id, user_id, item.key)
+    if row is None:
+        await message.reply(f"{item.name} вам не принадлежит.")
+        return
+    level = int(row["level"])
+    if level >= business_catalog.MAX_LEVEL:
+        await message.reply(f"{item.name} уже {level} уровня — это максимум.")
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией — апгрейд недоступен.")
+        return
+
+    cost = item.upgrade_cost(level + 1)
+    # «Бизнес-план» (предмет магазина) оплачивает апгрейд за вас. Заряд
+    # тратится ТОЛЬКО здесь, когда апгрейд точно состоится: проверки выше уже
+    # пройдены, максимальный уровень отсеян.
+    free = await db.consume_item_effect(chat_id, user_id,
+                                        shop_effects.EFFECT_FREE_UPGRADE)
+    if not free and not await spend_coins(chat_id, user_id, cost):
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Недостаточно монет: апгрейд до {level + 1} ур. стоит <b>{cost}</b> i¢, "
+            f"а у вас {wallet.get('coins', 0)} i¢."
+        )
+        return
+    if free:
+        cost = 0
+
+    # Копилку фиксируем ИМЕННО СЕЙЧАС: у нового уровня свой потолок, и без
+    # пересчёта накопленное посчиталось бы задним числом по новым правилам.
+    pending = _business_pending(row)
+    await db.set_business_level(chat_id, user_id, item.key, level + 1, pending,
+                                datetime.utcnow())
+    await db.add_log("business_upgrade", chat_id=chat_id, actor_id=user_id,
+                     details=f"{item.key}:{level + 1}:{cost}")
+    await message.reply(
+        f"⬆️ {item.name} прокачан до <b>{level + 1}</b> уровня за {cost} i¢.\n"
+        f"Доход: {item.income(level)} → <b>{item.income(level + 1)}</b> i¢/час, "
+        f"копилка: {item.cap(level)} → <b>{item.cap(level + 1)}</b> i¢."
+    )
+
+
+# --- Продажа боту, продажа игроку и передача --------------------------------
+# Общее правило для всех трёх: копилка прежнего владельца инкассируется С
+# НАЛОГОМ до смены хозяина, и бизнес уходит пустым. Без этого «продай самому
+# себе на второй аккаунт» было бы способом снять доход мимо налога.
+
+BUSINESS_SELL_BOT_RE = re.compile(r"(?i)^бизнес\s+продать\s+(\S+)$")
+# Цена стоит ПЕРЕД получателем, поэтому голый ID цели здесь не поддерживаем
+# (см. allow_bare_id ниже): «бизнес продать shaurma 5000» — 5000 это цена,
+# и трактовать её как user_id нельзя.
+BUSINESS_SELL_USER_RE = re.compile(r"(?i)^бизнес\s+продать\s+(\S+)\s+(\d+)(?:\s+.*)?$")
+BUSINESS_GIVE_RE = re.compile(r"(?i)^бизнес\s+(?:передать|подарить)\s+(\S+)(?:\s+.*)?$")
+
+
+async def _business_owned_or_reply(message: Message, raw_key: str):
+    """Общее начало продажи/передачи: найти бизнес и убедиться, что он ваш."""
+    item = business_catalog.resolve(raw_key)
+    if item is None:
+        await message.reply("Такого бизнеса нет — посмотрите <code>бизнесы</code>.")
+        return None, None
+    row = await db.get_user_business(message.chat.id, message.from_user.id, item.key)
+    if row is None:
+        await message.reply(f"{item.name} вам не принадлежит.")
+        return None, None
+    return item, row
+
+
+async def _business_target(message: Message):
+    """Получатель бизнеса: @username/text_mention в тексте или reply."""
+    target, _ = await resolve_command_target(message, trigger_words=2, allow_bare_id=False)
+    if target is None and message.reply_to_message:
+        target = message.reply_to_message.from_user
+    return target
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_SELL_BOT_RE.match(t.strip()))),
+)
+async def cmd_business_sell_to_bot(message: Message):
+    """«бизнес продать {ключ}» без цены и без адресата — сдать боту.
+
+    Только СПРАШИВАЕТ. Продажа боту необратима и отдаёт лишь 70% цены, а
+    команда без цены — ровно то, что напишет человек, который собирался
+    продать игроку и забыл дописать цену. Поэтому здесь кнопка подтверждения,
+    а сама продажа — в cb_business_sell_bot ниже.
+    """
+    if not _check_misc_access(message.from_user.id, "business_sell"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    item, row = await _business_owned_or_reply(
+        message, BUSINESS_SELL_BOT_RE.match(message.text.strip()).group(1)
+    )
+    if item is None:
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией — продажа недоступна.")
+        return
+
+    payout = item.buyback()
+    level = int(row["level"])
+    pending = _business_pending(row)
+    lines = [
+        f"🤝 <b>Продать боту?</b>",
+        DIVIDER,
+        f"{item.name} · {level} ур. · {item.income(level)} i¢/час",
+        f"Бот заплатит: <b>{payout}</b> i¢ "
+        f"({int(business_catalog.BUYBACK_SHARE * 100)}% от цены {item.price} i¢).",
+    ]
+    if pending:
+        tax = business_catalog.tax_for(pending)
+        lines.append(f"Копилку ({pending} i¢) заберёте с налогом {tax} → +{pending - tax} i¢.")
+    if level > 1:
+        lines.append("⚠️ За апгрейды бот не доплачивает — {} i¢ вложений сгорят.".format(
+            sum(item.upgrade_cost(l) for l in range(2, level + 1))
+        ))
+    lines.append("")
+    lines.append(f"Продать игроку дороже: <code>бизнес продать {item.key} {{цена}} @кому</code>")
+
+    sent = await message.answer("\n".join(lines), reply_markup=_business_sell_kb(payout))
+    _business_bot_sales[(chat_id, sent.message_id)] = {
+        "seller_id": user_id,
+        "key": item.key,
+        "expires_at": datetime.utcnow() + BUSINESS_OFFER_TTL,
+    }
+
+
+def _business_sell_kb(payout: int, closed: bool = False) -> InlineKeyboardMarkup:
+    text = "Сделка закрыта" if closed else f"✅ Да, продать за {payout} i¢"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="business_sell_bot")
+    ]])
+
+
+@router.callback_query(F.data == "business_sell_bot")
+async def cb_business_sell_bot(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    deal = _business_bot_sales.get((chat_id, callback.message.message_id))
+    if deal is None or datetime.utcnow() >= deal["expires_at"]:
+        _business_bot_sales.pop((chat_id, callback.message.message_id), None)
+        await callback.answer("Предложение устарело.", show_alert=True)
+        return
+    seller_id = deal["seller_id"]
+    if callback.from_user.id != seller_id:
+        await callback.answer("Это не ваш бизнес.", show_alert=True)
+        return
+
+    item = business_catalog.BY_KEY.get(deal["key"])
+    row = await db.get_user_business(chat_id, seller_id, deal["key"])
+    if item is None or row is None:
+        _business_bot_sales.pop((chat_id, callback.message.message_id), None)
+        await callback.answer("Этого бизнеса у вас уже нет.", show_alert=True)
+        return
+    if await is_account_frozen(chat_id, seller_id):
+        await callback.answer("Ваш счёт заморожен администрацией.", show_alert=True)
+        return
+
+    net, tax = await _business_cash_out(chat_id, seller_id, row)
+    payout = item.buyback()
+    await db.delete_business(chat_id, seller_id, deal["key"])
+    await db.add_coins(chat_id, seller_id, payout)
+    await db.add_log("business_sell_bot", chat_id=chat_id, actor_id=seller_id,
+                     details=f"{deal['key']}:{payout}")
+    _business_bot_sales.pop((chat_id, callback.message.message_id), None)
+
+    lines = [f"🤝 {item.name} продан боту за <b>{payout}</b> i¢."]
+    if net or tax:
+        lines.append(f"💰 Из копилки забрали {net + tax} i¢, налог {tax} → на руки {net} i¢.")
+    try:
+        await callback.message.edit_text(
+            "\n".join(lines), reply_markup=_business_sell_kb(payout, closed=True)
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Продано.")
+
+
+def _business_offer_kb(closed: bool = False) -> InlineKeyboardMarkup:
+    text = "Сделка закрыта" if closed else "✅ Купить"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="business_buy_offer")
+    ]])
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_SELL_USER_RE.match(t.strip()))),
+)
+async def cmd_business_sell_to_user(message: Message):
+    """«бизнес продать {ключ} {цена}» + reply/@username — предложить игроку."""
+    if not _check_misc_access(message.from_user.id, "business_sell"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    match = BUSINESS_SELL_USER_RE.match(message.text.strip())
+    item, row = await _business_owned_or_reply(message, match.group(1))
+    if item is None:
+        return
+
+    price = int(match.group(2))
+    if price <= 0:
+        await message.reply("Цена должна быть больше нуля.")
+        return
+
+    target = await _business_target(message)
+    if target is None:
+        await message.reply(
+            "Укажите покупателя: ответьте командой на его сообщение "
+            "либо укажите @username после цены."
+        )
+        return
+    if target.id is None:
+        await message.reply("Бот ещё не видел этого человека в чате.")
+        return
+    if target.id == user_id:
+        await message.reply("Продать бизнес самому себе не выйдет 🙂")
+        return
+    if getattr(target, "is_bot", False):
+        await message.reply(
+            "Ботам бизнес не продают. Сдать боту — <code>бизнес продать "
+            f"{item.key}</code> за {item.buyback()} i¢."
+        )
+        return
+    if await db.get_user_business(chat_id, target.id, item.key):
+        await message.reply(f"У покупателя уже есть {item.name} — второй такой не положен.")
+        return
+
+    buyer_name = await display_name_by_id(chat_id, target.id)
+    seller_name = await display_name(chat_id, message.from_user)
+    pending = _business_pending(row)
+    sent = await message.answer(
+        f"🤝 <b>Сделка</b>\n{DIVIDER}\n"
+        f"{seller_name} продаёт {buyer_name}\n"
+        f"{item.name} · {row['level']} ур. · {item.income(int(row['level']))} i¢/час\n"
+        f"Цена: <b>{price}</b> i¢\n\n"
+        f"Копилку ({pending} i¢) продавец заберёт себе с налогом — "
+        f"бизнес перейдёт пустым.\n"
+        f"Купить может только {buyer_name}. Предложение живёт "
+        f"{format_duration_ru(BUSINESS_OFFER_TTL)}.",
+        reply_markup=_business_offer_kb(),
+    )
+    _business_offers[(chat_id, sent.message_id)] = {
+        "seller_id": user_id,
+        "buyer_id": target.id,
+        "key": item.key,
+        "price": price,
+        "expires_at": datetime.utcnow() + BUSINESS_OFFER_TTL,
+    }
+
+
+@router.callback_query(F.data == "business_buy_offer")
+async def cb_business_buy_offer(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    offer = _business_offers.get((chat_id, callback.message.message_id))
+    if offer is None or datetime.utcnow() >= offer["expires_at"]:
+        _business_offers.pop((chat_id, callback.message.message_id), None)
+        await callback.answer("Предложение устарело.", show_alert=True)
+        return
+    if callback.from_user.id != offer["buyer_id"]:
+        await callback.answer("Это предложение не вам.", show_alert=True)
+        return
+
+    item = business_catalog.BY_KEY.get(offer["key"])
+    seller_id, buyer_id, price = offer["seller_id"], offer["buyer_id"], offer["price"]
+    row = await db.get_user_business(chat_id, seller_id, offer["key"])
+    if item is None or row is None:
+        _business_offers.pop((chat_id, callback.message.message_id), None)
+        await callback.answer("Продавец уже расстался с этим бизнесом.", show_alert=True)
+        return
+    if await db.get_user_business(chat_id, buyer_id, offer["key"]):
+        await callback.answer("У вас уже есть такой бизнес.", show_alert=True)
+        return
+    if await is_account_frozen(chat_id, buyer_id):
+        await callback.answer("Ваш счёт заморожен администрацией.", show_alert=True)
+        return
+
+    # Порядок важен и выбран так, чтобы ни один сбой не создавал и не терял
+    # денег: сначала списываем с покупателя (не хватило — ничего не произошло),
+    # потом инкассируем копилку продавцу, потом переносим бизнес, и только
+    # если перенос удался — платим продавцу. Не удался — возвращаем деньги.
+    if not await spend_coins(chat_id, buyer_id, price):
+        await callback.answer(f"Нужно {price} i¢, а у вас меньше.", show_alert=True)
+        return
+
+    await _business_cash_out(chat_id, seller_id, row)
+    if not await db.move_business(chat_id, seller_id, buyer_id, offer["key"],
+                                  datetime.utcnow()):
+        await db.add_coins(chat_id, buyer_id, price)
+        await callback.answer("Сделка сорвалась, деньги вернулись.", show_alert=True)
+        return
+
+    await db.add_coins(chat_id, seller_id, price)
+    await db.add_log("business_sell_user", chat_id=chat_id, actor_id=seller_id,
+                     target_id=buyer_id, details=f"{offer['key']}:{price}")
+    _business_offers.pop((chat_id, callback.message.message_id), None)
+
+    seller_name = await display_name_by_id(chat_id, seller_id)
+    buyer_name = await display_name_by_id(chat_id, buyer_id)
+    try:
+        await callback.message.edit_text(
+            f"🤝 <b>Сделка состоялась.</b>\n{DIVIDER}\n"
+            f"{item.name} ({row['level']} ур.) перешёл от {seller_name} к {buyer_name} "
+            f"за <b>{price}</b> i¢.\nКопилка обнулена — доход пошёл заново.",
+            reply_markup=_business_offer_kb(closed=True),
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Бизнес ваш!")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_GIVE_RE.match(t.strip()))),
+)
+async def cmd_business_give(message: Message):
+    """«бизнес передать {ключ}» + reply/@username — отдать даром, без кнопок:
+    дарителю подтверждать нечего, а получателю подарок ничего не стоит."""
+    if not _check_misc_access(message.from_user.id, "business_transfer"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    item, row = await _business_owned_or_reply(
+        message, BUSINESS_GIVE_RE.match(message.text.strip()).group(1)
+    )
+    if item is None:
+        return
+
+    target = await _business_target(message)
+    if target is None:
+        await message.reply(
+            "Укажите, кому передаёте: ответьте командой на его сообщение "
+            "либо укажите @username после ключа."
+        )
+        return
+    if target.id is None:
+        await message.reply("Бот ещё не видел этого человека в чате.")
+        return
+    if target.id == user_id:
+        await message.reply("Себе же и передать? 🙂")
+        return
+    if getattr(target, "is_bot", False):
+        await message.reply(
+            f"Ботам бизнес не дарят. Сдать боту за {item.buyback()} i¢ — "
+            f"<code>бизнес продать {item.key}</code>."
+        )
+        return
+
+    net, tax = await _business_cash_out(chat_id, user_id, row)
+    if not await db.move_business(chat_id, user_id, target.id, item.key, datetime.utcnow()):
+        await message.reply(f"У получателя уже есть {item.name} — второй такой не положен.")
+        return
+
+    await db.add_log("business_transfer", chat_id=chat_id, actor_id=user_id,
+                     target_id=target.id, details=item.key)
+    target_name = await display_name_by_id(chat_id, target.id)
+    lines = [f"🎁 {item.name} ({row['level']} ур.) передан {target_name}."]
+    if net or tax:
+        lines.append(f"💰 Копилку забрали вам: {net + tax} i¢, налог {tax} → на руки {net} i¢.")
+    await message.reply("\n".join(lines))
+
+
+# --- Поломки и срочные предложения ------------------------------------------
+# Цикл раз в BUSINESS_TICK заглядывает во все бизнесы всех чатов и с небольшой
+# вероятностью ломает один или подкидывает владельцу выгодное предложение.
+#
+# Вероятность за тик выводится из желаемого срока, а не подбирается на глаз:
+# при тике в 20 минут и цели «в среднем раз в 2.5 суток» это
+#   20 мин / (2.5 * 24 * 60 мин) = 0.0056.
+# Меняете тик — вероятности пересчитаются сами, и частота поломок не поедет.
+BUSINESS_TICK = timedelta(minutes=20)
+BUSINESS_BREAK_EVERY = timedelta(days=2.5)
+BUSINESS_OFFER_EVERY = timedelta(days=1.5)
+BUSINESS_BREAK_CHANCE = BUSINESS_TICK / BUSINESS_BREAK_EVERY
+BUSINESS_OFFER_CHANCE = BUSINESS_TICK / BUSINESS_OFFER_EVERY
+# Сколько живёт срочное предложение, пока владелец не нажал кнопку.
+BUSINESS_URGENT_TTL = timedelta(hours=2)
+
+_business_urgent: dict[tuple[int, int], dict] = {}   # (chat_id, message_id) -> предложение
+
+
+def _business_repair_kb(cost: int, closed: bool = False) -> InlineKeyboardMarkup:
+    text = "Починено" if closed else f"🔧 Починить за {cost} i¢"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="business_repair")
+    ]])
+
+
+def _business_urgent_kb(cost: int, closed: bool = False) -> InlineKeyboardMarkup:
+    text = "Предложение закрыто" if closed else f"💡 Вложить {cost} i¢"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="business_urgent")
+    ]])
+
+
+async def _dm_or_none(user_id: int, text: str, keyboard=None):
+    """Пишет в личку. None — не дошло (лс закрыты, бот заблокирован).
+
+    Повторять такую отправку бессмысленно, поэтому вызывающий просто
+    продолжает работу: состояние поломки всё равно видно по команде «бизнес».
+    """
+    try:
+        return await bot.send_message(user_id, text, reply_markup=keyboard)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return None
+    except Exception as exc:
+        log_suppressed("_dm_or_none", exc)
+        return None
+
+
+async def _break_business(chat_id: int, row: dict) -> None:
+    """Ломает один бизнес и, если получится, пишет владельцу в личку."""
+    item = business_catalog.BY_KEY.get(row["business_key"])
+    if item is None:
+        return
+    level = int(row["level"])
+    user_id = int(row["user_id"])
+    # Страховка гасит ровно одну поломку и тратится. Проверяем ДО того, как
+    # что-то менять: иначе застрахованный бизнес успел бы сломаться, а заряд
+    # сгорел бы вхолостую.
+    if await db.consume_item_effect(chat_id, user_id, shop_effects.EFFECT_SHIELD):
+        await db.add_log("business_shielded", chat_id=chat_id, actor_id=user_id,
+                         details=item.key)
+        await _dm_or_none(
+            user_id,
+            f"🛡 В {item.name} случилась было авария — но сработала страховка. "
+            f"Бизнес работает как ни в чём не бывало, страховка потрачена."
+        )
+        return
+
+    kind = random.choice(business_catalog.BREAKDOWNS.get(item.key, ("поломка",)))
+    pending = _business_pending(row)
+    if not await db.set_business_broken(chat_id, user_id, item.key, kind,
+                                        pending, datetime.utcnow()):
+        return                      # уже сломан — второй раз не ломаем
+    cost = business_catalog.repair_cost(item, level)
+    await db.add_log("business_broken", chat_id=chat_id, actor_id=user_id,
+                     details=f"{item.key}:{kind}:{cost}")
+
+    sent = await _dm_or_none(
+        user_id,
+        f"🛠 <b>ЧП в вашем бизнесе</b>\n{DIVIDER}\n"
+        f"{item.name} — <b>{kind}</b>.\n\n"
+        f"Пока не почините, бизнес <b>не приносит доход</b>. "
+        f"Уже накопленные {pending} i¢ никуда не денутся — их можно забрать "
+        f"как обычно.\n\n"
+        f"Ремонт: <b>{cost}</b> i¢.\n"
+        f"Починить можно и в чате: <code>бизнес починить {item.key}</code>",
+        _business_repair_kb(cost),
+    )
+    if sent is not None:
+        _business_urgent[(sent.chat.id, sent.message_id)] = {
+            "kind": "repair", "chat_id": chat_id, "user_id": user_id,
+            "key": item.key, "cost": cost,
+        }
+
+
+async def _offer_business_upgrade(chat_id: int, row: dict) -> None:
+    """Подкидывает владельцу срочное предложение — вложиться и поднять доход."""
+    item = business_catalog.BY_KEY.get(row["business_key"])
+    if item is None:
+        return
+    level = int(row["level"])
+    user_id = int(row["user_id"])
+    what = random.choice(business_catalog.OFFERS.get(item.key, ("вложиться",)))
+    cost = business_catalog.offer_cost(item, level)
+    profit = business_catalog.offer_profit(item, level)
+
+    sent = await _dm_or_none(
+        user_id,
+        f"💡 <b>Срочное предложение</b>\n{DIVIDER}\n"
+        f"{item.name}: можно <b>{what}</b>.\n\n"
+        f"Вложите <b>{cost}</b> i¢ — и ближайшие "
+        f"{business_catalog.OFFER_HOURS} ч доход будет на "
+        f"<b>+{business_catalog.OFFER_BONUS_PERCENT}%</b> выше "
+        f"({item.income(level)} → "
+        f"{int(item.income(level) * (100 + business_catalog.OFFER_BONUS_PERCENT) / 100)} i¢/час).\n"
+        f"Итого лишних примерно <b>{profit}</b> i¢ — если успеете забирать копилку.\n\n"
+        f"Предложение действует {format_duration_ru(BUSINESS_URGENT_TTL)}.",
+        _business_urgent_kb(cost),
+    )
+    if sent is not None:
+        _business_urgent[(sent.chat.id, sent.message_id)] = {
+            "kind": "offer", "chat_id": chat_id, "user_id": user_id,
+            "key": item.key, "cost": cost,
+            "expires_at": datetime.utcnow() + BUSINESS_URGENT_TTL,
+        }
+
+
+async def businesses_loop() -> None:
+    """Раз в BUSINESS_TICK ломает случайные бизнесы и подкидывает предложения."""
+    while True:
+        try:
+            await asyncio.sleep(BUSINESS_TICK.total_seconds())
+            for chat_id in await db.list_active_chat_ids():
+                try:
+                    for row in await db.list_chat_businesses(chat_id):
+                        if row.get("broken_kind"):
+                            continue          # сломанный уже не сломать сильнее
+                        if random.random() < BUSINESS_BREAK_CHANCE:
+                            await _break_business(chat_id, row)
+                        elif random.random() < BUSINESS_OFFER_CHANCE:
+                            await _offer_business_upgrade(chat_id, row)
+                except Exception:
+                    logger.exception("Сбой обслуживания бизнесов в чате %s", chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой в цикле бизнесов")
+
+
+BUSINESS_REPAIR_RE = re.compile(r"(?i)^бизнес\s+(?:починить|ремонт)\s+(\S+)$")
+BUSINESS_PIN_RE = re.compile(r"(?i)^бизнес\s+закрепить\s+(\S+)$")
+BUSINESS_UNPIN_TRIGGERS = {"бизнес открепить", "бизнес снять закреп"}
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_PIN_RE.match(t.strip()))),
+)
+async def cmd_business_pin(message: Message):
+    """Показывать бизнес в карточке профиля — рядом с закрепом и ачивкой."""
+    if not _check_misc_access(message.from_user.id, "business_pin"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    item = business_catalog.resolve(BUSINESS_PIN_RE.match(message.text.strip()).group(1))
+    if item is None:
+        await message.reply("Такого бизнеса нет — посмотрите <code>бизнесы</code>.")
+        return
+    # Закреплять можно только свой: карточка профиля иначе показывала бы
+    # бизнес, которого у человека нет.
+    if not await db.get_user_business(chat_id, user_id, item.key):
+        await message.reply(f"{item.name} вам не принадлежит.")
+        return
+    await db.set_pinned_business(chat_id, user_id, item.key)
+    await message.reply(
+        f"📌 {item.name} закреплён в профиле.\n"
+        f"Открепить: <code>бизнес открепить</code>"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in BUSINESS_UNPIN_TRIGGERS),
+)
+async def cmd_business_unpin(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_pin"):
+        return
+    await db.set_pinned_business(message.chat.id, message.from_user.id, None)
+    await message.reply("📌 Бизнес больше не показывается в профиле.")
+
+
+async def _do_repair(chat_id: int, user_id: int, key: str) -> tuple[bool, str]:
+    """Общий ремонт для команды и для кнопки. (получилось, текст ответа)."""
+    item = business_catalog.BY_KEY.get(key)
+    row = await db.get_user_business(chat_id, user_id, key)
+    if item is None or row is None:
+        return False, "Этот бизнес вам не принадлежит."
+    if not row.get("broken_kind"):
+        return False, f"{item.name} и так работает — чинить нечего."
+    if await is_account_frozen(chat_id, user_id):
+        return False, "🧊 Ваш счёт заморожен администрацией — ремонт недоступен."
+
+    cost = business_catalog.repair_cost(item, int(row["level"]))
+    if not await spend_coins(chat_id, user_id, cost):
+        wallet = await db.get_wallet(chat_id, user_id)
+        return False, (f"Ремонт стоит <b>{cost}</b> i¢, а у вас "
+                       f"{wallet.get('coins', 0)} i¢.")
+    if not await db.repair_business(chat_id, user_id, key, datetime.utcnow()):
+        # Починили из другого места, пока мы списывали, — деньги вернуть.
+        await db.add_coins(chat_id, user_id, cost)
+        return False, f"{item.name} уже починили."
+
+    await db.add_log("business_repair", chat_id=chat_id, actor_id=user_id,
+                     details=f"{key}:{cost}")
+    return True, (f"🔧 {item.name} снова работает — ремонт обошёлся в "
+                  f"<b>{cost}</b> i¢.\nДоход пошёл заново.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_REPAIR_RE.match(t.strip()))),
+)
+async def cmd_business_repair(message: Message):
+    if not _check_misc_access(message.from_user.id, "business_repair"):
+        return
+    item = business_catalog.resolve(BUSINESS_REPAIR_RE.match(message.text.strip()).group(1))
+    if item is None:
+        await message.reply("Такого бизнеса нет — посмотрите <code>бизнесы</code>.")
+        return
+    _, text = await _do_repair(message.chat.id, message.from_user.id, item.key)
+    await message.reply(text)
+
+
+@router.callback_query(F.data == "business_repair")
+async def cb_business_repair(callback: CallbackQuery):
+    deal = _business_urgent.get((callback.message.chat.id, callback.message.message_id))
+    if deal is None or deal.get("kind") != "repair":
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    if callback.from_user.id != deal["user_id"]:
+        await callback.answer("Это не ваш бизнес.", show_alert=True)
+        return
+
+    ok, text = await _do_repair(deal["chat_id"], deal["user_id"], deal["key"])
+    if not ok:
+        await callback.answer(re.sub(r"</?b>", "", text), show_alert=True)
+        return
+    _business_urgent.pop((callback.message.chat.id, callback.message.message_id), None)
+    try:
+        await callback.message.edit_text(
+            text, reply_markup=_business_repair_kb(deal["cost"], closed=True)
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Готово!")
+
+
+@router.callback_query(F.data == "business_urgent")
+async def cb_business_urgent(callback: CallbackQuery):
+    key_ = (callback.message.chat.id, callback.message.message_id)
+    deal = _business_urgent.get(key_)
+    if deal is None or deal.get("kind") != "offer":
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    if datetime.utcnow() >= deal["expires_at"]:
+        _business_urgent.pop(key_, None)
+        await callback.answer("Предложение уже неактуально.", show_alert=True)
+        return
+    if callback.from_user.id != deal["user_id"]:
+        await callback.answer("Это не ваш бизнес.", show_alert=True)
+        return
+
+    chat_id, user_id = deal["chat_id"], deal["user_id"]
+    item = business_catalog.BY_KEY.get(deal["key"])
+    row = await db.get_user_business(chat_id, user_id, deal["key"])
+    if item is None or row is None:
+        _business_urgent.pop(key_, None)
+        await callback.answer("Этого бизнеса у вас уже нет.", show_alert=True)
+        return
+    if row.get("broken_kind"):
+        await callback.answer("Сначала почините бизнес.", show_alert=True)
+        return
+    if not await spend_coins(chat_id, user_id, deal["cost"]):
+        await callback.answer(f"Нужно {deal['cost']} i¢, а у вас меньше.", show_alert=True)
+        return
+
+    # Копилку фиксируем до включения надбавки: время до этого момента шло по
+    # обычной ставке, и задним числом пересчитывать его нельзя.
+    pending = _business_pending(row)
+    until = datetime.utcnow() + timedelta(hours=business_catalog.OFFER_HOURS)
+    await db.set_business_boost(chat_id, user_id, deal["key"], until,
+                                pending, datetime.utcnow())
+    await db.add_log("business_offer", chat_id=chat_id, actor_id=user_id,
+                     details=f"{deal['key']}:{deal['cost']}")
+    _business_urgent.pop(key_, None)
+
+    level = int(row["level"])
+    try:
+        await callback.message.edit_text(
+            f"💡 Вложено <b>{deal['cost']}</b> i¢ в {item.name}.\n"
+            f"Ближайшие {business_catalog.OFFER_HOURS} ч доход "
+            f"<b>{int(item.income(level) * (100 + business_catalog.OFFER_BONUS_PERCENT) / 100)}</b> "
+            f"i¢/час вместо {item.income(level)}.",
+            reply_markup=_business_urgent_kb(deal["cost"], closed=True),
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Вложено!")
+
+
+# ============================================================================
+# ⚔️ БОСС ЧАТА — единственное занятие, где чат играет ВМЕСТЕ.
+#
+# Весь баланс (здоровье, урон, награда) — в bosses.py. Здесь бой и деньги.
+#
+# Устройство намеренно такое:
+#
+#  * Нажатие кнопки НЕ редактирует сообщение. Оно только копит урон в памяти.
+#    Перерисовывает отдельная задача, раз в BOSS_REDRAW_SECONDS. Иначе при
+#    двадцати бьющих бот упрётся в флуд-контроль Telegram и бой встанет.
+#
+#  * Состояние боя живёт в памяти, а не в БД: бой идёт минуты, и после
+#    перезапуска кнопка честно скажет «бой закончен» — так же, как у шапки
+#    по кругу и сделок с бизнесом.
+#
+#  * Урон человека считается ОДИН раз за бой и кэшируется: профессия и
+#    бизнесы за пятнадцать минут не меняются, а без кэша каждое нажатие
+#    стоило бы трёх запросов в базу.
+# ============================================================================
+BOSS_REDRAW_SECONDS = 3
+BOSS_SPAWN_TICK = timedelta(minutes=30)
+BOSS_SPAWN_EVERY = timedelta(days=3)
+BOSS_SPAWN_CHANCE = BOSS_SPAWN_TICK / BOSS_SPAWN_EVERY
+
+# (chat_id, message_id) -> бой
+_boss_fights: dict[tuple[int, int], dict] = {}
+
+
+def _boss_off_key(chat_id: int) -> str:
+    return f"boss_off:{chat_id}"
+
+
+async def boss_enabled(chat_id: int) -> bool:
+    return (await db.get_data(_boss_off_key(chat_id))) is None
+
+
+def _boss_kb(closed: bool = False) -> InlineKeyboardMarkup:
+    text = "Бой окончен" if closed else "⚔️ Атаковать"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="boss_hit")
+    ]])
+
+
+def _boss_text(fight: dict) -> str:
+    boss = fight["boss"]
+    bar = boss_catalog.hp_bar(fight["hp"], boss.hp)
+    left = fight["expires_at"] - datetime.utcnow()
+    lines = [
+        f"⚔️ <b>{boss.title}</b>",
+        DIVIDER,
+        boss.taunt,
+        "",
+        f"{bar}  <b>{max(0, fight['hp'])}</b> / {boss.hp}",
+        f"Бьют: {len(fight['damage'])} чел. · осталось "
+        f"{format_duration_ru(left) if left.total_seconds() > 0 else '0 сек'}",
+    ]
+    top = boss_catalog.top_fighters(fight["damage"], places=3)
+    if top:
+        lines.append("")
+        medals = ("🥇", "🥈", "🥉")
+        for i, (user_id, dealt) in enumerate(top):
+            lines.append(f"{medals[i]} {mention_id(user_id)} — {dealt}")
+    lines.append("")
+    lines.append(
+        f"Награда за победу: <b>{boss.pool}</b> i¢ — делится по вкладу. "
+        f"Удар раз в {boss_catalog.HIT_COOLDOWN_SECONDS} сек."
+    )
+    return "\n".join(lines)
+
+
+async def _boss_power(chat_id: int, user_id: int) -> tuple[int, int, int]:
+    """Из чего складывается урон: уровень профессии, сумма уровней бизнесов,
+    звёздность фермы. Три запроса — поэтому результат кэшируется на весь бой."""
+    prof = await db.get_profession_stats(chat_id, user_id)
+    businesses = await db.list_user_businesses(chat_id, user_id)
+    wallet = await db.get_wallet(chat_id, user_id)
+    return (
+        int(prof.get("prof_level") or 0) if prof.get("profession_key") else 0,
+        sum(int(b["level"]) for b in businesses),
+        int(wallet.get("star_level") or 0),
+    )
+
+
+async def _finish_boss_fight(key: tuple[int, int], won: bool) -> None:
+    """Раздаёт награду (или забирает казну) и закрывает бой."""
+    fight = _boss_fights.get(key)
+    if fight is None:
+        return
+    chat_id, message_id = key
+    boss = fight["boss"]
+    _boss_fights.pop(key, None)
+
+    if won:
+        shares = boss_catalog.split_reward(boss.pool, fight["damage"])
+        for user_id, amount in shares.items():
+            await db.add_coins(chat_id, user_id, amount)
+        # Верхним местам — ещё и предмет.
+        trophy = shop_effects.BY_KEY.get("talisman")
+        top = boss_catalog.top_fighters(fight["damage"])
+        if trophy is not None:
+            await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+            for user_id, _dealt in top:
+                await db.add_inventory_item(chat_id, user_id, trophy.key)
+        await db.add_log("boss_defeated", chat_id=chat_id,
+                         details=f"{boss.key}:{sum(shares.values())}")
+        lines = [
+            f"🏆 <b>{boss.title} повержен!</b>",
+            DIVIDER,
+            f"Награда: <b>{sum(shares.values())}</b> i¢ на {len(shares)} чел., по вкладу.",
+        ]
+        medals = ("🥇", "🥈", "🥉")
+        for i, (user_id, dealt) in enumerate(top):
+            got = shares.get(user_id, 0)
+            lines.append(f"{medals[i]} {mention_id(user_id)} — {dealt} урона, +{got} i¢")
+        if top and trophy is not None:
+            lines.append(f"\n{trophy.emoji} Топ-{len(top)} получают «{trophy.name}».")
+    else:
+        treasury = int(await db.get_chat_coins(chat_id))
+        stolen = max(0, int(treasury * boss_catalog.DEFEAT_TREASURY_SHARE))
+        if stolen:
+            await db.add_chat_coins(chat_id, -stolen)
+        await db.add_log("boss_escaped", chat_id=chat_id, details=f"{boss.key}:{stolen}")
+        lines = [f"💀 <b>{boss.title} ушёл.</b>", DIVIDER, boss.defeat_line]
+        if stolen:
+            lines.append(f"Казна чата потеряла <b>{stolen}</b> i¢.")
+        else:
+            lines.append("В казне и так было пусто — забирать оказалось нечего.")
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text="\n".join(lines),
+            reply_markup=_boss_kb(closed=True),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        log_suppressed("_finish_boss_fight", exc)
+
+
+async def _boss_ticker(key: tuple[int, int]) -> None:
+    """Перерисовывает полосу здоровья и закрывает бой по времени.
+
+    Единственное место, которое трогает сообщение во время боя, — поэтому
+    сколько бы человек ни жало кнопку, запросов к Telegram будет не больше
+    одного в BOSS_REDRAW_SECONDS.
+    """
+    try:
+        while True:
+            await asyncio.sleep(BOSS_REDRAW_SECONDS)
+            fight = _boss_fights.get(key)
+            if fight is None:
+                return                      # бой уже закрыт добивающим ударом
+            if datetime.utcnow() >= fight["expires_at"]:
+                await _finish_boss_fight(key, won=False)
+                return
+            if not fight["dirty"]:
+                continue
+            fight["dirty"] = False
+            try:
+                await bot.edit_message_text(
+                    chat_id=key[0], message_id=key[1], text=_boss_text(fight),
+                    reply_markup=_boss_kb(),
+                )
+            except TelegramBadRequest:
+                pass                        # текст не изменился — не беда
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Сбой в отрисовке боя с боссом %s", key)
+
+
+async def spawn_boss(chat_id: int, boss: boss_catalog.Boss) -> bool:
+    """Выпускает босса в чат. False — отправить сообщение не удалось."""
+    now = datetime.utcnow()
+    fight = {
+        "boss": boss,
+        "hp": boss.hp,
+        "damage": {},
+        "last_hit": {},
+        "power": {},          # кэш урона: user_id -> сколько бьёт
+        "expires_at": now + timedelta(minutes=boss_catalog.FIGHT_MINUTES),
+        "dirty": False,
+        "closed": False,
+    }
+    try:
+        sent = await bot.send_message(chat_id, _boss_text(fight),
+                                      reply_markup=_boss_kb())
+    except Exception:
+        logger.exception("Не удалось выпустить босса в чат %s", chat_id)
+        return False
+    key = (chat_id, sent.message_id)
+    _boss_fights[key] = fight
+    await db.add_log("boss_spawned", chat_id=chat_id, details=boss.key)
+    asyncio.create_task(_boss_ticker(key))
+    return True
+
+
+@router.callback_query(F.data == "boss_hit")
+async def cb_boss_hit(callback: CallbackQuery):
+    key = (callback.message.chat.id, callback.message.message_id)
+    fight = _boss_fights.get(key)
+    if fight is None or fight["closed"]:
+        await callback.answer("Этот бой уже закончен.", show_alert=True)
+        return
+
+    chat_id, user_id = key[0], callback.from_user.id
+    now = datetime.utcnow()
+    last = fight["last_hit"].get(user_id)
+    if last and (now - last).total_seconds() < boss_catalog.HIT_COOLDOWN_SECONDS:
+        left = boss_catalog.HIT_COOLDOWN_SECONDS - int((now - last).total_seconds())
+        await callback.answer(f"Отдышитесь — удар через {left} сек.", show_alert=False)
+        return
+    # Отметку ставим ДО похода в базу: иначе два быстрых нажатия успевают
+    # пройти проверку оба, пока первое считает силу удара.
+    fight["last_hit"][user_id] = now
+
+    power = fight["power"].get(user_id)
+    if power is None:
+        try:
+            power = await _boss_power(chat_id, user_id)
+        except Exception:
+            power = (0, 0, 0)
+        fight["power"][user_id] = power
+
+    dealt = boss_catalog.damage_for(
+        *power,
+        roll=random.uniform(boss_catalog.DAMAGE_SPREAD_MIN,
+                            boss_catalog.DAMAGE_SPREAD_MAX),
+    )
+
+    # Между этой проверкой и записью НЕТ await: иначе два добивающих удара,
+    # пришедшие одновременно, прошли бы оба. Это ПЕРВАЯ из двух защит от
+    # двойной выплаты; вторая — снятие боя из реестра до раздачи денег в
+    # _finish_boss_fight. Хватает любой, дублирование намеренное: состояние
+    # живёт в памяти, и опереться на условие в SQL, как с поломкой бизнеса,
+    # здесь не на что.
+    if fight["closed"]:
+        await callback.answer("Этот бой уже закончен.", show_alert=True)
+        return
+    fight["hp"] -= dealt
+    fight["damage"][user_id] = fight["damage"].get(user_id, 0) + dealt
+    fight["dirty"] = True
+    killed = fight["hp"] <= 0
+    if killed:
+        fight["closed"] = True
+
+    await callback.answer(f"⚔️ −{dealt}")
+    if killed:
+        await _finish_boss_fight(key, won=True)
+
+
+BOSS_STATUS_TRIGGERS = {"босс", "боссы", "!босс", "!боссы"}
+BOSS_TOGGLE_TRIGGERS = {"+босс", "-босс", "+боссы", "-боссы"}
+BOSS_SUMMON_RE = re.compile(r"(?i)^!?босс\s+(?:призвать|спавн)(?:\s+(.+))?$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in BOSS_STATUS_TRIGGERS),
+)
+async def cmd_boss_status(message: Message):
+    if not _check_misc_access(message.from_user.id, "boss_status"):
+        return
+    chat_id = message.chat.id
+    active = next((f for (c, _m), f in _boss_fights.items() if c == chat_id), None)
+    lines: list[str] = []
+    if active is not None:
+        left = active["expires_at"] - datetime.utcnow()
+        lines += [
+            f"⚔️ Сейчас в чате: <b>{active['boss'].title}</b>",
+            f"Осталось здоровья: {max(0, active['hp'])} / {active['boss'].hp}",
+            f"До конца боя: {format_duration_ru(left) if left.total_seconds() > 0 else '0 сек'}",
+            "",
+        ]
+    lines.append(f"⚔️ <b>Боссы чата</b> ({len(boss_catalog.BOSSES)})")
+    lines.append(DIVIDER)
+    for boss in boss_catalog.BOSSES:
+        lines.append(f"{boss.title} (<code>{boss.key}</code>) — "
+                     f"{boss.hp} HP, награда {boss.pool} i¢")
+    lines += [
+        "",
+        f"Бой идёт {boss_catalog.FIGHT_MINUTES} мин, удар раз в "
+        f"{boss_catalog.HIT_COOLDOWN_SECONDS} сек.",
+        "Урон зависит от профессии, бизнесов и звёздности — качаться выгодно.",
+        "Награда делится по вкладу, топ-3 получают предмет.",
+    ]
+    if not await boss_enabled(chat_id):
+        lines.append("\n⚠️ Боссы в этом чате выключены (<code>+босс</code> — включить).")
+    if has_level(message.from_user.id, required_level("boss_toggle")):
+        lines.append("Призвать вручную: <code>босс призвать {название}</code>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in BOSS_TOGGLE_TRIGGERS),
+)
+async def cmd_boss_toggle(message: Message):
+    min_level = required_level("boss_toggle")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Включать и выключать боссов может «{level_name(min_level)}» и выше.")
+        return
+    if message.text.strip().startswith("+"):
+        await db.delete_data(_boss_off_key(message.chat.id))
+        await message.reply("⚔️ Боссы включены — жди гостей.")
+    else:
+        await db.set_data(_boss_off_key(message.chat.id), "1",
+                          updated_by=message.from_user.id)
+        await message.reply("⚔️ Боссы выключены. Сами приходить не будут.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BOSS_SUMMON_RE.match(t.strip()))),
+)
+async def cmd_boss_summon(message: Message):
+    min_level = required_level("boss_toggle")
+    if not has_level(message.from_user.id, min_level):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Призывать боссов может «{level_name(min_level)}» и выше.")
+        return
+    chat_id = message.chat.id
+    if any(c == chat_id for c, _m in _boss_fights):
+        await message.reply("В чате уже идёт бой — сначала разберитесь с этим.")
+        return
+
+    raw = (BOSS_SUMMON_RE.match(message.text.strip()).group(1) or "").strip()
+    if raw:
+        boss = boss_catalog.resolve(raw)
+        if boss is None:
+            keys = ", ".join(f"<code>{b.key}</code>" for b in boss_catalog.BOSSES)
+            await message.reply(f"Нет такого босса. Доступные:\n{keys}")
+            return
+    else:
+        boss = random.choice(boss_catalog.BOSSES)
+
+    # Ручной призыв работает и при выключенном спавне: выключатель гасит
+    # случайные появления, а не саму механику — иначе админ не смог бы
+    # устроить бой по случаю.
+    if not await spawn_boss(chat_id, boss):
+        await message.reply("Не удалось выпустить босса — попробуйте ещё раз.")
+
+
+async def boss_spawn_loop() -> None:
+    """Раз в BOSS_SPAWN_TICK с небольшой вероятностью выпускает босса.
+
+    Вероятность выводится из желаемого срока (см. BOSS_SPAWN_EVERY), а не
+    подбирается на глаз: поменяете тик — частота останется прежней.
+    """
+    while True:
+        try:
+            await asyncio.sleep(BOSS_SPAWN_TICK.total_seconds())
+            for chat_id in await db.list_active_chat_ids():
+                try:
+                    if any(c == chat_id for c, _m in _boss_fights):
+                        continue          # в чате уже идёт бой
+                    if not await boss_enabled(chat_id):
+                        continue
+                    if random.random() >= BOSS_SPAWN_CHANCE:
+                        continue
+                    await spawn_boss(chat_id, random.choice(boss_catalog.BOSSES))
+                except Exception:
+                    logger.exception("Сбой призыва босса в чате %s", chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой в цикле боссов")
 
 
 BCOIN_RE = re.compile(r"(?i)^бкоин\s+(\S+)$")
@@ -13461,6 +15426,168 @@ async def cmd_transfer(message: Message):
 ITEM_USE_RE = re.compile(r"(?i)^использовать\s+(\S+)")
 
 
+async def _daily_item_payout(chat_id: int, user_id: int, shifts: int) -> int:
+    """Сколько платит предмет «раз в сутки» — во столько-то смен.
+
+    Считаем по ТЕКУЩЕЙ профессии человека, а не по фиксированному числу:
+    иначе выплата разъехалась бы со шкалой заработков при следующей правке
+    баланса. Профессии нет — берём самую скромную, чтобы предмет всё равно
+    что-то давал.
+    """
+    stats = await db.get_profession_stats(chat_id, user_id)
+    prof = PROFESSIONS.get(stats.get("profession_key") or "")
+    if prof is None:
+        prof = PROFESSIONS["уборщик"]
+    low, high = prof["income"]
+    return max(1, int((low + high) / 2 * max(1, shifts)))
+
+
+async def _passive_bonus(chat_id: int, user_id: int, activity: str) -> int:
+    """Прибавка в процентах от предметов за ачивки, лежащих в инвентаре.
+
+    Ничего не тратит и ничего не требует нажимать: предмет работает самим
+    фактом наличия (см. shop_effects.ACHIEVEMENT_ITEMS).
+    """
+    try:
+        keys = [i["item_key"] for i in await db.list_inventory(chat_id, user_id)]
+    except Exception:
+        # Прибавка — приятный бонус, а не основа начисления: если инвентарь
+        # почему-то не прочитался, заработок должен пройти без неё, а не упасть.
+        log_suppressed("_passive_bonus", None)
+        return 0
+    return shop_effects.passive_percent(keys, activity)
+
+
+async def _with_passive(chat_id: int, user_id: int, activity: str,
+                        amount: int) -> tuple[int, int]:
+    """Награда с учётом пассивной прибавки. Возвращает (сумма, процент)."""
+    percent = await _passive_bonus(chat_id, user_id, activity)
+    if not percent:
+        return amount, 0
+    return max(1, round(amount * (100 + percent) / 100)), percent
+
+
+async def _apply_lucky(chat_id: int, user_id: int, amount: int) -> tuple[int, bool]:
+    """Талисман удачи: если у человека есть заряд — удваивает награду и тратит его.
+
+    Заряд списывается ОДНИМ запросом (см. db.consume_item_effect): иначе две
+    команды подряд — ферма и рыбалка — успели бы обе увидеть один и тот же
+    заряд, и один талисман сработал бы дважды.
+    """
+    if not await db.consume_item_effect(chat_id, user_id, shop_effects.EFFECT_LUCKY):
+        return amount, False
+    return amount * shop_effects.LUCKY_MULTIPLIER, True
+
+
+async def _use_effect_item(message: Message, item_key: str) -> None:
+    """Применяет полезный предмет (см. shop_effects) — на себя, без цели.
+
+    Предмет списывается ТОЛЬКО если эффект реально сработал: чинить нечего —
+    ремкомплект остаётся в инвентаре. Иначе человек тратил бы покупку впустую
+    на опечатке или на исправном бизнесе.
+    """
+    chat_id, user_id = message.chat.id, message.from_user.id
+    spec = shop_effects.BY_KEY.get(item_key) or shop_effects.ACHIEVEMENT_BY_KEY[item_key]
+
+    inventory = await db.list_inventory(chat_id, user_id)
+    if not any(i["item_key"] == item_key for i in inventory):
+        await message.reply(
+            f"У вас нет предмета «{html.escape(item_key)}». Проверьте «инвентарь»."
+        )
+        return
+
+    result: Optional[str] = None
+
+    if spec.effect == shop_effects.EFFECT_REPAIR:
+        broken = [
+            row for row in await db.list_user_businesses(chat_id, user_id)
+            if row.get("broken_kind")
+        ]
+        if not broken:
+            await message.reply("Ломаться нечему — все ваши бизнесы работают.")
+            return
+        row = broken[0]
+        item = business_catalog.BY_KEY.get(row["business_key"])
+        if not await db.repair_business(chat_id, user_id, row["business_key"],
+                                        datetime.utcnow()):
+            await message.reply("Бизнес уже починили — ремкомплект остался у вас.")
+            return
+        name = item.name if item else row["business_key"]
+        result = f"🧰 {name} починен бесплатно. Доход пошёл заново."
+
+    elif spec.effect == shop_effects.EFFECT_REFRESH:
+        await db.reset_earning_cooldowns(chat_id, user_id)
+        result = ("⚡ Кулдауны сброшены: ферма, рыбалка и клад доступны "
+                  "прямо сейчас.")
+
+    elif spec.effect == shop_effects.EFFECT_WORK_REFRESH:
+        stats = await db.get_profession_stats(chat_id, user_id)
+        if not stats.get("profession_key"):
+            await message.reply(
+                "Сначала устройтесь на работу: "
+                "<code>!работа устроиться {профессия}</code>."
+            )
+            return
+        await db.reset_work_cooldown(chat_id, user_id)
+        result = "☕ Кулдаун смены сброшен — можно работать прямо сейчас."
+
+    elif spec.effect == shop_effects.EFFECT_HEAL:
+        stats = await db.get_profession_stats(chat_id, user_id)
+        if not stats.get("profession_key"):
+            await message.reply("Аптечка нужна работающим — профессии у вас пока нет.")
+            return
+        if all(int(stats.get(f) or 0) >= 100 for f in ("energy", "mood", "health")):
+            await message.reply("Вы и так в полном порядке — аптечка не понадобилась.")
+            return
+        await db.restore_profession_state(chat_id, user_id)
+        result = "⛑ Энергия, настроение и здоровье восстановлены до 100."
+
+    elif spec.effect in shop_effects.PENDING_EFFECTS:
+        await db.add_item_effect(chat_id, user_id, spec.effect)
+        if spec.effect == shop_effects.EFFECT_LUCKY:
+            result = (f"🍀 Талисман активирован: следующая ферма, рыбалка или клад "
+                      f"принесут в {shop_effects.LUCKY_MULTIPLIER} раза больше.")
+        elif spec.effect == shop_effects.EFFECT_FREE_UPGRADE:
+            result = ("📈 Бизнес-план готов: следующий апгрейд бизнеса "
+                      "обойдётся бесплатно.")
+        else:
+            result = "🛡 Страховка оформлена: ближайшая поломка бизнеса пройдёт мимо."
+
+    elif spec.effect == shop_effects.EFFECT_DAILY_CASH:
+        # Предмет за ачивку не тратится — он остаётся навсегда, ограничение
+        # только по времени: раз в сутки. Отметку держим в общем KV-хранилище,
+        # отдельная таблица ради одной даты не нужна.
+        stamp_key = f"itemdaily:{chat_id}:{user_id}:{item_key}"
+        row = await db.get_data(stamp_key)
+        today = utc_today().isoformat()
+        if row and row.get("data_value") == today:
+            await message.reply(
+                f"{spec.emoji} «{spec.name}» сегодня уже приносил доход. "
+                "Приходите завтра."
+            )
+            return
+        payout = await _daily_item_payout(chat_id, user_id, spec.shifts)
+        await db.set_data(stamp_key, today, updated_by=user_id)
+        await db.add_coins(chat_id, user_id, payout)
+        await db.add_log("item_daily", chat_id=chat_id, actor_id=user_id,
+                         details=f"{item_key}:{payout}")
+        await _check_coin_achievements(chat_id, user_id)
+        await message.reply(
+            f"{spec.emoji} «{spec.name}» принёс <b>{payout}</b> i¢ "
+            f"(как {spec.shifts} смены).\nСледующий раз — завтра."
+        )
+        return
+
+    if result is None:
+        await message.reply("Этот предмет пока ничего не умеет.")
+        return
+
+    # Эффект сработал — только теперь предмет уходит.
+    await db.remove_inventory_item(chat_id, user_id, item_key)
+    await db.add_log("item_effect", chat_id=chat_id, actor_id=user_id, details=item_key)
+    await message.reply(f"{spec.emoji} {result}")
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and bool(ITEM_USE_RE.match(t.strip()))),
@@ -13475,6 +15602,19 @@ async def cmd_item_use(message: Message):
 
     match = ITEM_USE_RE.match(message.text.strip())
     item_key = match.group(1).casefold()
+
+    # Полезные предметы действуют НА СЕБЯ (ремкомплект чинит свой бизнес,
+    # энергетик сбрасывает свои кулдауны) — цель им не нужна и требовать её
+    # нельзя, иначе их вообще не применить. Уходят в отдельную ветку до
+    # разбора цели.
+    if shop_effects.effect_of(item_key):
+        await _use_effect_item(message, item_key)
+        return
+    if shop_effects.is_reward(item_key):
+        await message.reply(
+            "🎖 Награду не «используют» — она просто есть у вас и видна в профиле."
+        )
+        return
 
     target, _remaining = await resolve_command_target(message, trigger_words=2)
     if target is None and message.reply_to_message:
@@ -13572,6 +15712,9 @@ async def cmd_sell_item(message: Message):
     amount = int(match.group(2)) if match.group(2) else 1
     if amount <= 0:
         await message.reply("Количество должно быть больше нуля.")
+        return
+    if shop_effects.is_reward(item_key):
+        await message.reply("🎖 Награды не продаются — это знак отличия, а не товар.")
         return
 
     chat_id, user_id = message.chat.id, message.from_user.id
@@ -13879,7 +16022,24 @@ CASINO_COLOR_ALIASES = {
 }
 CASINO_COLOR_EMOJI = {"red": "🔴", "black": "⚫", "green": "🟢"}
 CASINO_COLOR_LABEL = {"red": "Красное", "black": "Чёрное", "green": "Зелёное"}
-CASINO_ROULETTE_RE = re.compile(r"(?i)^\.рулетка\s+(\S+)\s+(\S+)$")
+# Рулетка вызывается просто словом «рулетка». Точка и «!» перед ним
+# необязательны и оставлены ради тех, кто привык к старой форме «.рулетка».
+# Со словом «русскаяру» (шуточная игра с киком) это не пересекается: у неё
+# другое слово, а её переключатели «+рулетка»/«-рулетка» идут без аргументов.
+CASINO_ROULETTE_RE = re.compile(r"(?i)^[.!]?рулетка\s+(\S+)\s+(\S+)$")
+# Голое «рулетка» без ставки — подсказка, а не игра: иначе человек, узнавший
+# о команде, получает молчание и решает, что её нет.
+CASINO_ROULETTE_BARE_RE = re.compile(r"(?i)^[.!]?рулетка$")
+
+_CASINO_ROULETTE_USAGE = (
+    "🎰 <b>Рулетка</b>\n"
+    "Использование: <code>рулетка {ставка} {цвет}</code>\n"
+    "Цвет — красное / чёрное / зелёное.\n"
+    "Например: <code>рулетка 100 красное</code>\n\n"
+    "Красное и чёрное — x2, зелёное — x14.\n"
+    "Играют с баланса казино: <code>казино баланс</code>, "
+    "<code>казино пополнить {сумма}</code>."
+)
 CASINO_ROULETTE_MAX_BET = 100_000  # предохранитель от переполнения/абсурдных ставок
 CASINO_DAILY_BONUS = 100
 CASINO_MAX_BET = 100_000
@@ -13887,6 +16047,16 @@ CASINO_DICE_RE = re.compile(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
 CASINO_COIN_RE = re.compile(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
 CASINO_POKER_RE = re.compile(r"(?i)^!?покер\s+(\S+)$")
 CASINO_TOPUP_RE = re.compile(r"(?i)^!?казино\s+пополнить\s+(\S+)$")
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(CASINO_ROULETTE_BARE_RE.match(t.strip()))),
+)
+async def cmd_casino_roulette_help(message: Message):
+    if not _check_misc_access(message.from_user.id, "casino_roulette"):
+        return
+    await message.reply(_CASINO_ROULETTE_USAGE)
+
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -13901,11 +16071,7 @@ async def cmd_casino_roulette(message: Message):
     color = CASINO_COLOR_ALIASES.get(m.group(2).casefold())
 
     if color is None:
-        await message.reply(
-            "Использование: <code>.рулетка {ставка} {цвет}</code>\n"
-            "Цвет — красное / чёрное / зелёное.\n"
-            "Например: <code>.рулетка 100 красное</code>"
-        )
+        await message.reply(_CASINO_ROULETTE_USAGE)
         return
     if bet_amount is None or bet_amount <= 0:
         await message.reply("Ставка должна быть больше нуля.")
@@ -13915,14 +16081,21 @@ async def cmd_casino_roulette(message: Message):
         return
 
     chat_id, user_id = message.chat.id, message.from_user.id
-    # Ставку списываем ДО розыгрыша, одним атомарным запросом. Раньше баланс
-    # только проверялся, а списывался лишь при проигрыше, — и две рулетки,
-    # запущенные одновременно, обе проходили проверку с одними и теми же
-    # монетами: можно было играть на деньги, которых нет.
-    if not await spend_coins(chat_id, user_id, bet_amount):
-        wallet = await db.get_wallet(chat_id, user_id)
+    # Играем с БАЛАНСА КАЗИНО — того же, что у костей, орла/решки и покера
+    # (пополняется «казино пополнить»). Раньше рулетка была единственной игрой,
+    # тянувшей деньги прямо из кошелька i¢: выигрыш в казино нельзя было
+    # проиграть в казино, а вывод через «казино вывести» её не касался.
+    #
+    # Списание — одним атомарным запросом ДО розыгрыша, как и было. Заменять
+    # его на «прочитать баланс, сравнить, потом вычесть» нельзя: две рулетки,
+    # посланные подряд, обе прошли бы проверку с одними и теми же деньгами.
+    if not await try_spend_casino(chat_id, user_id, bet_amount):
+        wallet = await db.get_casino_wallet(chat_id, user_id)
         await message.reply(
-            f"Недостаточно монет: у вас {wallet.get('coins', 0)} i¢, ставка {bet_amount} i¢."
+            f"Недостаточно средств в казино: у вас {wallet['balance']} i¢, "
+            f"ставка {bet_amount} i¢.\n"
+            "Пополнить — <code>казино пополнить {сумма}</code>, "
+            "бонус — <code>казино баланс</code>."
         )
         return
 
@@ -13937,10 +16110,11 @@ async def cmd_casino_roulette(message: Message):
         # выигрыш, ставка не трогается (см. chat_events.py).
         delta = max(1, round(delta * await event_multiplier(chat_id, chat_events.T_CASINO)))
         # Ставка уже списана выше — возвращаем её вместе с выигрышем.
-        await db.add_coins(chat_id, user_id, bet_amount + delta)
+        new_balance = await db.add_casino_balance(chat_id, user_id, bet_amount + delta)
         outcome_text = f"✅ <b>Выигрыш!</b> +{delta} i¢ (x{multiplier})"
     else:
         # Ставка уже списана — доплачивать нечего.
+        new_balance = (await db.get_casino_wallet(chat_id, user_id))["balance"]
         outcome_text = f"❌ <b>Проигрыш.</b> -{bet_amount} i¢"
 
     await message.answer(
@@ -13948,7 +16122,8 @@ async def cmd_casino_roulette(message: Message):
         f"{DIVIDER}\n"
         f"Ставка: {bet_amount} i¢ на {CASINO_COLOR_LABEL[color]}\n"
         f"Выпало: {CASINO_COLOR_EMOJI[result_color]} <b>{number}</b> ({CASINO_COLOR_LABEL[result_color]})\n"
-        f"{outcome_text}"
+        f"{outcome_text}\n"
+        f"Баланс казино: {new_balance} i¢"
     )
     await db.add_log(
         "casino_roulette", chat_id=chat_id, actor_id=user_id,
@@ -15331,6 +17506,80 @@ async def cmd_titles_list(message: Message):
 async def cb_noop(callback: CallbackQuery):
     await callback.answer()
 
+async def my_titles_page(chat_id: int, user_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Только свои титулы — с пометкой, какой надет.
+
+    Отдельно от «титул» (общего каталога) намеренно: у активного игрока там
+    полсотни строк, и найти среди них свои три невозможно.
+    """
+    owned = await db.list_user_titles(chat_id, user_id)
+    if not owned:
+        return (
+            "🎖 <b>Мои титулы</b>\n\nУ вас пока нет ни одного титула.\n"
+            "Список всех — <code>титул</code>, купить — <code>титул купить {ключ}</code>.",
+            None,
+        )
+
+    card = await db.get_profile_card(chat_id, user_id)
+    active = (card or {}).get("active_title")
+
+    page = max(page, 0)
+    total_pages = max((len(owned) + TITLES_LIST_PAGE_SIZE - 1) // TITLES_LIST_PAGE_SIZE, 1)
+    page = min(page, total_pages - 1)
+    chunk = owned[page * TITLES_LIST_PAGE_SIZE : (page + 1) * TITLES_LIST_PAGE_SIZE]
+
+    lines = [f"🎖 <b>Мои титулы</b> — {len(owned)} шт.", DIVIDER]
+    for t in chunk:
+        mark = " ← <b>надет</b>" if t["title_key"] == active else ""
+        lines.append(f"{t['name']} (<code>{t['title_key']}</code>){mark}")
+    lines.append("")
+    if active:
+        lines.append("Снять: <code>титул снять</code>")
+    lines.append("Надеть: <code>титул надеть {ключ}</code>")
+    text = "\n".join(lines)
+
+    if total_pages == 1:
+        return text, None
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"mytitles_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mytitles_page:{page + 1}"))
+    return text, InlineKeyboardMarkup(inline_keyboard=[nav])
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+        "мои титулы", "!мои титулы", "мой титул", "мои титул",
+    )),
+)
+async def cmd_my_titles(message: Message):
+    if not _check_misc_access(message.from_user.id, "titles_my"):
+        return
+    text, kb = await my_titles_page(message.chat.id, message.from_user.id, 0)
+    await message.reply(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("mytitles_page:"))
+async def paginate_my_titles(callback: CallbackQuery):
+    if not _check_misc_access(callback.from_user.id, "titles_my"):
+        await callback.answer()
+        return
+    try:
+        page = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Не удалось открыть эту страницу.", show_alert=True)
+        return
+    text, kb = await my_titles_page(callback.message.chat.id, callback.from_user.id, page)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("titles_page:"))
 async def paginate_titles_list(callback: CallbackQuery):
     if not _check_misc_access(callback.from_user.id, "titles_list"):
@@ -15447,73 +17696,42 @@ def shop_item_line(item: dict) -> str:
         stock_part = f" · осталось: {stock}"
     else:
         stock_part = " · <b>раскуплено</b>"
-    return f"{item['emoji']} <b>{html.escape(item['name'])}</b> ({item['item_key']}) — {item['price']} i¢{stock_part}{desc}"
+    # У наград цена в схеме есть, но она заведомо неоплатная (см.
+    # shop_effects) — показывать её нельзя, вышло бы «999999999 i¢».
+    # Пишем прямо, что это знак отличия: пусть люди видят, что бывает.
+    if shop_effects.is_reward(item["item_key"]):
+        price_part = "🎖 <b>награда</b>, не продаётся"
+        stock_part = ""
+    else:
+        price_part = f"{item['price']} i¢"
+    # Ключ — в <code>: в Telegram по такому тексту тапают и он копируется
+    # целиком. Иначе ключ приходится перенабирать руками в «магазин купить»,
+    # а промах в одной букве выглядит как «товара нет».
+    return (f"{item['emoji']} <b>{html.escape(item['name'])}</b> "
+            f"(<code>{html.escape(item['item_key'])}</code>) — "
+            f"{price_part}{stock_part}{desc}")
 
-DEFAULT_SHOP_ITEMS: list[tuple[str, str, int, str, str]] = [
-    # (item_key, name, price, description, emoji)
-
-    ("fishka", "Фишка", 50, "Обычная фишка чата — просто красивая штука для коллекции", "🪙"),
-    ("sharik", "Шарик", 40, "Яркий воздушный шарик", "🎈"),
-    ("pechenka", "Печенька", 30, "Сладкая печенька", "🍪"),
-    ("coffee", "Кофе", 70, "Горячий кофе", "☕"),
-    ("cvetok", "Цветок", 80, "Красивый цветок", "🌸"),
-    ("tort", "Тортик", 100, "Виртуальный тортик — угостите друга", "🎂"),
-    ("chocolate", "Шоколад", 120, "Сладкая плитка шоколада", "🍫"),
-    ("morojenoe", "Мороженое", 140, "Освежающее мороженое", "🍦"),
-    ("zvezda", "Звезда", 200, "Блестящая звезда", "⭐"),
-    ("gift", "Подарок", 250, "Красиво упакованный подарок", "🎁"),
-    ("pizza", "Пицца", 300, "Большая горячая пицца", "🍕"),
-    ("burger", "Бургер", 280, "Аппетитный бургер", "🍔"),
-    ("firework", "Фейерверк", 450, "Праздничный салют", "🎆"),
-    ("korona", "Корона", 500, "Почувствуйте себя королём чата", "👑"),
-    ("medal", "Медаль", 700, "Памятная медаль", "🏅"),
-    ("kubok", "Кубок", 900, "Кубок победителя", "🏆"),
-    ("cat", "Котик", 1000, "Милый домашний котик", "🐈"),
-    ("dog", "Пёс", 1100, "Верный друг", "🐕"),
-    ("ring", "Кольцо", 1500, "Красивое золотое кольцо", "💍"),
-    ("diamond", "Алмаз", 2500, "Редкий драгоценный камень", "💎"),
-    ("robot", "Робот", 3000, "Электронный помощник", "🤖"),
-    ("wand", "Волшебная палочка", 3500, "Полна магии", "🪄"),
-    ("book", "Книга заклинаний", 4000, "Древняя книга магии", "📖"),
-    ("shield", "Щит", 4500, "Надёжная защита", "🛡️"),
-    ("sword", "Меч", 5000, "Оружие героя", "⚔️"),
-    ("rocket", "Ракета", 6500, "Настоящая космическая ракета", "🚀"),
-    ("dragon", "Дракон", 9000, "Легендарный дракон", "🐉"),
-    ("phoenix", "Феникс", 12000, "Мифическая птица", "🔥"),
-
-    # Новые предметы из таблицы
-    ("bdsm_pletka", "Бдсм Плетка", 700, "Для ваших маленьких игровых затей", "🪢"),
-    ("yabloko", "яблоко", 20, "Яблоко. Просто яблоко", "🍎"),
-    ("vip_badge", "Вип", 10000, "Вип значок", "🎁"),
-    ("kolco", "Кольцо", 900, "Красивое кольцо", "💍"),
-    ("crown_gold", "Золотая корона", 4000, "Настоящая корона", "👑"),
-    ("trophy", "Кубок", 3000, "Символ победителя", "🏆"),
-    ("ringbell", "Колокольчик", 110, "Звонкий сувенир", "🔔"),
-    ("gem", "Самоцвет", 2800, "Таинственный камень", "🔮"),
-    ("skull", "Череп", 666, "Для любителей мрачного", "💀"),
-    ("ghost", "Призрак", 777, "Жуткий сувенир", "👻"),
-    ("pumpkin", "Тыква", 350, "Хэллоуинская тыква", "🎃"),
-    ("magicbook", "Книга магии", 2800, "Полна заклинаний", "📖"),
-    ("magicwand", "Волшебная палочка", 3500, "Исполняет чудеса", "🪄"),
-    ("treasure", "Сундук", 2000, "Полный сокровищ", "🪙"),
-]
 # ============================================================================
 # Модуль «Профессии» — см. FARM_TRIGGERS выше: «!работа»/«!работать» больше
 # НЕ синонимы «фермы», это отдельная система.
 # ============================================================================
 PROFESSIONS: dict[str, dict] = {
-    "уборщик":     {"emoji": "🧹",         "name": "Уборщик",     "income": (40, 80),      "req_days": 0,   "req_coins": 0,    "expense": 5,   "energy": 20},
-    "курьер":      {"emoji": "📦",         "name": "Курьер",      "income": (60, 120),     "req_days": 3,   "req_coins": 0,    "expense": 15,  "energy": 25},
-    "повар":       {"emoji": "🍳",         "name": "Повар",       "income": (80, 160),     "req_days": 0,   "req_coins": 0,    "expense": 20,  "energy": 30},
-    "стриптизер":  {"emoji": "👯",         "name": "Стриптизер",  "income": (90, 180),     "req_days": 0,   "req_coins": 0,    "expense": 20,  "energy": 30},
-    "шлюха":       {"emoji": "🍒 ",        "name": "Шлюха",       "income": (900, 3000),   "req_days": 0,   "req_coins": 0,    "expense": 20,  "energy": 30},
-    "сантехник":   {"emoji": "🛠",         "name": "Сантехник",   "income": (100, 200),    "req_days": 7,   "req_coins": 0,    "expense": 25,  "energy": 30},
-    "учитель":     {"emoji": "🧑‍🏫",         "name": "Учитель",     "income": (120, 240),    "req_days": 10,  "req_coins": 0,    "expense": 10,  "energy": 25},
-    "программист": {"emoji": "💻",         "name": "Программист", "income": (160, 320),    "req_days": 20,  "req_coins": 0,    "expense": 30,  "energy": 35},
-    "врач":        {"emoji": "🏥",         "name": "Врач",        "income": (200, 400),    "req_days": 30,  "req_coins": 500,  "expense": 40,  "energy": 35},
-    "юрист":       {"emoji": "⚖️",         "name": "Юрист",       "income": (250, 500),    "req_days": 50,  "req_coins": 1000, "expense": 50,  "energy": 30},
-    "банкир":      {"emoji": "🏦",         "name": "Банкир",      "income": (300, 600),    "req_days": 100, "req_coins": 2000, "expense": 60,  "energy": 25},
-    "космонавт":   {"emoji": "🚀",         "name": "Космонавт",   "income": (500, 1000),   "req_days": 200, "req_coins": 5000, "expense": 100, "energy": 40},
+    "уборщик":     {"emoji": "🧹",         "name": "Уборщик",     "income": (400, 800),      "req_days": 0,   "req_coins": 0,    "expense": 50,   "energy": 20},
+    "курьер":      {"emoji": "📦",         "name": "Курьер",      "income": (600, 1200),     "req_days": 3,   "req_coins": 0,    "expense": 150,  "energy": 25},
+    "повар":       {"emoji": "🍳",         "name": "Повар",       "income": (800, 1600),     "req_days": 0,   "req_coins": 0,    "expense": 200,  "energy": 30},
+    "стриптизер":  {"emoji": "👯",         "name": "Стриптизер",  "income": (900, 1800),     "req_days": 0,   "req_coins": 0,    "expense": 200,  "energy": 30},
+    # Единственная строка, которую при подъёме шкалы в 10 раз НЕ трогали: она
+    # и до этого стояла на порядок выше соседей (900–3000 против 90–180), то
+    # есть уже была в нужном масштабе. Умножь её ещё раз — и одна смена раз
+    # в час обгоняла бы Аэропорт 3 уровня. Теперь она вровень с соседями.
+    "шлюха":       {"emoji": "🍒 ",        "name": "Шлюха",       "income": (900, 3000),   "req_days": 0,   "req_coins": 0,    "expense": 200,  "energy": 30},
+    "сантехник":   {"emoji": "🛠",         "name": "Сантехник",   "income": (1000, 2000),    "req_days": 7,   "req_coins": 0,    "expense": 250,  "energy": 30},
+    "учитель":     {"emoji": "🧑‍🏫",         "name": "Учитель",     "income": (1200, 2400),    "req_days": 10,  "req_coins": 0,    "expense": 100,  "energy": 25},
+    "программист": {"emoji": "💻",         "name": "Программист", "income": (1600, 3200),    "req_days": 20,  "req_coins": 0,    "expense": 300,  "energy": 35},
+    "врач":        {"emoji": "🏥",         "name": "Врач",        "income": (2000, 4000),    "req_days": 30,  "req_coins": 5000,  "expense": 400,  "energy": 35},
+    "юрист":       {"emoji": "⚖️",         "name": "Юрист",       "income": (2500, 5000),    "req_days": 50,  "req_coins": 10000, "expense": 500,  "energy": 30},
+    "банкир":      {"emoji": "🏦",         "name": "Банкир",      "income": (3000, 6000),    "req_days": 100, "req_coins": 20000, "expense": 600,  "energy": 25},
+    "космонавт":   {"emoji": "🚀",         "name": "Космонавт",   "income": (5000, 10000),   "req_days": 200, "req_coins": 50000, "expense": 1000, "energy": 40},
 }
 
 # Кумулятивные пороги XP по уровням (1..10), из ТЗ.
@@ -15612,11 +17830,19 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
 
     # Аврал на производстве (событие чата) множит заработок смены.
     final_income = int(final_income * await event_multiplier(chat_id, chat_events.T_WORK))
+    # «Робот работяги» (предмет за ачивку) поднимает доход, пока лежит
+    # в инвентаре — тратить и нажимать ничего не нужно.
+    final_income, work_passive = await _with_passive(
+        chat_id, user_id, shop_effects.ACTIVITY_WORK, final_income)
     await db.add_coins(chat_id, user_id, final_income)
     stats = await db.update_profession_after_shift(
         chat_id, user_id, xp_gain, final_income, energy_delta, mood_delta,
         health_delta, new_streak, today,
     )
+    # Ачивка «Работяга» — за 20 смен. Считаем по счётчику, который только что
+    # обновился, поэтому порог срабатывает ровно один раз.
+    if int(stats.get("total_shifts") or 0) >= 20:
+        await grant_achievement(chat_id, user_id, "work_20")
 
     new_level = profession_level_from_xp(stats["prof_xp"])
     level_up_text = ""
@@ -15664,7 +17890,10 @@ async def cmd_prof_join(message: Message):
     prof = PROFESSIONS.get(key)
     if prof is None:
         names = ", ".join(f"{p['emoji']} {p['name']} ({k})" for k, p in PROFESSIONS.items())
-        await message.reply(f"Укажите профессию: <code>!работа устроиться уборщик</code>\n\nДоступные: {names}")
+        await message.reply(
+            f"Укажите профессию: <code>!работа устроиться уборщик</code>\n\nДоступные: {names}\n\n"
+            "Подробно (доход, требования, расход) — <code>профессии</code>."
+        )
         return
 
     stats = await db.get_profession_stats(message.chat.id, message.from_user.id)
@@ -15785,6 +18014,92 @@ async def cmd_prof_top(message: Message):
     await message.reply("\n".join(lines))
 
 
+PROFESSIONS_PAGE_SIZE = 4
+
+
+async def professions_page(chat_id: int, user_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Каталог профессий: сколько платят, что требуют, чего стоит смена.
+
+    Раньше этот список показывался только как текст ошибки при неверном
+    «!работа устроиться» — то есть увидеть его можно было, лишь ошибившись.
+    Требования показываем сразу с отметкой «доступна / не хватает стажа», для
+    чего нужен спрашивающий: без этого выбирать приходится вслепую.
+    """
+    items = list(PROFESSIONS.items())
+    page = max(page, 0)
+    total_pages = max((len(items) + PROFESSIONS_PAGE_SIZE - 1) // PROFESSIONS_PAGE_SIZE, 1)
+    page = min(page, total_pages - 1)
+    chunk = items[page * PROFESSIONS_PAGE_SIZE : (page + 1) * PROFESSIONS_PAGE_SIZE]
+
+    first_seen = await db.get_member_first_seen(chat_id, user_id)
+    days_in_chat = (datetime.utcnow() - first_seen).days if first_seen else 0
+    wallet = await db.get_wallet(chat_id, user_id)
+    coins = wallet.get("coins", 0)
+    stats = await db.get_profession_stats(chat_id, user_id)
+    current = stats.get("profession_key")
+
+    lines = [f"💼 <b>Профессии</b> — {len(items)} шт.", DIVIDER]
+    for key, prof in chunk:
+        low, high = prof["income"]
+        if key == current:
+            mark = "✅ ваша"
+        elif days_in_chat < prof["req_days"]:
+            mark = f"🔒 нужен стаж {prof['req_days']} дн. (у вас {days_in_chat})"
+        elif coins < prof["req_coins"]:
+            mark = f"🔒 нужно {prof['req_coins']} i¢ на входе"
+        else:
+            mark = "🟢 доступна"
+        lines.append(
+            f"{prof['emoji']} <b>{prof['name']}</b> (<code>{key}</code>) — {mark}\n"
+            f"   💰 {low}–{high} i¢ за смену · ⚡ {prof['energy']} энергии · 💸 расход {prof['expense']}"
+        )
+    lines.append("")
+    lines.append("Устроиться: <code>!работа устроиться {ключ}</code>")
+    lines.append("Смена раз в час: <code>!работа</code> · профиль: <code>!работа профиль</code>")
+    text = "\n".join(lines)
+
+    if total_pages == 1:
+        return text, None
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"profs_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"profs_page:{page + 1}"))
+    return text, InlineKeyboardMarkup(inline_keyboard=[nav])
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+        "профессии", "!профессии", "!работа профессии", "!работа список",
+    )),
+)
+async def cmd_professions(message: Message):
+    if not _check_misc_access(message.from_user.id, "prof_catalog"):
+        return
+    text, kb = await professions_page(message.chat.id, message.from_user.id, 0)
+    await message.reply(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("profs_page:"))
+async def paginate_professions(callback: CallbackQuery):
+    if not _check_misc_access(callback.from_user.id, "prof_catalog"):
+        await callback.answer()
+        return
+    try:
+        page = int(callback.data.split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Не удалось открыть эту страницу.", show_alert=True)
+        return
+    text, kb = await professions_page(callback.message.chat.id, callback.from_user.id, page)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and t.strip().casefold() == "!работа рынок"),
@@ -15806,7 +18121,11 @@ async def cmd_prof_market(message: Message):
 
 async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     await db.seed_default_shop_items(chat_id)
-    await db.seed_robbery_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+    # Дозасев (не требует пустого магазина): так новые товары доезжают
+    # и в чаты, где магазин давно наполнен, — иначе они не появились бы
+    # никогда, ведь seed_default_shop_items у непустого магазина молчит.
+    await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
     items = await db.list_shop_items(chat_id)
     items.sort(key=lambda i: (i.get("stock") == 0, i["price"]))
     if not items:
@@ -15885,7 +18204,8 @@ async def cmd_shop_add(message: Message):
         return
     await db.add_log("shop_item_added", chat_id=message.chat.id, actor_id=message.from_user.id, details=item_key)
     await message.reply(
-        f"✅ Добавлено в магазин: 🎁 <b>{html.escape(name)}</b> ({item_key}) — {price} i¢"
+        f"✅ Добавлено в магазин: 🎁 <b>{html.escape(name)}</b> "
+        f"(<code>{html.escape(item_key)}</code>) — {price} i¢"
     )
 
 def shop_menu_kb(items: list[dict]) -> ReplyKeyboardMarkup:
@@ -16058,7 +18378,7 @@ async def shop_open_item(message: Message, state: FSMContext):
     stock_text = "без лимита" if item.get("stock") is None else str(item["stock"])
     restock_text = "выкл." if not item.get("restock_max") else f"до {item['restock_max']} шт./день (в 15:00 UTC)"
     await message.answer(
-        f"🏷 <b>{html.escape(item['name'])}</b> ({item_key})\n"
+        f"🏷 <b>{html.escape(item['name'])}</b> (<code>{html.escape(item_key)}</code>)\n"
         f"Цена: {item['price']} i¢\nОстаток: {stock_text}\nПополнение: {restock_text}\n"
         f"Статус: {'включён' if item['is_active'] else 'выключен'}",
         reply_markup=shop_item_menu_kb(item["is_active"]),
@@ -16239,6 +18559,12 @@ async def cmd_shop_buy(message: Message):
     if item is None or not item["is_active"]:
         await message.reply(f"Товар с ключом «{html.escape(item_key)}» не найден в магазине. Список — «магазин».")
         return
+    if shop_effects.is_reward(item_key):
+        await message.reply(
+            f"{item['emoji']} «{html.escape(item['name'])}» не продаётся — "
+            "это награда чата, её выдают за заслуги."
+        )
+        return
     if item.get("stock") is not None and item["stock"] <= 0:
         await message.reply(f"⚠️ Товар «{html.escape(item['name'])}» раскуплен — остатка больше нет.")
         return
@@ -16286,10 +18612,16 @@ async def cmd_inventory(message: Message):
         item_name = i.get("name") or i["item_key"]
         used = await db.get_item_usage_count(message.chat.id, target.id, i["item_key"])
         left = max(db.ITEM_USE_LIMIT - used, 0)
+        # Ключ показываем и здесь: именно из инвентаря его переписывают
+        # в «использовать», «подарить» и «магазин продать». Раньше строка
+        # называла только предмет, и ключ приходилось искать в магазине.
         lines.append(
-            f"{emoji} {html.escape(item_name)} × {i['quantity']} "
+            f"{emoji} {html.escape(item_name)} (<code>{html.escape(i['item_key'])}</code>) "
+            f"× {i['quantity']} "
             f"(осталось использований: {left}/{db.ITEM_USE_LIMIT})"
         )
+    lines.append("")
+    lines.append("Ключ можно нажать — он скопируется.")
     await message.reply("\n".join(lines))
 
 
@@ -16324,6 +18656,12 @@ async def cmd_gift_item(message: Message):
         return
     if getattr(target, "is_bot", False):
         await message.reply("Ботам подарки не нужны 🤖")
+        return
+    if shop_effects.is_reward(item_key):
+        await message.reply(
+            "🎖 Награды не дарят — их выдают за заслуги. "
+            "Этот знак останется вашим."
+        )
         return
 
     removed = await db.remove_inventory_item(message.chat.id, message.from_user.id, item_key)
@@ -16420,7 +18758,11 @@ async def _lootbox_build_pools(chat_id: int) -> tuple[list[dict], list[dict]]:
     пустым просто потому, что никто ещё не писал «магазин» в этом чате.
     """
     await db.seed_default_shop_items(chat_id)
-    await db.seed_robbery_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+    # Дозасев (не требует пустого магазина): так новые товары доезжают
+    # и в чаты, где магазин давно наполнен, — иначе они не появились бы
+    # никогда, ведь seed_default_shop_items у непустого магазина молчит.
+    await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
 
     pool: list[dict] = []
     for item in await db.list_shop_items(chat_id, active_only=True):
@@ -16742,12 +19084,17 @@ async def cmd_warn(message: Message):
             )
         except TelegramBadRequest as e:
             await message.reply(f"⚠️ Предупреждение выдано, но автобан не удался: {e.message}")
+        await _tell_moderator_warn_kind(message, target_name, fake=False, count=count)
         return
 
     await message.reply(_warn_card(
         actor_name=actor_name, target_name=target_name, reason_text=reason_text,
         expiry_text=expiry_text, count=count,
     ))
+    # Сообщаем и про настоящий варн тоже: если в личку приходит только про
+    # розыгрыш, то само наличие письма становится ответом, и модератор
+    # перестаёт читать — а с ним теряется весь смысл напоминания.
+    await _tell_moderator_warn_kind(message, target_name, fake=False, count=count)
 
 
 @router.message(
@@ -16776,6 +19123,33 @@ async def cmd_unwarn(message: Message):
 # не банит. Подробности и причины решений — в fake_warns.py.
 
 FAKE_WARNS_IN_LIST_DEFAULT = True
+
+
+async def _tell_moderator_warn_kind(message: Message, target_name: str,
+                                    *, fake: bool, count: int) -> None:
+    """Пишет выдавшему в личку, настоящий это был варн или розыгрыш.
+
+    Нужно ровно затем, чтобы модератор не запутался в собственной шутке:
+    разыграв двоих, легко забыть, кому что выдано, и добить человека
+    НАСТОЯЩИМ третьим варном по ложному следу. В журнале это видно, но в лс
+    приходит сразу и без похода в панель.
+
+    В чат такое писать нельзя ни при каких условиях — это выдало бы розыгрыш.
+    Личка закрыта — молча пропускаем: у соседних команд («&варны», «&-варн»)
+    ровно то же поведение и по той же причине.
+    """
+    kind = ("🃏 <b>Это был ОБМАННЫЙ варн.</b> В базе его нет, бана не будет."
+            if fake else
+            "⚠️ <b>Это был НАСТОЯЩИЙ варн.</b> Он записан в базу.")
+    try:
+        await bot.send_message(
+            message.from_user.id,
+            f"{kind}\nКому: {target_name}\nВсего варнов у него сейчас: {count}.",
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    except Exception as exc:
+        log_suppressed("_tell_moderator_warn_kind", exc)
 
 
 def fake_warns_in_list() -> bool:
@@ -16846,6 +19220,8 @@ async def cmd_fake_warn(message: Message):
         count=count,
         footer=footer,
     ))
+
+    await _tell_moderator_warn_kind(message, target_name, fake=True, count=count)
 
     if footer:
         # Шутка доиграна — обнуляем, иначе следующий «&варн» покажет 4/3, а в
@@ -17704,6 +20080,28 @@ ROLE_TAG_NO_RIGHTS = dict(
 def _role_tag_flag_key(chat_id: int, user_id: int) -> str:
     return f"roletag:{chat_id}:{user_id}"
 
+
+def _rest_tag_flag_key(chat_id: int, user_id: int) -> str:
+    return f"resttag:{chat_id}:{user_id}"
+
+
+async def _remember_rest_tag(chat_id: int, user_id: int, is_resting: bool) -> None:
+    """Помечает, что в теге этого человека СЕЙЧАС стоит приписка «рест».
+
+    Отдельно от roletag: тот ставится только когда админку выдал бот, а
+    настоящему администратору (владельцу, например) бот лишь меняет подпись
+    и roletag не пишет. Цикл снятия приписки перебирал только roletag —
+    и у настоящих админов «рест» в теге оставался навсегда.
+
+    Ключ живёт ровно пока приписка стоит: сняли — удалили, чтобы цикл не
+    ходил в Telegram за теми, у кого и так всё в порядке.
+    """
+    key = _rest_tag_flag_key(chat_id, user_id)
+    if is_resting:
+        await db.set_data(key, "1")
+    else:
+        await db.delete_data(key)
+
 def _build_role_title(role_name: str, is_resting: bool) -> str:
     """custom_title: максимум 16 симв., эмодзи запрещены Telegram API —
     поэтому рест помечаем текстом, а не пальмой."""
@@ -17746,6 +20144,8 @@ async def sync_role_title(chat_id: int, user_id: int) -> None:
                 "sync_role_title(%s, %s): set_chat_administrator_custom_title (already admin) failed: %s",
                 chat_id, user_id, e,
             )
+        else:
+            await _remember_rest_tag(chat_id, user_id, bool(rest))
         return
 
     if member.status != "member":
@@ -17761,6 +20161,7 @@ async def sync_role_title(chat_id: int, user_id: int) -> None:
     except (TelegramForbiddenError, TelegramBadRequest) as e:
         logger.warning("sync_role_title(%s, %s): promote/set_custom_title failed: %s", chat_id, user_id, e)
     else:
+        await _remember_rest_tag(chat_id, user_id, bool(rest))
         logger.info("sync_role_title(%s, %s): успешно установлен тег %r", chat_id, user_id, title)
 
 
@@ -18921,12 +21322,21 @@ async def cmd_reward(message: Message):
         target_id=target.id, details=f"degree={degree} id={reward_id}",
     )
 
+    # Вместе с наградой — материальный знак в инвентарь. Он не продаётся,
+    # не дарится и не тратится: это отличие, а не расходник (см. shop_effects).
+    trophy = shop_effects.trophy_for_degree(degree)
+    trophy_line = ""
+    if trophy is not None:
+        await db.seed_extra_shop_items(message.chat.id, shop_effects.shop_rows())
+        await db.add_inventory_item(message.chat.id, target.id, trophy.key)
+        trophy_line = f"\n{trophy.emoji} В инвентарь: <b>{trophy.name}</b>"
+
     # actor_name = await display_name(message.chat.id, message.from_user)
     target_name = await display_name(message.chat.id, target)
     # reason_text = html.escape(reason) if reason else "не указана"
     emoji_degree = f"{reward_degree_emoji(degree)}{_subscript_number(degree)}"
     await message.reply(
-        f"{emoji_degree} <b>Награда</b> {target_name} <b>вручена</b>\n"
+        f"{emoji_degree} <b>Награда</b> {target_name} <b>вручена</b>{trophy_line}"
         # f"👤 Выдал: {actor_name}\n"
         # f"📝 Заслуга: {reason_text}"
     )
@@ -19525,6 +21935,20 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     if card and card.get("pinned_achievement") and card["pinned_achievement"] in ACHIEVEMENTS:
         ach = ACHIEVEMENTS[card["pinned_achievement"]]
         lines.append(f"🏅 Ачивка: {ach['emoji']} <b>{ach['title']}</b>")
+    if card and card.get("pinned_business"):
+        # Бизнес мог быть продан или передан уже после закрепления — тогда
+        # строку просто не рисуем, а не показываем чужое. Уровень и состояние
+        # берём из самой записи: закреп должен показывать текущее положение
+        # дел, включая поломку, иначе им будут хвастаться сломанным.
+        biz = await db.get_user_business(chat_id, target.id, card["pinned_business"])
+        item = business_catalog.BY_KEY.get(card["pinned_business"])
+        if biz and item:
+            level = int(biz["level"])
+            state = " · 🛠 сломан" if biz.get("broken_kind") else ""
+            lines.append(
+                f"🏢 Бизнес: {item.name} · {level} ур. · "
+                f"{item.income(level)} i¢/час{state}"
+            )
     # Кошелёк (наши реальные валюты: коины i¢ и звёздность) — строку показываем,
     # только если есть чем; тысячи разделяем пробелом («3 578»). Репутация —
     # одно число, показываем всегда.
@@ -19720,7 +22144,8 @@ async def _inventory_view(chat_id: int, target_id: int, requester_id: int, viewe
         used = await db.get_item_usage_count(chat_id, target_id, i["item_key"])
         left = max(db.ITEM_USE_LIMIT - used, 0)
         lines.append(
-            f"{emoji} {html.escape(item_name)} × {i['quantity']} "
+            f"{emoji} {html.escape(item_name)} (<code>{html.escape(i['item_key'])}</code>) "
+            f"× {i['quantity']} "
             f"(осталось использований: {left}/{db.ITEM_USE_LIMIT})"
         )
         # кнопки закрепления/продажи — только при просмотре своего инвентаря
@@ -19979,7 +22404,64 @@ async def cmd_streak(message: Message):
     await message.reply(f"🔥 Стрик активности {name}: <b>{streak}</b> дн. подряд")
 
 
-STREAK_TOP_LIMIT = 10
+STREAK_TOP_PAGE_SIZE = 10
+# Топ стриков считается дорого: для КАЖДОГО кандидата отдельным запросом
+# поднимаются его дни активности (до 300 запросов на один показ). Пересчитывать
+# это на каждое нажатие стрелки нельзя, поэтому готовый рейтинг чата живёт
+# короткое время в памяти. Срок маленький: стрик меняется раз в сутки, но
+# список участников — нет, и держать его долго значит показывать вчерашний
+# расклад тому, кто только что написал первое сообщение.
+STREAK_TOP_CACHE_TTL = timedelta(minutes=5)
+_streak_top_cache: dict[int, tuple[datetime, list]] = {}
+
+
+async def _streak_ranking(chat_id: int) -> list[tuple[int, dict]]:
+    """Рейтинг чата по стрикам, убыванием. Кэш на STREAK_TOP_CACHE_TTL."""
+    cached = _streak_top_cache.get(chat_id)
+    now = datetime.utcnow()
+    if cached and now - cached[0] < STREAK_TOP_CACHE_TTL:
+        return cached[1]
+
+    scored: list[tuple[int, dict]] = []
+    for row in await db.list_recent_active_users(chat_id, limit=300):
+        streak = compute_streak(await db.list_active_days(chat_id, row["user_id"]))
+        if streak > 0:
+            scored.append((streak, row))
+    scored.sort(key=lambda x: -x[0])
+    _streak_top_cache[chat_id] = (now, scored)
+    return scored
+
+
+async def streak_top_page(chat_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    scored = await _streak_ranking(chat_id)
+    if not scored:
+        return "🔥 Пока ни у кого нет активного стрика.", None
+
+    page = max(page, 0)
+    total_pages = max((len(scored) + STREAK_TOP_PAGE_SIZE - 1) // STREAK_TOP_PAGE_SIZE, 1)
+    page = min(page, total_pages - 1)
+    start = page * STREAK_TOP_PAGE_SIZE
+    chunk = scored[start : start + STREAK_TOP_PAGE_SIZE]
+
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    lines = [f"🔥 <b>Топ по стрикам</b> — {len(scored)} участников", DIVIDER]
+    for offset, (streak, row) in enumerate(chunk):
+        index = start + offset
+        name = mention_id(row["user_id"], full_name=row.get("full_name"), username=row.get("username"))
+        place = medals.get(index, f"{index + 1}.")
+        lines.append(f"{place} {name} — {streak} дн. подряд")
+    text = "\n".join(lines)
+
+    if total_pages == 1:
+        return text, None
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"streaktop_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"streaktop_page:{page + 1}"))
+    return text, InlineKeyboardMarkup(inline_keyboard=[nav])
+
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -19988,28 +22470,26 @@ STREAK_TOP_LIMIT = 10
 async def cmd_streak_top(message: Message):
     if not _check_misc_access(message.from_user.id, "streak_top"):
         return
-    candidates = await db.list_recent_active_users(message.chat.id, limit=300)
-    if not candidates:
-        await message.reply("🔥 Пока ни у кого нет активного стрика.")
+    text, kb = await streak_top_page(message.chat.id, 0)
+    await message.reply(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("streaktop_page:"))
+async def paginate_streak_top(callback: CallbackQuery):
+    if not _check_misc_access(callback.from_user.id, "streak_top"):
+        await callback.answer()
         return
-    scored: list[tuple[int, dict]] = []
-    for row in candidates:
-        days = await db.list_active_days(message.chat.id, row["user_id"])
-        streak = compute_streak(days)
-        if streak > 0:
-            scored.append((streak, row))
-    if not scored:
-        await message.reply("🔥 Пока ни у кого нет активного стрика.")
+    try:
+        page = int((callback.data or "").split(":", maxsplit=1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Не удалось открыть эту страницу.", show_alert=True)
         return
-    scored.sort(key=lambda x: -x[0])
-    top = scored[:STREAK_TOP_LIMIT]
-    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
-    lines = ["🔥 <b>Топ по стрикам</b>", DIVIDER]
-    for i, (streak, row) in enumerate(top):
-        name = mention_id(row["user_id"], full_name=row.get("full_name"), username=row.get("username"))
-        place = medals.get(i, f"{i + 1}.")
-        lines.append(f"{place} {name} — {streak} дн. подряд")
-    await message.reply("\n".join(lines))
+    text, kb = await streak_top_page(callback.message.chat.id, page)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("top_page:"))
 async def paginate_top(callback: CallbackQuery):
@@ -20200,8 +22680,13 @@ async def stat_period_page(chat_id: int, period: str, page: int) -> tuple[str, O
 
 # Второе слово команды, которое означает СОВСЕМ другой отчёт и должно уйти
 # своему обработчику: «топ кланов», «топ браков», «стата по часам» и т.п.
+# «стриков»/«стрик» — тоже чужие: их берёт cmd_streak_top. Без них фильтр
+# подходил и сюда, и туда, и «топ стриков» доставался тому обработчику, который
+# просто зарегистрирован раньше, — то есть работал по случайности порядка строк
+# в файле, а не по правилу.
 _STAT_FOREIGN_SECOND_WORDS = (
     "кланов", "монет", "ачивок", "репутации", "браков", "уловов", "рыбалки", "по",
+    "стриков", "стрик",
 )
 
 
@@ -21247,15 +23732,27 @@ async def cmd_rest_cancel(message: Message):
 
 
 async def rest_tag_expiry_loop() -> None:
+    """Снимает приписку «рест» с тега, когда рест кончился.
+
+    Смотрим ДВА набора ключей. roletag: — те, кому админку выдал сам бот ради
+    тега. resttag: — все, у кого приписка сейчас стоит, включая настоящих
+    администраторов: им бот админку не выдавал и roletag не писал, поэтому
+    раньше цикл их просто не находил и «рест» оставался в теге навсегда.
+    """
     while True:
         try:
-            rows = await db.list_data_by_prefix("roletag:")
+            seen: set[tuple[int, int]] = set()
+            rows = (await db.list_data_by_prefix("roletag:")) + \
+                   (await db.list_data_by_prefix("resttag:"))
             for row in rows:
                 try:
                     _, chat_id_s, user_id_s = row["data_key"].split(":")
                     chat_id, user_id = int(chat_id_s), int(user_id_s)
                 except ValueError:
                     continue
+                if (chat_id, user_id) in seen:
+                    continue          # человек есть в обоих наборах
+                seen.add((chat_id, user_id))
                 rest = await db.get_active_rest(chat_id, user_id)
                 if not rest:
                     await sync_role_title(chat_id, user_id)
@@ -22215,8 +24712,12 @@ async def _apply_moment_event(chat_id: int, event: chat_events.Event) -> Optiona
             return None
         winner = random.choice(holders)
         await db.add_coins(chat_id, int(winner["user_id"]), int(event.amount))
+        # display_name_by_id() отдаёт ГОТОВУЮ HTML-ссылку (имя внутри уже
+        # экранировано). Экранировать её ещё раз нельзя: тогда в чат уходит
+        # «&lt;a href=…&gt;», и Telegram рисует это видимым текстом вместо
+        # кликабельного имени — именно так ломался «Метеоритный дождь».
         name = await display_name_by_id(chat_id, int(winner["user_id"]))
-        return chat_events.describe(event, name=html.escape(name), amount=int(event.amount))
+        return chat_events.describe(event, name=name, amount=int(event.amount))
 
     if key == "pickpocket":
         holders = await db.list_wallet_holders(chat_id, min_coins=100, limit=200)
@@ -22227,8 +24728,8 @@ async def _apply_moment_event(chat_id: int, event: chat_events.Event) -> Optiona
         stolen = await db.take_coins_up_to(chat_id, int(victim["user_id"]), stolen)
         if not stolen:
             return None      # у жертвы уже пусто — событие не состоялось
-        name = await display_name_by_id(chat_id, int(victim["user_id"]))
-        return chat_events.describe(event, name=html.escape(name), amount=stolen)
+        name = await display_name_by_id(chat_id, int(victim["user_id"]))  # уже HTML-ссылка, см. выше
+        return chat_events.describe(event, name=name, amount=stolen)
 
     if key == "handout":
         treasury = await db.get_chat_coins(chat_id)
@@ -22266,6 +24767,24 @@ async def _apply_moment_event(chat_id: int, event: chat_events.Event) -> Optiona
             return None
         return chat_events.describe(event, count=touched)
 
+    if key == "charity":
+        # Единственное событие, которое платит адресно: тем, у кого в кармане
+        # меньше порога. Порог — event.amount, размер выплаты считаем от того,
+        # что реально лежит в казне: выдумывать деньги нельзя, поэтому если на
+        # всех не хватает — событие просто не состоялось.
+        threshold = int(event.amount)
+        poor = await db.list_poor_wallets(chat_id, threshold, limit=100)
+        if not poor:
+            return None
+        treasury = int(await db.get_chat_coins(chat_id))
+        per_head = min(threshold // 2, treasury // len(poor))
+        if per_head < 1:
+            return None
+        payout = per_head * len(poor)
+        await db.add_chat_coins(chat_id, -payout)
+        got = await db.add_coins_to_users(chat_id, [int(u["user_id"]) for u in poor], per_head)
+        return chat_events.describe(event, amount=threshold, per_head=per_head, count=got)
+
     logger.warning("Мгновенное событие «%s» не имеет обработчика", key)
     return None
 
@@ -22280,17 +24799,28 @@ async def _announce_event_end(chat_id: int, key: str) -> None:
         log_suppressed("_announce_event_end", exc)
 
 
-async def fire_chat_event(chat_id: int, event: chat_events.Event) -> bool:
-    """Запускает конкретное событие в чате. True — получилось и объявлено."""
+async def fire_chat_event(chat_id: int, event: chat_events.Event,
+                          minutes: Optional[int] = None) -> bool:
+    """Запускает конкретное событие в чате. True — получилось и объявлено.
+
+    minutes — своя длительность вместо штатной (команда «ивент {название}
+    {время}»). Мгновенных событий не касается: им длиться нечем.
+    """
     if event.kind == chat_events.MOMENT:
         text = await _apply_moment_event(chat_id, event)
         if text is None:
             return False
         state = {"key": event.key, "until": None}
     else:
-        until = datetime.utcnow() + timedelta(minutes=event.minutes)
+        lasts = minutes if minutes else event.minutes
+        until = datetime.utcnow() + timedelta(minutes=lasts)
         state = {"key": event.key, "until": until.isoformat()}
         text = chat_events.describe(event)
+        if minutes and minutes != event.minutes:
+            # Тексты событий описывают срок прозой («ближайший час»), поэтому
+            # при своей длительности к ним дописывается честная строка —
+            # иначе объявление противоречило бы тому, что реально произойдёт.
+            text += f"\n⏱ Продлится: {format_duration_ru(timedelta(minutes=lasts))}."
 
     # История нужна, чтобы pick() не гонял одно и то же по кругу.
     history = state.get("history") or []
@@ -22312,15 +24842,16 @@ async def fire_chat_event(chat_id: int, event: chat_events.Event) -> bool:
     await db.add_log("chat_event", chat_id=chat_id, details=event.key)
 
     if event.kind == chat_events.BUFF:
-        asyncio.create_task(_schedule_event_end(chat_id, event))
+        asyncio.create_task(_schedule_event_end(chat_id, event, minutes))
     return True
 
 
-async def _schedule_event_end(chat_id: int, event: chat_events.Event) -> None:
+async def _schedule_event_end(chat_id: int, event: chat_events.Event,
+                              minutes: Optional[int] = None) -> None:
     """Объявляет конец баффа. Отдельной задачей, а не в цикле, чтобы «кончилось»
     приходило вовремя, а не с точностью до тика в 10 минут."""
     try:
-        await asyncio.sleep(event.minutes * 60)
+        await asyncio.sleep((minutes if minutes else event.minutes) * 60)
         current = await db.get_data(_events_state_key(chat_id))
         if not current:
             return
@@ -22384,6 +24915,19 @@ async def chat_events_loop() -> None:
             logger.exception("Сбой в цикле событий чата")
 
 
+# «Ивент» и «событие» — одно и то же, просто кто-то говорит так, кто-то эдак.
+# Обе формы держим в одном месте, чтобы синонимы не расползались по файлу.
+# Голого «ивент» здесь нет намеренно: это слово занято запуском
+# («ивент {название} {время}»), и держать его в обоих списках значило бы
+# сделать «ивент» неоднозначным для опознавания команды по тексту. Смотреть —
+# «ивенты», во множественном числе.
+EVENT_STATUS_TRIGGERS = {
+    "события", "!события", "событие",
+    "ивенты", "!ивенты",
+}
+EVENT_TOGGLE_TRIGGERS = {"+события", "-события", "+ивент", "-ивент", "+ивенты", "-ивенты"}
+
+
 def _event_status_lines(state: Optional[dict]) -> list[str]:
     event = chat_events.EVENTS_BY_KEY.get((state or {}).get("key") or "")
     if event is None or event.kind != chat_events.BUFF:
@@ -22402,20 +24946,29 @@ def _event_status_lines(state: Optional[dict]) -> list[str]:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!события", "события", "событие")),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in EVENT_STATUS_TRIGGERS),
 )
 async def cmd_chat_event_status(message: Message):
     if not _check_misc_access(message.from_user.id, "chat_events"):
         return
     lines = _event_status_lines(await get_active_event(message.chat.id))
     if not await events_enabled(message.chat.id):
-        lines.append("\n⚠️ События в этом чате выключены (<code>+события</code> — включить).")
+        lines.append("\n⚠️ События в этом чате выключены (<code>+ивент</code> — включить).")
+    # Список названий нужен прямо здесь: без него человек не знает, что писать
+    # в «ивент {название} {время}», и идёт искать в справке.
+    lines.append("")
+    lines.append(f"📋 <b>Какие бывают</b> ({len(chat_events.EVENTS)}):")
+    lines.append(", ".join(f"<code>{e.key}</code>" for e in chat_events.EVENTS))
+    if has_level(message.from_user.id, required_level("chat_events_toggle")):
+        lines.append("")
+        lines.append("Запустить: <code>ивент {название} {время}</code> — "
+                     "например <code>ивент gold_rush 30м</code>")
     await message.answer("\n".join(lines))
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+события", "-события")),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in EVENT_TOGGLE_TRIGGERS),
 )
 async def cmd_chat_events_toggle(message: Message):
     min_level = required_level("chat_events_toggle")
@@ -22432,7 +24985,20 @@ async def cmd_chat_events_toggle(message: Message):
         await message.reply("🎲 Случайные события выключены.")
 
 
-EVENT_FORCE_RE = re.compile(r"(?i)^!?событие\s+запустить\s+(\S+)$")
+# «ивент {название} {время}» и старая форма «событие запустить {ключ}».
+# Название ловим жадно и разбираем уже в обработчике: у событий есть
+# многословные заголовки («золотая лихорадка»), и резать по первому пробелу
+# значило бы принимать только ключи.
+# Голого «событие {что-то}» здесь намеренно НЕТ: «событие века», «событие
+# произошло вчера» — обычные фразы, и админ, написавший такое в чате, получал
+# бы в ответ простыню со списком событий. У «ивент» такой проблемы нет: в
+# живой речи оно почти не встречается отдельным словом с продолжением.
+EVENT_FORCE_RE = re.compile(
+    r"(?i)^!?(?:событие\s+запустить|ивент)\s+(.+)$"
+)
+# Верхний предел — чтобы «ивент gold_rush 100д» не подвесил бафф на неделю:
+# задача события — встряхнуть чат на время, а не поменять правила навсегда.
+EVENT_MAX_MINUTES = 24 * 60
 
 
 @router.message(
@@ -22445,13 +25011,43 @@ async def cmd_chat_event_force(message: Message):
         if get_level(message.from_user.id) > 0:
             await message.reply(f"⛔ Запускать события вручную может «{level_name(min_level)}» и выше.")
         return
-    key = EVENT_FORCE_RE.match(message.text.strip()).group(1).casefold()
-    event = chat_events.EVENTS_BY_KEY.get(key)
+
+    rest = EVENT_FORCE_RE.match(message.text.strip()).group(1).strip()
+    # Время — последнее слово, но только если оно и правда время: у события
+    # может быть многословное название, и «ивент золотая лихорадка» без срока
+    # обязано работать так же, как с ним.
+    minutes: Optional[int] = None
+    parts = rest.rsplit(maxsplit=1)
+    if len(parts) == 2:
+        duration = parse_duration(parts[1])
+        if duration is not None:
+            rest = parts[0]
+            minutes = max(1, int(duration.total_seconds() // 60))
+
+    event = chat_events.resolve(rest)
     if event is None:
         keys = ", ".join(f"<code>{e.key}</code>" for e in chat_events.EVENTS)
-        await message.reply(f"Нет такого события. Доступные:\n{keys}")
+        await message.reply(
+            f"Нет такого события — или название подходит сразу к нескольким.\n"
+            f"Доступные:\n{keys}"
+        )
         return
-    if not await fire_chat_event(message.chat.id, event):
+
+    if minutes is not None:
+        if event.kind == chat_events.MOMENT:
+            await message.reply(
+                f"«{event.title}» срабатывает мгновенно — длительность ему не задать. "
+                f"Запускаю как есть."
+            )
+            minutes = None
+        elif minutes > EVENT_MAX_MINUTES:
+            await message.reply(
+                f"Слишком долго: максимум "
+                f"{format_duration_ru(timedelta(minutes=EVENT_MAX_MINUTES))}."
+            )
+            return
+
+    if not await fire_chat_event(message.chat.id, event, minutes):
         await message.reply(
             "Событие не подошло к текущему состоянию чата "
             "(например, пустая казна или некого награждать). Попробуйте другое."
@@ -22853,6 +25449,14 @@ ACHIEVEMENTS: dict = {
     "race_win":        {"emoji": "🏇", "title": "Жокей", "desc": "выиграть в гонках"},
     "race_master":     {"emoji": "🏆", "title": "Чемпион ипподрома", "desc": "выиграть в гонках 10 раз"},
     "generous_20":      {"emoji": "🎁", "title": "Щедрая душа", "desc": "подарить 20 предметов"},
+    # За эти четыре, кроме записи в списке, падает ещё и ПРЕДМЕТ — см.
+    # shop_effects.ITEM_BY_ACHIEVEMENT. Предмет либо пассивно поднимает доход
+    # от того же занятия, либо раз в сутки платит.
+    "work_20":         {"emoji": "🤖", "title": "Работяга", "desc": "отработать 20 смен"},
+    "farm_100":        {"emoji": "🚜", "title": "Фермер", "desc": "собрать ферму 100 раз"},
+    "fish_100":        {"emoji": "🎣", "title": "Рыбак", "desc": "поймать 100 уловов"},
+    "treasure_10":     {"emoji": "🗺", "title": "Кладоискатель", "desc": "найти 10 кладов"},
+    "sidejob_50":      {"emoji": "🧰", "title": "Мастер на все руки", "desc": "взять 50 подработок"},
 }
 # Бонус монет, который выдаётся ОДИН РАЗ вместе с соответствующей ачивкой
 # стрика (grant_achievement идемпотентен — повторно не начислит).
@@ -22914,6 +25518,24 @@ async def grant_achievement(
             await db.add_coins(chat_id, user_id, bonus_coins)
         except Exception:
             logger.exception("Не удалось начислить бонус монет за ачивку %s", code)
+    # За часть ачивок положен ПРЕДМЕТ — выдаём тем же путём, что монеты
+    # и титул: достижение одно, а следствий у него несколько.
+    item = shop_effects.ITEM_BY_ACHIEVEMENT.get(code)
+    if item is not None:
+        try:
+            # Запись в магазине нужна ради названия и эмодзи: без неё предмет
+            # показался бы в инвентаре голым ключом.
+            await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+            await db.add_inventory_item(chat_id, user_id, item.key)
+            if announce:
+                who = await display_name_by_id(chat_id, user_id)
+                await bot.send_message(
+                    chat_id,
+                    f"{item.emoji} {who} получает предмет «{item.name}»!\n"
+                    f"<i>{html.escape(item.description)}</i>",
+                )
+        except Exception:
+            logger.exception("Не удалось выдать предмет за ачивку %s", code)
     # НОВОЕ: если за эту ачивку положен титул — выдаём и его.
     try:
         for title in await db.list_titles():
@@ -28925,6 +31547,9 @@ async def main():
     await db.ensure_daily_article_table()
     await db.ensure_cmd_cleanup_table()
     await db.ensure_command_cleanup_column()
+    await db.ensure_command_cleanup_table()   # свой срок очистки у отдельных команд
+    await db.ensure_earning_activity_table()  # бонус / подработка / шапка
+    await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_timezone_column()
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)
     await db.ensure_rel2_tables()
@@ -28973,7 +31598,8 @@ async def main():
     # каждом старте. Заодно — актуальные названия уровней и порядок категорий.
     await db.ensure_command_registry_table()
     await db.replace_command_registry([
-        (key, meta["category"], meta["phrase"], meta["level"], meta.get("overridable", True), i)
+        (key, meta["category"], meta["phrase"], meta["level"], meta.get("overridable", True), i,
+         is_cleanup_targetable(key))
         for i, (key, meta) in enumerate(COMMAND_REGISTRY.items())
     ])
     _levels_present = {0, LEVEL_MODERATOR, LEVEL_ADMIN, LEVEL_SENIOR} | {m["level"] for m in COMMAND_REGISTRY.values()}
@@ -28999,6 +31625,8 @@ async def main():
     asyncio.create_task(shop_restock_loop())
     asyncio.create_task(stock_market_loop())
     asyncio.create_task(chat_events_loop())
+    asyncio.create_task(businesses_loop())
+    asyncio.create_task(boss_spawn_loop())
     asyncio.create_task(bank_penalty_loop())
     asyncio.create_task(warn_expiry_loop())
     asyncio.create_task(marriage_expiry_loop())
