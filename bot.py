@@ -47,6 +47,7 @@ from aiogram.types import (
     ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
@@ -985,6 +986,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "complaints":      {"phrase": "жалоба (в личке) / раздел «🚨 Жалобы» в админке", "category": "Модерация", "level": LEVEL_MODERATOR},
     "mod_themes":      {"phrase": "!темы / названия рангов / +иконка модераторов", "category": "Настройка", "level": LEVEL_SENIOR},
     "cmd_cleanup_set": {"phrase": "чистка команд {минуты} (0 — выкл.)", "category": "Настройка", "level": LEVEL_SENIOR},
+    "webapp":         {"phrase": "приложение (в личке боту) — мини-приложение Telegram: профиль, пара, семья, клан кнопками", "category": "Разное", "level": 0},
     "timezone_set":   {"phrase": "часовой пояс {Москва | Europe/Moscow | +3} — пояс показа времени; «время» / «часовой пояс» — посмотреть", "category": "Настройка", "level": LEVEL_SENIOR},
     "call_all":        {"phrase": "созыв / хуйланы_сюда / хуйланысюда / калл [текст] ", "category": "Созывы", "level": LEVEL_MODERATOR},
     "call_admins":     {"phrase": "калладминс / созыв админов [текст]", "category": "Созывы", "level": LEVEL_MODERATOR},
@@ -1182,6 +1184,7 @@ for _entry in COMMAND_REGISTRY.values():
     COMMAND_TRIGGER_WORDS |= _extract_trigger_words(_entry["phrase"])
 COMMAND_TRIGGER_WORDS |= {
     "рест", "аноним", "жалоба", "жалобы", "сайт", "аккаунт", "мой", "моя",
+    "приложение",
     "названия", "предложить", "предложения", "рп", "право", "дк",
     "команды", "дерево", "помощь", "хелп", "перевод", "перевести",
     "профиль",
@@ -2448,9 +2451,77 @@ async def cmd_site_code(message: Message):
         "в разделе привязки Telegram в панели, чтобы привязать свой аккаунт к тг. "
         f"Код одноразовый и действует {PANEL_LINK_CODE_TTL_MIN} минут.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🌐 Сайт", url=PANEL_SITE_URL)]]
+            inline_keyboard=[
+                # Приложению код не нужен — Telegram сам подтверждает, кто вы.
+                [InlineKeyboardButton(text="🎮 Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL))],
+                [InlineKeyboardButton(text="🌐 Сайт в браузере", url=PANEL_SITE_URL)],
+            ]
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Мини-приложение Telegram: тот же раздел участника, но экраном вместо команд.
+#
+# Вход не нужен вообще: Telegram сам передаёт приложению подписанные данные о
+# том, кто его открыл (проверка подписи — webapp_auth.py на стороне панели).
+# Поэтому «сайт» с одноразовым кодом остаётся только для персонала и для
+# обычного браузера.
+#
+# ВАЖНО про кнопки: web_app-кнопку Telegram разрешает ТОЛЬКО в личке с ботом.
+# В группе такая кнопка просто не отрисуется, поэтому там даём обычную ссылку
+# на личку бота — оттуда человек и откроет приложение.
+# ---------------------------------------------------------------------------
+WEBAPP_URL = rp_photos.public_base_url() + "/app"
+WEBAPP_TRIGGERS = ("приложение", "/app", "мини", "апп")
+
+
+def webapp_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🎮 Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL))
+        ]]
+    )
+
+
+@router.message(
+    F.chat.type == "private",
+    F.text.func(lambda t: bool(t) and t.strip().casefold().split("@")[0] in WEBAPP_TRIGGERS),
+)
+async def cmd_webapp(message: Message):
+    # Как и у прочих команд уровня 0: порог можно поднять через ДК/сайт.
+    # Без этой проверки запись в дереве команд была бы декорацией.
+    if not _check_misc_access(message.from_user.id, "webapp"):
+        return
+    await message.answer(
+        "🎮 <b>Приложение бота</b>\n\n"
+        "Профиль и активность, брак и отношения, семья (дом, питомцы, дети), "
+        "клан и действия с партнёром — всё кнопками, прямо внутри Telegram.\n\n"
+        "Вводить ничего не нужно: бот узнаёт вас сам.",
+        reply_markup=webapp_keyboard(),
+    )
+
+
+async def setup_webapp_menu_button() -> None:
+    """Ставит постоянную кнопку-меню рядом с полем ввода в личке бота.
+
+    Один вызов на старте — и приложение доступно всем и всегда, без команд.
+    Ошибку глотаем намеренно: не настроилось меню — бот всё равно работает,
+    а приложение открывается командой «приложение».
+    """
+    try:
+        from aiogram.types import MenuButtonWebApp
+
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Приложение", web_app=WebAppInfo(url=WEBAPP_URL))
+        )
+        logger.info("Кнопка-меню мини-приложения установлена: %s", WEBAPP_URL)
+    except Exception:
+        logger.warning(
+            "Не удалось поставить кнопку-меню мини-приложения (нужен https-адрес "
+            "в PANEL_PUBLIC_URL). Приложение остаётся доступным по команде «приложение».",
+            exc_info=True,
+        )
 
 
 @router.message(
@@ -28121,6 +28192,7 @@ async def main():
     asyncio.create_task(bank_penalty_loop())
     asyncio.create_task(warn_expiry_loop())
     asyncio.create_task(marriage_expiry_loop())
+    asyncio.create_task(setup_webapp_menu_button())
     asyncio.create_task(mute_expiry_sweep_loop())
     asyncio.create_task(birthday_congrats_loop())
     asyncio.create_task(relationships_v2.spark_decay_loop(bot))

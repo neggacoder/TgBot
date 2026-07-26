@@ -43,6 +43,15 @@ if __name__ == "__main__":
         "    uvicorn webpanel.app:app --host 127.0.0.1 --port 8080"
     )
 
+from dotenv import load_dotenv
+
+# .env читаем и здесь. Раньше это делал только webpanel/__main__.py, то
+# есть при запуске через «uvicorn webpanel.app:app» (такой способ описан в
+# INSTALL.md) панель оставалась без BOT_TOKEN — а на нём считается подпись
+# мини-приложения. Вызов идемпотентный: уже заданные переменные окружения
+# он не перетирает.
+load_dotenv()
+
 import aiomysql
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -59,6 +68,7 @@ import db
 import relationships_v2
 import rest_rules
 import rp_photos
+import webapp_auth
 import tz_settings
 
 from . import auth, roles
@@ -115,26 +125,50 @@ async def on_shutdown() -> None:
     await db.close_pool()
 
 
+# Мини-приложение Telegram открывается ВНУТРИ клиента: в Telegram Web это
+# обычный iframe, поэтому глобальные X-Frame-Options: DENY и frame-ancestors
+# 'none' его просто не покажут. Послабление делаем адресно — только для
+# страницы мини-аппа, и только на встраивание доменами Telegram. Все /api/*
+# и сама панель остаются запрещёнными к встраиванию, как были.
+WEBAPP_PATH = "/app"
+TELEGRAM_FRAME_ANCESTORS = "https://web.telegram.org https://telegram.org"
+# SDK мини-приложения лежит на telegram.org — единственный внешний скрипт во
+# всём проекте, и разрешён он ровно на одной странице.
+TELEGRAM_SDK_ORIGIN = "https://telegram.org"
+
+_BASE_CSP = (
+    "default-src 'self'; img-src 'self' data:; style-src 'self' \'unsafe-inline\'; "
+    "connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'"
+)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     """Заголовки безопасности: панель смотрит в интернет через Funnel."""
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     # Куки помечены secure — но без HSTS браузер, впервые пришедший по http,
     # успевает отдать запрос в открытом виде. Funnel всегда https, так что
     # включаем на год и на поддомены.
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    # Панель не должна попадать в чужой browsing context group и не открывает
-    # окон, которым доверяет.
-    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; "
-        "base-uri 'none'; form-action 'self'; object-src 'none'"
-    )
+
+    is_webapp = request.url.path == WEBAPP_PATH or request.url.path.startswith(WEBAPP_PATH + "/")
+    if is_webapp:
+        # Встраивание — только клиентам Telegram; X-Frame-Options не ставим
+        # вовсе: он умеет лишь DENY/SAMEORIGIN и здесь только помешал бы.
+        response.headers["Content-Security-Policy"] = (
+            f"{_BASE_CSP}; script-src 'self' {TELEGRAM_SDK_ORIGIN}; "
+            f"frame-ancestors {TELEGRAM_FRAME_ANCESTORS}"
+        )
+    else:
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Content-Security-Policy"] = (
+            f"{_BASE_CSP}; script-src 'self'; frame-ancestors 'none'"
+        )
     return response
+
 
 # ---------------------------------------------------------------------------
 # Действия в отношениях,фразы
@@ -4011,6 +4045,54 @@ def _index_html() -> HTMLResponse:
 @app.get("/")
 async def index():
     return _index_html()
+
+
+@app.get("/api/webapp-check")
+async def api_webapp_check(request: Request):
+    """Почему мини-приложение не пустило.
+
+    Без этого отказ выглядит как «Нужен вход» и одинаково означает и
+    «панель запущена с другим токеном бота», и «разъехалось время», и
+    «клиент ничего не прислал». Ручка публичная, но не выдаёт ничего
+    полезного для подбора: ни токена, ни подписи, ни чужих данных —
+    только вердикт по тому, что прислал сам вызывающий.
+    """
+    init_data = request.headers.get(auth.WEBAPP_INIT_DATA_HEADER, "")
+    user, reason = webapp_auth.check_init_data(init_data)
+    return {
+        "ok": user is not None,
+        "reason": reason,
+        "got_init_data": bool(init_data),
+        "bot_token_configured": bool(os.getenv("BOT_TOKEN")),
+        "server_time": int(time.time()),
+        "user_id": user.id if user else None,
+    }
+
+
+@app.get(WEBAPP_PATH)
+async def webapp_page():
+    """Страница мини-приложения Telegram.
+
+    Отдаётся без входа — но это НЕ дыра: сама страница ничего не знает,
+    все данные она берёт через /api/member/*, а те требуют подписанную
+    initData от Telegram (см. auth.telegram_webapp_user). Открыв этот
+    адрес браузером, посторонний увидит только предложение открыть
+    приложение из чата.
+
+    Кэш-бастинг тот же, что у панели: поменялся файл — поменялась версия.
+    """
+    with open(os.path.join(STATIC_DIR, "webapp.html"), encoding="utf-8") as f:
+        html = f.read()
+    try:
+        version = int(max(
+            os.path.getmtime(os.path.join(STATIC_DIR, "webapp.js")),
+            os.path.getmtime(os.path.join(STATIC_DIR, "webapp.css")),
+        ))
+    except OSError:
+        version = 0
+    html = html.replace("/static/webapp.js", f"/static/webapp.js?v={version}")
+    html = html.replace("/static/webapp.css", f"/static/webapp.css?v={version}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/setup")

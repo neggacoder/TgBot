@@ -120,6 +120,10 @@ def test_гонка_дубликат_tg_user_id_даёт_чистый_409(client
 
 class _FakeRequest:
     cookies: dict = {}
+    # require_member сначала смотрит заголовок мини-приложения Telegram
+    # (X-Telegram-Init-Data); здесь его нет — значит, проверяется обычный
+    # путь через сессию, как и задумано этими тестами.
+    headers: dict = {}
 
 
 def test_require_member_пускает_привязанный_персонал(monkeypatch):

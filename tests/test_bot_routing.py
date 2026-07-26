@@ -565,3 +565,23 @@ def test_команда_часового_пояса_доходит(text):
 
 def test_слово_время_внутри_фразы_не_триггерит():
     assert "cmd_timezone" not in handlers_for(message(text="сколько сейчас время"))
+
+
+# ---------------------------------------------------------------------------
+# Мини-приложение Telegram
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["приложение", "Приложение", "/app", "апп", "мини"])
+def test_команда_приложения_доходит_в_личке(text):
+    assert "cmd_webapp" in handlers_for(message(text=text, chat_type="private"))
+
+
+def test_приложение_не_срабатывает_в_группе():
+    """web_app-кнопку Telegram разрешает только в личке — в группе она бы
+    просто не отрисовалась, поэтому и команды там быть не должно."""
+    assert "cmd_webapp" not in handlers_for(message(text="приложение"))
+
+
+def test_упоминание_слова_в_разговоре_не_триггерит():
+    taken = handlers_for(message(text="скачал приложение вчера", chat_type="private"))
+    assert "cmd_webapp" not in taken

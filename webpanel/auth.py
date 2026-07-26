@@ -28,7 +28,10 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from fastapi import HTTPException, Request, status
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
+import aiomysql
+
 import db
+import webapp_auth
 
 logger = logging.getLogger(__name__)
 
@@ -255,11 +258,91 @@ async def require_user(request: Request) -> PanelUser:
     return user
 
 
+WEBAPP_INIT_DATA_HEADER = "X-Telegram-Init-Data"
+
+
+async def telegram_webapp_user(request: Request) -> Optional[PanelUser]:
+    """Участник, подтверждённый подписью Telegram Mini App, — или None.
+
+    Мини-приложение открывается кнопкой прямо в чате: Telegram сам присылает
+    подписанные данные о том, кто его открыл, и вводить код от бота не нужно.
+    Подпись считается на секрете бота (см. webapp_auth), поэтому подделать её
+    нельзя, а значит tg_user_id отсюда так же надёжен, как из сессии.
+
+    Строку аккаунта заводим/находим ту же самую, что и при входе по коду, —
+    чтобы владелец видел участника в панели, а не только внутри Telegram.
+    """
+    init_data = request.headers.get(WEBAPP_INIT_DATA_HEADER)
+    if not init_data:
+        return None
+    verified, reason = webapp_auth.check_init_data(init_data)
+    if verified is None:
+        # В лог — с причиной: иначе «не пускает» неотличимо от «панель подняли
+        # с другим токеном». Саму подпись не пишем.
+        logger.warning("Мини-приложение: вход отклонён (%s)", reason)
+        return None
+
+    # Ищем аккаунт по tg_user_id ЛЮБОЙ роли, а не только role='member'.
+    #
+    # Почему это важно: колонка panel_users.tg_user_id — UNIQUE, а персонал
+    # (owner/admin) привязывает к ней свой Telegram сам (команда «сайт» прямо
+    # это советует). При поиске только участников такая строка не находилась,
+    # мы пытались завести вторую с тем же tg_user_id, упирались в UNIQUE — и
+    # отказывали. То есть ВЛАДЕЛЕЦ не мог войти в собственное приложение,
+    # а обычный участник мог. Именно так это и проявилось при первом заходе.
+    row = await db.get_panel_user_by_tg(verified.id)
+    if row is None:
+        # Аккаунта нет вовсе — первое открытие, заводим участника. Гонку
+        # (приложение дёргает несколько ручек сразу) ловим по UNIQUE.
+        try:
+            member_id = await db.create_panel_member(
+                verified.id, f"tg{verified.id}", verified.full_name
+            )
+        except aiomysql.IntegrityError:
+            row = await db.get_panel_user_by_tg(verified.id)
+            if row is None:
+                logger.warning("Мини-приложение: не удалось завести аккаунт для tg %s", verified.id)
+                return None
+            member_id = row["id"]
+        role = ROLE_MEMBER
+        username = f"tg{verified.id}"
+    else:
+        if row.get("disabled"):
+            # Аккаунт отключили в панели — подпись Telegram это не отменяет.
+            logger.warning("Мини-приложение: аккаунт tg %s отключён", verified.id)
+            return None
+        member_id = row["id"]
+        # Роль сохраняем настоящую: привязанный персонал ходит в раздел
+        # участника под собой — ровно как и с обычной сессией (см.
+        # require_member ниже). Админские ручки при этом остаются закрытыми:
+        # их проверяет require_user, а он смотрит только куку.
+        role = row.get("role") or ROLE_MEMBER
+        username = row.get("username") or f"tg{verified.id}"
+        if verified.full_name and row.get("tg_full_name") != verified.full_name:
+            await db.update_panel_member_name(member_id, verified.full_name)
+
+    # Помечаем запрос: verify_csrf по этой метке пропустит проверку (см. там же).
+    request.state.telegram_webapp = True
+    return PanelUser(
+        id=member_id, username=username, role=role,
+        tg_user_id=verified.id, tg_full_name=verified.full_name,
+    )
+
+
 async def require_member(request: Request) -> PanelUser:
     """Доступ для аккаунта-участника (роль member) — а также для персонала
     (admin/owner), самостоятельно привязавшего свой аккаунт к Telegram
     (POST /api/link-telegram): тогда те же member-эндпоинты работают под их
-    собственным tg_user_id, дополнительно к обычной админ-панели."""
+    собственным tg_user_id, дополнительно к обычной админ-панели.
+
+    Третий способ — мини-приложение в Telegram: там вместо куки приходит
+    подписанная initData. Проверяем её ПЕРВОЙ и только при наличии заголовка,
+    так что на обычный вход через сайт это никак не влияет.
+    """
+    from_webapp = await telegram_webapp_user(request)
+    if from_webapp is not None:
+        return from_webapp
+
     user = await current_user(request)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Нужен вход")
@@ -282,7 +365,15 @@ def verify_csrf(request: Request) -> None:
 
     Без этого любой сторонний сайт мог бы, пока вы залогинены, заставить ваш
     браузер отправить сообщение от имени бота.
+
+    Мини-приложение Telegram — исключение, и это не послабление. CSRF защищает
+    от того, что браузер САМ подставляет куку к чужому запросу; там же куки нет
+    вовсе — доступ даёт подписанная initData в заголовке, а выставить свой
+    заголовок в кросс-сайтовом запросе чужая страница не может. Метку ставит
+    require_member, уже проверив подпись (см. telegram_webapp_user).
     """
+    if getattr(request.state, "telegram_webapp", False):
+        return
     sent = request.headers.get(CSRF_HEADER)
     expected = request.cookies.get(CSRF_COOKIE)
     if not sent or not expected or not secrets.compare_digest(sent, expected):
