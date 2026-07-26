@@ -80,6 +80,8 @@ from help_texts import build_help_sections
 # в локальные переменные («businesses = await db.list_user_businesses(...)»),
 # и модуль бы там затенился.
 import bosses as boss_catalog
+import collections_meta
+import seasons
 import businesses as business_catalog
 import pets as pets_catalog
 import shop_effects
@@ -277,6 +279,10 @@ class MessageCounterMiddleware(BaseMiddleware):
                     now = datetime.utcnow()
                     await db.increment_message_count(event.chat.id, event.from_user.id)
                     await db.increment_daily_count(event.chat.id, event.from_user.id, now.date())
+                    # Очки сезона за сообщение — по одному, с потолком внутри
+                    # (см. seasons.py): зачёт не должен сводиться к спаму.
+                    await _add_season_points(event.chat.id, event.from_user.id,
+                                             seasons.POINTS_PER_MESSAGE)
                     await db.increment_hourly_count(event.chat.id, event.from_user.id, now.date(), now.hour)
                     await db.upsert_known_user(
                         event.chat.id,
@@ -1218,6 +1224,8 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет", "category": "Экономика", "level": 0},
     "business_equip":  {"phrase": "бизнес оснащение [ключ] / бизнес оснастить {бизнес} {что}", "category": "Экономика", "level": 0},
     "business_raid":   {"phrase": "налёт [@кому] / бизнес налёт — обнести чужую копилку", "category": "Экономика", "level": 0},
+    "collections":     {"phrase": "коллекции — что собрано и что осталось", "category": "Экономика", "level": 0},
+    "season_status":   {"phrase": "сезон / сезоны / сезон {ГГГГ-ММ} — зачёт месяца и его итоги", "category": "Экономика", "level": 0},
     "boss_status":     {"phrase": "босс / боссы — кто сейчас в чате и какие бывают", "category": "Экономика", "level": 0},
     "boss_toggle":     {"phrase": "+босс / -босс / босс призвать {название}", "category": "Экономика", "level": LEVEL_ADMIN},
 }
@@ -14208,6 +14216,7 @@ async def cmd_business_buy(message: Message):
 
     await db.add_log("business_buy", chat_id=chat_id, actor_id=user_id,
                      details=f"{item.key}:{item.price}")
+    await _check_collections(chat_id, user_id)
     await message.reply(
         f"🏢 Поздравляем с покупкой!\n{item.name} теперь ваш — "
         f"<b>{item.income(1)}</b> i¢/час, копилка до {item.cap(1)} i¢.\n"
@@ -14262,6 +14271,7 @@ async def cmd_business_collect(message: Message):
         await db.add_chat_coins(chat_id, tax)
     await db.add_log("business_collect", chat_id=chat_id, actor_id=user_id,
                      details=f"{len(rows)}:{gross}:{tax}")
+    await _add_season_points(chat_id, user_id, seasons.points_for_coins(net))
     await _check_coin_achievements(chat_id, user_id)
 
     await message.reply(
@@ -14321,6 +14331,7 @@ async def cmd_business_upgrade(message: Message):
                                 datetime.utcnow())
     await db.add_log("business_upgrade", chat_id=chat_id, actor_id=user_id,
                      details=f"{item.key}:{level + 1}:{cost}")
+    await _check_collections(chat_id, user_id)
     await message.reply(
         f"⬆️ {item.name} прокачан до <b>{level + 1}</b> уровня за {cost} i¢.\n"
         f"Доход: {item.income(level)} → <b>{item.income(level + 1)}</b> i¢/час, "
@@ -15312,6 +15323,7 @@ async def cb_boss_hit(callback: CallbackQuery):
     fight["hp"] -= dealt
     fight["damage"][user_id] = fight["damage"].get(user_id, 0) + dealt
     fight["dirty"] = True
+    await _add_season_points(chat_id, user_id, seasons.points_for_boss_damage(dealt))
     killed = fight["hp"] <= 0
     if killed:
         fight["closed"] = True
@@ -15711,6 +15723,7 @@ async def cmd_pet_buy(message: Message):
         return
     await db.add_log("pet_buy", chat_id=chat_id, actor_id=user_id,
                      details=f"{spec.key}:{spec.price}")
+    await _check_collections(chat_id, user_id)
     ability = pets_catalog.ability_text(spec.ability)
     lines = [f"🐾 У вас появился {spec.title}!"]
     if ability:
@@ -16206,6 +16219,237 @@ async def cmd_pet_delete(message: Message):
         await message.reply(f"🐾 Питомец «{html.escape(key)}» убран из каталога.")
     else:
         await message.reply(f"В каталоге нет питомца «{html.escape(key)}».")
+
+
+# ============================================================================
+# 🏆 СЕЗОНЫ — единственное место в боте, где награду нельзя получить позже.
+#
+# Всё остальное бесконечно повторяемо: любую вещь, титул и ачивку можно взять
+# в любой момент, опоздать невозможно. Поэтому ничто по-настоящему не редкое.
+# Сезонный титул несёт в себе месяц и больше никогда не выдаётся — ценность
+# в том, что человек был здесь тогда и был первым.
+#
+# Награда — только титул и ачивка, намеренно. Оба не предметы: их нельзя
+# подарить, продать и нельзя потерять (user_titles нигде не удаляется, а
+# медвежатник и продажа работают только с инвентарём).
+# ============================================================================
+SEASON_TICK = timedelta(minutes=30)
+
+
+def _current_season() -> str:
+    return seasons.season_key(utc_today())
+
+
+async def _add_season_points(chat_id: int, user_id: int, points: int) -> None:
+    if points <= 0:
+        return
+    try:
+        await db.add_season_points(chat_id, _current_season(), user_id, points)
+    except Exception as exc:
+        # Очки — надстройка над игрой, а не её часть: сбой здесь не должен
+        # ронять ни ферму, ни бой с боссом.
+        log_suppressed("_add_season_points", exc)
+
+
+async def _season_standings_text(chat_id: int, season: Optional[str] = None) -> str:
+    season = season or _current_season()
+    rows = await db.list_season_scores(chat_id, season, limit=10)
+    label = seasons.season_label(season)
+    if not rows:
+        return (f"🏆 <b>Сезон {label}</b>\n{DIVIDER}\n"
+                "Очки ещё никто не набрал. Пишите, бейте боссов, собирайте доход.")
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    lines = [f"🏆 <b>Сезон {label}</b>", DIVIDER]
+    for index, row in enumerate(rows):
+        name = mention_id(int(row["user_id"]))
+        place = medals.get(index, f"{index + 1}.")
+        lines.append(f"{place} {name} — {row['points']}")
+    lines += [
+        "",
+        "Очки дают: сообщения, урон по боссам и собранный доход бизнеса.",
+        f"Первые {seasons.PLACES} в конце месяца получают титул и ачивку, "
+        "которых больше никогда не выдадут.",
+    ]
+    return "\n".join(lines)
+
+
+async def close_season_for_chat(chat_id: int, season: str) -> Optional[str]:
+    """Подводит итоги сезона и выдаёт награды. None — уже закрывали.
+
+    Пометку ставим ПЕРВОЙ: цикл закрытия может совпасть с ручным вызовом, и
+    без этого призы выдались бы дважды. Проверка и запись — одним запросом
+    (см. db.close_season).
+    """
+    if not await db.close_season(chat_id, season, datetime.utcnow()):
+        return None
+    rows = await db.list_season_scores(chat_id, season, limit=seasons.PLACES)
+    if not rows:
+        return None
+
+    label = seasons.season_label(season)
+    lines = [f"🏆 <b>Сезон {label} завершён!</b>", DIVIDER]
+    for index, row in enumerate(rows, start=1):
+        award = seasons.award_for(season, index)
+        if award is None:
+            continue
+        user_id = int(row["user_id"])
+        # Титул заводим по факту выдачи и без цены: купить сезонный титул
+        # нельзя ни за какие деньги (см. cmd_title_buy).
+        await db.add_title_if_missing(award.title_key, award.title_name)
+        await db.grant_title(chat_id, user_id, award.title_key)
+        await grant_achievement(chat_id, user_id, award.achievement_code,
+                                announce=False)
+        who = await display_name_by_id(chat_id, user_id)
+        lines.append(f"{award.title_name} — {who} ({row['points']} очков)")
+    for row in rows:
+        # Сезон закрылся — у кого-то могла достроиться «Династия».
+        await _check_collections(chat_id, int(row["user_id"]))
+    lines += ["", "Эти титулы больше никогда не выдадут — они только за этот месяц."]
+    await db.add_log("season_closed", chat_id=chat_id, details=season)
+    return "\n".join(lines)
+
+
+async def seasons_loop() -> None:
+    """Раз в SEASON_TICK проверяет, не начался ли новый месяц.
+
+    Сравниваем именно с ПРЕДЫДУЩИМ сезоном относительно сегодняшнего дня:
+    так закрытие сработает при первом же тике нового месяца, даже если бот
+    простоял выключенным всю ночь на стыке.
+    """
+    while True:
+        try:
+            await asyncio.sleep(SEASON_TICK.total_seconds())
+            previous = seasons.previous_season_key(utc_today())
+            for chat_id in await db.list_active_chat_ids():
+                try:
+                    text = await close_season_for_chat(chat_id, previous)
+                    if text:
+                        await bot.send_message(chat_id, text)
+                except Exception:
+                    logger.exception("Сбой закрытия сезона в чате %s", chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой в цикле сезонов")
+
+
+# ---------- Коллекции ----------
+# Награда за то, что собрано ВСЁ, а не только выгодное. Своей таблицы нет:
+# состав считается по тому, что уже лежит в базе (бизнесы, питомцы, титулы).
+# Второе место правды рано или поздно разошлось бы с первым.
+
+async def _collection_progress(chat_id: int, user_id: int) -> dict:
+    """Для каждой коллекции — сколько собрано из скольких."""
+    out: dict = {}
+
+    owned_biz = await db.list_user_businesses(chat_id, user_id)
+    total_biz = len(business_catalog.BUSINESSES)
+    out["tycoon"] = (len(owned_biz), total_biz)
+    maxed = sum(1 for row in owned_biz
+                if int(row["level"]) >= business_catalog.MAX_LEVEL)
+    out["empire"] = (maxed, total_biz)
+
+    specs = await _pet_specs(chat_id)
+    owned_pets = {row["pet_key"] for row in await db.list_pets(chat_id, user_id)}
+    # Считаем по КАТАЛОГУ ЧАТА, а не по встроенному списку: админ мог завести
+    # своих питомцев, и без них коллекция была бы уже неполной.
+    out["zoo"] = (len(owned_pets & set(specs)), len(specs))
+
+    titles = {row["title_key"] for row in await db.list_user_titles(chat_id, user_id)}
+    streak = collections_meta.season_streak_keys(_current_season(), seasons.previous_of)
+    got = sum(1 for key in streak
+              if any(f"season_{key}_{place}" in titles
+                     for place in range(1, seasons.PLACES + 1)))
+    out["dynasty"] = (got, collections_meta.SEASON_STREAK)
+    return out
+
+
+async def _check_collections(chat_id: int, user_id: int, announce: bool = True) -> None:
+    """Выдаёт награды за собранные коллекции. Зовётся после действий, которые
+    могут её достроить: покупка бизнеса и питомца, апгрейд, закрытие сезона."""
+    try:
+        progress = await _collection_progress(chat_id, user_id)
+    except Exception as exc:
+        log_suppressed("_check_collections", exc)
+        return
+    for collection in collections_meta.COLLECTIONS:
+        done, total = progress.get(collection.key, (0, 0))
+        if not collections_meta.is_complete(done, total):
+            continue
+        # Титул без цены — купить коллекционный титул нельзя (см. cmd_title_buy).
+        await db.add_title_if_missing(collection.title_key, collection.title_name)
+        if not await db.grant_title(chat_id, user_id, collection.title_key):
+            continue                      # уже был — второй раз не объявляем
+        await grant_achievement(chat_id, user_id, collection.achievement_code,
+                                announce=False)
+        await db.add_log("collection_done", chat_id=chat_id, actor_id=user_id,
+                         details=collection.key)
+        if announce:
+            who = await display_name_by_id(chat_id, user_id)
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"{collection.emoji} {who} собрал(а) коллекцию "
+                    f"«{collection.name}»!\n<i>{collection.description}</i>\n"
+                    f"Титул: {collection.title_name}",
+                )
+            except Exception as exc:
+                log_suppressed("_check_collections announce", exc)
+
+
+COLLECTION_TRIGGERS = {"коллекции", "коллекция", "!коллекции"}
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in COLLECTION_TRIGGERS),
+)
+async def cmd_collections(message: Message):
+    if not _check_misc_access(message.from_user.id, "collections"):
+        return
+    target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
+    chat_id = message.chat.id
+    progress = await _collection_progress(chat_id, target.id)
+    titles = {row["title_key"] for row in await db.list_user_titles(chat_id, target.id)}
+
+    name = await display_name(chat_id, target)
+    lines = [f"📚 <b>Коллекции</b> — {name}", DIVIDER]
+    for collection in collections_meta.COLLECTIONS:
+        done, total = progress.get(collection.key, (0, 0))
+        mark = " ✅" if collection.title_key in titles else ""
+        lines.append(
+            f"{collection.emoji} <b>{collection.name}</b>{mark}\n"
+            f"   {collections_meta.progress_text(done, total)} {done}/{total} — "
+            f"{collection.description}"
+        )
+    lines += ["", "За полный сбор — титул, который нельзя купить."]
+    await message.reply("\n".join(lines))
+
+
+SEASON_TRIGGERS = {"сезон", "сезоны", "!сезон", "!сезоны"}
+SEASON_PAST_RE = re.compile(r"(?i)^!?сезон\s+(\d{4}-\d{2})$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in SEASON_TRIGGERS),
+)
+async def cmd_season(message: Message):
+    if not _check_misc_access(message.from_user.id, "season_status"):
+        return
+    await message.answer(await _season_standings_text(message.chat.id))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(SEASON_PAST_RE.match(t.strip()))),
+)
+async def cmd_season_past(message: Message):
+    """«сезон 2026-07» — итоги прошедшего месяца."""
+    if not _check_misc_access(message.from_user.id, "season_status"):
+        return
+    season = SEASON_PAST_RE.match(message.text.strip()).group(1)
+    await message.answer(await _season_standings_text(message.chat.id, season))
 
 
 BCOIN_RE = re.compile(r"(?i)^бкоин\s+(\S+)$")
@@ -26855,6 +27099,15 @@ ACHIEVEMENTS: dict = {
     # За эти четыре, кроме записи в списке, падает ещё и ПРЕДМЕТ — см.
     # shop_effects.ITEM_BY_ACHIEVEMENT. Предмет либо пассивно поднимает доход
     # от того же занятия, либо раз в сутки платит.
+    # Коллекции: за полный сбор (см. collections_meta.py).
+    "collection_tycoon":  {"emoji": "🏢", "title": "Промышленник", "desc": "владеть всеми видами бизнеса"},
+    "collection_empire":  {"emoji": "👑", "title": "Империя", "desc": "все бизнесы на 3 уровне"},
+    "collection_zoo":     {"emoji": "🐾", "title": "Зоопарк", "desc": "завести всех питомцев"},
+    "collection_dynasty": {"emoji": "🏆", "title": "Династия", "desc": "три сезона подряд в призах"},
+    # Сезонные: выдаются только за место в месячном зачёте (см. seasons.py).
+    "season_1":        {"emoji": "🥇", "title": "Чемпион сезона", "desc": "занять 1 место в месячном зачёте"},
+    "season_2":        {"emoji": "🥈", "title": "Призёр сезона", "desc": "занять 2 место в месячном зачёте"},
+    "season_3":        {"emoji": "🥉", "title": "Бронза сезона", "desc": "занять 3 место в месячном зачёте"},
     "work_20":         {"emoji": "🤖", "title": "Работяга", "desc": "отработать 20 смен"},
     "farm_100":        {"emoji": "🚜", "title": "Фермер", "desc": "собрать ферму 100 раз"},
     "fish_100":        {"emoji": "🎣", "title": "Рыбак", "desc": "поймать 100 уловов"},
@@ -32954,6 +33207,7 @@ async def main():
     await db.ensure_earning_activity_table()  # бонус / подработка / шапка
     await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_pets_table()              # личные питомцы
+    await db.ensure_seasons_table()           # месячный зачёт
     await db.ensure_timezone_column()
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)
     await db.ensure_rel2_tables()
@@ -33031,6 +33285,7 @@ async def main():
     asyncio.create_task(chat_events_loop())
     asyncio.create_task(businesses_loop())
     asyncio.create_task(boss_spawn_loop())
+    asyncio.create_task(seasons_loop())
     asyncio.create_task(bank_penalty_loop())
     asyncio.create_task(warn_expiry_loop())
     asyncio.create_task(marriage_expiry_loop())

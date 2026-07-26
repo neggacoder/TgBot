@@ -7739,6 +7739,72 @@ async def ensure_pets_table() -> None:
     await _add_column_if_missing("profile_cards", "pinned_pet", "VARCHAR(32) DEFAULT NULL")
 
 
+async def ensure_seasons_table() -> None:
+    """Очки сезона копятся по мере игры, а не считаются задним числом:
+    урон по боссам и собранный доход нигде не хранятся историей, и восстановить
+    их в конце месяца было бы уже не из чего."""
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS season_scores ("
+        "chat_id BIGINT NOT NULL, "
+        "season VARCHAR(7) NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "points INT NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (chat_id, season, user_id), "
+        "INDEX idx_season_top (chat_id, season, points DESC)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS season_closed ("
+        "chat_id BIGINT NOT NULL, "
+        "season VARCHAR(7) NOT NULL, "
+        "closed_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, season)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def add_season_points(chat_id: int, season: str, user_id: int, points: int) -> None:
+    if points <= 0:
+        return
+    await _execute(
+        "INSERT INTO season_scores (chat_id, season, user_id, points) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE points = points + VALUES(points)",
+        (chat_id, season, user_id, int(points)),
+    )
+
+
+async def list_season_scores(chat_id: int, season: str, limit: int = 50) -> list[dict]:
+    return await _fetchall(
+        "SELECT user_id, points FROM season_scores "
+        "WHERE chat_id = %s AND season = %s AND points > 0 "
+        "ORDER BY points DESC, user_id ASC LIMIT %s",
+        (chat_id, season, limit),
+    )
+
+
+async def get_season_points(chat_id: int, season: str, user_id: int) -> int:
+    row = await _fetchone(
+        "SELECT points FROM season_scores "
+        "WHERE chat_id = %s AND season = %s AND user_id = %s",
+        (chat_id, season, user_id),
+    )
+    return int(row["points"]) if row else 0
+
+
+async def close_season(chat_id: int, season: str, now) -> bool:
+    """Помечает сезон закрытым. False — его уже закрывали.
+
+    Проверка и запись одним запросом: цикл закрытия может совпасть с ручным
+    вызовом, и без этого награды выдались бы дважды.
+    """
+    return bool(await _execute(
+        "INSERT IGNORE INTO season_closed (chat_id, season, closed_at) "
+        "VALUES (%s, %s, %s)",
+        (chat_id, season, now),
+    ))
+
+
 async def ensure_pet_catalog(chat_id: int, defaults) -> int:
     """Каталог питомцев чата. Встроенные из pets.py досеиваются, свои —
     добавляются админом через панель и живут только здесь.
@@ -9818,6 +9884,18 @@ async def seed_titles_if_empty() -> int:
             (key, name, price, ach),
         )
     return len(DEFAULT_TITLES)
+
+async def add_title_if_missing(title_key: str, name: str,
+                               price: Optional[int] = None) -> None:
+    """Заводит титул, если такого ещё нет. Цена None — купить нельзя (см.
+    cmd_title_buy: титул без цены не продаётся). Нужно сезонам: их титулы
+    выдаются только за место и появляются в каталоге по факту выдачи."""
+    await _execute(
+        "INSERT IGNORE INTO titles (title_key, name, price, achievement_code) "
+        "VALUES (%s, %s, %s, NULL)",
+        (title_key, name, price),
+    )
+
 
 async def seed_titles_missing() -> int:
     added = 0
