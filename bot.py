@@ -85,7 +85,11 @@ import bosses as boss_catalog
 import collections_meta
 import seasons
 import businesses as business_catalog
+import crafting
 import pets as pets_catalog
+import pins
+import professions
+import ru_text
 import shop_effects
 from quote_render import QuoteMessage, render_quote
 from quote_render import assets as quote_assets
@@ -350,6 +354,66 @@ class MessageCounterMiddleware(BaseMiddleware):
 
 
 router.message.outer_middleware(MessageCounterMiddleware())
+
+
+class CommandPermissionMiddleware(BaseMiddleware):
+    """Общий заслон по уровню доступа для команд, опознаваемых по тексту.
+
+    Зачем он вообще нужен. Уровень команды правится словом «право» и панелью,
+    но читает его только сам обработчик — а из 324 команд реестра 85 ключей
+    нигде, кроме объявления, не встречаются. Для них «право» записывало
+    уровень в базу, отвечало «✅ Теперь команда требует уровень: X» и не
+    меняло ничего. Дописывать проверку в 81 обработчик — 81 шанс ошибиться;
+    вместо этого ключ команды опознаётся по тексту здесь, один раз.
+
+    Опознаём тем же resolve_command_key, по которому бот уже решает, через
+    сколько минут удалять сообщение команды: то есть текст, считающийся здесь
+    командой, и так считается ею в другом месте — новой трактовки мы не
+    вводим.
+
+    ГЛАВНОЕ ОГРАНИЧЕНИЕ: заслон работает ТОЛЬКО по явно выставленным уровням
+    (command_level_overrides — то, что админ задал словом «право» или в
+    панели), а не по уровням реестра по умолчанию. Ровно это и было сломано:
+    админ ставит уровень, получает «✅ готово» и не получает ничего.
+
+    Уровни по умолчанию не трогаем сознательно. Их и сейчас проверяют сами
+    обработчики, причём некоторые — шире, чем «уровень не ниже N» (скажем,
+    по признаку админа чата в Telegram). Начни заслон применять умолчания —
+    и он закрыл бы команды, которых никто не настраивал, по причине, которую
+    никто не выбирал.
+
+    Регистрируется ПОСЛЕ MessageCounterMiddleware, чтобы фильтр слов и
+    счётчики сообщений отработали до заслона: команда не по уровню — всё
+    равно сообщение, и оно должно попасть в статистику, а мат в нём —
+    удалиться.
+    """
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message) or event.from_user is None:
+            return await handler(event, data)
+        if not command_level_overrides:
+            return await handler(event, data)   # ничего не настраивали — не мешаем
+        key = resolve_command_key(event.text or event.caption)
+        if key is None or key not in command_level_overrides:
+            return await handler(event, data)
+        level = command_level_overrides[key]
+        if level <= 0 or has_level(event.from_user.id, level):
+            return await handler(event, data)
+        # Тому, у кого уровень есть, объясняем; постороннему молчим — так же,
+        # как это делают обработчики, проверяющие уровень сами.
+        if get_level(event.from_user.id) > 0:
+            try:
+                await event.reply(f"⛔ Команда доступна только с уровнем "
+                                  f"«{level_name(level)}» и выше.")
+            except TelegramBadRequest:
+                pass
+        return None
+
+
+router.message.outer_middleware(CommandPermissionMiddleware())
+# «Отношения 2.0» живут в своём роутере, включённом раньше основного, — без
+# отдельной регистрации их команды заслон бы не увидел.
+relationships_v2.router.message.outer_middleware(CommandPermissionMiddleware())
 
 
 # ----------------------------------------------------------------------------
@@ -667,7 +731,7 @@ _CALL_EMOJI_POOL_DEFAULT = [
 # Живой кэш — заполняется в load_caches() из db.list_call_emoji_pool().
 CALL_EMOJI_POOL = list(_CALL_EMOJI_POOL_DEFAULT)
 
-EMOJI_RE = re.compile(
+EMOJI_RE = ru_text.rx(
     "^[\U0001F300-\U0001FAFF\u2600-\u27BF\u2190-\u21FF\u2B00-\u2BFF\uFE0F\u200D]{1,8}$"
 )
 
@@ -1251,10 +1315,12 @@ COMMAND_REGISTRY: dict[str, dict] = {
     # автоочистка и права, и форма, забытая здесь, эту привязку теряет молча.
     "pet_admin":       {"phrase": "пет удалить {ключ} — убрать вид питомца из каталога", "category": "Разное", "level": LEVEL_ADMIN},
     "pet_list":        {"phrase": "пет / питомцы — свои питомцы, пет каталог — кого можно завести", "category": "Разное", "level": 0},
-    "pet_buy":         {"phrase": "пет купить {ключ}", "category": "Разное", "level": 0},
-    "pet_care":        {"phrase": "пет кормить / пет гладить / пет поцеловать / пет назвать / пет закрепить / пет способность / пет способности", "category": "Разное", "level": 0},
+    "pet_buy":         {"phrase": "пет купить {ключ} / пет продать {ключ}", "category": "Разное", "level": 0},
+    "pet_care":        {"phrase": "пет кормить / пет гладить / пет обнять / пет поцеловать / пет гулять (можно «все» вместо ключа) / пет корм — купить корма / пет назвать / пет закрепить / пет способность / пет способности", "category": "Разное", "level": 0},
+    "craft":           {"phrase": "крафты — список рецептов / крафт {ключ} — что нужно / крафт {ключ} да — собрать / крафт кукла @кому — именной сувенир / куклы — своя коллекция / закрепить куклу @кому — показывать в профиле", "category": "Экономика", "level": 0},
+    "pet_food_grant":  {"phrase": "пет раздать — выдать всем владельцам питомцев по 10 корма (раз в неделю)", "category": "Разное", "level": LEVEL_ADMIN},
     "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет", "category": "Экономика", "level": 0},
-    "market":          {"phrase": "рынок / рынок купить {ключ} [кол-во] / рынок заявка {ключ} {цена} {название} / рынок мои / рынок снять {ключ} — торговля между участниками", "category": "Экономика", "level": 0},
+    "market":          {"phrase": "рынок / рынок купить {ключ} [кол-во] / рынок заявка {ключ} {цена} {название} / рынок мои / рынок снять {ключ} / рынок цена {ключ} {число} / рынок описание {ключ} {текст} — торговля между участниками", "category": "Экономика", "level": 0},
     "market_manage":   {"phrase": "рынок заявки / рынок принять {номер} / рынок отклонить {номер} / рынок режим ручной|авто|отклонять / рынок комиссия {число} / рынок потолок {число} / рынок лимит {число}", "category": "Экономика", "level": LEVEL_ADMIN},
     "item_sabotage":   {"phrase": "саботаж @кому — сломать бизнес выбранного человека (предмет «Саботаж»)", "category": "Экономика", "level": 0},
     "item_kompromat":  {"phrase": "компромат @кому — поднять старую фразу человека картинкой-цитатой (предмет «Компромат»)", "category": "Экономика", "level": 0},
@@ -1298,6 +1364,11 @@ COMMAND_TRIGGER_WORDS |= {
     "команды", "дерево", "помощь", "хелп", "перевод", "перевести",
     "профиль",
 }
+# Набор сравнивается с нормализованным входом (ru_text.yo), поэтому и сам
+# обязан быть в е-написании: иначе «чёрное» и «налёт» стали бы недостижимы
+# ОБА, а не только в одном написании. Нормализуем один раз здесь, а не при
+# каждом сравнении.
+COMMAND_TRIGGER_WORDS = {ru_text.yo(_word) for _word in COMMAND_TRIGGER_WORDS}
 
 
 def is_command_like(text: Optional[str]) -> bool:
@@ -1306,7 +1377,7 @@ def is_command_like(text: Optional[str]) -> bool:
     first_word = (text.strip().split() or [""])[0].casefold()
     if first_word.startswith(("!", ".", "+", "-", "&", "[")):
         return True
-    return first_word in COMMAND_TRIGGER_WORDS
+    return ru_text.yo(first_word) in COMMAND_TRIGGER_WORDS
 
 
 DEFAULT_CMD_CLEANUP_MINUTES = 15
@@ -1328,7 +1399,7 @@ CMD_CLEANUP_MAX_MINUTES = 48 * 60
 # вести себя в чате ровно как настоящий варн. Оставь чистку только настоящим —
 # и обманные начнут исчезать через 15 минут, а настоящие оставаться. Это
 # выдавало бы шутку вернее любого амперсанда.
-_CLEANUP_KEEP_RE = re.compile(
+_CLEANUP_KEEP_RE = ru_text.rx(
     r"(?i)^\s*!?(?:"
     r"перевод|перевести"
     r"|&?-?варн-?|&?варн"
@@ -1853,6 +1924,15 @@ class AnonMessageStates(StatesGroup):
     waiting_text = State()
     waiting_confirm = State()
 
+
+class MarketOwnStates(StatesGroup):
+    """Управление своими товарами рынка в личке бота. Значение приходит
+    следующим сообщением: reply-кнопка умеет отправить только свой текст, а
+    цену и описание нужно откуда-то взять."""
+    waiting_price = State()
+    waiting_description = State()
+
+
 class BirthdayStates(StatesGroup):
     waiting_birthday = State()
 
@@ -1978,6 +2058,10 @@ LBL_SELF_ADD_ACTION = "Новое действие"
 BTN_ROLE_RESERVE = "Забронировать роль"
 BTN_ROLE_TAKE = "Снять роль"
 BTN_ROLE_HELP = "Справка по ролям"
+# Текст кнопки И текстовый триггер одновременно — см. докстринг
+# private_menu_kb: кнопка отправляет свой текст и обязана попадать в тот же
+# обработчик, что и набранное вручную.
+BTN_MY_MARKET = "Мой рынок"
 
 
 def _reply_kb(rows: list[list[str]]) -> ReplyKeyboardMarkup:
@@ -2059,6 +2143,28 @@ def special_menu_kb() -> ReplyKeyboardMarkup:
     rows = [[f"✏️ {user_id}", f"❌ {user_id}"] for user_id in sorted(custom_responses.keys())]
     rows.append([f"➕ {LBL_ADD_USER}", BTN_BACK])
     return _reply_kb(rows)
+
+
+_HTML_TAG_RE = ru_text.rx(r"<[^>]+>")
+
+
+def plain_name(name: Optional[str]) -> str:
+    """Имя без HTML-разметки — для того, что ХРАНИТСЯ и потом экранируется.
+
+    display_name()/display_name_by_id() всегда возвращают HTML-ссылку. Записав
+    её в базу как есть, при показе получаем экранированные теги прямо в тексте
+    («&lt;a href=...&gt;»). Чистим и при записи, и при показе: записи,
+    сделанные до починки, уже лежат с разметкой.
+    """
+    return html.unescape(_HTML_TAG_RE.sub("", name or "")).strip() or "—"
+
+
+async def plain_name_by_id(chat_id: int, user_id: int) -> str:
+    """Имя человека без разметки: ник чата, иначе то, что знает кэш."""
+    nickname = await db.get_nickname(chat_id, user_id)
+    if nickname:
+        return plain_name(nickname)
+    return plain_name(_plain_display_name(user_id))
 
 
 def _plain_display_name(user_id: int, max_len: int = 25) -> str:
@@ -2263,7 +2369,7 @@ def owner_role_text(user_id: int) -> str:
 
 @router.message(
     F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in OWNER_ROLE_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in OWNER_ROLE_TRIGGERS),
 )
 async def cmd_owner_role(message: Message):
     if not is_owner(message.from_user.id):
@@ -2348,6 +2454,7 @@ def private_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Помощь"), KeyboardButton(text="Жалоба")],
             [KeyboardButton(text="🌴 Рест"), KeyboardButton(text="🎭 Роли")],
             [KeyboardButton(text="Аноним"), KeyboardButton(text="Сайт")],
+            [KeyboardButton(text=BTN_MY_MARKET)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -2457,7 +2564,7 @@ async def birthday_set_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-BIRTHDAY_RE = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$")
+BIRTHDAY_RE = ru_text.rx(r"^(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?$")
 
 
 @router.message(StateFilter(BirthdayStates.waiting_birthday), F.chat.type == "private")
@@ -2489,7 +2596,7 @@ async def birthday_process_input(message: Message, state: FSMContext):
 
 @router.message(
     F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("мой днр", "мой день рождения", "деньрождения")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("мой днр", "мой день рождения", "деньрождения")),
 )
 async def cmd_my_birthday(message: Message, state: FSMContext):
     row = await db.get_birthday(message.from_user.id)
@@ -2507,7 +2614,7 @@ async def cmd_my_birthday(message: Message, state: FSMContext):
 
 @router.message(
     F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("-мой днр", "-мой день рождения", "-деньрождения")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("-мой днр", "-мой день рождения", "-деньрождения")),
 )
 async def cmd_my_birthday_clear(message: Message):
     row = await db.get_birthday(message.from_user.id)
@@ -2603,7 +2710,7 @@ async def cmd_help_search(message: Message):
     )
 
 
-@router.message(F.text.func(lambda t: bool(t) and t.strip().casefold() in ("помощь", "хелп")))
+@router.message(F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("помощь", "хелп")))
 async def cmd_help(message: Message):
     if message.chat.type in {"group", "supergroup"}:
         await _clear_stale_reply_keyboard(message)
@@ -2664,8 +2771,17 @@ async def help_subsection_callback(callback: CallbackQuery):
         return
     try:
         await callback.message.edit_text(sub["text"], reply_markup=help_subsection_kb(section_key, sub_key))
-    except TelegramBadRequest:
-        pass
+    except TelegramBadRequest as exc:
+        # «message is not modified» — повторный тык в ту же кнопку, он
+        # безобиден. Всё остальное раньше глоталось молча, и кнопка выглядела
+        # мёртвой: именно так проявился раздел, переросший лимит Telegram в
+        # 4096 символов. Ошибку теперь видно и в логах, и человеку.
+        if "not modified" not in str(exc).casefold():
+            logger.warning("Не удалось показать помощь %s:%s — %s",
+                           section_key, sub_key, exc)
+            await callback.answer("Не удалось показать раздел — сообщите администрации.",
+                                  show_alert=True)
+            return
     await callback.answer()
 
 
@@ -6817,7 +6933,7 @@ async def cmd_role_force_give(message: Message):
     await message.reply(f"✅ Роль «{html.escape(role['name'])}» принудительно закреплена за {mention_id(target.id)}.")
 
 
-ROLE_GIVE_BY_USERNAME_RE = re.compile(r"^роль\s+отдать\s+@(?P<username>\w{4,32})\s+(?P<name>.+)$", re.IGNORECASE | re.DOTALL)
+ROLE_GIVE_BY_USERNAME_RE = ru_text.rx(r"^роль\s+отдать\s+@(?P<username>\w{4,32})\s+(?P<name>.+)$", re.IGNORECASE | re.DOTALL)
 
 
 # ----------------------------------------------------------------------------
@@ -6910,7 +7026,7 @@ async def cmd_role_force_reserve(message: Message):
     )
 
 
-ROLE_RESERVE_BY_USERNAME_RE = re.compile(r"^роль\s+забронировать\s+@(?P<username>\w{4,32})\s+(?P<name>.+)$", re.IGNORECASE | re.DOTALL)
+ROLE_RESERVE_BY_USERNAME_RE = ru_text.rx(r"^роль\s+забронировать\s+@(?P<username>\w{4,32})\s+(?P<name>.+)$", re.IGNORECASE | re.DOTALL)
 
 
 # ----------------------------------------------------------------------------
@@ -6991,7 +7107,7 @@ async def cmd_role_force_take(message: Message):
     await _role_force_take_for(message, target.id)
 
 
-ROLE_TAKE_BY_USERNAME_RE = re.compile(r"^роль\s+снять\s+@(?P<username>\w{4,32})\s*$", re.IGNORECASE)
+ROLE_TAKE_BY_USERNAME_RE = ru_text.rx(r"^роль\s+снять\s+@(?P<username>\w{4,32})\s*$", re.IGNORECASE)
 
 
 # ----------------------------------------------------------------------------
@@ -8424,7 +8540,8 @@ def _rp_reply_text(remaining_words: list[str], trigger_word_count: int) -> str:
     Непустая — значит после действия дописан произвольный текст, и это обычная
     фраза, а не команда (действие выполнять не нужно)."""
     tail = remaining_words[trigger_word_count:]
-    if tail and all(w.casefold().strip(".,!?…") in _RP_TARGET_POINTER_WORDS for w in tail):
+    if tail and all(ru_text.yo(w.casefold()).strip(".,!?…") in _RP_TARGET_POINTER_WORDS
+                    for w in tail):
         return ""
     return " ".join(tail).strip()
 
@@ -9627,7 +9744,7 @@ _DURATION_UNITS = {
 }
 # Принимает как слитную запись ("30м", "2ч", "1мес"), так и полное слово,
 # в том числе отдельно от числа через пробел ("2 часа", "7 дней").
-_DURATION_RE = re.compile(
+_DURATION_RE = ru_text.rx(
     r"^(\d+)\s*("
     r"сек(?:унд[аы]?)?|с|"
     r"мин(?:ут[аы]?)?|м|"
@@ -9705,14 +9822,14 @@ async def try_spend_casino(chat_id: int, user_id: int, amount: int) -> bool:
 # срок (т.к. проверялось только первое слово "3" без единицы) и вместо мута
 # на 3 часа тихо ставили ПЕРМАНЕНТНЫЙ мут с причиной "3 часа" — это и есть
 # дыра, которую здесь закрываем.
-_LONE_NUMBER_RE = re.compile(r"^\d+$")
+_LONE_NUMBER_RE = ru_text.rx(r"^\d+$")
 # Разбор сумм с сокращениями: 10000 / 10к / 10k / 1.5к / 2м / 1млн / 1млрд
 _AMOUNT_SUFFIXES = {
     "к": 1_000, "k": 1_000, "тыс": 1_000,
     "м": 1_000_000, "m": 1_000_000, "млн": 1_000_000,
     "млрд": 1_000_000_000, "b": 1_000_000_000, "б": 1_000_000_000,
 }
-_AMOUNT_RE = re.compile(
+_AMOUNT_RE = ru_text.rx(
     r"^(-?\d+(?:[.,]\d+)?)\s*(тыс|млрд|млн|к|k|m|м|b|б)?$", re.IGNORECASE
 )
 
@@ -10713,7 +10830,7 @@ async def cancel_nuke(callback: CallbackQuery):
 
 
 @router.message(
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+бесконечность", "-бесконечность")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+бесконечность", "-бесконечность")),
 )
 async def cmd_infinite_money_toggle(message: Message):
     if not is_owner(message.from_user.id):
@@ -10914,7 +11031,7 @@ async def is_roulette_enabled(chat_id: int) -> bool:
 # Без числа — обычная одиночная игра, как раньше. Верхний предел — чтобы
 # командой с большим числом нельзя было заспамить чат простынёй строк.
 ROULETTE_MAX_SPINS = 6
-_ROULETTE_COMMAND_RE = re.compile(r"^русскаяру(?:\s+(\d+))?$", re.IGNORECASE)
+_ROULETTE_COMMAND_RE = ru_text.rx(r"^русскаяру(?:\s+(\d+))?$", re.IGNORECASE)
 
 
 def _parse_roulette_count(text: Optional[str]) -> Optional[int]:
@@ -11030,7 +11147,7 @@ async def _play_roulette_multi(chat_id: int, user, count: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+рулетка", "-рулетка")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+рулетка", "-рулетка")),
 )
 async def cmd_roulette_toggle(message: Message):
     min_level = required_level("roulette_toggle")
@@ -11652,7 +11769,7 @@ async def cmd_duel_stats(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in {"!дуэли сброс", "!сброс дуэлей"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in {"!дуэли сброс", "!сброс дуэлей"}),
 )
 async def cmd_duel_stats_reset(message: Message):
     if not has_level(message.from_user.id, required_level("duel_stats_reset")):
@@ -11672,7 +11789,7 @@ async def cmd_duel_stats_reset(message: Message):
 # при желании меняется как обычно через «право»/«дк» (см. COMMAND_REGISTRY,
 # ключи misc_*).
 # ============================================================================
-_RANDOM_RE = re.compile(r"(?i)^рандом(?:\s+(-?\d+)(?:\s+(-?\d+))?)?\s*$")
+_RANDOM_RE = ru_text.rx(r"(?i)^рандом(?:\s+(-?\d+)(?:\s+(-?\d+))?)?\s*$")
 
 
 def _check_misc_access(user_id: int, key: str) -> bool:
@@ -11867,7 +11984,7 @@ RATING_COMMENTS = [
     "могло быть и хуже", "шедевр в своём роде", "ну такое",
 ]
 
-RATE_RE = re.compile(r"(?i)^!?оценить\s+(.+)$")
+RATE_RE = ru_text.rx(r"(?i)^!?оценить\s+(.+)$")
 
 
 @router.message(
@@ -11888,7 +12005,7 @@ async def cmd_magic_ball(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("гороскоп", "!гороскоп", "мой гороскоп")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("гороскоп", "!гороскоп", "мой гороскоп")),
 )
 async def cmd_horoscope(message: Message):
     """Гороскоп на сутки — один и тот же при повторных нажатиях."""
@@ -11907,7 +12024,7 @@ async def cmd_horoscope(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("погода", "!погода", "погода в чате")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("погода", "!погода", "погода в чате")),
 )
 async def cmd_chat_weather(message: Message):
     """Погода в чате — тоже на сутки, но общая для всех: это погода чата,
@@ -11923,7 +12040,7 @@ async def cmd_chat_weather(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("тост", "!тост")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("тост", "!тост")),
 )
 async def cmd_toast(message: Message):
     if not _check_misc_access(message.from_user.id, "fun_toast"):
@@ -11933,7 +12050,7 @@ async def cmd_toast(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("отмазка", "!отмазка", "оправдание")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("отмазка", "!отмазка", "оправдание")),
 )
 async def cmd_excuse(message: Message):
     """Собирается из трёх частей — так вариантов сотни, а не десяток."""
@@ -11947,7 +12064,7 @@ async def cmd_excuse(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("мудрость", "!мудрость")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("мудрость", "!мудрость")),
 )
 async def cmd_wisdom(message: Message):
     if not _check_misc_access(message.from_user.id, "fun_wisdom"):
@@ -11978,7 +12095,7 @@ async def cmd_rate(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in MY_ARTICLE_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in MY_ARTICLE_TRIGGERS),
 )
 async def cmd_my_article(message: Message):
     if not _check_misc_access(message.from_user.id, "misc_my_article"):
@@ -12651,7 +12768,7 @@ async def cmd_quote_sticker(message: Message):
         await grant_achievement(message.chat.id, message.from_user.id, "quotes_10")
 
 
-STICKER_CMD_RE = re.compile(r"^\.стикер(?:\s+(\d{1,2}))?$", re.IGNORECASE)
+STICKER_CMD_RE = ru_text.rx(r"^\.стикер(?:\s+(\d{1,2}))?$", re.IGNORECASE)
 
 
 def _fallback_text_for(msg: Message) -> Optional[str]:
@@ -13050,7 +13167,7 @@ _YESNO_MAYBE = (
 )
 
 # Триггеры: «!данет {вопрос}» и разговорные «бот данет …» / «бот да нет …».
-YESNO_CMD_RE = re.compile(r"^(?:!?данет|бот\s+данет|бот\s+да\s+нет)\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
+YESNO_CMD_RE = ru_text.rx(r"^(?:!?данет|бот\s+данет|бот\s+да\s+нет)\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
 def _yesno_answer() -> str:
@@ -13199,7 +13316,7 @@ _PING_REPLIES = {
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in _PING_REPLIES),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in _PING_REPLIES),
 )
 async def cmd_misc_ping(message: Message):
     if not _check_misc_access(message.from_user.id, "misc_ping"):
@@ -13517,8 +13634,49 @@ EARNINGS_SCALE = 10
 FARM_BASE_MIN = 400
 FARM_BASE_MAX = 1200
 FARM_STAR_CAP = 10
-FARM_FARMS_PER_STAR = 20
+# Было 20 фармов на звезду. При кулдауне в 4 часа это 3,3 суток игры без
+# единого пропуска ради одной звезды и месяц с лишним ради максимума — рост
+# формально работал, но за ним невозможно было уследить, и звёздности никто
+# не видел. Пять фармов — первая звезда за сутки, максимум примерно за неделю.
+FARM_FARMS_PER_STAR = 5
 FARM_STAR_BONUS_PER_LEVEL = 0.05  # +5% к множителю за каждую звезду
+
+
+def farm_star_progress(total_farms: int) -> tuple[int, int, int]:
+    """(звёзд сейчас, фармов в текущей звезде, сколько нужно на следующую).
+
+    На максимуме «набрано» и «нужно» равны — полоса просто полная, а не
+    делится на ноль (так же сделано у уровня питомца, см. pets.level_progress).
+    """
+    total = max(0, int(total_farms))
+    stars = min(FARM_STAR_CAP, total // FARM_FARMS_PER_STAR)
+    if stars >= FARM_STAR_CAP:
+        return stars, FARM_FARMS_PER_STAR, FARM_FARMS_PER_STAR
+    return stars, total % FARM_FARMS_PER_STAR, FARM_FARMS_PER_STAR
+
+
+def wallet_stars(wallet: dict) -> int:
+    """Звёздность кошелька — ВСЕГДА из числа фармов, а не из столбца.
+
+    star_level в базе пересчитывается только внутри record_farm, то есть при
+    фарме. После правки FARM_FARMS_PER_STAR столбец отстаёт до следующего
+    фарма, и кошелёк показывал бы больше звёзд, чем на самом деле даёт бонус
+    к доходу и урону по боссу. Столбец остаётся кэшем для сортировок, а
+    источник правды — total_farms.
+    """
+    return farm_star_progress(int(wallet.get("total_farms") or 0))[0]
+
+
+def farm_star_line(total_farms: int) -> str:
+    """Строка звёздности с полосой прогресса — одна на все места, где она
+    показывается: раньше в кошельке было голое «фармов всего: N», по которому
+    до следующей звезды не посчитать."""
+    stars, gained, needed = farm_star_progress(total_farms)
+    icons = "⭐" * stars if stars else "—"
+    if stars >= FARM_STAR_CAP:
+        return f"✨ Звёздность: {icons} — максимум"
+    bar = pets_catalog.bar(round(100 * gained / needed))
+    return f"✨ Звёздность: {icons} {bar} {gained}/{needed} до следующей звезды"
 # «Везение» — случайная добавка к множителю на конкретный фарм (не хранится,
 # каждый раз заново), отображается отдельно в скобках рядом с расчётом.
 FARM_LUCK_MIN = 0.85
@@ -13555,7 +13713,7 @@ async def _farm_execute(chat_id: int, user_id: int) -> str:
             )
 
     yield_percent = await db.get_farm_yield(chat_id)
-    star_level = int(wallet.get("star_level") or 0)
+    star_level = wallet_stars(wallet)
     star_bonus = 1 + star_level * FARM_STAR_BONUS_PER_LEVEL
     luck = random.uniform(FARM_LUCK_MIN, FARM_LUCK_MAX)
     multiplier = (yield_percent / 100) * star_bonus * luck
@@ -13572,18 +13730,31 @@ async def _farm_execute(chat_id: int, user_id: int) -> str:
     luck_percent = round(luck * 100)
     multiplier_str = _ru_decimal(multiplier)
     await _check_coin_achievements(chat_id, user_id)
-    if int((updated or {}).get("total_farms") or 0) >= 100:
+    total_farms = int((updated or {}).get("total_farms") or 0)
+    if total_farms >= 100:
         await grant_achievement(chat_id, user_id, "farm_100")
-    return (
-        f"✅ ЗАЧЁТ! ☢️ +{amount} i¢ = {base}×{multiplier_str} ({luck_percent}%)\n"
-        f"✨ Сила звёздности: {int(updated.get('star_level') or 0)}\n"
-        f"⏳ Урожайность: {multiplier_str}"
-    )
+    lines = [
+        f"✅ ЗАЧЁТ! ☢️ +{amount} i¢ = {base}×{multiplier_str} ({luck_percent}%)",
+        farm_star_line(total_farms),
+        f"⏳ Урожайность: {multiplier_str}",
+    ]
+    # Новая звезда — отдельной строкой и с объяснением, что она даёт: сам по
+    # себе счётчик «сила звёздности: 4» ни о чём не говорил, и рост проходил
+    # мимо внимания даже когда случался.
+    new_stars = wallet_stars(updated or {})
+    if new_stars > star_level:
+        lines.append(
+            f"🌟 <b>Новая звезда!</b> Теперь у вас {'⭐' * new_stars} — "
+            f"ферма приносит на {round(new_stars * FARM_STAR_BONUS_PER_LEVEL * 100)}% "
+            f"больше, и вы бьёте босса сильнее "
+            f"(+{new_stars * boss_catalog.DAMAGE_PER_STAR} к урону)."
+        )
+    return "\n".join(lines)
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in FARM_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in FARM_TRIGGERS),
 )
 async def cmd_farm_run(message: Message):
     if not _check_misc_access(message.from_user.id, "farm_run"):
@@ -13593,12 +13764,12 @@ async def cmd_farm_run(message: Message):
 
 async def _farm_balance_text(chat_id: int, user_id: int) -> str:
     wallet = await db.get_wallet(chat_id, user_id)
-    stars = "⭐" * int(wallet.get("star_level") or 0) or "—"
+    total_farms = int(wallet.get("total_farms") or 0)
     lines = [
         "👛 <b>Ваш кошелёк</b>",
         DIVIDER,
         f"☢️ Коины: <b>{wallet.get('coins', 0)}</b> i¢",
-        f"✨ Звёздность: {stars} (фармов всего: {wallet.get('total_farms', 0)})",
+        f"{farm_star_line(total_farms)} (фармов всего: {total_farms})",
     ]
     last_farm_at = wallet.get("last_farm_at")
     if last_farm_at:
@@ -13614,7 +13785,7 @@ async def _farm_balance_text(chat_id: int, user_id: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("монеты", "баланс","мешок")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("монеты", "баланс","мешок")),
 )
 async def cmd_farm_balance(message: Message):
     if not _check_misc_access(message.from_user.id, "farm_balance"):
@@ -13642,7 +13813,7 @@ async def farm_top_page(chat_id: int, page: int) -> tuple[str, Optional[InlineKe
     lines = [f"🏆 <b>Топ по коинам</b> — {total} участников", DIVIDER]
     for index, row in enumerate(rows, start=page * FARM_TOP_PAGE_SIZE + 1):
         name = await display_name_by_id(chat_id, row["user_id"])
-        stars = "⭐" * int(row.get("star_level") or 0)
+        stars = "⭐" * wallet_stars(row)
         lines.append(f"{index}. {name} — {row['coins']} i¢ {stars}")
     text = "\n".join(lines)
 
@@ -13857,10 +14028,10 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
 # применяется в момент ПРОДАЖИ, а не поимки. Ровно поэтому улов имеет смысл
 # придержать: рыба, пойманная вчера, продаётся по сегодняшнему клёву.
 # ----------------------------------------------------------------------------
-NET_SELL_RE = re.compile(r"(?i)^!?сетка\s+продать(?:\s+(\d+))?$")
-NET_RELEASE_RE = re.compile(r"(?i)^!?сетка\s+выпустить\s+(\d+)$")
-FISH_PIN_RE = re.compile(r"(?i)^!?закрепить\s+рыбу\s+(\d+)$")
-FISH_UNPIN_RE = re.compile(r"(?i)^!?открепить\s+рыбу$")
+NET_SELL_RE = ru_text.rx(r"(?i)^!?сетка\s+продать(?:\s+(\d+))?$")
+NET_RELEASE_RE = ru_text.rx(r"(?i)^!?сетка\s+выпустить\s+(\d+)$")
+FISH_PIN_RE = ru_text.rx(r"(?i)^!?закрепить\s+рыбу\s+(\d+)$")
+FISH_UNPIN_RE = ru_text.rx(r"(?i)^!?открепить\s+рыбу$")
 
 
 def _fish_view(row: dict, now: datetime) -> tuple[Optional[fishing.Species], int, float]:
@@ -13898,7 +14069,7 @@ async def _net_lines(chat_id: int, user_id: int, now: datetime) -> tuple[list[st
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("сетка", "!сетка", "садок")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("сетка", "!сетка", "садок")),
 )
 async def cmd_net_show(message: Message):
     if not _check_misc_access(message.from_user.id, "fishing_net"):
@@ -14078,7 +14249,7 @@ async def cmd_fish_unpin(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ рыбаков", "топ по весу")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("топ рыбаков", "топ по весу")),
 )
 async def cmd_fishing_weight_top(message: Message):
     """Рекорды по весу — то, чем рыбаки и хвастаются в жизни."""
@@ -14104,7 +14275,7 @@ async def cmd_fishing_weight_top(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in FISHING_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in FISHING_TRIGGERS),
 )
 async def cmd_fishing(message: Message):
     if not _check_misc_access(message.from_user.id, "fishing_run"):
@@ -14114,7 +14285,7 @@ async def cmd_fishing(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ уловов", "топ рыбалки")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("топ уловов", "топ рыбалки")),
 )
 async def cmd_fishing_top(message: Message):
     if not _check_misc_access(message.from_user.id, "fishing_top"):
@@ -14250,7 +14421,7 @@ async def _treasure_execute(chat_id: int, user_id: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in TREASURE_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in TREASURE_TRIGGERS),
 )
 async def cmd_treasure_dig(message: Message):
     if not _check_misc_access(message.from_user.id, "treasure_dig"):
@@ -14260,7 +14431,7 @@ async def cmd_treasure_dig(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("клад инфа", "клад стата")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("клад инфа", "клад стата")),
 )
 async def cmd_treasure_info(message: Message):
     if not _check_misc_access(message.from_user.id, "treasure_info"):
@@ -14381,7 +14552,7 @@ async def _daily_bonus_execute(chat_id: int, user_id: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in DAILY_BONUS_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in DAILY_BONUS_TRIGGERS),
 )
 async def cmd_daily_bonus(message: Message):
     if not _check_misc_access(message.from_user.id, "daily_bonus"):
@@ -14467,7 +14638,7 @@ async def _side_job_execute(chat_id: int, user_id: int) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in SIDE_JOB_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in SIDE_JOB_TRIGGERS),
 )
 async def cmd_side_job(message: Message):
     if not _check_misc_access(message.from_user.id, "side_job"):
@@ -14512,7 +14683,7 @@ def _hat_kb(closed: bool = False) -> InlineKeyboardMarkup:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in HAT_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in HAT_TRIGGERS),
 )
 async def cmd_hat(message: Message):
     if not _check_misc_access(message.from_user.id, "hat_round"):
@@ -14873,14 +15044,14 @@ async def _my_businesses_text(chat_id: int, user_id: int) -> str:
 # может утащить настройку не туда.
 BUSINESS_LIST_TRIGGERS = {"бизнесы", "бизнес каталог", "бизнес список"}
 BUSINESS_MINE_TRIGGERS = {"бизнес", "бизнес мой", "бизнес мои"}
-BUSINESS_BUY_RE = re.compile(r"(?i)^бизнес\s+купить\s+(\S+)$")
-BUSINESS_UPGRADE_RE = re.compile(r"(?i)^бизнес\s+(?:улучшить|апгрейд)\s+(\S+)$")
-BUSINESS_COLLECT_RE = re.compile(r"(?i)^бизнес\s+(?:собрать|забрать)(?:\s+(\S+))?$")
+BUSINESS_BUY_RE = ru_text.rx(r"(?i)^бизнес\s+купить\s+(\S+)$")
+BUSINESS_UPGRADE_RE = ru_text.rx(r"(?i)^бизнес\s+(?:улучшить|апгрейд)\s+(\S+)$")
+BUSINESS_COLLECT_RE = ru_text.rx(r"(?i)^бизнес\s+(?:собрать|забрать)(?:\s+(\S+))?$")
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in BUSINESS_LIST_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in BUSINESS_LIST_TRIGGERS),
 )
 async def cmd_business_catalog(message: Message):
     if not _check_misc_access(message.from_user.id, "business_catalog"):
@@ -14890,12 +15061,20 @@ async def cmd_business_catalog(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in BUSINESS_MINE_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in BUSINESS_MINE_TRIGGERS),
 )
 async def cmd_business_mine(message: Message):
     if not _check_misc_access(message.from_user.id, "business_mine"):
         return
-    await message.reply(await _my_businesses_text(message.chat.id, message.from_user.id))
+    # Самопочинку закреплённого пускаем и отсюда: сломанный бизнес ничего не
+    # копит, поэтому за доходом к нему не идут — идут смотреть список. Хук
+    # только в «собрать» означал бы, что слот не срабатывает почти никогда.
+    repaired = await _pinned_business_self_repair(message.chat.id, message.from_user.id)
+    text = await _my_businesses_text(message.chat.id, message.from_user.id)
+    if repaired:
+        text += (f"\n\n📌 <b>{html.escape(repaired)}</b> починился сам — он у вас "
+                 f"закреплён (раз в {pins.BUSINESS_SELF_REPAIR_HOURS} ч).")
+    await message.reply(text)
 
 
 @router.message(
@@ -14947,6 +15126,47 @@ async def cmd_business_buy(message: Message):
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and bool(BUSINESS_COLLECT_RE.match(t.strip()))),
 )
+async def _pinned_business_self_repair(chat_id: int, user_id: int) -> Optional[str]:
+    """Закреплённый бизнес чинится сам, но не чаще раза в сутки.
+
+    Возвращает название починенного или None. Это слот экипировки: закреп
+    избавляет от беготни с ремкомплектом ровно у одного бизнеса, поэтому сам
+    ремкомплект по-прежнему нужен всем остальным.
+
+    Отметку держим в общем KV-хранилище: это одна дата на человека, и ради
+    неё заводить таблицу незачем (так же сделан счётчик применений закрепа).
+
+    Ошибку глотаем: самопочинка — приятная надстройка, и упавший запрос не
+    должен мешать снять доход.
+    """
+    try:
+        card = await db.get_profile_card(chat_id, user_id)
+        key = (card or {}).get("pinned_business")
+        if not key:
+            return None
+        row = await db.get_user_business(chat_id, user_id, key)
+        if not row or not row.get("broken_kind"):
+            return None
+        stamp = f"pinrepair:{chat_id}:{user_id}"
+        last = await db.get_data(stamp)
+        now = datetime.utcnow()
+        if last and last.get("data_value"):
+            try:
+                when = datetime.fromisoformat(last["data_value"])
+            except ValueError:
+                when = None
+            if when and now - when < timedelta(hours=pins.BUSINESS_SELF_REPAIR_HOURS):
+                return None
+        if not await db.repair_business(chat_id, user_id, key, now):
+            return None
+        await db.set_data(stamp, now.isoformat(), updated_by=user_id)
+        spec = business_catalog.BY_KEY.get(key)
+        return spec.name if spec else key
+    except Exception as exc:
+        log_suppressed("_pinned_business_self_repair", exc)
+        return None
+
+
 async def cmd_business_collect(message: Message):
     if not _check_misc_access(message.from_user.id, "business_collect"):
         return
@@ -14956,6 +15176,7 @@ async def cmd_business_collect(message: Message):
         return
 
     raw = BUSINESS_COLLECT_RE.match(message.text.strip()).group(1)
+    repaired = await _pinned_business_self_repair(chat_id, user_id)
     rows = await _load_businesses(chat_id, user_id)
     if not rows:
         await message.reply("У вас нет ни одного бизнеса — каталог: <code>бизнесы</code>.")
@@ -14976,7 +15197,15 @@ async def cmd_business_collect(message: Message):
     # пять раз и в сумме меньше, чем владелец одного крупного.
     gross = sum(_business_pending(r) for r in rows)
     if gross <= 0:
-        await message.reply("Копилки пусты — зайдите позже.")
+        # Про самопочинку сказать нужно и здесь: сломанный бизнес ничего не
+        # копит, поэтому у владельца одного бизнеса это САМЫЙ вероятный
+        # исход — и он молча терял бы единственное уведомление о ней.
+        text = "Копилки пусты — зайдите позже."
+        if repaired:
+            text = (f"📌 <b>{html.escape(repaired)}</b> починился сам — он у вас "
+                    f"закреплён (раз в {pins.BUSINESS_SELF_REPAIR_HOURS} ч).\n"
+                    f"{text}")
+        await message.reply(text)
         return
 
     tax = business_catalog.tax_for(gross)
@@ -14993,11 +15222,13 @@ async def cmd_business_collect(message: Message):
     await _add_season_points(chat_id, user_id, seasons.points_for_coins(net))
     await _check_coin_achievements(chat_id, user_id)
 
-    await message.reply(
-        f"💰 Забрали <b>{gross}</b> i¢ с {len(rows)} бизнес(-ов).\n"
-        f"🧾 Налог: {tax} i¢ ({tax * 100 // gross}%) — ушёл в казну чата.\n"
-        f"На руки: <b>{net}</b> i¢"
-    )
+    text = (f"💰 Забрали <b>{gross}</b> i¢ с {len(rows)} бизнес(-ов).\n"
+            f"🧾 Налог: {tax} i¢ ({tax * 100 // gross}%) — ушёл в казну чата.\n"
+            f"На руки: <b>{net}</b> i¢")
+    if repaired:
+        text += (f"\n📌 <b>{html.escape(repaired)}</b> починился сам — он у вас "
+                 f"закреплён (раз в {pins.BUSINESS_SELF_REPAIR_HOURS} ч).")
+    await message.reply(text)
 
 
 @router.message(
@@ -15063,12 +15294,12 @@ async def cmd_business_upgrade(message: Message):
 # НАЛОГОМ до смены хозяина, и бизнес уходит пустым. Без этого «продай самому
 # себе на второй аккаунт» было бы способом снять доход мимо налога.
 
-BUSINESS_SELL_BOT_RE = re.compile(r"(?i)^бизнес\s+продать\s+(\S+)$")
+BUSINESS_SELL_BOT_RE = ru_text.rx(r"(?i)^бизнес\s+продать\s+(\S+)$")
 # Цена стоит ПЕРЕД получателем, поэтому голый ID цели здесь не поддерживаем
 # (см. allow_bare_id ниже): «бизнес продать shaurma 5000» — 5000 это цена,
 # и трактовать её как user_id нельзя.
-BUSINESS_SELL_USER_RE = re.compile(r"(?i)^бизнес\s+продать\s+(\S+)\s+(\d+)(?:\s+.*)?$")
-BUSINESS_GIVE_RE = re.compile(r"(?i)^бизнес\s+(?:передать|подарить)\s+(\S+)(?:\s+.*)?$")
+BUSINESS_SELL_USER_RE = ru_text.rx(r"(?i)^бизнес\s+продать\s+(\S+)\s+(\d+)(?:\s+.*)?$")
+BUSINESS_GIVE_RE = ru_text.rx(r"(?i)^бизнес\s+(?:передать|подарить)\s+(\S+)(?:\s+.*)?$")
 
 
 async def _business_owned_or_reply(message: Message, raw_key: str):
@@ -15553,9 +15784,9 @@ async def businesses_loop() -> None:
             logger.exception("Сбой в цикле бизнесов")
 
 
-BUSINESS_REPAIR_RE = re.compile(r"(?i)^бизнес\s+(?:починить|ремонт)\s+(\S+)$")
-BUSINESS_EQUIP_LIST_RE = re.compile(r"(?i)^бизнес\s+оснащение(?:\s+(\S+))?$")
-BUSINESS_EQUIP_BUY_RE = re.compile(r"(?i)^бизнес\s+оснастить\s+(\S+)\s+(\S+)$")
+BUSINESS_REPAIR_RE = ru_text.rx(r"(?i)^бизнес\s+(?:починить|ремонт)\s+(\S+)$")
+BUSINESS_EQUIP_LIST_RE = ru_text.rx(r"(?i)^бизнес\s+оснащение(?:\s+(\S+))?$")
+BUSINESS_EQUIP_BUY_RE = ru_text.rx(r"(?i)^бизнес\s+оснастить\s+(\S+)\s+(\S+)$")
 
 
 @router.message(
@@ -15652,7 +15883,7 @@ async def cmd_business_equip(message: Message):
     )
 
 
-BUSINESS_PIN_RE = re.compile(r"(?i)^бизнес\s+закрепить\s+(\S+)$")
+BUSINESS_PIN_RE = ru_text.rx(r"(?i)^бизнес\s+закрепить\s+(\S+)$")
 BUSINESS_UNPIN_TRIGGERS = {"бизнес открепить", "бизнес снять закреп"}
 
 
@@ -15683,7 +15914,7 @@ async def cmd_business_pin(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in BUSINESS_UNPIN_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in BUSINESS_UNPIN_TRIGGERS),
 )
 async def cmd_business_unpin(message: Message):
     if not _check_misc_access(message.from_user.id, "business_pin"):
@@ -15893,7 +16124,7 @@ async def _boss_power(chat_id: int, user_id: int) -> tuple[int, int, int]:
     return (
         int(prof.get("prof_level") or 0) if prof.get("profession_key") else 0,
         sum(int(b["level"]) for b in businesses),
-        int(wallet.get("star_level") or 0),
+        wallet_stars(wallet),
     )
 
 
@@ -16070,12 +16301,12 @@ async def cb_boss_hit(callback: CallbackQuery):
 
 BOSS_STATUS_TRIGGERS = {"босс", "боссы", "!босс", "!боссы"}
 BOSS_TOGGLE_TRIGGERS = {"+босс", "-босс", "+боссы", "-боссы"}
-BOSS_SUMMON_RE = re.compile(r"(?i)^!?босс\s+(?:призвать|спавн)(?:\s+(.+))?$")
+BOSS_SUMMON_RE = ru_text.rx(r"(?i)^!?босс\s+(?:призвать|спавн)(?:\s+(.+))?$")
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in BOSS_STATUS_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in BOSS_STATUS_TRIGGERS),
 )
 async def cmd_boss_status(message: Message):
     if not _check_misc_access(message.from_user.id, "boss_status"):
@@ -16112,7 +16343,7 @@ async def cmd_boss_status(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in BOSS_TOGGLE_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in BOSS_TOGGLE_TRIGGERS),
 )
 async def cmd_boss_toggle(message: Message):
     min_level = required_level("boss_toggle")
@@ -16201,14 +16432,42 @@ async def boss_spawn_loop() -> None:
 # ============================================================================
 PET_WORD = r"(?:пет|питомец|питомцы|петы)"
 PET_LIST_TRIGGERS = {"пет", "петы", "питомец", "питомцы", "!петы", "!питомцы"}
-PET_SHOP_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+(?:каталог|магазин|список)$")
-PET_BUY_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+купить\s+(\S+)$")
-PET_NAME_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+назвать\s+(\S+)\s+(.+)$")
-PET_FEED_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+(?:кормить|покормить)(?:\s+(\S+))?$")
-PET_CARE_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+(гладить|погладить|поцеловать|целовать)(?:\s+(\S+))?$")
-PET_PIN_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+закрепить\s+(\S+)$")
+# Глаголы ухода. «Обнять» приравнено к «гладить»: разные слова для одной
+# прибавки настроения, а не отдельная механика с отдельным откатом.
+PET_CARE_VERBS = r"гладить|погладить|обнять|обнимать|поцеловать|целовать"
+# Слова, означающие «сразу все мои». Вынесены в свою группу, потому что
+# участвуют дважды: в массовых командах — как цель, в одиночных — как ЗАПРЕТ.
+# Без запрета «пет покормить все» матчится одиночной командой, «все» уезжает
+# в группу ключа питомца, и бот отвечает «такого питомца нет».
+#
+# Порядок регистрации обработчиков (массовые объявлены ВЫШЕ одиночных) тоже
+# разводит их, но опираться только на него нельзя: перестановка функций в
+# файле сломала бы команды молча, а тесты зовут обработчики напрямую и
+# маршрутизацию не проверяют.
+PET_ALL_WORD = r"(?:все|всех|всем)"
+_NOT_ALL = rf"(?!{PET_ALL_WORD}$)"
+PET_SHOP_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:каталог|магазин|список)$")
+PET_BUY_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+купить\s+(\S+)$")
+PET_NAME_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+назвать\s+(\S+)\s+(.+)$")
+PET_FEED_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:кормить|покормить)(?:\s+{_NOT_ALL}(\S+))?$")
+PET_FEED_ALL_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:кормить|покормить)\s+{PET_ALL_WORD}$")
+PET_CARE_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+({PET_CARE_VERBS})(?:\s+{_NOT_ALL}(\S+))?$")
+PET_CARE_ALL_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+({PET_CARE_VERBS})\s+{PET_ALL_WORD}$")
+# Ключ необязателен: с единственным питомцем «пет продать» и так понятно, о ком
+# речь (как у кормёжки), а молчать в ответ на команду нельзя — это единственное
+# необратимое действие с питомцем.
+PET_SELL_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+продать(?:\s+(\S+))?(?:\s+(да))?$")
+PET_FOOD_BUY_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:корм|еда|еду)(?:\s+(\d+))?$")
+PET_WALK_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:гулять|погулять|прогулка)(?:\s+{_NOT_ALL}(\S+))?$")
+PET_EVOLVE_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:эволюция|эволюционировать|эвол)\s+(\S+)(?:\s+(да))?$")
+PET_WALK_ALL_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+(?:гулять|погулять|прогулка)\s+{PET_ALL_WORD}$")
+PET_FOOD_GRANT_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+раздать(?:\s+корм[а]?)?$")
+# Метка последней раздачи корма живёт в bot_data по чату — там же, где метка
+# ежедневной награды за активность.
+PET_FOOD_GRANT_KEY = "pet_food_grant_last"
+PET_PIN_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+закрепить\s+(\S+)$")
 PET_UNPIN_TRIGGERS = {"пет открепить", "питомец открепить", "петы открепить"}
-PET_ABILITY_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+способность\s+(\S+)(?:\s+(\d+))?$")
+PET_ABILITY_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+способность\s+(\S+)(?:\s+(\d+))?$")
 PET_ABILITY_LIST_TRIGGERS = {"пет способности", "питомец способности", "петы способности",
                              "!пет способности", "!питомец способности", "!петы способности"}
 
@@ -16221,6 +16480,7 @@ async def _pet_lucky(chat_id: int, user_id: int, amount: int, ability: str) -> i
     забыть одно из них.
     """
     percent = await _pet_bonus(chat_id, user_id, ability)
+    percent += await _pin_bonus(chat_id, user_id, ability)
     if not percent:
         return amount
     return amount + amount * percent // 100
@@ -16247,24 +16507,110 @@ async def _pet_bonus(chat_id: int, user_id: int, ability: str) -> int:
         log_suppressed("_pet_bonus", exc)
         return 0
 
-    # «Компаньон» замедляет падение настроения — учитываем его до проверки
+    # «Компаньон» замедляет падение настроения — учитываем его ДО проверки
     # активности остальных, иначе панда не могла бы вытянуть загрустившую
     # компанию, ради чего она и заводится.
+    pinned_key = await _pinned_pet_key(chat_id, user_id)
+    slowdown = _pet_mood_slowdown(rows, specs, pinned_key)
+    # Закреплённому питомцу способность засыпает позже — это его слот
+    # экипировки (см. pins.PET_LOW_STAT). Карточку читаем один раз на весь
+    # проход, а не по разу на питомца.
     total = 0
     for row in rows:
         spec = specs.get(row["pet_key"])
         if spec is None:
             continue
-        current = _effective_ability(row, spec)
-        if current != ability:
+        if ability not in _effective_abilities(row, spec):
             continue
-        hunger, mood = _pet_now(row)
-        if not pets_catalog.is_active(hunger, mood):
+        hunger, mood = _pet_now(row, slowdown)
+        if not _pet_is_active(row, hunger, mood, pinned_key):
             continue
-        found = pets_catalog.ABILITY_BY_KEY.get(current)
-        if found is not None:
-            total += found.percent + pets_catalog.level_ability_bonus(_pet_level(row))
+        total += pets_catalog.ability_percent(
+            ability, _pet_level(row), evolved=bool(row.get("evolved")))
     return total
+
+
+ABILITY_PET_MOOD = "pet_mood"
+
+
+def _pet_is_active(row: dict, hunger: int, mood: int,
+                   pinned_key: Optional[str]) -> bool:
+    """Работает ли способность этого питомца прямо сейчас.
+
+    У закреплённого порог ниже обычного: закреп — слот экипировки, и его
+    смысл в том, что закреплённому прощается пропущенная кормёжка. Не
+    «никогда не засыпает» — ухаживать всё равно надо.
+    """
+    if pinned_key and row.get("pet_key") == pinned_key:
+        return hunger >= pins.PET_LOW_STAT and mood >= pins.PET_LOW_STAT
+    return pets_catalog.is_active(hunger, mood)
+
+
+async def _pinned_pet_key(chat_id: int, user_id: int) -> Optional[str]:
+    try:
+        card = await db.get_profile_card(chat_id, user_id)
+    except Exception as exc:
+        log_suppressed("_pinned_pet_key", exc)
+        return None
+    return (card or {}).get("pinned_pet")
+
+
+def _pet_mood_slowdown(rows: list[dict], specs: dict,
+                       pinned_key: Optional[str] = None) -> int:
+    """На сколько процентов медленнее падает настроение у всех питомцев хозяина.
+
+    Это способность «Компаньон» (панда). Раньше она применялась ровно в одном
+    месте — при отрисовке списка «пет», — то есть меняла показанное число и
+    больше ничего: способности не платили, а кормление и ласка записывали в
+    базу настроение, посчитанное БЕЗ поблажки, тем самым стирая её при каждом
+    взаимодействии. Панда за 45 000 i¢ была украшением, хотя каталог обещал
+    работающий эффект, и её вдобавок можно купить за «пет способность».
+
+    Рекурсии здесь нет намеренно: активность самого «Компаньона» определяется
+    по его состоянию БЕЗ поблажки. Иначе панда поддерживала бы сама себя, и
+    вопрос «работает ли она» не имел бы однозначного ответа.
+    """
+    total = 0
+    ability = pets_catalog.ABILITY_BY_KEY.get(ABILITY_PET_MOOD)
+    if ability is None:
+        return 0
+    for row in rows:
+        spec = specs.get(row["pet_key"])
+        if spec is None or ABILITY_PET_MOOD not in _effective_abilities(row, spec):
+            continue
+        hunger, mood = _pet_now(row)          # без поблажки — см. докстринг
+        if not _pet_is_active(row, hunger, mood, pinned_key):
+            continue
+        total += pets_catalog.ability_percent(
+            ABILITY_PET_MOOD, _pet_level(row), evolved=bool(row.get("evolved")))
+    return total
+
+
+async def _pet_slowdown_for(chat_id: int, user_id: int) -> int:
+    """То же самое, но когда строк питомцев под рукой нет (поштучные команды).
+
+    Ошибку глотаем по той же причине, что и в _pet_bonus: поблажка — приятная
+    добавка, а не основа расчёта, и упавший запрос не должен ломать кормёжку.
+    """
+    try:
+        rows = await db.list_pets(chat_id, user_id)
+        if not rows:
+            return 0
+        return _pet_mood_slowdown(rows, await _pet_specs(chat_id),
+                                  await _pinned_pet_key(chat_id, user_id))
+    except Exception as exc:
+        log_suppressed("_pet_slowdown_for", exc)
+        return 0
+
+
+def _effective_abilities(row: dict, spec) -> tuple[str, ...]:
+    """Все способности питомца: своя (или вида) плюс вторая, если он
+    эволюционировал. Считаются обе — в этом и смысл эволюции."""
+    out = [_effective_ability(row, spec)]
+    second = row.get("ability2")
+    if second and second != pets_catalog.ABILITY_NONE:
+        out.append(second)
+    return tuple(a for a in out if a and a != pets_catalog.ABILITY_NONE)
 
 
 def _effective_ability(row: dict, spec) -> str:
@@ -16364,16 +16710,26 @@ def _pet_now(row: dict, mood_slowdown: int = 0) -> tuple[int, int]:
     """
     hours = _pet_hours(row)
     mood_hours = hours * (100 - max(0, min(mood_slowdown, 90))) / 100
-    return (pets_catalog.hunger_now(int(row.get("hunger") or 0), hours),
-            pets_catalog.mood_now(int(row.get("mood") or 0), mood_hours))
+    stored_hunger = int(row.get("hunger") or 0)
+    hunger = (pets_catalog.hunger_now_evolved(stored_hunger, hours)
+              if row.get("evolved")
+              else pets_catalog.hunger_now(stored_hunger, hours))
+    return hunger, pets_catalog.mood_now(int(row.get("mood") or 0), mood_hours)
 
 
 def _pet_display(row: dict, spec=None) -> str:
     """Как питомец называется в тексте. spec можно передать снаружи, чтобы
     не ходить в каталог второй раз; без него берётся встроенный, а для
-    заведённого админом — просто ключ."""
+    заведённого админом — просто ключ.
+
+    Эволюционировавший показывается НОВЫМ обликом: ради него эволюцию и
+    делают, и видеть в списке прежнего хомяка было бы обидно."""
     spec = spec or pets_catalog.BY_KEY.get(row["pet_key"])
-    base = spec.title if spec else row["pet_key"]
+    grown = pets_catalog.evolution_of(row["pet_key"]) if row.get("evolved") else None
+    if grown is not None:
+        base = f"{grown.emoji} {grown.name}"
+    else:
+        base = spec.title if spec else row["pet_key"]
     given = row.get("pet_name")
     return f"{base} «{html.escape(given)}»" if given else base
 
@@ -16386,7 +16742,8 @@ async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
                 "<code>пет купить {ключ}</code>." if own
                 else "🐾 У этого человека пока нет питомцев.")
     specs = await _pet_specs(chat_id)
-    slowdown = await _pet_bonus(chat_id, user_id, "pet_mood")
+    pinned_key = await _pinned_pet_key(chat_id, user_id)
+    slowdown = _pet_mood_slowdown(rows, specs, pinned_key)
     lines = [f"🐾 <b>Питомцы</b> — {len(rows)}", DIVIDER]
     for row in rows:
         spec = specs.get(row["pet_key"])
@@ -16402,20 +16759,38 @@ async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
         if level < pets_catalog.MAX_PET_LEVEL:
             progress = round(100 * gained / needed) if needed else 100
             line += f"\n   📈 {pets_catalog.bar(progress)} {gained}/{needed} опыта"
-        # Способность и то, работает ли она сейчас: иначе непонятно, зачем
-        # вообще кормить. Процент — уже с прибавкой за уровень.
-        ability_key = _effective_ability(row, spec) if spec else ""
-        text = pets_catalog.ability_text_at_level(ability_key, level) if ability_key else ""
-        if text:
-            works = "✅" if pets_catalog.is_active(hunger, mood) else "💤 спит"
-            line += f"\n   ✨ {text} — {works}"
+        # Способности и то, работают ли они сейчас: иначе непонятно, зачем
+        # вообще кормить. Процент — уже с прибавкой за уровень, а у
+        # эволюционировавшего ещё и с удвоенной базой. Способностей может быть
+        # две — вторая появляется как раз с эволюцией.
+        evolved = bool(row.get("evolved"))
+        works = "✅" if _pet_is_active(row, hunger, mood, pinned_key) else "💤 спит"
+        for ability_key in (_effective_abilities(row, spec) if spec else ()):
+            found = pets_catalog.ABILITY_BY_KEY.get(ability_key)
+            if found is None:
+                continue
+            percent = pets_catalog.ability_percent(ability_key, level, evolved)
+            line += f"\n   ✨ {found.description.format(p=percent)} — {works}"
+        if evolved:
+            line += "\n   🌟 Эволюционировал(а)"
         lines.append(line)
     if own:
-        lines += ["", "<code>пет кормить {ключ}</code> · "
-                      "<code>пет гладить {ключ}</code> · "
-                      "<code>пет поцеловать {ключ}</code>",
+        food = await db.get_inventory_quantity(chat_id, user_id,
+                                               pets_catalog.FOOD_ITEM_KEY)
+        lines += ["", f"{pets_catalog.FOOD_ITEM_EMOJI} Корма у вас: {food} "
+                      f"(одно кормление — один корм, "
+                      f"<code>пет корм 10</code>)",
+                  "<code>пет кормить {ключ}</code> · "
+                  "<code>пет гладить {ключ}</code> · "
+                  "<code>пет обнять {ключ}</code> · "
+                  "<code>пет поцеловать {ключ}</code>",
+                  "<code>пет гулять {ключ}</code> — питомец принесёт находку "
+                  f"(раз в {pets_catalog.WALK_COOLDOWN_HOURS} ч)",
+                  "<code>пет кормить все</code> · <code>пет обнять все</code> · "
+                  "<code>пет гулять все</code> — сразу всем",
                   "<code>пет назвать {ключ} {имя}</code> · "
                   "<code>пет закрепить {ключ}</code>",
+                  "<code>пет продать {ключ}</code> — вернуть половину цены",
                   "<code>пет способность {ключ} {номер}</code> — сменить "
                   "способность за i¢, список номеров: <code>пет способности</code>",
                   "⭐ Уровень растёт сам по себе со временем, кормёжка и "
@@ -16425,7 +16800,7 @@ async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in PET_LIST_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in PET_LIST_TRIGGERS),
 )
 async def cmd_pets_mine(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_list"):
@@ -16455,7 +16830,11 @@ async def cmd_pets_catalog(message: Message):
         "",
         f"Сытость падает на {pets_catalog.HUNGER_PER_HOUR} в час, "
         f"настроение — на {pets_catalog.MOOD_PER_HOUR}. Кормите и гладьте.",
-        "Купить: <code>пет купить {ключ}</code>",
+        f"{pets_catalog.FOOD_ITEM_EMOJI} Кормление тратит корм — "
+        f"{pets_catalog.FOOD_ITEM_PRICE} i¢ за штуку "
+        f"(<code>пет корм 10</code>). Ласка бесплатна.",
+        "Купить: <code>пет купить {ключ}</code>, "
+        "продать обратно за половину: <code>пет продать {ключ}</code>",
     ]
     await message.reply("\n".join(lines))
 
@@ -16468,7 +16847,16 @@ async def cmd_pet_buy(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_buy"):
         return
     chat_id, user_id = message.chat.id, message.from_user.id
-    spec = await _pet_spec(chat_id, PET_BUY_RE.match(message.text.strip()).group(1))
+    raw_key = PET_BUY_RE.match(message.text.strip()).group(1)
+    # Корм — товар, а не вид питомца, но наши же подсказки зовут его «корм»,
+    # и «пет купить корм» напрашивается само. Отвечать «такого питомца нет»
+    # на осмысленную просьбу — худшее, что тут можно сделать.
+    if raw_key.casefold() in (pets_catalog.FOOD_ITEM_KEY, "корм", "корма", "еда", "еду"):
+        await message.reply(f"{pets_catalog.FOOD_ITEM_EMOJI} Корм покупается так: "
+                            f"<code>пет корм 10</code> "
+                            f"({pets_catalog.FOOD_ITEM_PRICE} i¢ за штуку).")
+        return
+    spec = await _pet_spec(chat_id, raw_key)
     if spec is None:
         await message.reply("Такого питомца нет — посмотрите <code>пет каталог</code>.")
         return
@@ -16499,7 +16887,11 @@ async def cmd_pet_buy(message: Message):
             f"а у вас {wallet.get('coins', 0)} i¢."
         )
         return
-    if not await db.add_pet(chat_id, user_id, spec.key, datetime.utcnow()):
+    # Если этого же питомца уже продавали, счётчик платных смен способности
+    # возвращается вместе с ним — продажа не должна работать как дешёвый
+    # сброс подорожания (см. db.remember_pet_rerolls).
+    rerolls = await db.recall_pet_rerolls(chat_id, user_id, spec.key)
+    if not await db.add_pet(chat_id, user_id, spec.key, datetime.utcnow(), rerolls):
         await db.add_coins(chat_id, user_id, spec.price)   # гонка — деньги назад
         await message.reply("Не удалось завести питомца — попробуйте ещё раз.")
         return
@@ -16511,7 +16903,11 @@ async def cmd_pet_buy(message: Message):
     if ability:
         lines.append(f"✨ {ability} — пока он сыт и доволен.")
     lines += [f"Назвать: <code>пет назвать {spec.key} {{имя}}</code>",
-              f"Кормить: <code>пет кормить {spec.key}</code>"]
+              f"Кормить: <code>пет кормить {spec.key}</code> — тратит корм "
+              f"(<code>пет корм 10</code>)"]
+    if rerolls:
+        lines.append(f"✨ Смен способности за вами уже числится {rerolls} — "
+                     f"цена следующей это учитывает.")
     await message.reply("\n".join(lines))
 
 
@@ -16534,9 +16930,232 @@ async def _pick_pet(message: Message, raw: Optional[str]):
         return None, None
     if len(rows) > 1:
         await message.reply("У вас несколько питомцев — укажите, кого именно "
-                            "(<code>пет кормить кот</code>).")
+                            "(<code>пет кормить кот</code>) или сразу всех "
+                            "(<code>пет кормить все</code>).")
         return None, None
     return (await _pet_specs(chat_id)).get(rows[0]["pet_key"]), rows[0]
+
+
+def _pet_cooldown_left(row: dict, field: str, minutes: int) -> Optional[timedelta]:
+    """Сколько ещё ждать до повтора действия. None — можно прямо сейчас.
+
+    Отдельная функция, потому что откат теперь проверяется в четырёх местах:
+    поштучно и массово, для кормёжки и для ласки. В массовой команде он не
+    ошибка, а строка в сводке, — и разъехавшиеся копии проверки означали бы
+    «поштучно рано, а пачкой уже можно».
+    """
+    last = row.get(field)
+    if not last:
+        return None
+    left = timedelta(minutes=minutes) - (datetime.utcnow() - last)
+    return left if left > timedelta(0) else None
+
+
+def _pet_feed_left(row: dict) -> Optional[timedelta]:
+    return _pet_cooldown_left(row, "last_fed_at", pets_catalog.FEED_COOLDOWN_MINUTES)
+
+
+def _pet_care_left(row: dict) -> Optional[timedelta]:
+    return _pet_cooldown_left(row, "last_care_at", pets_catalog.CARE_COOLDOWN_MINUTES)
+
+
+def _pet_no_food_text() -> str:
+    return (f"{pets_catalog.FOOD_ITEM_EMOJI} Корма нет — кормить нечем.\n"
+            f"Купить: <code>пет корм 10</code> "
+            f"(1 шт. — {pets_catalog.FOOD_ITEM_PRICE} i¢).")
+
+
+async def _feed_pet(chat_id: int, user_id: int, spec, row: dict,
+                    now: datetime, slowdown: int = 0) -> Optional[tuple[int, int, int]]:
+    """Одно кормление: тратит корм и банкует статы.
+
+    Возвращает (сытость, уровень до, уровень после) или None — корма не
+    хватило. Списание И ЕСТЬ проверка запаса: между «посмотрели, сколько
+    корма» и «покормили» его могли потратить соседним сообщением, а два
+    отдельных шага «проверить и списать» разошлись бы именно на этом.
+
+    Корм уходит ДО записи статов и возвращается, если запись не удалась, —
+    тем же порядком, каким при покупке питомца сначала списываются деньги,
+    а потом возвращаются при неудаче.
+    """
+    if not await db.remove_inventory_item(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY):
+        return None
+    # Поблажка «Компаньона» обязана участвовать здесь: настроение отсюда
+    # БАНКУЕТСЯ, и посчитанное без неё стёрло бы её накопленный эффект.
+    hunger, mood = _pet_now(row, slowdown)
+    hunger = pets_catalog.gain(hunger, pets_catalog.FEED_GAIN)
+    level_before = _pet_level(row)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_FEED)
+    try:
+        await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
+                               now, fed_at=now)
+    except Exception:
+        await db.add_inventory_item(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY)
+        raise
+    return hunger, level_before, pets_catalog.level_for_xp(xp)
+
+
+def _care_gain(verb: str) -> int:
+    if verb.startswith(("поцел", "целов")):
+        return pets_catalog.KISS_GAIN
+    if verb.startswith("обн"):
+        return pets_catalog.HUG_GAIN
+    return pets_catalog.PET_GAIN
+
+
+def _care_past(verb: str) -> str:
+    """Как назвать сделанное в ответе."""
+    if verb.startswith(("поцел", "целов")):
+        return "поцеловали"
+    if verb.startswith("обн"):
+        return "обняли"
+    return "погладили"
+
+
+async def _care_pet(chat_id: int, user_id: int, spec, row: dict, verb: str,
+                    now: datetime, slowdown: int = 0) -> tuple[int, int, int]:
+    """Одна ласка: (настроение, уровень до, уровень после). Ласка бесплатна —
+    платить нужно за еду, а не за внимание.
+
+    slowdown — поблажка «Компаньона»: настроение отсюда банкуется, и посчитать
+    его без неё значило бы стирать её при каждой ласке."""
+    hunger, mood = _pet_now(row, slowdown)
+    mood = pets_catalog.gain(mood, _care_gain(verb))
+    level_before = _pet_level(row)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_CARE)
+    await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
+                           now, care_at=now)
+    return mood, level_before, pets_catalog.level_for_xp(xp)
+
+
+async def _pets_for_bulk(message: Message) -> list[tuple[dict, object]]:
+    """Питомцы хозяина парами (строка, вид) для массовых команд.
+
+    Пустой список — питомцев нет, и об этом уже сказано ответом.
+    """
+    chat_id, user_id = message.chat.id, message.from_user.id
+    rows = await db.list_pets(chat_id, user_id)
+    if not rows:
+        await message.reply("У вас нет питомцев — каталог: <code>пет каталог</code>.")
+        return []
+    specs = await _pet_specs(chat_id)
+    # Вид могли удалить из каталога чата: такого питомца не нарисовать и не
+    # описать, поэтому в пачку он не идёт (поштучно на него ругнётся _pick_pet).
+    pairs = [(row, specs[row["pet_key"]]) for row in rows if row["pet_key"] in specs]
+    if not pairs:
+        # Питомцы есть, но все — удалённых из каталога видов. Молчать нельзя:
+        # человек написал команду и должен понять, почему ничего не произошло.
+        await message.reply("Ваши питомцы больше не значатся в каталоге чата — "
+                            "спросите администрацию.")
+    return pairs
+
+
+def _pet_waiting_line(waiting: list[tuple[object, timedelta]]) -> str:
+    shown = ", ".join(f"{spec.name} ({format_duration_ru(left)})"
+                      for spec, left in waiting[:5])
+    tail = f" и ещё {len(waiting) - 5}" if len(waiting) > 5 else ""
+    return f"⏳ Ждут отката: {shown}{tail}"
+
+
+# ВНИМАНИЕ: массовые обработчики объявлены ВЫШЕ поштучных намеренно — aiogram
+# раздаёт сообщение по порядку регистрации, а она происходит в момент
+# декорирования. Порядок здесь подстрахован запретом слов-целей в самих
+# поштучных регулярках (см. _NOT_ALL), так что перестановка не сломает команды
+# молча, но менять его без нужды всё равно не стоит.
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_FEED_ALL_RE.match(t.strip()))),
+)
+async def cmd_pet_feed_all(message: Message):
+    """«пет покормить все» — накормить всех, на кого хватит корма."""
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    pairs = await _pets_for_bulk(message)
+    if not pairs:
+        return
+    now = datetime.utcnow()
+    slowdown = _pet_mood_slowdown(
+        [row for row, _ in pairs], {spec.key: spec for _, spec in pairs},
+        await _pinned_pet_key(chat_id, user_id))
+    waiting: list[tuple[object, timedelta]] = []
+    hungry: list[tuple[dict, object]] = []
+    for row, spec in pairs:
+        left = _pet_feed_left(row)
+        if left is not None:
+            waiting.append((spec, left))
+        else:
+            hungry.append((row, spec))
+    if not hungry:
+        await message.reply("🍽 Все ваши питомцы уже сыты.\n" + _pet_waiting_line(waiting))
+        return
+    fed: list[tuple[dict, object, tuple[int, int, int]]] = []
+    unfed = 0
+    for i, (row, spec) in enumerate(hungry):
+        result = await _feed_pet(chat_id, user_id, spec, row, now, slowdown)
+        if result is None:
+            # Корм кончился — остальных кормить нечем, дальше идти незачем.
+            unfed = len(hungry) - i
+            break
+        fed.append((row, spec, result))
+    if not fed:
+        await message.reply(_pet_no_food_text())
+        return
+    lines = [f"🍽 <b>Покормлено: {len(fed)} из {len(hungry)}</b>", DIVIDER]
+    for row, spec, (hunger, before, after) in fed:
+        line = f"{_pet_display(row, spec)} — {pets_catalog.bar(hunger)} {hunger}"
+        if after > before:
+            line += f"\n   ⭐ Новый уровень: {after}!"
+        lines.append(line)
+    if unfed:
+        lines.append(f"{pets_catalog.FOOD_ITEM_EMOJI} Корма не хватило ещё на "
+                     f"{unfed} — купить: <code>пет корм 10</code>")
+    if waiting:
+        lines.append(_pet_waiting_line(waiting))
+    left_food = await db.get_inventory_quantity(chat_id, user_id,
+                                                pets_catalog.FOOD_ITEM_KEY)
+    lines.append(f"{pets_catalog.FOOD_ITEM_EMOJI} Корма осталось: {left_food}")
+    await message.reply("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_CARE_ALL_RE.match(t.strip()))),
+)
+async def cmd_pet_care_all(message: Message):
+    """«пет обнять все» — приласкать всех разом."""
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    verb = PET_CARE_ALL_RE.match(message.text.strip()).group(1).casefold()
+    pairs = await _pets_for_bulk(message)
+    if not pairs:
+        return
+    now = datetime.utcnow()
+    slowdown = _pet_mood_slowdown(
+        [row for row, _ in pairs], {spec.key: spec for _, spec in pairs},
+        await _pinned_pet_key(chat_id, user_id))
+    waiting: list[tuple[object, timedelta]] = []
+    done: list[tuple[dict, object, tuple[int, int, int]]] = []
+    for row, spec in pairs:
+        left = _pet_care_left(row)
+        if left is not None:
+            waiting.append((spec, left))
+            continue
+        done.append((row, spec,
+                     await _care_pet(chat_id, user_id, spec, row, verb, now, slowdown)))
+    if not done:
+        await message.reply("😊 Все ваши питомцы уже довольны.\n" + _pet_waiting_line(waiting))
+        return
+    lines = [f"💞 Вы {_care_past(verb)} всех — {len(done)} из {len(pairs)}", DIVIDER]
+    for row, spec, (mood, before, after) in done:
+        line = f"{_pet_display(row, spec)} — {pets_catalog.bar(mood)} {mood} ({spec.sound})"
+        if after > before:
+            line += f"\n   ⭐ Новый уровень: {after}!"
+        lines.append(line)
+    if waiting:
+        lines.append(_pet_waiting_line(waiting))
+    await message.reply("\n".join(lines))
 
 
 @router.message(
@@ -16549,24 +17168,25 @@ async def cmd_pet_feed(message: Message):
     spec, row = await _pick_pet(message, PET_FEED_RE.match(message.text.strip()).group(1))
     if spec is None:
         return
-    now = datetime.utcnow()
-    last = row.get("last_fed_at")
-    if last and (now - last) < timedelta(minutes=pets_catalog.FEED_COOLDOWN_MINUTES):
-        left = timedelta(minutes=pets_catalog.FEED_COOLDOWN_MINUTES) - (now - last)
+    left = _pet_feed_left(row)
+    if left is not None:
         await message.reply(f"🍽 {spec.name} пока сыт — покормить снова через "
                             f"{format_duration_ru(left)}.")
         return
-    hunger, mood = _pet_now(row)
-    hunger = pets_catalog.gain(hunger, pets_catalog.FEED_GAIN)
-    level_before = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_FEED)
-    await db.set_pet_stats(message.chat.id, message.from_user.id, spec.key,
-                           hunger, mood, xp, now, fed_at=now)
-    text = (f"🍽 {_pet_display(row)} накормлен(а). Сытость: "
-           f"{pets_catalog.bar(hunger)} {hunger}")
-    level_after = pets_catalog.level_for_xp(xp)
+    slowdown = await _pet_slowdown_for(message.chat.id, message.from_user.id)
+    result = await _feed_pet(message.chat.id, message.from_user.id, spec, row,
+                            datetime.utcnow(), slowdown)
+    if result is None:
+        await message.reply(_pet_no_food_text())
+        return
+    hunger, level_before, level_after = result
+    text = (f"🍽 {_pet_display(row, spec)} накормлен(а). Сытость: "
+            f"{pets_catalog.bar(hunger)} {hunger}")
     if level_after > level_before:
         text += f"\n⭐ Новый уровень: {level_after}!"
+    left_food = await db.get_inventory_quantity(message.chat.id, message.from_user.id,
+                                                pets_catalog.FOOD_ITEM_KEY)
+    text += f"\n{pets_catalog.FOOD_ITEM_EMOJI} Корма осталось: {left_food}"
     await message.reply(text)
 
 
@@ -16575,8 +17195,8 @@ async def cmd_pet_feed(message: Message):
     F.text.func(lambda t: bool(t) and bool(PET_CARE_RE.match(t.strip()))),
 )
 async def cmd_pet_care(message: Message):
-    """Гладить и целовать — одно действие с общим откатом: разные слова для
-    настроения, а не две отдельные механики."""
+    """Гладить, обнимать и целовать — одно действие с общим откатом: разные
+    слова для настроения, а не три отдельные механики."""
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
     match = PET_CARE_RE.match(message.text.strip())
@@ -16584,27 +17204,402 @@ async def cmd_pet_care(message: Message):
     spec, row = await _pick_pet(message, match.group(2))
     if spec is None:
         return
-    now = datetime.utcnow()
-    last = row.get("last_care_at")
-    if last and (now - last) < timedelta(minutes=pets_catalog.CARE_COOLDOWN_MINUTES):
-        left = timedelta(minutes=pets_catalog.CARE_COOLDOWN_MINUTES) - (now - last)
+    left = _pet_care_left(row)
+    if left is not None:
         await message.reply(f"😊 {spec.name} уже доволен(а) — ещё раз через "
                             f"{format_duration_ru(left)}.")
         return
-    hunger, mood = _pet_now(row)
-    kiss = verb.startswith(("поцел", "целов"))
-    mood = pets_catalog.gain(mood, pets_catalog.KISS_GAIN if kiss else pets_catalog.PET_GAIN)
-    level_before = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_CARE)
-    await db.set_pet_stats(message.chat.id, message.from_user.id, spec.key,
-                           hunger, mood, xp, now, care_at=now)
-    action = "поцеловали" if kiss else "погладили"
-    text = (f"💞 Вы {action} {_pet_display(row)} — {spec.sound}. "
-           f"Настроение: {pets_catalog.bar(mood)} {mood}")
-    level_after = pets_catalog.level_for_xp(xp)
+    slowdown = await _pet_slowdown_for(message.chat.id, message.from_user.id)
+    mood, level_before, level_after = await _care_pet(
+        message.chat.id, message.from_user.id, spec, row, verb,
+        datetime.utcnow(), slowdown)
+    text = (f"💞 Вы {_care_past(verb)} {_pet_display(row, spec)} — {spec.sound}. "
+            f"Настроение: {pets_catalog.bar(mood)} {mood}")
     if level_after > level_before:
         text += f"\n⭐ Новый уровень: {level_after}!"
     await message.reply(text)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_FOOD_BUY_RE.match(t.strip()))),
+)
+async def cmd_pet_food_buy(message: Message):
+    """«пет корм 10» — тот же магазин, только не выходя из «пет».
+
+    Покупка идёт через общий _shop_buy: распродажа, скидка «Торгаша», остаток
+    на полке и отчисления в казну должны работать так же, как при «купить korm».
+    """
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    # Корм мог ещё не доехать в магазин этого чата: витрину с момента
+    # обновления бота могли ни разу не открыть, а покупать корм уже нужно.
+    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
+    raw_qty = PET_FOOD_BUY_RE.match(message.text.strip()).group(1)
+    if raw_qty is None:
+        have = await db.get_inventory_quantity(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY)
+        await message.reply(
+            f"{pets_catalog.FOOD_ITEM_EMOJI} <b>Корм</b> — "
+            f"{pets_catalog.FOOD_ITEM_PRICE} i¢ за штуку.\n"
+            f"У вас: {have} шт. Одно кормление — один корм.\n"
+            f"Купить: <code>пет корм 10</code>"
+        )
+        return
+    await _shop_buy(message, pets_catalog.FOOD_ITEM_KEY, int(raw_qty))
+
+
+def _pet_walk_left(row: dict) -> Optional[timedelta]:
+    return _pet_cooldown_left(row, "last_walk_at",
+                              int(pets_catalog.WALK_COOLDOWN_HOURS * 60))
+
+
+async def _walk_pet(chat_id: int, user_id: int, spec, row: dict, now: datetime,
+                    slowdown: int) -> tuple[str, int]:
+    """Одна прогулка: (что рассказать, сколько монет). Монеты 0 — принесён предмет.
+
+    Питомец тратит немного сытости и получает настроение: гулять ему нравится,
+    но нагуливается и аппетит — иначе прогулка была бы бесплатным источником
+    монет, не связанным с кормом.
+    """
+    hunger, mood = _pet_now(row, slowdown)
+    hunger = max(0, hunger - pets_catalog.WALK_HUNGER_COST)
+    mood = pets_catalog.gain(mood, pets_catalog.WALK_MOOD_GAIN)
+    level = _pet_level(row)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.WALK_XP_BONUS)
+    await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp, now,
+                           walk_at=now)
+    finds = pets_catalog.walk_finds(spec.key)
+    if finds and random.randint(1, 100) <= pets_catalog.WALK_ITEM_CHANCE:
+        find = random.choice(finds)
+        # Товар мог быть не засеян в этом чате — тогда в инвентаре он выглядел
+        # бы голым ключом, поэтому засеваем каталог перед выдачей.
+        await db.seed_default_shop_items(chat_id)
+        await db.add_inventory_item(chat_id, user_id, find.item_key)
+        item = await db.get_shop_item(chat_id, find.item_key)
+        name = f"{item['emoji']} {html.escape(item['name'])}" if item else find.item_key
+        return f"{find.text} — {name}", 0
+    coins = pets_catalog.walk_coins(
+        level, random.randint(pets_catalog.WALK_COINS_MIN, pets_catalog.WALK_COINS_MAX))
+    await db.add_coins(chat_id, user_id, coins)
+    return f"нагулял(а) <b>{coins}</b> i¢", coins
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_WALK_ALL_RE.match(t.strip()))),
+)
+async def cmd_pet_walk_all(message: Message):
+    """«пет гулять все» — выгулять всех, кто может идти."""
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    pairs = await _pets_for_bulk(message)
+    if not pairs:
+        return
+    now = datetime.utcnow()
+    pinned_key = await _pinned_pet_key(chat_id, user_id)
+    slowdown = _pet_mood_slowdown([row for row, _ in pairs],
+                                  {spec.key: spec for _, spec in pairs}, pinned_key)
+    waiting: list[tuple[object, timedelta]] = []
+    lines: list[str] = []
+    tired: list[str] = []
+    for row, spec in pairs:
+        left = _pet_walk_left(row)
+        if left is not None:
+            waiting.append((spec, left))
+            continue
+        hunger, mood = _pet_now(row, slowdown)
+        if not _pet_is_active(row, hunger, mood, pinned_key):
+            tired.append(spec.name)
+            continue
+        told, _coins = await _walk_pet(chat_id, user_id, spec, row, now, slowdown)
+        lines.append(f"{_pet_display(row, spec)} {told}")
+    if not lines:
+        parts = ["🚶 Гулять сейчас некому."]
+        if tired:
+            parts.append(f"😔 Не в настроении: {', '.join(tired)} — покормите и приласкайте.")
+        if waiting:
+            parts.append(_pet_waiting_line(waiting))
+        await message.reply("\n".join(parts))
+        return
+    out = [f"🚶 <b>Прогулка</b> — {len(lines)} из {len(pairs)}", DIVIDER] + lines
+    if tired:
+        out.append(f"😔 Не в настроении: {', '.join(tired)}")
+    if waiting:
+        out.append(_pet_waiting_line(waiting))
+    await message.reply("\n".join(out))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_WALK_RE.match(t.strip()))),
+)
+async def cmd_pet_walk(message: Message):
+    """«пет гулять {ключ}» — питомец уходит и приносит находку."""
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    spec, row = await _pick_pet(message, PET_WALK_RE.match(message.text.strip()).group(1))
+    if spec is None:
+        return
+    left = _pet_walk_left(row)
+    if left is not None:
+        await message.reply(f"🚶 {spec.name} уже нагулялся(-ась) — снова через "
+                            f"{format_duration_ru(left)}.")
+        return
+    slowdown = await _pet_slowdown_for(chat_id, user_id)
+    hunger, mood = _pet_now(row, slowdown)
+    if not _pet_is_active(row, hunger, mood, await _pinned_pet_key(chat_id, user_id)):
+        await message.reply(f"😔 {spec.name} никуда не пойдёт — сначала покормите "
+                            f"и приласкайте.")
+        return
+    told, _coins = await _walk_pet(chat_id, user_id, spec, row, now := datetime.utcnow(),
+                                  slowdown)
+    await message.reply(
+        f"🚶 {_pet_display(row, spec)} сходил(а) погулять и {told}.\n"
+        f"Следующая прогулка — через {pets_catalog.WALK_COOLDOWN_HOURS} ч."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_FOOD_GRANT_RE.match(t.strip()))),
+)
+async def cmd_pet_food_grant(message: Message):
+    """«пет раздать» — админская раздача корма всем владельцам питомцев.
+
+    Раз в неделю на чат: корм — расходник, и раздача без ограничения превратила
+    бы его в бесплатный, то есть отменила бы сама себя.
+    """
+    if not _check_misc_access(message.from_user.id, "pet_food_grant"):
+        # Постороннему команда просто не отвечает (её и в справке у него нет),
+        # а тому, у кого уровень есть, объясняем — иначе выглядит как поломка.
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Команда доступна только с уровнем "
+                f"«{level_name(required_level('pet_food_grant'))}» и выше."
+            )
+        return
+    chat_id = message.chat.id
+    now = datetime.utcnow()
+    cooldown = timedelta(days=pets_catalog.FOOD_GRANT_COOLDOWN_DAYS)
+    key = f"{PET_FOOD_GRANT_KEY}:{chat_id}"
+    last_row = await db.get_data(key)
+    if last_row and last_row.get("data_value"):
+        try:
+            last = datetime.fromisoformat(last_row["data_value"])
+        except ValueError:
+            last = None      # метку испортили руками — считаем, что раздачи не было
+        if last and now - last < cooldown:
+            await message.reply(
+                f"{pets_catalog.FOOD_ITEM_EMOJI} Корм в этом чате уже раздавали. "
+                f"Следующая раздача — через "
+                f"{format_duration_ru(cooldown - (now - last))}."
+            )
+            return
+    owners = await db.list_pet_owners(chat_id)
+    if not owners:
+        # Недельный лимит на это не тратим: раздавать было некому, а не «уже роздано».
+        await message.reply("🐾 В этом чате пока не у кого раздавать корм — "
+                            "питомцев ни у кого нет.")
+        return
+    # Метку ставим ДО раздачи, а не после. Если выдача упадёт на середине,
+    # часть людей корм уже получит, и повтор выдал бы им вторую порцию.
+    # Тот же выбор и по той же причине, что в цикле ежедневной награды за топ:
+    # потерять раздачу менее вредно, чем задвоить.
+    await db.set_data(key, now.isoformat(), updated_by=message.from_user.id)
+    # Без записи в магазине корм показался бы в инвентаре голым ключом:
+    # витрину чата с момента обновления могли ни разу не открыть.
+    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
+    given = await db.add_inventory_item_bulk(
+        chat_id, owners, pets_catalog.FOOD_ITEM_KEY, pets_catalog.FOOD_GRANT_AMOUNT)
+    await db.add_log("pet_food_grant", chat_id=chat_id, actor_id=message.from_user.id,
+                     details=f"{given}x{pets_catalog.FOOD_GRANT_AMOUNT}")
+    await message.answer(
+        f"{pets_catalog.FOOD_ITEM_EMOJI} <b>Раздача корма!</b>\n"
+        f"По {pets_catalog.FOOD_GRANT_AMOUNT} корма получили {given} "
+        f"владельцев питомцев.\n"
+        f"Проверить запас — <code>пет корм</code>, покормить всех — "
+        f"<code>пет кормить все</code>.\n"
+        f"Следующая раздача возможна через "
+        f"{pets_catalog.FOOD_GRANT_COOLDOWN_DAYS} дней."
+    )
+
+
+def _pet_second_ability(row: dict, spec, others: list[dict], specs: dict) -> str:
+    """Вторая способность для эволюции: случайная, но не совпадающая с первой
+    и не дублирующая способности других питомцев хозяина.
+
+    Правило то же, что уже действует у платной смены способности: одинаковые
+    способности не складываются, и выдавать дубль значило бы подарить пустое
+    место. Если свободных не осталось — пустая строка, эволюция всё равно
+    состоится ради остальных трёх выгод.
+    """
+    taken = set(_effective_abilities(row, spec))
+    for other in others:
+        if other["pet_key"] == row["pet_key"]:
+            continue
+        taken.update(_effective_abilities(other, specs.get(other["pet_key"])))
+    free = [a.key for a in pets_catalog.ABILITIES if a.key not in taken]
+    return random.choice(free) if free else ""
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_EVOLVE_RE.match(t.strip()))),
+)
+async def cmd_pet_evolve(message: Message):
+    """«пет эволюция {ключ}» показывает требования, «... да» эволюционирует.
+
+    Десятый уровень был тупиком: опыт упирается в потолок и дальше не
+    происходит ничего. Эволюция — то, ради чего туда доходят.
+    """
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    match = PET_EVOLVE_RE.match(message.text.strip())
+    chat_id, user_id = message.chat.id, message.from_user.id
+    spec, row = await _pick_pet(message, match.group(1))
+    if spec is None:
+        return
+    grown = pets_catalog.evolution_of(spec.key)
+    if grown is None:
+        await message.reply(
+            f"{spec.title} эволюционировать не умеет — это вид, заведённый "
+            f"администрацией, и кем он вырастет, придумать за неё мы не можем."
+        )
+        return
+    if row.get("evolved"):
+        await message.reply(f"{_pet_display(row, spec)} уже эволюционировал(а) — "
+                            f"второй раз тот же питомец не растёт.")
+        return
+    level = _pet_level(row)
+    price = pets_catalog.evolve_price(spec.price)
+    elixir = shop_effects.CRAFT_BY_KEY["elixir"]
+    have_elixir = await db.get_inventory_quantity(chat_id, user_id, "elixir")
+    wallet = await db.get_wallet(chat_id, user_id)
+    ok_level = level >= pets_catalog.EVOLVE_LEVEL
+    ok_elixir = have_elixir >= 1
+    ok_coins = int(wallet.get("coins") or 0) >= price
+    if match.group(2) is None or not (ok_level and ok_elixir and ok_coins):
+        await message.reply(
+            f"🌟 <b>Эволюция</b>: {spec.title} → {grown.emoji} {grown.name}\n"
+            f"{DIVIDER}\n"
+            f"Нужно:\n"
+            f"   {'✅' if ok_level else '❌'} уровень "
+            f"{pets_catalog.EVOLVE_LEVEL} (сейчас {level})\n"
+            f"   {'✅' if ok_elixir else '❌'} {elixir.emoji} {elixir.name} "
+            f"(<code>крафт elixir</code>)\n"
+            f"   {'✅' if ok_coins else '❌'} {price} i¢\n\n"
+            f"Что даёт:\n"
+            f"   🌟 новый облик — {grown.emoji} {grown.name}\n"
+            f"   ✨ базовый процент способности ×{pets_catalog.EVOLVE_ABILITY_MULTIPLIER}\n"
+            f"   ✨ ВТОРАЯ способность — считаются обе\n"
+            f"   🍽 сытость падает на {pets_catalog.EVOLVE_HUNGER_SLOWDOWN}% медленнее\n"
+            f"   ⭐ уровень обнуляется и растёт заново\n\n"
+            + (f"Подтвердить: <code>пет эволюция {spec.key} да</code>"
+               if (ok_level and ok_elixir and ok_coins)
+               else "Чего-то не хватает — отмечено ❌.")
+        )
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    specs = await _pet_specs(chat_id)
+    others = await db.list_pets(chat_id, user_id)
+    second = _pet_second_ability(row, spec, others, specs)
+    # Эликсир списываем первым: он и есть главная плата, а вернуть его при
+    # неудаче проще, чем объяснять, куда делись деньги.
+    if not await db.remove_inventory_item(chat_id, user_id, "elixir"):
+        await message.reply("Эликсир куда-то делся — проверьте «инвентарь».")
+        return
+    if price and not await spend_coins(chat_id, user_id, price):
+        await db.add_inventory_item(chat_id, user_id, "elixir")
+        await message.reply(f"Недостаточно монет: нужно {price} i¢. "
+                            f"Эликсир остался у вас.")
+        return
+    if not await db.evolve_pet(chat_id, user_id, spec.key, second, datetime.utcnow()):
+        # Гонка: два «пет эволюция ... да» подряд. Возвращаем всё.
+        await db.add_inventory_item(chat_id, user_id, "elixir")
+        if price:
+            await db.add_coins(chat_id, user_id, price)
+        await message.reply("Не удалось эволюционировать — попробуйте ещё раз.")
+        return
+    await db.add_log("pet_evolve", chat_id=chat_id, actor_id=user_id,
+                     details=f"{spec.key}:{second}")
+    first = _effective_ability(row, spec)
+    lines = [f"🌟 <b>{_pet_display(row, spec)} эволюционировал(а)!</b>",
+             f"Теперь это {grown.emoji} <b>{grown.name}</b>."]
+    if first:
+        lines.append(f"✨ {pets_catalog.ability_text_evolved(first, 1)}")
+    if second:
+        lines.append(f"✨ Новая способность: "
+                     f"{pets_catalog.ability_text_evolved(second, 1)}")
+    else:
+        lines.append("✨ Свободных способностей не осталось — вторую выдать "
+                     "было неоткуда, зато остальное при нём.")
+    lines += [f"🍽 Сытость теперь падает на {pets_catalog.EVOLVE_HUNGER_SLOWDOWN}% медленнее.",
+              "⭐ Уровень обнулился и растёт заново."]
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_SELL_RE.match(t.strip()))),
+)
+async def cmd_pet_sell(message: Message):
+    """«пет продать кот» показывает цену, «пет продать кот да» — продаёт.
+
+    Два шага, как у платной смены способности: цену нужно узнать ДО того, как
+    питомца не станет, а не после. Уровень и опыт при продаже сгорают —
+    их нажили временем, и выкупить обратно нельзя.
+    """
+    if not _check_misc_access(message.from_user.id, "pet_buy"):
+        return
+    match = PET_SELL_RE.match(message.text.strip())
+    chat_id, user_id = message.chat.id, message.from_user.id
+    spec, row = await _pick_pet(message, match.group(1))
+    if spec is None:
+        return
+    price = pets_catalog.sell_price(spec.price)
+    level = _pet_level(row)
+    rerolls = int(row.get("ability_rerolls") or 0)
+    if match.group(2) is None:
+        lines = [f"🐾 {_pet_display(row, spec)} — продажа за <b>{price}</b> i¢ "
+                 f"(половина цены каталога, {spec.price} i¢).",
+                 f"Сгорят уровень ⭐{level} и весь опыт — обратно их не выкупить."]
+        # Купленная способность — обычно самое дорогое, что теряется, а из
+        # слов «уровень и опыт» этого не видно. Счётчик смен при этом
+        # останется, то есть вернуть её будет стоить как следующую смену.
+        if row.get("ability"):
+            bought = pets_catalog.ability_text_at_level(row["ability"], level)
+            lines.append(f"✨ Купленная способность ({bought}) тоже сгорит, "
+                         f"а счётчик смен ({rerolls}) останется — вернуть её "
+                         f"будет стоить "
+                         f"{pets_catalog.ability_reroll_price(spec.price, rerolls)} i¢.")
+        lines.append(f"Подтвердить: <code>пет продать {spec.key} да</code>")
+        await message.reply("\n".join(lines))
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    # Счётчик платных смен способности переживает продажу: иначе продать и
+    # купить заново было бы дешёвым способом сбросить подорожавшие смены
+    # (см. pets.ability_reroll_price).
+    if rerolls:
+        await db.remember_pet_rerolls(chat_id, user_id, spec.key, rerolls)
+    if not await db.delete_pet(chat_id, user_id, spec.key):
+        # Гонка: два «пет продать ... да» подряд. Деньги начислять нельзя.
+        await message.reply(f"{spec.title} у вас уже нет.")
+        return
+    await db.add_coins(chat_id, user_id, price)
+    card = await db.get_profile_card(chat_id, user_id)
+    if card and card.get("pinned_pet") == spec.key:
+        await db.set_pinned_pet(chat_id, user_id, None)
+    await db.add_log("pet_sell", chat_id=chat_id, actor_id=user_id,
+                     details=f"{spec.key}:{price}")
+    await message.reply(f"🐾 {_pet_display(row, spec)} продан(а) за <b>{price}</b> i¢.\n"
+                        f"Завести снова: <code>пет купить {spec.key}</code>")
 
 
 @router.message(
@@ -16647,7 +17642,7 @@ async def cmd_pet_pin(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in PET_UNPIN_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in PET_UNPIN_TRIGGERS),
 )
 async def cmd_pet_unpin(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_care"):
@@ -16658,7 +17653,7 @@ async def cmd_pet_unpin(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in PET_ABILITY_LIST_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in PET_ABILITY_LIST_TRIGGERS),
 )
 async def cmd_pet_abilities_list(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_care"):
@@ -16701,8 +17696,14 @@ async def cmd_pet_ability_reroll(message: Message):
     rerolls = int(row.get("ability_rerolls") or 0)
     price = pets_catalog.ability_reroll_price(spec.price, rerolls)
     level = _pet_level(row)
-    current_text = (pets_catalog.ability_text_at_level(_effective_ability(row, spec), level)
+    evolved = bool(row.get("evolved"))
+    current = _effective_ability(row, spec)
+    current_text = ((pets_catalog.ability_text_evolved(current, level) if evolved
+                     else pets_catalog.ability_text_at_level(current, level))
                     or "без способности")
+    if evolved and row.get("ability2"):
+        current_text += (" + " + pets_catalog.ability_text_evolved(
+            row["ability2"], level))
     # Без номера — только показать цену и текущую способность, деньги не
     # трогаем: цену нужно узнать ДО того, как она спишется, а не после.
     if match.group(2) is None:
@@ -16728,11 +17729,21 @@ async def cmd_pet_ability_reroll(message: Message):
     # иначе выгоднее было бы не разнообразить питомцев, а перевести всех на
     # одну способность.
     if new_ability != pets_catalog.ABILITY_NONE:
+        # Своя же вторая способность (появляется с эволюцией) считается
+        # дублем: _pet_bonus проверяет вхождение, а не считает штуки, так что
+        # платить за одинаковую пару значило бы платить ни за что.
+        if new_ability == (row.get("ability2") or ""):
+            ability_name = pets_catalog.ABILITY_BY_KEY[new_ability].name
+            await message.reply(
+                f"Способность «{ability_name}» у {_pet_display(row, spec)} уже "
+                f"есть второй — одинаковые способности не складываются."
+            )
+            return
         specs = await _pet_specs(chat_id)
         for other in await db.list_pets(chat_id, user_id):
             if other["pet_key"] == spec.key:
                 continue
-            if _effective_ability(other, specs.get(other["pet_key"])) == new_ability:
+            if new_ability in _effective_abilities(other, specs.get(other["pet_key"])):
                 ability_name = pets_catalog.ABILITY_BY_KEY[new_ability].name
                 await message.reply(
                     f"Способность «{ability_name}» уже есть у другого вашего "
@@ -17101,7 +18112,7 @@ async def pet_add_ability(message: Message, state: FSMContext):
     await _show_pets_menu(message, state)
 
 
-PET_DELETE_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+удалить\s+(\S+)$")
+PET_DELETE_RE = ru_text.rx(rf"(?i)^!?{PET_WORD}\s+удалить\s+(\S+)$")
 
 
 @router.message(
@@ -17309,7 +18320,7 @@ COLLECTION_TRIGGERS = {"коллекции", "коллекция", "!колле�
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in COLLECTION_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in COLLECTION_TRIGGERS),
 )
 async def cmd_collections(message: Message):
     if not _check_misc_access(message.from_user.id, "collections"):
@@ -17334,12 +18345,12 @@ async def cmd_collections(message: Message):
 
 
 SEASON_TRIGGERS = {"сезон", "сезоны", "!сезон", "!сезоны"}
-SEASON_PAST_RE = re.compile(r"(?i)^!?сезон\s+(\d{4}-\d{2})$")
+SEASON_PAST_RE = ru_text.rx(r"(?i)^!?сезон\s+(\d{4}-\d{2})$")
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in SEASON_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in SEASON_TRIGGERS),
 )
 async def cmd_season(message: Message):
     if not _check_misc_access(message.from_user.id, "season_status"):
@@ -17359,7 +18370,7 @@ async def cmd_season_past(message: Message):
     await message.answer(await _season_standings_text(message.chat.id, season))
 
 
-BCOIN_RE = re.compile(r"(?i)^бкоин\s+(\S+)$")
+BCOIN_RE = ru_text.rx(r"(?i)^бкоин\s+(\S+)$")
 
 
 @router.message(
@@ -17441,7 +18452,7 @@ async def cmd_bcoin_history(message: Message):
     await message.reply("\n".join(lines))
 
 
-TRANSFER_CMD_RE = re.compile(r"(?i)^(?:перевод|перевести)\b")
+TRANSFER_CMD_RE = ru_text.rx(r"(?i)^(?:перевод|перевести)\b")
 
 
 @router.message(
@@ -17524,7 +18535,7 @@ async def cmd_transfer(message: Message):
     )
 
 
-ITEM_USE_RE = re.compile(r"(?i)^использовать\s+(\S+)")
+ITEM_USE_RE = ru_text.rx(r"(?i)^использовать\s+(\S+)")
 
 
 async def _daily_item_payout(chat_id: int, user_id: int, shifts: int) -> int:
@@ -17560,7 +18571,34 @@ async def _passive_bonus(chat_id: int, user_id: int, activity: str) -> int:
     # Питомец с подходящей способностью прибавляет к тому же занятию —
     # ферма, рыбалка, клад, подработка, бонус, смена (см. pets.ABILITIES).
     percent += await _pet_bonus(chat_id, user_id, activity)
+    # Закрепы профиля: тема «Труд» у ачивки прибавляет к любому занятию,
+    # «Экономика» — к ежедневному бонусу, рыба-трофей — к улову.
+    percent += await _pin_bonus(chat_id, user_id, activity)
     return percent
+
+
+async def _pin_bonus(chat_id: int, user_id: int, effect_key: str) -> int:
+    """Прибавка от закрепов профиля (см. pins.py) к этому эффекту.
+
+    Закреп — экипировка: слот один на вид, и что он усиливает, выбирает сам
+    игрок. Здесь считаются ачивка (по теме) и рыба-трофей (к улову); предмет
+    усиливается в момент применения, бизнес чинится сам, а питомцу закреп
+    опускает порог засыпания — те трое живут в своих местах.
+
+    Ошибку глотаем по той же причине, что и _pet_bonus: прибавка — надстройка,
+    и непрочитавшаяся карточка профиля не должна ронять саму ферму.
+    """
+    try:
+        card = await db.get_profile_card(chat_id, user_id)
+    except Exception as exc:
+        log_suppressed("_pin_bonus", exc)
+        return 0
+    if not card:
+        return 0
+    total = pins.achievement_bonus(card.get("pinned_achievement"), effect_key)
+    if card.get("pinned_fish") and effect_key == shop_effects.ACTIVITY_FISHING:
+        total += pins.FISH_CATCH_PERCENT
+    return total
 
 
 async def _item_perk(chat_id: int, user_id: int, perk: str) -> int:
@@ -17604,7 +18642,7 @@ async def _apply_lucky(chat_id: int, user_id: int, amount: int) -> tuple[int, bo
     return amount * shop_effects.LUCKY_MULTIPLIER, True
 
 
-MEDVEZHATNIK_RE = re.compile(r"(?i)^!?медвежатник\b\s*(.*)$")
+MEDVEZHATNIK_RE = ru_text.rx(r"(?i)^!?медвежатник\b\s*(.*)$")
 
 
 @router.message(
@@ -17701,12 +18739,16 @@ async def cmd_steal_item(message: Message):
 # Участник заводит свой товар, администрация его подтверждает, и дальше в
 # этом чате им торгует только он. Купленное падает в обычный инвентарь.
 # ============================================================================
-MARKET_APPLY_RE = re.compile(r"(?i)^!?рынок\s+заявка\s+(\S+)\s+(\S+)\s+(.+)$")
-MARKET_BUY_RE = re.compile(r"(?i)^!?рынок\s+купить\s+(\S+)(?:\s+(\d+))?$")
-MARKET_WITHDRAW_RE = re.compile(r"(?i)^!?рынок\s+снять\s+(\S+)$")
-MARKET_DECIDE_RE = re.compile(r"(?i)^!?рынок\s+(принять|отклонить)\s+(\d+)$")
-MARKET_MODE_RE = re.compile(r"(?i)^!?рынок\s+режим\s+(ручной|авто|отклонять)$")
-MARKET_CFG_RE = re.compile(r"(?i)^!?рынок\s+(комиссия|потолок|лимит)\s+(\d+)$")
+MARKET_APPLY_RE = ru_text.rx(r"(?i)^!?рынок\s+заявка\s+(\S+)\s+(\S+)\s+(.+)$")
+MARKET_BUY_RE = ru_text.rx(r"(?i)^!?рынок\s+купить\s+(\S+)(?:\s+(\d+))?$")
+MARKET_WITHDRAW_RE = ru_text.rx(r"(?i)^!?рынок\s+снять\s+(\S+)$")
+MARKET_DECIDE_RE = ru_text.rx(r"(?i)^!?рынок\s+(принять|отклонить)\s+(\d+)$")
+MARKET_MODE_RE = ru_text.rx(r"(?i)^!?рынок\s+режим\s+(ручной|авто|отклонять)$")
+MARKET_CFG_RE = ru_text.rx(r"(?i)^!?рынок\s+(комиссия|потолок|лимит)\s+(\d+)$")
+# Свои товары: то же самое, что делают кнопки в личке, но текстом — кнопки
+# удобнее с телефона, а тем, кто привык набирать, ничего не отнимается.
+MARKET_PRICE_RE = ru_text.rx(r"(?i)^!?рынок\s+цена\s+(\S+)\s+(\d+)$")
+MARKET_DESC_RE = ru_text.rx(r"(?i)^!?рынок\s+описание\s+(\S+)\s+(.+)$")
 
 
 def _market_settings(row: dict) -> market.Settings:
@@ -17851,9 +18893,659 @@ def _market_line(good: dict, seller: str) -> str:
             f"{good['price']} i¢ · продавец: {seller}{desc}")
 
 
+# ============================================================================
+# 🔨 КРАФТЫ. Рецепты и требования — в crafting.py, сами предметы — в
+# shop_effects.CRAFT_ITEMS.
+#
+# Требование либо расходуется (предметы, монеты), либо только проверяется
+# (титул, уровень питомца, ачивка). Расходуемое списывается ТОЛЬКО после того,
+# как проверены все требования, а монеты уходят последними: если предметы уже
+# списались, а монет не хватило, возвращать пришлось бы вручную.
+# ============================================================================
+CRAFT_LIST_TRIGGERS = {"крафты", "!крафты", "крафт", "!крафт", "рецепты"}
+CRAFT_RE = ru_text.rx(r"(?i)^!?крафт\s+(\S+)(?:\s+(да))?$")
+# Кукла — единственный рецепт с целью, поэтому и разбор свой: «крафт кукла
+# @вася» в общий CRAFT_RE не влезает (там второй группой ждётся «да»).
+CRAFT_DOLL_RE = ru_text.rx(r"(?i)^!?крафт\s+кукл[ауы](?:\s+(.+))?$")
+DOLL_LIST_TRIGGERS = {"куклы", "!куклы", "мои куклы", "кукла", "!кукла"}
+DOLL_PIN_RE = ru_text.rx(r"(?i)^!?закрепить\s+куклу(?:\s+(.+))?$")
+DOLL_UNPIN_TRIGGERS = {"открепить куклу", "!открепить куклу"}
+
+
+async def _craft_req_state(chat_id: int, user_id: int,
+                           req) -> tuple[bool, str]:
+    """(выполнено ли требование, как оно называется человеку).
+
+    Один разбор на все виды: добавить новый — это ветка здесь и строка в
+    рецепте, а не новое поле у всех рецептов сразу.
+    """
+    kind = req.kind
+    if kind == crafting.REQ_ITEM:
+        have = await db.get_inventory_quantity(chat_id, user_id, req.key)
+        item = await db.get_shop_item(chat_id, req.key)
+        name = (f"{item['emoji']} {item['name']}" if item else req.key)
+        return have >= req.amount, crafting.req_text(req, item_name=name)
+    if kind == crafting.REQ_COINS:
+        wallet = await db.get_wallet(chat_id, user_id)
+        return int(wallet.get("coins") or 0) >= req.amount, crafting.req_text(req)
+    if kind == crafting.REQ_TITLE:
+        if req.key:
+            return await db.has_title(chat_id, user_id, req.key), crafting.req_text(req)
+        return bool(await db.list_user_titles(chat_id, user_id)), crafting.req_text(req)
+    if kind == crafting.REQ_PET_LEVEL:
+        rows = await db.list_pets(chat_id, user_id)
+        return (any(_pet_level(r) >= req.amount for r in rows),
+                crafting.req_text(req))
+    if kind == crafting.REQ_PET_EVOLVED:
+        rows = await db.list_pets(chat_id, user_id)
+        return any(r.get("evolved") for r in rows), crafting.req_text(req)
+    if kind == crafting.REQ_ACHIEVEMENT:
+        codes = await db.get_achievement_codes(chat_id, user_id)
+        info = ACHIEVEMENTS.get(req.key) or {}
+        return req.key in codes, crafting.req_text(
+            req, achievement_name=info.get("title") or req.key)
+    if kind == crafting.REQ_STARS:
+        return (wallet_stars(await db.get_wallet(chat_id, user_id)) >= req.amount,
+                crafting.req_text(req))
+    if kind == crafting.REQ_PROF_LEVEL:
+        stats = await db.get_profession_stats(chat_id, user_id)
+        level = int(stats.get("prof_level") or 0) if stats.get("profession_key") else 0
+        return level >= req.amount, crafting.req_text(req)
+    # Неизвестный вид требования не пропускаем: молча разрешить крафт хуже,
+    # чем сказать, что рецепт сломан.
+    return False, crafting.req_text(req)
+
+
+async def _craft_recipe_lines(chat_id: int, user_id: int,
+                              recipe) -> tuple[bool, list[str]]:
+    """(можно ли скрафтить, строки с галочками по каждому требованию)."""
+    ready = True
+    lines = []
+    for req in recipe.reqs:
+        ok, text = await _craft_req_state(chat_id, user_id, req)
+        ready = ready and ok
+        lines.append(f"   {'✅' if ok else '❌'} {text}")
+    return ready, lines
+
+
+# Куклу вуду описываем здесь, а не в shop_effects: это не предмет магазина —
+# в инвентаре её нет, она живёт своей таблицей. Поля те же, что читает список
+# крафтов, чтобы он не разбирал два разных случая.
+class _DollSpec:
+    emoji = "🧵"
+    name = "Кукла вуду"
+    description = ("Именной сувенир с лицом участника чата. Ничего не делает — "
+                   "просто лежит и радует. Не теряется, не продаётся и не "
+                   "крадётся: она вообще не в инвентаре")
+
+
+DOLL_SPEC = _DollSpec()
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("рынок", "!рынок")),
+    F.text.func(lambda t: bool(t) and bool(CRAFT_DOLL_RE.match(t.strip()))),
+)
+async def cmd_craft_doll(message: Message):
+    """«крафт кукла @кому» — именной сувенир.
+
+    Кукла НЕ кладётся в user_inventory, и это главное решение: по инвентарю
+    ходят продажа, подарок, Медвежатник и лимит применений, а того, чего там
+    нет, они физически не достанут. Список запретов пришлось бы дополнять при
+    каждом новом способе отобрать предмет — про куклу такой способ просто не
+    узнает.
+    """
+    if not _check_misc_access(message.from_user.id, "craft"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    recipe = crafting.BY_KEY["кукла"]
+    target = await _target_for_item(
+        message,
+        "Использование: <code>крафт кукла @кому</code> "
+        "(или ответом на его сообщение)."
+    )
+    if target is None:
+        return
+    existing = {int(d["target_id"]) for d in await db.list_voodoo_dolls(chat_id, user_id)}
+    if target.id in existing:
+        name = await display_name_by_id(chat_id, target.id)
+        await message.reply(f"🧵 Кукла «{name}» у вас уже есть — вторая такая же "
+                            f"ничего не добавит.")
+        return
+    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+    ready, lines = await _craft_recipe_lines(chat_id, user_id, recipe)
+    if not ready:
+        await message.reply("\n".join(
+            [f"{DOLL_SPEC.emoji} <b>{DOLL_SPEC.name}</b>", DOLL_SPEC.description,
+             DIVIDER, "Нужно:"] + lines + ["", "Чего-то не хватает — отмечено ❌."]))
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    taken: list = []
+    for req in recipe.consumed:
+        if req.kind != crafting.REQ_ITEM:
+            continue
+        if not await db.remove_inventory_item(chat_id, user_id, req.key, req.amount):
+            for done in taken:
+                await db.add_inventory_item(chat_id, user_id, done.key, done.amount)
+            await message.reply("Не хватило материалов — проверьте «инвентарь».")
+            return
+        taken.append(req)
+    coins = sum(r.amount for r in recipe.consumed if r.kind == crafting.REQ_COINS)
+    if coins and not await spend_coins(chat_id, user_id, coins):
+        for done in taken:
+            await db.add_inventory_item(chat_id, user_id, done.key, done.amount)
+        await message.reply(f"Недостаточно монет: нужно {coins} i¢. "
+                            f"Материалы остались у вас.")
+        return
+    # Имя храним БЕЗ разметки: display_name_by_id отдаёт HTML-ссылку, и она
+    # при показе экранируется в теги прямо в тексте.
+    target_name = plain_name(await display_name_by_id(chat_id, target.id))
+    if not await db.add_voodoo_doll(chat_id, user_id, target.id, target_name,
+                                    datetime.utcnow()):
+        # Гонка: два «крафт кукла @вася» подряд. Возвращаем всё.
+        for done in taken:
+            await db.add_inventory_item(chat_id, user_id, done.key, done.amount)
+        if coins:
+            await db.add_coins(chat_id, user_id, coins)
+        await message.reply("Такая кукла у вас уже есть.")
+        return
+    await db.add_log("craft_doll", chat_id=chat_id, actor_id=user_id,
+                     details=str(target.id))
+    actor_name = await display_name(chat_id, message.from_user)
+    await message.answer(
+        f"🧵 <b>{actor_name}</b> смастерил(а) куклу вуду с лицом "
+        f"<b>{target_name}</b>.\nПросто на память, честное слово.\n"
+        f"Свои куклы — <code>куклы</code>."
+    )
+
+
+async def _doll_link(chat_id: int, doll: dict) -> str:
+    """Кликабельное имя того, с кого слеплена кукла.
+
+    Ссылку строим ЖИВЬЁМ по target_id, а не храним готовую разметку: человек
+    мог сменить ник или юзернейм, и сохранённая ссылка устарела бы. Хранимое
+    имя остаётся запасным вариантом — на случай, если бот человека уже не
+    видит.
+
+    Возвращённое из display_name_by_id экранировать НЕЛЬЗЯ: оно уже готовая
+    HTML-ссылка, и повторное экранирование выведет теги текстом (именно так и
+    ломался список кукол).
+    """
+    try:
+        return await display_name_by_id(chat_id, int(doll["target_id"]))
+    except Exception as exc:
+        log_suppressed("_doll_link", exc)
+        return html.escape(plain_name(doll.get("target_name")))
+
+
+async def _doll_names(chat_id: int, dolls: list[dict]) -> str:
+    return ", ".join([await _doll_link(chat_id, d) for d in dolls])
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(DOLL_PIN_RE.match(t.strip()))),
+)
+async def cmd_doll_pin(message: Message):
+    """«закрепить куклу @кому» — показывать сувенир в профиле.
+
+    Закреп здесь ровно то же, чем он был у предметов до усиления: витрина.
+    Кукла ничего не умеет, усиливать в ней нечего, и придумывать ей силу ради
+    единообразия значило бы превратить сувенир в снаряжение.
+    """
+    if not _check_misc_access(message.from_user.id, "craft"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    dolls = await db.list_voodoo_dolls(chat_id, user_id)
+    if not dolls:
+        await message.reply("🧵 У вас нет ни одной куклы — "
+                            "сделать: <code>крафт кукла @кому</code>")
+        return
+    target = await _target_for_item(
+        message, "Использование: <code>закрепить куклу @кому</code> "
+                 "(или ответом на его сообщение)."
+    )
+    if target is None:
+        return
+    doll = await db.get_voodoo_doll(chat_id, user_id, target.id)
+    if doll is None:
+        name = plain_name(await display_name_by_id(chat_id, target.id))
+        await message.reply(f"🧵 Куклы «{html.escape(name)}» у вас нет — "
+                            f"сделать: <code>крафт кукла @кому</code>")
+        return
+    await db.set_pinned_doll(chat_id, user_id, target.id)
+    await message.reply(f"📌 Кукла «{await _doll_link(chat_id, doll)}» "
+                        f"закреплена в профиле.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in DOLL_UNPIN_TRIGGERS),
+)
+async def cmd_doll_unpin(message: Message):
+    if not _check_misc_access(message.from_user.id, "craft"):
+        return
+    await db.set_pinned_doll(message.chat.id, message.from_user.id, None)
+    await message.reply("📌 Кукла больше не показывается в профиле.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in DOLL_LIST_TRIGGERS),
+)
+async def cmd_doll_list(message: Message):
+    """«куклы» — своя коллекция сувениров (ответом — чужая)."""
+    if not _check_misc_access(message.from_user.id, "craft"):
+        return
+    chat_id = message.chat.id
+    target = (message.reply_to_message.from_user if message.reply_to_message
+              else message.from_user)
+    dolls = await db.list_voodoo_dolls(chat_id, target.id)
+    whose = await display_name(chat_id, target)
+    if not dolls:
+        await message.reply(
+            f"🧵 У {whose} пока ни одной куклы.\n"
+            f"Сделать: <code>крафт кукла @кому</code>"
+        )
+        return
+    names = await _doll_names(chat_id, dolls)
+    made_of = await db.count_voodoo_dolls_of(chat_id, target.id)
+    lines = [f"🧵 <b>Куклы вуду</b> — {whose}, {len(dolls)} шт.", DIVIDER, names]
+    if made_of:
+        lines.append(f"\nА с {whose} куклу слепили {made_of} чел. — тоже, "
+                     f"конечно, просто на память.")
+    await message.reply("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in CRAFT_LIST_TRIGGERS),
+)
+async def cmd_craft_list(message: Message):
+    if not _check_misc_access(message.from_user.id, "craft"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+    lines = ["🔨 <b>Крафты</b> — что можно собрать", DIVIDER]
+    for recipe in crafting.RECIPES:
+        spec = (DOLL_SPEC if recipe.target
+                else shop_effects.CRAFT_BY_KEY[recipe.result])
+        ready, _ = await _craft_recipe_lines(chat_id, user_id, recipe)
+        mark = "✅ доступен" if ready else "🔒"
+        call = (f"крафт {recipe.key} @кому" if recipe.target
+                else f"крафт {recipe.key}")
+        lines.append(f"{spec.emoji} <b>{spec.name}</b> "
+                     f"(<code>{call}</code>) — {mark}")
+        lines.append(f"   {spec.description}")
+    lines += ["", "Что нужно для рецепта: <code>крафт {ключ}</code>",
+              "Собрать: <code>крафт {ключ} да</code>",
+              "Хлам для крафта продаётся в «магазин» — он для того и нужен."]
+    await message.reply("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(CRAFT_RE.match(t.strip()))),
+)
+async def cmd_craft(message: Message):
+    """«крафт {ключ}» показывает требования, «крафт {ключ} да» собирает."""
+    if not _check_misc_access(message.from_user.id, "craft"):
+        return
+    match = CRAFT_RE.match(message.text.strip())
+    chat_id, user_id = message.chat.id, message.from_user.id
+    recipe = crafting.resolve(match.group(1))
+    if recipe is None:
+        await message.reply("Такого рецепта нет — список: <code>крафты</code>.")
+        return
+    if recipe.target:
+        # Сюда попадает «крафт кукла» без человека: у рецепта с целью свой
+        # обработчик, и без цели он бессмыслен.
+        await message.reply(f"Нужен человек: <code>крафт {recipe.key} @кому</code> "
+                            f"(или ответом на его сообщение).")
+        return
+    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+    spec = shop_effects.CRAFT_BY_KEY[recipe.result]
+    ready, lines = await _craft_recipe_lines(chat_id, user_id, recipe)
+    if match.group(2) is None or not ready:
+        head = [f"{spec.emoji} <b>{spec.name}</b>", spec.description, DIVIDER,
+                "Нужно:"] + lines
+        head.append("")
+        head.append(f"Собрать: <code>крафт {recipe.key} да</code>" if ready
+                    else "Чего-то не хватает — отмечено ❌.")
+        await message.reply("\n".join(head))
+        return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    # Предметы списываем до монет: если монет вдруг не хватит (потратили в
+    # соседнем сообщении), предметы придётся вернуть — а вот наоборот вернуть
+    # монеты после потраченных предметов было бы сложнее и заметнее.
+    taken: list = []
+    for req in recipe.consumed:
+        if req.kind != crafting.REQ_ITEM:
+            continue
+        if not await db.remove_inventory_item(chat_id, user_id, req.key, req.amount):
+            for done in taken:
+                await db.add_inventory_item(chat_id, user_id, done.key, done.amount)
+            await message.reply("Не хватило материалов — проверьте «инвентарь».")
+            return
+        taken.append(req)
+    coins = sum(r.amount for r in recipe.consumed if r.kind == crafting.REQ_COINS)
+    if coins and not await spend_coins(chat_id, user_id, coins):
+        for done in taken:
+            await db.add_inventory_item(chat_id, user_id, done.key, done.amount)
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(f"Недостаточно монет: нужно {coins} i¢, "
+                            f"а у вас {wallet.get('coins', 0)} i¢. "
+                            f"Материалы остались у вас.")
+        return
+    await db.add_inventory_item(chat_id, user_id, recipe.result)
+    await db.add_log("craft", chat_id=chat_id, actor_id=user_id, details=recipe.key)
+    await message.reply(
+        f"🔨 Собрано: {spec.emoji} <b>{spec.name}</b>!\n"
+        f"{spec.description}\n"
+        f"Предмет работает, пока лежит в инвентаре."
+    )
+
+
+# ----------------------------------------------------------------------------
+# СВОИ ТОВАРЫ В ЛИЧКЕ. Товар принадлежит чату, а в личке чата нет — поэтому
+# список идёт сразу по всем чатам, а chat_id и id товара едут в callback_data
+# кнопки. Заодно снимается неоднозначность: один и тот же ключ может
+# продаваться в двух чатах, и по одному ключу товар не опознать.
+#
+# Название не меняется никогда — под ним товар одобрили, и в инвентарях
+# покупателей он значится именно так.
+# ----------------------------------------------------------------------------
+MARKET_OWN_TRIGGERS = {BTN_MY_MARKET.casefold(), "мой рынок", "рынок мои", "мои товары"}
+MARKET_STATUS_LABELS = {
+    "approved": "✅ на витрине",
+    "pending": "⏳ ждёт одобрения",
+    "rejected": "🚫 отклонён",
+    "withdrawn": "📦 снят с витрины",
+}
+
+
+async def _market_chat_title(chat_id: int) -> str:
+    """Название чата для списка. Бот может уже не состоять в чате — тогда
+    показываем id, а не роняем весь список из-за одной строки."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        return html.escape(chat.title or str(chat_id))
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return str(chat_id)
+
+
+def _market_own_kb(good: dict) -> InlineKeyboardMarkup:
+    good_id = int(good["id"])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💰 Цена", callback_data=f"mkt_price:{good_id}"),
+        InlineKeyboardButton(text="📝 Описание", callback_data=f"mkt_desc:{good_id}"),
+        InlineKeyboardButton(text="🗑 Снять", callback_data=f"mkt_drop:{good_id}"),
+    ]])
+
+
+def _market_own_line(good: dict, chat_title: str) -> str:
+    desc = (f"\n   «{html.escape(good['description'])}»" if good.get("description")
+            else "\n   Описания нет — кнопка «📝 Описание» добавит.")
+    status = MARKET_STATUS_LABELS.get(good.get("status"), good.get("status") or "")
+    return (f"{good['emoji']} <b>{html.escape(good['name'])}</b> "
+            f"(<code>{html.escape(good['item_key'])}</code>) — "
+            f"{good['price']} i¢\n"
+            f"   Чат: {chat_title} · {status}{desc}")
+
+
+async def _send_market_own(message: Message) -> None:
+    goods = await db.list_market_goods_of_user(message.from_user.id)
+    if not goods:
+        await message.answer(
+            "🧺 <b>Ваши товары</b>\n\nПока ни одного.\n"
+            "Подать заявку можно в самом чате: "
+            "<code>рынок заявка {ключ} {цена} {название}</code>"
+        )
+        return
+    await message.answer(f"🧺 <b>Ваши товары</b> — {len(goods)}")
+    for good in goods:
+        await message.answer(
+            _market_own_line(good, await _market_chat_title(int(good["chat_id"]))),
+            reply_markup=_market_own_kb(good),
+        )
+
+
+@router.message(
+    F.chat.type == "private",
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in MARKET_OWN_TRIGGERS),
+)
+async def cmd_market_own(message: Message, state: FSMContext):
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    await state.clear()
+    await _send_market_own(message)
+
+
+async def _market_own_pick(callback: CallbackQuery) -> Optional[dict]:
+    """Товар из кнопки — обязательно свой. Владение проверяется запросом по
+    seller_id, а не тем, что пришло в callback_data: её содержимое приходит
+    от клиента и признаком доступа быть не может."""
+    try:
+        good_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Не понял, о каком товаре речь.", show_alert=True)
+        return None
+    good = await db.get_market_good_of_user(good_id, callback.from_user.id)
+    if good is None:
+        await callback.answer("Этот товар вам не принадлежит или его уже нет.",
+                              show_alert=True)
+        return None
+    if good.get("status") == "sold":
+        await callback.answer("Проданный товар менять нельзя.", show_alert=True)
+        return None
+    return good
+
+
+@router.callback_query(F.data.startswith("mkt_price:"))
+async def market_own_price_ask(callback: CallbackQuery, state: FSMContext):
+    good = await _market_own_pick(callback)
+    if good is None:
+        return
+    settings = _market_settings(await db.get_market_settings(int(good["chat_id"])))
+    await state.set_state(MarketOwnStates.waiting_price)
+    await state.update_data(good_id=int(good["id"]))
+    await callback.message.answer(
+        f"💰 Новая цена для «{html.escape(good['name'])}» "
+        f"(сейчас {good['price']} i¢).\n"
+        f"Потолок в этом чате — {settings.max_price} i¢.\n"
+        f"Пришлите число следующим сообщением.",
+        reply_markup=_market_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mkt_desc:"))
+async def market_own_desc_ask(callback: CallbackQuery, state: FSMContext):
+    good = await _market_own_pick(callback)
+    if good is None:
+        return
+    await state.set_state(MarketOwnStates.waiting_description)
+    await state.update_data(good_id=int(good["id"]))
+    await callback.message.answer(
+        f"📝 Описание для «{html.escape(good['name'])}».\n"
+        f"До {market.DESC_MAX} символов. Пришлите текст следующим сообщением "
+        f"(или «-», чтобы убрать описание).",
+        reply_markup=_market_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mkt_drop:"))
+async def market_own_drop(callback: CallbackQuery, state: FSMContext):
+    good = await _market_own_pick(callback)
+    if good is None:
+        return
+    await state.clear()
+    removed = await db.remove_market_good(int(good["chat_id"]), good["item_key"],
+                                          seller_id=callback.from_user.id)
+    if removed is None:
+        await callback.answer("Товара уже нет.", show_alert=True)
+        return
+    await db.add_log("market_withdraw", chat_id=int(good["chat_id"]),
+                     actor_id=callback.from_user.id, details=good["item_key"])
+    await callback.message.answer(
+        f"🗑 «{html.escape(good['name'])}» снят с витрины."
+    )
+    await callback.answer()
+
+
+def _market_cancel_kb() -> ReplyKeyboardMarkup:
+    """У каждого шага ввода должен быть выход, иначе человек застревает
+    в ожидании значения и не может пользоваться остальной личкой."""
+    return _reply_kb([[MARKET_CANCEL_WORD]])
+
+
+MARKET_CANCEL_WORD = "Отмена"
+
+
+@router.message(
+    F.chat.type == "private",
+    StateFilter(MarketOwnStates.waiting_price, MarketOwnStates.waiting_description),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == MARKET_CANCEL_WORD.casefold()),
+)
+async def market_own_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=private_menu_kb(message.from_user.id))
+
+
+@router.message(F.chat.type == "private", StateFilter(MarketOwnStates.waiting_price))
+async def market_own_price_set(message: Message, state: FSMContext):
+    data = await state.get_data()
+    good = await db.get_market_good_of_user(int(data.get("good_id") or 0),
+                                            message.from_user.id)
+    if good is None:
+        await state.clear()
+        await message.answer("Товара уже нет.",
+                             reply_markup=private_menu_kb(message.from_user.id))
+        return
+    price = parse_amount((message.text or "").strip())
+    if price is None:
+        await message.answer("Не понял цену — пришлите число.")
+        return
+    settings = _market_settings(await db.get_market_settings(int(good["chat_id"])))
+    error = market.validate_price(price, settings)
+    if error:
+        await message.answer(error)
+        return
+    await db.set_market_good_price(int(good["id"]), message.from_user.id, price)
+    await db.add_log("market_price", chat_id=int(good["chat_id"]),
+                     actor_id=message.from_user.id,
+                     details=f"{good['item_key']}:{price}")
+    await state.clear()
+    await message.answer(
+        f"💰 «{html.escape(good['name'])}» теперь стоит <b>{price}</b> i¢.",
+        reply_markup=private_menu_kb(message.from_user.id),
+    )
+
+
+@router.message(F.chat.type == "private", StateFilter(MarketOwnStates.waiting_description))
+async def market_own_desc_set(message: Message, state: FSMContext):
+    data = await state.get_data()
+    good = await db.get_market_good_of_user(int(data.get("good_id") or 0),
+                                            message.from_user.id)
+    if good is None:
+        await state.clear()
+        await message.answer("Товара уже нет.",
+                             reply_markup=private_menu_kb(message.from_user.id))
+        return
+    raw = (message.text or "").strip()
+    if len(raw) > market.DESC_MAX:
+        await message.answer(f"Описание длиннее {market.DESC_MAX} символов — "
+                             f"сейчас {len(raw)}. Сократите.")
+        return
+    description = None if raw == "-" else raw
+    await db.set_market_good_description(int(good["id"]), message.from_user.id,
+                                         description)
+    await db.add_log("market_description", chat_id=int(good["chat_id"]),
+                     actor_id=message.from_user.id, details=good["item_key"])
+    await state.clear()
+    await message.answer(
+        (f"📝 Описание для «{html.escape(good['name'])}» сохранено."
+         if description else f"📝 Описание для «{html.escape(good['name'])}» убрано."),
+        reply_markup=private_menu_kb(message.from_user.id),
+    )
+
+
+async def _market_own_by_key(message: Message, key: str) -> Optional[dict]:
+    """Свой товар по ключу. В группе ищем в ЭТОМ чате, в личке — по всем, и
+    там один ключ может оказаться в двух чатах: тогда просим уточнить, а не
+    выбираем наугад."""
+    key = key.casefold()
+    goods = [g for g in await db.list_market_goods_of_user(message.from_user.id)
+             if g["item_key"].casefold() == key]
+    if message.chat.type != "private":
+        goods = [g for g in goods if int(g["chat_id"]) == message.chat.id]
+    if not goods:
+        await message.reply(f"У вас нет товара «{html.escape(key)}» на рынке. "
+                            f"Список — «{BTN_MY_MARKET}» в личке бота.")
+        return None
+    if len(goods) > 1:
+        await message.reply(
+            f"Товар «{html.escape(key)}» есть у вас в нескольких чатах — "
+            f"выберите нужный кнопками: «{BTN_MY_MARKET}»."
+        )
+        return None
+    return goods[0]
+
+
+@router.message(F.text.func(lambda t: bool(t) and bool(MARKET_PRICE_RE.match(t.strip()))))
+async def cmd_market_own_price(message: Message):
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    match = MARKET_PRICE_RE.match(message.text.strip())
+    good = await _market_own_by_key(message, match.group(1))
+    if good is None:
+        return
+    price = int(match.group(2))
+    settings = _market_settings(await db.get_market_settings(int(good["chat_id"])))
+    error = market.validate_price(price, settings)
+    if error:
+        await message.reply(error)
+        return
+    await db.set_market_good_price(int(good["id"]), message.from_user.id, price)
+    await db.add_log("market_price", chat_id=int(good["chat_id"]),
+                     actor_id=message.from_user.id,
+                     details=f"{good['item_key']}:{price}")
+    await message.reply(f"💰 «{html.escape(good['name'])}» теперь стоит "
+                        f"<b>{price}</b> i¢.")
+
+
+@router.message(F.text.func(lambda t: bool(t) and bool(MARKET_DESC_RE.match(t.strip()))))
+async def cmd_market_own_desc(message: Message):
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    match = MARKET_DESC_RE.match(message.text.strip())
+    good = await _market_own_by_key(message, match.group(1))
+    if good is None:
+        return
+    raw = match.group(2).strip()
+    if len(raw) > market.DESC_MAX:
+        await message.reply(f"Описание длиннее {market.DESC_MAX} символов — "
+                            f"сейчас {len(raw)}. Сократите.")
+        return
+    description = None if raw == "-" else raw
+    await db.set_market_good_description(int(good["id"]), message.from_user.id,
+                                         description)
+    await db.add_log("market_description", chat_id=int(good["chat_id"]),
+                     actor_id=message.from_user.id, details=good["item_key"])
+    await message.reply(
+        f"📝 Описание для «{html.escape(good['name'])}» "
+        + ("сохранено." if description else "убрано.")
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("рынок", "!рынок")),
 )
 async def cmd_market_show(message: Message):
     if not _check_misc_access(message.from_user.id, "market"):
@@ -18055,7 +19747,7 @@ async def cmd_market_buy(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("рынок мои", "!рынок мои")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("рынок мои", "!рынок мои")),
 )
 async def cmd_market_mine(message: Message):
     if not _check_misc_access(message.from_user.id, "market"):
@@ -18111,7 +19803,7 @@ async def cmd_market_withdraw(message: Message):
 # --- разбор заявок (администрация) ------------------------------------------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("рынок заявки", "!рынок заявки")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("рынок заявки", "!рынок заявки")),
 )
 async def cmd_market_requests(message: Message):
     if not has_level(message.from_user.id, required_level("market_manage")):
@@ -18219,10 +19911,10 @@ async def cmd_market_config(message: Message):
 # Общее у всех четырёх: предмет списывается ТОЛЬКО когда эффект реально
 # сработал — то же правило, что и в _use_effect_item.
 # ----------------------------------------------------------------------------
-SABOTAZH_RE = re.compile(r"(?i)^!?саботаж\b\s*(.*)$")
-KOMPROMAT_RE = re.compile(r"(?i)^!?компромат\b\s*(.*)$")
-DOSSIER_RE = re.compile(r"(?i)^!?досье\b\s*(.*)$")
-MEGAFON_RE = re.compile(r"(?i)^!?мегафон$")
+SABOTAZH_RE = ru_text.rx(r"(?i)^!?саботаж\b\s*(.*)$")
+KOMPROMAT_RE = ru_text.rx(r"(?i)^!?компромат\b\s*(.*)$")
+DOSSIER_RE = ru_text.rx(r"(?i)^!?досье\b\s*(.*)$")
+MEGAFON_RE = ru_text.rx(r"(?i)^!?мегафон$")
 
 MEGAPHONE_PIN_MINUTES = 60
 
@@ -18403,7 +20095,7 @@ async def cmd_dossier(message: Message):
         f"🕵️ <b>Досье: {target_name}</b>",
         DIVIDER,
         f"💰 В кошельке: <b>{int(wallet.get('coins') or 0)}</b> i¢",
-        f"⭐ Звёздность: {int(wallet.get('star_level') or 0)}",
+        f"⭐ Звёздность: {wallet_stars(wallet)}",
         f"🏢 Бизнесов: {len(businesses)}" + (f" (сломано: {broken})" if broken else ""),
         f"📊 Акций на руках: {float(holding['shares']):.2f}",
         f"🥷 Ограблений: удачных {int(rob.get('successes') or 0)}, "
@@ -18493,6 +20185,42 @@ GENEROSITY_COST = 30_000
 GENEROSITY_MAX_TARGETS = 50
 
 
+async def _is_item_pinned(chat_id: int, user_id: int, item_key: str) -> bool:
+    card = await db.get_profile_card(chat_id, user_id)
+    return bool(card and card.get("pinned_item") == item_key)
+
+
+async def _spend_effect_item(chat_id: int, user_id: int, item_key: str,
+                             pinned: bool) -> bool:
+    """Списывает применённый предмет. True — штука ушла из инвентаря.
+
+    Закреплённый расходуется раз в PIN_MULTIPLIER применений: у предметов с
+    эффектом «лимит применений» — это само количество в инвентаре, поэтому
+    впятеро больше применений и означает впятеро более редкий расход.
+
+    Счётчик держим в общем KV-хранилище, а не в новой таблице: это одно число
+    на связку чат-человек-предмет, и ради него городить схему незачем (так же
+    сделана отметка «предмет за ачивку сегодня уже приносил доход»).
+    """
+    if not pinned:
+        await db.remove_inventory_item(chat_id, user_id, item_key)
+        return True
+    stamp_key = f"pinuse:{chat_id}:{user_id}:{item_key}"
+    row = await db.get_data(stamp_key)
+    try:
+        used = int((row or {}).get("data_value") or 0)
+    except (TypeError, ValueError):
+        used = 0
+    used += 1
+    if used < shop_effects.PIN_MULTIPLIER:
+        await db.set_data(stamp_key, str(used), updated_by=user_id)
+        return False
+    # Пятое применение — штука уходит, счёт начинается заново.
+    await db.set_data(stamp_key, "0", updated_by=user_id)
+    await db.remove_inventory_item(chat_id, user_id, item_key)
+    return True
+
+
 async def _use_effect_item(message: Message, item_key: str) -> None:
     """Применяет полезный предмет (см. shop_effects) — на себя, без цели.
 
@@ -18509,6 +20237,11 @@ async def _use_effect_item(message: Message, item_key: str) -> None:
             f"У вас нет предмета «{html.escape(item_key)}». Проверьте «инвентарь»."
         )
         return
+
+    # Закреп усиливает предмет впятеро (см. shop_effects.PIN_MULTIPLIER).
+    # Считаем ОДИН раз здесь: ниже это нужно и заряду, и сумме, и расходу, а
+    # три отдельных запроса за одним и тем же полем разошлись бы при правке.
+    pinned = await _is_item_pinned(chat_id, user_id, item_key)
 
     result: Optional[str] = None
 
@@ -18640,7 +20373,16 @@ async def _use_effect_item(message: Message, item_key: str) -> None:
 
     elif spec.effect == shop_effects.EFFECT_GENEROSITY:
         wallet = await db.get_wallet(chat_id, user_id)
-        if int(wallet.get("coins") or 0) < GENEROSITY_COST:
+        coins_now = int(wallet.get("coins") or 0)
+        # Закреплённая щедрость раздаёт впятеро больше и столько же списывает.
+        # Если на пятикратную сумму не хватает — раздаём обычную, а не
+        # отказываем: предмет уже применён, и отказ был бы худшим исходом.
+        cost = GENEROSITY_COST
+        pin_boosted = False
+        if pinned and coins_now >= GENEROSITY_COST * shop_effects.PIN_MULTIPLIER:
+            cost = GENEROSITY_COST * shop_effects.PIN_MULTIPLIER
+            pin_boosted = True
+        if coins_now < GENEROSITY_COST:
             await message.reply(
                 f"🎁 На широкий жест нужно {GENEROSITY_COST} i¢ в кошельке. "
                 "Предмет остался у вас."
@@ -18659,8 +20401,8 @@ async def _use_effect_item(message: Message, item_key: str) -> None:
                 "Предмет остался у вас."
             )
             return
-        share = max(1, GENEROSITY_COST // len(targets))
-        await db.add_coins(chat_id, user_id, -GENEROSITY_COST)
+        share = max(1, cost // len(targets))
+        await db.add_coins(chat_id, user_id, -cost)
         for uid in targets:
             await db.add_coins(chat_id, uid, share)
         actor = await display_name(chat_id, message.from_user)
@@ -18668,25 +20410,31 @@ async def _use_effect_item(message: Message, item_key: str) -> None:
         more = f" и ещё {len(targets) - 15}" if len(targets) > 15 else ""
         await db.add_log("item_generosity", chat_id=chat_id, actor_id=user_id,
                          details=f"{len(targets)}x{share}")
+        boost = (f"\n📌 Закреплён — раздача в {shop_effects.PIN_MULTIPLIER} раз щедрее."
+                 if pin_boosted else "")
         await message.answer(
             f"🎁 <b>{actor} угощает весь чат!</b>\n"
-            f"По <b>{share}</b> i¢ получают: {names}{more}."
+            f"По <b>{share}</b> i¢ получают: {names}{more}.{boost}"
         )
         result = ""
 
     elif spec.effect in shop_effects.PENDING_EFFECTS:
-        await db.add_item_effect(chat_id, user_id, spec.effect)
+        # Отложенные эффекты и так живут зарядами — закрепу достаточно выдать
+        # их сразу пять вместо одного.
+        charges = shop_effects.PIN_MULTIPLIER if pinned else 1
+        await db.add_item_effect(chat_id, user_id, spec.effect, charges=charges)
+        times = f" (зарядов: {charges})" if charges > 1 else ""
         if spec.effect == shop_effects.EFFECT_LUCKY:
             result = (f"🍀 Талисман активирован: следующая ферма, рыбалка или клад "
-                      f"принесут в {shop_effects.LUCKY_MULTIPLIER} раза больше.")
+                      f"принесут в {shop_effects.LUCKY_MULTIPLIER} раза больше{times}.")
         elif spec.effect == shop_effects.EFFECT_FREE_UPGRADE:
             result = ("📈 Бизнес-план готов: следующий апгрейд бизнеса "
-                      "обойдётся бесплатно.")
+                      f"обойдётся бесплатно{times}.")
         elif spec.effect == shop_effects.EFFECT_MIRROR:
             result = ("🪞 Зеркало повешено: ближайшее ограбление против вас "
-                      "отразится на самого грабителя.")
+                      f"отразится на самого грабителя{times}.")
         else:
-            result = "🛡 Страховка оформлена: ближайшая поломка бизнеса пройдёт мимо."
+            result = f"🛡 Страховка оформлена: ближайшая поломка бизнеса пройдёт мимо{times}."
 
     elif spec.effect == shop_effects.EFFECT_DAILY_CASH:
         # Предмет за ачивку не тратится — он остаётся навсегда, ограничение
@@ -18728,13 +20476,28 @@ async def _use_effect_item(message: Message, item_key: str) -> None:
         await message.reply("Этот предмет пока ничего не умеет.")
         return
 
-    # Эффект сработал — только теперь предмет уходит.
-    await db.remove_inventory_item(chat_id, user_id, item_key)
+    # Эффект сработал — только теперь предмет уходит. Медленный расход — это
+    # усиление ТОЛЬКО для тех, кому нечего усилить иначе. Отложенным эффектам
+    # закреп уже выдал пятикратные заряды, щедрости — пятикратную раздачу;
+    # добавить им сюда ещё и пятикратный срок службы значило бы усилить их
+    # в двадцать пять раз с одной штуки.
+    slow_spend = (pinned
+                  and spec.effect not in shop_effects.PENDING_EFFECTS
+                  and spec.effect not in shop_effects.PIN_AMOUNT_EFFECTS)
+    spent = await _spend_effect_item(chat_id, user_id, item_key, slow_spend)
     await db.add_log("item_effect", chat_id=chat_id, actor_id=user_id, details=item_key)
     # Пустая строка — предмет уже сам всё объявил в чат (ва-банк, щедрость):
     # общий хвост в таком случае повторил бы объявление одним эмодзи.
     if result:
-        await message.reply(f"{spec.emoji} {result}")
+        # Про усиление говорим только там, где оно не видно из самого текста:
+        # у отложенных эффектов число зарядов уже названо, у щедрости —
+        # приписка ушла вместе с объявлением в чат.
+        note = ""
+        if slow_spend:
+            note = (f"\n📌 Закреплён — расходуется раз в "
+                    f"{shop_effects.PIN_MULTIPLIER} применений"
+                    + ("." if spent else ", штука осталась у вас."))
+        await message.reply(f"{spec.emoji} {result}{note}")
 
 
 @router.message(
@@ -18760,6 +20523,15 @@ async def cmd_item_use(message: Message):
         await _use_effect_item(message, item_key)
         return
     if shop_effects.is_reward(item_key):
+        spec = shop_effects.ACHIEVEMENT_BY_KEY.get(item_key)
+        if spec is not None and spec.effect == shop_effects.EFFECT_EVOLUTION:
+            # Расходник, но со своей командой: общий ответ про «награду»
+            # сбивал бы с толку — предмет как раз тратится, просто иначе.
+            await message.reply(
+                f"{spec.emoji} «{html.escape(spec.name)}» тратится не здесь, а "
+                f"на эволюцию питомца: <code>пет эволюция {{ключ}}</code>."
+            )
+            return
         await message.reply(
             "🎖 Награду не «используют» — она просто есть у вас и видна в профиле."
         )
@@ -18825,11 +20597,11 @@ async def cmd_item_use(message: Message):
         )
 
 
-SELL_ITEM_RE = re.compile(r"(?i)^(?:!?магазин\s+продать|!продать)\s+(\S+)(?:\s+(\d+))?$")
+SELL_ITEM_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+продать|!продать)\s+(\S+)(?:\s+(\d+))?$")
 # «!продать 500» одинаково похоже на продажу акций и на продажу предмета
 # с ключом «500» — раньше эту форму молча забирал продавец предметов, и
 # продажа акций была недостижима. Теперь голое число просит уточнения.
-LEGACY_SELL_AMOUNT_RE = re.compile(r"(?i)^!продать\s+(\S+)$")
+LEGACY_SELL_AMOUNT_RE = ru_text.rx(r"(?i)^!продать\s+(\S+)$")
 
 
 def _is_legacy_sell_amount(text: str) -> bool:
@@ -19148,7 +20920,7 @@ async def cmd_robbery(message: Message):
 # отменяет другое.
 EARN_BUSINESS_RAID = "business_raid"
 RAID_TRIGGERS = {"налёт", "налет", "!налёт", "!налет"}
-RAID_RE = re.compile(r"(?i)^!?(?:бизнес\s+)?нал[её]т\b")
+RAID_RE = ru_text.rx(r"(?i)^!?(?:бизнес\s+)?нал[её]т\b")
 
 
 def _is_raid_command(text: Optional[str]) -> bool:
@@ -19346,7 +21118,7 @@ async def cmd_business_raid(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("стата ограблений", "моя стата ограблений")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("стата ограблений", "моя стата ограблений")),
 )
 async def cmd_robbery_stats(message: Message):
     if not _check_misc_access(message.from_user.id, "robbery_stats"):
@@ -19386,7 +21158,7 @@ async def cmd_robbery_top(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!откуп", "купить откуп", "откуп")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!откуп", "купить откуп", "откуп")),
 )
 async def cmd_robbery_pardon(message: Message):
     if not _check_misc_access(message.from_user.id, "robbery_pardon"):
@@ -19422,10 +21194,10 @@ CASINO_COLOR_LABEL = {"red": "Красное", "black": "Чёрное", "green":
 # необязательны и оставлены ради тех, кто привык к старой форме «.рулетка».
 # Со словом «русскаяру» (шуточная игра с киком) это не пересекается: у неё
 # другое слово, а её переключатели «+рулетка»/«-рулетка» идут без аргументов.
-CASINO_ROULETTE_RE = re.compile(r"(?i)^[.!]?рулетка\s+(\S+)\s+(\S+)$")
+CASINO_ROULETTE_RE = ru_text.rx(r"(?i)^[.!]?рулетка\s+(\S+)\s+(\S+)$")
 # Голое «рулетка» без ставки — подсказка, а не игра: иначе человек, узнавший
 # о команде, получает молчание и решает, что её нет.
-CASINO_ROULETTE_BARE_RE = re.compile(r"(?i)^[.!]?рулетка$")
+CASINO_ROULETTE_BARE_RE = ru_text.rx(r"(?i)^[.!]?рулетка$")
 
 _CASINO_ROULETTE_USAGE = (
     "🎰 <b>Рулетка</b>\n"
@@ -19439,10 +21211,10 @@ _CASINO_ROULETTE_USAGE = (
 CASINO_ROULETTE_MAX_BET = 100_000  # предохранитель от переполнения/абсурдных ставок
 CASINO_DAILY_BONUS = 100
 CASINO_MAX_BET = 100_000
-CASINO_DICE_RE = re.compile(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
-CASINO_COIN_RE = re.compile(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
-CASINO_POKER_RE = re.compile(r"(?i)^!?покер\s+(\S+)$")
-CASINO_TOPUP_RE = re.compile(r"(?i)^!?казино\s+пополнить\s+(\S+)$")
+CASINO_DICE_RE = ru_text.rx(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
+CASINO_COIN_RE = ru_text.rx(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
+CASINO_POKER_RE = ru_text.rx(r"(?i)^!?покер\s+(\S+)$")
+CASINO_TOPUP_RE = ru_text.rx(r"(?i)^!?казино\s+пополнить\s+(\S+)$")
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -19584,7 +21356,7 @@ def _format_poker_hand(cards: list[tuple[int, str]]) -> str:
 # ---------- Казино: баланс + ежедневный бонус ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!казино баланс", "казино баланс")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!казино баланс", "казино баланс")),
 )
 async def cmd_casino_balance(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_balance"):
@@ -19603,7 +21375,7 @@ async def cmd_casino_balance(message: Message):
     await message.answer("\n".join(lines))
 
 
-CASINO_WITHDRAW_RE = re.compile(r"(?i)^!?казино\s+вывести\s+(\S+)$")
+CASINO_WITHDRAW_RE = ru_text.rx(r"(?i)^!?казино\s+вывести\s+(\S+)$")
 
 
 @router.message(
@@ -19830,7 +21602,7 @@ async def cmd_casino_poker(message: Message):
 # ============================================================================
 # Модуль «Гонки» — ставки на лошадей, баланс общий с «!казино баланс».
 # ============================================================================
-RACE_CMD_RE = re.compile(r"(?i)^!?гонки\s+(\S+)$")
+RACE_CMD_RE = ru_text.rx(r"(?i)^!?гонки\s+(\S+)$")
 RACE_JOIN_SECONDS = 15
 RACE_STEPS = 15
 RACE_TRACK_WIDTH = 15
@@ -20085,9 +21857,9 @@ def _stock_holding_lines(price: float, holding: dict) -> list[str]:
 # Старые одиночные формы «!купить»/«!продать» неоднозначны и теперь отвечают
 # подсказкой (cmd_legacy_buy_hint / cmd_legacy_sell_amount_hint), а «!дивиденды»
 # однозначна и работает молчаливым алиасом.
-STOCK_BUY_RE = re.compile(r"(?i)^!?биржа\s+купить(?:\s+(\S+))?$")
-STOCK_SELL_RE = re.compile(r"(?i)^!?биржа\s+продать(?:\s+(\S+))?$")
-STOCK_TOGGLE_RE = re.compile(r"(?i)^!?биржа\s+(вкл|включить|выкл|выключить)$")
+STOCK_BUY_RE = ru_text.rx(r"(?i)^!?биржа\s+купить(?:\s+(\S+))?$")
+STOCK_SELL_RE = ru_text.rx(r"(?i)^!?биржа\s+продать(?:\s+(\S+))?$")
+STOCK_TOGGLE_RE = ru_text.rx(r"(?i)^!?биржа\s+(вкл|включить|выкл|выключить)$")
 
 
 async def _stock_off(message: Message) -> bool:
@@ -20152,7 +21924,7 @@ async def cmd_stock_toggle(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!биржа", "биржа")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!биржа", "биржа")),
 )
 async def cmd_stock_market(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
@@ -20258,7 +22030,7 @@ async def cmd_stock_sell(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!биржа дивиденды", "биржа дивиденды", "!дивиденды")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!биржа дивиденды", "биржа дивиденды", "!дивиденды")),
 )
 async def cmd_stock_dividends(message: Message):
     if not _check_misc_access(message.from_user.id, "stock_market"):
@@ -20286,7 +22058,7 @@ async def cmd_stock_dividends(message: Message):
 # списком новых форм. Однозначные старые формы («купить {ключ}», «титулы»,
 # «откуп», «!дивиденды») продолжают работать молча.
 # ----------------------------------------------------------------------------
-LEGACY_BUY_RE = re.compile(r"(?i)^!купить(?:\s+(.*))?$")
+LEGACY_BUY_RE = ru_text.rx(r"(?i)^!купить(?:\s+(.*))?$")
 
 
 @router.message(
@@ -20310,17 +22082,17 @@ async def cmd_legacy_buy_hint(message: Message):
 # в момент открытия) и кредиты с комиссией и дневной пеней за просрочку.
 # Ставки и параметры кредита настраиваются админами командами «банк ...».
 # ============================================================================
-BANK_STATUS_RE = re.compile(r"(?i)^!?банк$")
-BANK_DEPOSIT_RE = re.compile(r"(?i)^!?банк\s+вклад\s+(\S+)\s+(\d+)$")
-BANK_WITHDRAW_RE = re.compile(r"(?i)^!?банк\s+снять$")
-BANK_CREDIT_RE = re.compile(r"(?i)^!?банк\s+кредит\s+(\S+)$")
-BANK_REPAY_RE = re.compile(r"(?i)^!?банк\s+погасить\s+(\S+)$")
+BANK_STATUS_RE = ru_text.rx(r"(?i)^!?банк$")
+BANK_DEPOSIT_RE = ru_text.rx(r"(?i)^!?банк\s+вклад\s+(\S+)\s+(\d+)$")
+BANK_WITHDRAW_RE = ru_text.rx(r"(?i)^!?банк\s+снять$")
+BANK_CREDIT_RE = ru_text.rx(r"(?i)^!?банк\s+кредит\s+(\S+)$")
+BANK_REPAY_RE = ru_text.rx(r"(?i)^!?банк\s+погасить\s+(\S+)$")
 
-BANK_RATE_SET_RE = re.compile(r"(?i)^банк\s+ставка\s+(1|3|7)д?\s+(\d+(?:\.\d+)?)$")
-BANK_CREDIT_FEE_RE = re.compile(r"(?i)^банк\s+кредит\s+комиссия\s+(\d+(?:\.\d+)?)$")
-BANK_CREDIT_PENALTY_RE = re.compile(r"(?i)^банк\s+кредит\s+пеня\s+(\d+(?:\.\d+)?)$")
-BANK_CREDIT_TERM_RE = re.compile(r"(?i)^банк\s+кредит\s+срок\s+(\d+)$")
-BANK_MIN_DEPOSIT_RE = re.compile(r"(?i)^банк\s+мин\s+вклад\s+(\S+)$")
+BANK_RATE_SET_RE = ru_text.rx(r"(?i)^банк\s+ставка\s+(1|3|7)д?\s+(\d+(?:\.\d+)?)$")
+BANK_CREDIT_FEE_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+комиссия\s+(\d+(?:\.\d+)?)$")
+BANK_CREDIT_PENALTY_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+пеня\s+(\d+(?:\.\d+)?)$")
+BANK_CREDIT_TERM_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+срок\s+(\d+)$")
+BANK_MIN_DEPOSIT_RE = ru_text.rx(r"(?i)^банк\s+мин\s+вклад\s+(\S+)$")
 
 BANK_RATE_COLUMN = {"1": "rate_1d", "3": "rate_3d", "7": "rate_7d"}
 
@@ -20745,7 +22517,7 @@ async def is_bank_auto_reject_enabled(chat_id: int) -> bool:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+банк автоотказ-кредит", "-банк автоотказ-кредит")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+банк автоотказ-кредит", "-банк автоотказ-кредит")),
 )
 async def cmd_bank_auto_reject_toggle(message: Message):
     min_level = required_level("bank_auto_reject_toggle")
@@ -20769,8 +22541,8 @@ async def cmd_bank_auto_reject_toggle(message: Message):
     )
 
 
-BANK_BLACKLIST_ADD_RE = re.compile(r"(?i)^банк\s+чс\s+добавить\b\s*(.*)$")
-BANK_BLACKLIST_REMOVE_RE = re.compile(r"(?i)^банк\s+чс\s+удалить\b\s*(.*)$")
+BANK_BLACKLIST_ADD_RE = ru_text.rx(r"(?i)^банк\s+чс\s+добавить\b\s*(.*)$")
+BANK_BLACKLIST_REMOVE_RE = ru_text.rx(r"(?i)^банк\s+чс\s+удалить\b\s*(.*)$")
 
 
 @router.message(
@@ -20831,7 +22603,7 @@ async def cmd_bank_blacklist_remove(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("банк чс", "банк чс список")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("банк чс", "банк чс список")),
 )
 async def cmd_bank_blacklist_list(message: Message):
     min_level = required_level("bank_blacklist_manage")
@@ -20918,11 +22690,11 @@ async def bank_penalty_loop() -> None:
 # Слово-раздел «титул» собирает список/покупку/надеть/снять в одном месте;
 # «!» перед разделом необязателен, а старые формы («титулы», «купить титул X»,
 # «титул X», «-титул») остаются рабочими алиасами.
-TITLE_BUY_RE = re.compile(r"(?i)^(?:!?титул\s+купить|купить\s+титул)\s+(\S+)$")
+TITLE_BUY_RE = ru_text.rx(r"(?i)^(?:!?титул\s+купить|купить\s+титул)\s+(\S+)$")
 # Негативный просмотр в короткой ветке обязателен: без него «титул снять»
 # разбирается как «надеть титул с ключом снять» — короткая ветка стоит
 # в файле раньше cmd_title_unequip и забрала бы команду себе.
-TITLE_EQUIP_RE = re.compile(
+TITLE_EQUIP_RE = ru_text.rx(
     r"(?i)^(?:!?титул\s+надеть|титул(?!\s+(?:купить|надеть|снять)\b))\s+(\S+)$"
 )
 
@@ -20967,7 +22739,7 @@ async def titles_list_page(chat_id: int, user_id: int, page: int) -> tuple[str, 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!титул", "титул", "титулы")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!титул", "титул", "титулы")),
 )
 async def cmd_titles_list(message: Message):
     if not _check_misc_access(message.from_user.id, "titles_list"):
@@ -21024,7 +22796,7 @@ async def my_titles_page(chat_id: int, user_id: int, page: int) -> tuple[str, Op
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "мои титулы", "!мои титулы", "мой титул", "мои титул",
     )),
 )
@@ -21117,7 +22889,7 @@ async def cmd_title_equip(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!титул снять", "титул снять", "-титул")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!титул снять", "титул снять", "-титул")),
 )
 async def cmd_title_unequip(message: Message):
     if not _check_misc_access(message.from_user.id, "title_equip"):
@@ -21153,16 +22925,16 @@ async def cmd_title_usage(message: Message):
 # Слово-раздел «магазин» (продажа предмета — SELL_ITEM_RE выше, там же
 # рядом с остальной логикой инвентаря). «!» везде необязателен, а короткие
 # формы без слова-раздела («купить {ключ}», «подарить {ключ}») сохранены.
-_SHOP_NS_RE = re.compile(r"(?i)^!?магазин\s")
-SHOP_ADD_RE = re.compile(r"(?is)^!?магазин\s+добавить\s+(\S+)\s+(\S+)\s+(.+)$")
-SHOP_DELETE_RE = re.compile(r"(?i)^!?магазин\s+удалить\s+(\S+)$")
-SHOP_TOGGLE_RE = re.compile(r"(?i)^!?магазин\s+(вкл|выкл)\s+(\S+)$")
+_SHOP_NS_RE = ru_text.rx(r"(?i)^!?магазин\s")
+SHOP_ADD_RE = ru_text.rx(r"(?is)^!?магазин\s+добавить\s+(\S+)\s+(\S+)\s+(.+)$")
+SHOP_DELETE_RE = ru_text.rx(r"(?i)^!?магазин\s+удалить\s+(\S+)$")
+SHOP_TOGGLE_RE = ru_text.rx(r"(?i)^!?магазин\s+(вкл|выкл)\s+(\S+)$")
 # Количество необязательно: «купить fishka» — как раньше, одна штука.
-SHOP_BUY_RE = re.compile(r"(?i)^(?:!?магазин\s+купить|купить)\s+(\S+)(?:\s+(\d+))?$")
+SHOP_BUY_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+купить|купить)\s+(\S+)(?:\s+(\d+))?$")
 # Потолок на одну команду: опечатка в количестве («купить fishka 100000»)
 # иначе разом выносит весь кошелёк.
 SHOP_BUY_MAX_QTY = 100
-SHOP_GIFT_RE = re.compile(r"(?i)^(?:!?магазин\s+подарить|подарить)\s+(\S+)\s*(.*)$")
+SHOP_GIFT_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+подарить|подарить)\s+(\S+)\s*(.*)$")
 
 def shop_item_line(item: dict) -> str:
     desc = f" — {html.escape(item['description'])}" if item.get("description") else ""
@@ -21449,7 +23221,7 @@ def _is_prof_cmd(t: Optional[str], sub: str) -> bool:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!работа", "!работать")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!работа", "!работать")),
 )
 async def cmd_prof_work(message: Message):
     await message.answer(await _profession_execute_work(message.chat.id, message.from_user.id))
@@ -21492,7 +23264,7 @@ async def cmd_prof_join(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!работа профиль", "!работа проф")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!работа профиль", "!работа проф")),
 )
 async def cmd_prof_profile(message: Message):
     target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
@@ -21509,9 +23281,23 @@ async def cmd_prof_profile(message: Message):
         f"{prof['emoji']} {prof['name']} ({stats['prof_level']} уровень)\n"
         f"⭐ XP: {stats['prof_xp']}/{next_threshold if stats['prof_level'] < PROFESSION_MAX_LEVEL else '—'}\n"
         f"⚡ Энергия: {stats['energy']}/100 · 🙂 Настроение: {stats['mood']}/100 · ❤️ Здоровье: {stats['health']}/100\n"
+        f"{_regen_line(stats)}\n"
         f"🔥 Серия смен: {stats['work_streak']}\n"
         f"💰 Всего заработано: {stats['total_earned']} i¢"
     )
+
+
+def _regen_line(stats: dict) -> str:
+    """Строка о самовосстановлении. Без неё скорость нигде не видна, и понять,
+    ждать отдыха или пить аптечку, не по чему."""
+    level = int(stats.get("prof_level") or 0) if stats.get("profession_key") else 0
+    per_hour = professions.regen_per_hour(level)
+    lowest = min(int(stats.get(name) or 0) for name in ("energy", "mood", "health"))
+    if lowest >= professions.MAX_STAT:
+        return f"🌙 Восстановление: +{per_hour} в час (всё и так полное)"
+    hours = professions.hours_to_full(lowest, per_hour)
+    return (f"🌙 Восстановление: +{per_hour} в час — до полного "
+            f"{format_duration_ru(timedelta(hours=hours))}")
 
 
 @router.message(
@@ -21966,7 +23752,7 @@ async def professions_page(chat_id: int, user_id: int, page: int) -> tuple[str, 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "профессии", "!профессии", "!работа профессии", "!работа список",
     )),
 )
@@ -22021,6 +23807,7 @@ async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineK
     # никогда, ведь seed_default_shop_items у непустого магазина молчит.
     await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
     await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
     items = await db.list_shop_items(chat_id)
     items.sort(key=lambda i: (i.get("stock") == 0, i["price"]))
     if not items:
@@ -22052,7 +23839,7 @@ async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineK
     return text, InlineKeyboardMarkup(inline_keyboard=[nav])
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!магазин","!магаз","магазин","магаз")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!магазин","!магаз","магазин","магаз")),
 )
 async def cmd_shop_list(message: Message):
     text, kb = await shop_list_page(message.chat.id, 0)
@@ -22450,27 +24237,37 @@ async def cmd_shop_toggle(message: Message):
 )
 async def cmd_shop_buy(message: Message):
     match = SHOP_BUY_RE.match(message.text.strip())
-    item_key = match.group(1).casefold()
-    qty = int(match.group(2)) if match.group(2) else 1
+    await _shop_buy(message, match.group(1).casefold(),
+                    int(match.group(2)) if match.group(2) else 1)
+
+
+async def _shop_buy(message: Message, item_key: str, qty: int) -> bool:
+    """Покупка товара магазина. Вынесена из обработчика, потому что тем же
+    путём покупается корм для питомцев («пет корм 10»): иначе распродажа,
+    скидка «Торгаша», остаток на полке и отчисления в казну разъехались бы
+    между двумя копиями кода.
+
+    Возвращает, состоялась ли покупка (все отказы объясняются ответом здесь же).
+    """
     if qty <= 0:
         await message.reply("Количество должно быть больше нуля.")
-        return
+        return False
     if qty > SHOP_BUY_MAX_QTY:
         await message.reply(f"За раз можно купить не больше {SHOP_BUY_MAX_QTY} шт.")
-        return
+        return False
     item = await db.get_shop_item(message.chat.id, item_key)
     if item is None or not item["is_active"]:
         await message.reply(f"Товар с ключом «{html.escape(item_key)}» не найден в магазине. Список — «магазин».")
-        return
+        return False
     if shop_effects.is_reward(item_key):
         await message.reply(
             f"{item['emoji']} «{html.escape(item['name'])}» не продаётся — "
             "это награда чата, её выдают за заслуги."
         )
-        return
+        return False
     if item.get("stock") is not None and item["stock"] <= 0:
         await message.reply(f"⚠️ Товар «{html.escape(item['name'])}» раскуплен — остатка больше нет.")
-        return
+        return False
     if item_key in robbery.ROBBERY_ITEMS:
         current_qty = next(
             (i["quantity"] for i in await db.list_inventory(message.chat.id, message.from_user.id)
@@ -22482,13 +24279,13 @@ async def cmd_shop_buy(message: Message):
                 f"⚠️ Предметов ограбления можно держать не больше "
                 f"{robbery.ROBBERY_ITEM_MAX_QUANTITY} шт. — у вас уже {current_qty}."
             )
-            return
+            return False
     if not await db.try_take_shop_stock(message.chat.id, item_key, qty):
         await message.reply(
             f"⚠️ Товара «{html.escape(item['name'])}» столько нет — "
             f"проверьте остаток в «магазин»."
         )
-        return
+        return False
     # Распродажа (событие чата) снижает цену только в момент покупки —
     # ценники в самом магазине не переписываем.
     price = max(1, round(int(item["price"]) * await event_multiplier(message.chat.id, chat_events.T_SHOP)))
@@ -22507,7 +24304,7 @@ async def cmd_shop_buy(message: Message):
             + (f" ({qty} × {price})" if qty > 1 else "")
             + f", а у вас {wallet.get('coins', 0)} i¢."
         )
-        return
+        return False
     await db.add_inventory_item(message.chat.id, message.from_user.id, item_key, qty)
     await db.add_log("shop_purchase", chat_id=message.chat.id,
                      actor_id=message.from_user.id, details=f"{item_key}:{qty}")
@@ -22523,11 +24320,12 @@ async def cmd_shop_buy(message: Message):
     # магазина не пересчитывались вовсе, потому что ни одна от него не зависела.
     if item_key in db.JUNK_ITEM_KEYS:
         await _check_collections(message.chat.id, message.from_user.id)
+    return True
 
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("инвентарь", "мой инвентарь")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("инвентарь", "мой инвентарь")),
 )
 async def cmd_inventory(message: Message):
     target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
@@ -22550,8 +24348,17 @@ async def cmd_inventory(message: Message):
             f"× {i['quantity']} "
             f"(осталось использований: {left}/{db.ITEM_USE_LIMIT})"
         )
+    dolls = await db.list_voodoo_dolls(message.chat.id, target.id)
+    if dolls:
+        # Куклы не в инвентаре (см. db.ensure_voodoo_table), но человек ищет
+        # их именно здесь — показываем отдельной строкой.
+        names = await _doll_names(message.chat.id, dolls)
+        lines.append(f"🧵 Куклы вуду ({len(dolls)}): {names}")
     lines.append("")
     lines.append("Ключ можно нажать — он скопируется.")
+    lines.append(f"📌 <b>Закреп усиливает.</b> «закрепить {{ключ}}» — и предмет "
+                 f"с эффектом работает в {shop_effects.PIN_MULTIPLIER} раз "
+                 f"сильнее: больше зарядов, щедрее раздача, реже расходуется.")
     await message.reply("\n".join(lines))
 
 
@@ -22693,6 +24500,7 @@ async def _lootbox_build_pools(chat_id: int) -> tuple[list[dict], list[dict]]:
     # никогда, ведь seed_default_shop_items у непустого магазина молчит.
     await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
     await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
 
     pool: list[dict] = []
     for item in await db.list_shop_items(chat_id, active_only=True):
@@ -22875,6 +24683,7 @@ async def cmd_lootbox(message: Message):
         # умножать там попросту нечего.
         rare_chance = info["rare_chance"]
         nyuhach = await _pet_bonus(chat_id, user_id, "lootbox")
+        nyuhach += await _pin_bonus(chat_id, user_id, "lootbox")   # тема «Коллекции»
         if nyuhach:
             rare_chance = min(100, rare_chance + rare_chance * nyuhach // 100)
 
@@ -22915,7 +24724,10 @@ async def cmd_lootbox(message: Message):
 
 
 
-PIN_ITEM_RE = re.compile(r"(?i)^закрепить\s+(\S+)$")
+# «куклу» и «рыбу» — свои команды со своими обработчиками. Порядок регистрации
+# их и так разводит, но опираться только на него нельзя: перестановка функций в
+# файле сломала бы команды молча (так уже было с массовыми командами питомцев).
+PIN_ITEM_RE = ru_text.rx(r"(?i)^закрепить\s+(?!кукл[уы]$|рыбу$)(\S+)$")
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -23446,7 +25258,7 @@ async def cmd_list_mutes(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("баны","банлист")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("баны","банлист")),
 )
 async def cmd_list_bans(message: Message):
     if not has_level(message.from_user.id, required_level("list_bans")):
@@ -23487,8 +25299,8 @@ TIMER_MAX_DURATION = timedelta(days=366)
 _TIMER_LIMIT_DEFAULT = int(os.getenv("TIMER_LIMIT", "5"))  # активных таймеров одновременно на чат
 TIMER_LIMIT = _TIMER_LIMIT_DEFAULT
 
-_TIMER_THROUGH_RE = re.compile(r"(?is)^таймер\s+через\s+(\S+)\s*\n(.+)$")
-_TIMER_AT_RE = re.compile(
+_TIMER_THROUGH_RE = ru_text.rx(r"(?is)^таймер\s+через\s+(\S+)\s*\n(.+)$")
+_TIMER_AT_RE = ru_text.rx(
     r"(?is)^таймер\s+на\s+(\d{1,2}\.\d{1,2}\.\d{2,4})(?:\s+(\d{1,2}:\d{2}))?\s*\n(.+)$"
 )
 
@@ -23703,7 +25515,7 @@ async def cmd_delete_timer(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!сбросить таймеры", "!удалить все таймеры")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!сбросить таймеры", "!удалить все таймеры")),
 )
 async def cmd_reset_timers(message: Message):
     if not has_level(message.from_user.id, required_level("timer")):
@@ -23726,7 +25538,7 @@ async def cmd_reset_timers(message: Message):
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.reply_to_message,
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (".закреп", "закреп", ".закреп тихо", "закреп тихо")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (".закреп", "закреп", ".закреп тихо", "закреп тихо")),
 )
 async def cmd_pin(message: Message):
     if not has_level(message.from_user.id, required_level("pin")):
@@ -23756,7 +25568,7 @@ async def cmd_pin(message: Message):
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.reply_to_message,
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (".открепить", "открепить")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (".открепить", "открепить")),
 )
 async def cmd_unpin(message: Message):
     if not has_level(message.from_user.id, required_level("unpin")):
@@ -23779,7 +25591,7 @@ async def cmd_unpin(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (".открепить все", "открепить все")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (".открепить все", "открепить все")),
 )
 async def cmd_unpin_all(message: Message):
     if not has_level(message.from_user.id, required_level("unpin_all")):
@@ -24671,7 +26483,7 @@ async def close_tg_rights(callback: CallbackQuery):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("тг админы", "тг админ")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("тг админы", "тг админ")),
 )
 async def cmd_tg_admins_list(message: Message):
     try:
@@ -24696,7 +26508,7 @@ async def cmd_tg_admins_list(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("права", "админы", "кто админ", "ктоадмин")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("права", "админы", "кто админ", "ктоадмин")),
 )
 async def cmd_rights(message: Message):
     if message.text.strip().casefold() == "права" and message.reply_to_message:
@@ -25017,7 +26829,7 @@ def cmd_tree_category_message(category: str, page: int) -> tuple[str, InlineKeyb
 
 @router.message(
     F.chat.type.in_({"group", "supergroup", "private"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("команды", "дерево команд", "дерево")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("команды", "дерево команд", "дерево")),
 )
 async def cmd_tree(message: Message):
     await message.reply(cmd_tree_root_text(), reply_markup=cmd_tree_root_kb())
@@ -25227,7 +27039,7 @@ REWARD_SAME_TARGET_COOLDOWN = timedelta(hours=24)
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ наград", "топ награждённых", "топ награжденных")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("топ наград", "топ награждённых", "топ награжденных")),
 )
 async def cmd_reward_top(message: Message):
     """Топ награждённых — по сумме степеней, а не по числу медалей."""
@@ -25433,7 +27245,7 @@ async def reward_list_page(
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("награды", "мои награды")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("награды", "мои награды")),
 )
 async def cmd_rewards(message: Message):
     if message.text.strip().casefold() == "мои награды":
@@ -25733,7 +27545,7 @@ async def _members_count(chat_id: int) -> Optional[int]:
         return None
 
 
-JOIN_LEAVE_TOGGLE_RE = re.compile(
+JOIN_LEAVE_TOGGLE_RE = ru_text.rx(
     r"^([+\-])\s*(входы\s*-\s*выходы|входы|выходы)$", re.IGNORECASE
 )
 
@@ -25777,7 +27589,7 @@ async def cmd_join_leave_toggle(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+стата", "-стата")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+стата", "-стата")),
 )
 async def cmd_stat_chart_toggle(message: Message):
     min_level = required_level("stat_chart_toggle")
@@ -25899,6 +27711,11 @@ async def cmd_profile(message: Message):
     await send_profile_card(message, message.chat.id, target)
 
 
+# Сколько символов описания влезает в карточку профиля. Полное — по команде
+# «о себе»: карточка и так длинная, а описание пишут какой угодно длины.
+PROFILE_ABOUT_MAX = 200
+
+
 async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[str, InlineKeyboardMarkup]:
     """Строит текст и инлайн-клавиатуру полной групповой карточки профиля.
     Используется и командой «профиль»/«кто я», и кнопкой «⬅️ Назад» из
@@ -25970,11 +27787,18 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
         # Питомца могли отпустить уже после закрепления — тогда строки просто
         # нет, а не «закреплён неизвестно кто».
         if pet_row and pet_spec:
-            hunger, mood = _pet_now(pet_row)
+            hunger, mood = _pet_now(
+                pet_row, await _pet_slowdown_for(chat_id, target.id))
             given = pet_row.get("pet_name")
             shown = f"{pet_spec.title} «{html.escape(given)}»" if given else pet_spec.title
             level = _pet_level(pet_row)
             lines.append(f"🐾 Питомец: {shown} — ⭐{level} — {pets_catalog.state_text(hunger, mood)}")
+    if card and card.get("pinned_doll"):
+        doll = await db.get_voodoo_doll(chat_id, target.id, int(card["pinned_doll"]))
+        # Куклу могли не сделать заново после отката базы — тогда строки просто
+        # нет, а не «закреплена неизвестно чья».
+        if doll:
+            lines.append(f"🧵 Кукла вуду: <b>{await _doll_link(chat_id, doll)}</b>")
     if card and card.get("pinned_business"):
         # Бизнес мог быть продан или передан уже после закрепления — тогда
         # строку просто не рисуем, а не показываем чужое. Уровень и состояние
@@ -26008,7 +27832,7 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     # одно число, показываем всегда.
     wallet = await db.get_wallet(chat_id, target.id)
     coins = int(wallet.get("coins") or 0)
-    stars = int(wallet.get("star_level") or 0)
+    stars = wallet_stars(wallet)
     if coins or stars:
         lines.append(f"В кошельке: ☢️ {coins:,} i¢ · ✨ {stars}".replace(",", " "))
     reputation = await db.get_reputation(chat_id, target.id)
@@ -26049,6 +27873,18 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
         extra.append(f"{GENDER_EMOJI[card['gender']]} Пол: <b>{GENDER_LABEL[card['gender']]}</b>")
     if anketa_shown and card and card.get("city"):
         extra.append(f"🏙 Город: <b>{html.escape(card['city'])}</b>")
+    if anketa_shown and card and card.get("about_text"):
+        # «О себе» показываем и здесь, а не только в анкете: профиль — то, что
+        # открывают в первую очередь, и описание человека логичнее видеть
+        # сразу, чем идти за ним отдельной командой. Скрытая анкета остаётся
+        # скрытой: правило видимости то же самое, своё описание владелец
+        # видит всегда.
+        about = card["about_text"].strip()
+        # Профиль — карточка, а не полотно: длинное описание подрезаем и
+        # отправляем за полным текстом в «о себе».
+        if len(about) > PROFILE_ABOUT_MAX:
+            about = about[:PROFILE_ABOUT_MAX].rstrip() + "… (полностью — «о себе»)"
+        extra.append(f"📝 О себе: {html.escape(about)}")
     if card and card.get("motto"):
         extra.append(f"💬 Девиз: «{html.escape(card['motto'])}»")
     if card and card.get("is_citizen"):
@@ -26437,7 +28273,7 @@ async def top_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup |
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ", "актив")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("топ", "актив")),
 )
 async def cmd_top(message: Message):
     text, keyboard = await top_page(message.chat.id, 0)
@@ -26467,7 +28303,7 @@ def compute_streak(days: list) -> int:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("стрик", "мой стрик", "стрик активности")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("стрик", "мой стрик", "стрик активности")),
 )
 async def cmd_streak(message: Message):
     target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
@@ -26541,7 +28377,7 @@ async def streak_top_page(chat_id: int, page: int) -> tuple[str, Optional[Inline
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ стриков", "топ по стрику", "топ стрик")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("топ стриков", "топ по стрику", "топ стрик")),
 )
 async def cmd_streak_top(message: Message):
     if not _check_misc_access(message.from_user.id, "streak_top"):
@@ -26862,7 +28698,7 @@ async def _render_chat_chart(chat_id: int, days: int, title: str = "Статис
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("чат инфо", "чатинфо")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("чат инфо", "чатинфо")),
 )
 async def cmd_chat_info(message: Message):
     chat = message.chat
@@ -27438,7 +29274,7 @@ async def cmd_unset_norm(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ( "не в норме","вне нормы")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ( "не в норме","вне нормы")),
 )
 async def cmd_norm_check(message: Message):
     if not has_level(message.from_user.id, required_level("norm_check")):
@@ -28272,7 +30108,7 @@ async def build_weekly_digest(chat_id: int, days: int = WEEKLY_DIGEST_DAYS) -> O
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "итоги", "итоги недели", "сводка",
     )),
 )
@@ -28288,7 +30124,7 @@ async def cmd_weekly_digest(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+итоги", "-итоги")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+итоги", "-итоги")),
 )
 async def cmd_weekly_digest_toggle(message: Message):
     min_level = required_level("digest_toggle")
@@ -28306,7 +30142,7 @@ async def cmd_weekly_digest_toggle(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+рстик", "-рстик")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+рстик", "-рстик")),
 )
 async def cmd_random_sticker_toggle(message: Message):
     min_level = required_level("random_sticker_toggle")
@@ -28563,7 +30399,7 @@ async def daily_top_reward_loop() -> None:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "!выдать топ активности", "!выдать топ", "выдать топ активности",
     )),
 )
@@ -28594,7 +30430,7 @@ async def cmd_daily_top_manual(message: Message):
 # неё как на глобальную. В итоге проверка фильтра падала с NameError на КАЖДОМ
 # сообщении, доходившем до этого места роутера, и все команды, объявленные
 # ниже по файлу, переставали работать.
-STOCK_SET_PRICE_RE = re.compile(r"(?i)^!?биржа\s+цена\s+(\S+)$")
+STOCK_SET_PRICE_RE = ru_text.rx(r"(?i)^!?биржа\s+цена\s+(\S+)$")
 
 
 @router.message(
@@ -28624,15 +30460,15 @@ async def cmd_stock_set_price(message: Message):
 # удобнее не открывать сайт. Слово «настройки» третьим словом обязательно:
 # без него «биржа дивиденды» — это команда участника «забрать дивиденды»,
 # и «биржа дивиденды 5» читалось бы как опечатка в ней, а не как настройка.
-STOCK_CFG_SHOW_RE = re.compile(r"(?i)^!?биржа\s+настройки$")
-STOCK_CFG_SET_RE = re.compile(r"(?i)^!?биржа\s+настройки\s+(рост|падение|дивиденды)\s+(\S+)$")
+STOCK_CFG_SHOW_RE = ru_text.rx(r"(?i)^!?биржа\s+настройки$")
+STOCK_CFG_SET_RE = ru_text.rx(r"(?i)^!?биржа\s+настройки\s+(рост|падение|дивиденды)\s+(\S+)$")
 # Готовые режимы: числа те же, что у пресетов в веб-панели.
 STOCK_PRESETS = {
     "спокойная": (-5.0, 5.0, 2.0),
     "обычная":   (-15.0, 15.0, 5.0),
     "азартная":  (-30.0, 30.0, 10.0),
 }
-STOCK_CFG_PRESET_RE = re.compile(
+STOCK_CFG_PRESET_RE = ru_text.rx(
     r"(?i)^!?биржа\s+настройки\s+(" + "|".join(STOCK_PRESETS) + r")$"
 )
 
@@ -29097,7 +30933,7 @@ def _event_status_lines(state: Optional[dict]) -> list[str]:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in EVENT_STATUS_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in EVENT_STATUS_TRIGGERS),
 )
 async def cmd_chat_event_status(message: Message):
     if not _check_misc_access(message.from_user.id, "chat_events"):
@@ -29119,7 +30955,7 @@ async def cmd_chat_event_status(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in EVENT_TOGGLE_TRIGGERS),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in EVENT_TOGGLE_TRIGGERS),
 )
 async def cmd_chat_events_toggle(message: Message):
     min_level = required_level("chat_events_toggle")
@@ -29144,7 +30980,7 @@ async def cmd_chat_events_toggle(message: Message):
 # произошло вчера» — обычные фразы, и админ, написавший такое в чате, получал
 # бы в ответ простыню со списком событий. У «ивент» такой проблемы нет: в
 # живой речи оно почти не встречается отдельным словом с продолжением.
-EVENT_FORCE_RE = re.compile(
+EVENT_FORCE_RE = ru_text.rx(
     r"(?i)^!?(?:событие\s+запустить|ивент)\s+(.+)$"
 )
 # Верхний предел — чтобы «ивент gold_rush 100д» не подвесил бафф на неделю:
@@ -29325,7 +31161,7 @@ REPUTATION_SAME_TARGET_COOLDOWN = 3600  # секунд между голосам
 
 # Только знак и (необязательно) число: «+», «+5», «-3». Ничего больше в
 # сообщении быть не должно, иначе поймали бы обычный текст вроде «-5 градусов».
-REPUTATION_RE = re.compile(r"^([+\-])\s*(\d{1,2})?$")
+REPUTATION_RE = ru_text.rx(r"^([+\-])\s*(\d{1,2})?$")
 
 
 def _minus_enabled_key(chat_id: int) -> str:
@@ -29466,7 +31302,7 @@ async def cmd_reputation_word(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+минусит", "-минусит")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+минусит", "-минусит")),
 )
 async def cmd_minus_toggle(message: Message):
     min_level = required_level("reputation_toggle")
@@ -29487,7 +31323,7 @@ async def cmd_minus_toggle(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "рейтинг", "репутация чата", "топ репутации",
     )),
 )
@@ -29511,7 +31347,7 @@ async def cmd_reputation_top(message: Message):
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and (
-        t.strip().casefold() in ("моя репутация", "мой рейтинг", "репутация")
+        ru_text.yo(t.strip().casefold()) in ("моя репутация", "мой рейтинг", "репутация")
         or t.strip().casefold().startswith("репутация ")
     )),
 )
@@ -29545,7 +31381,7 @@ async def cmd_reputation_show(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "!сбросить рейтинг", "!обнулить рейтинг",
     )),
 )
@@ -29782,7 +31618,7 @@ async def check_message_achievements(chat_id: int, user_id: int, when: datetime)
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (
         "мои ачивки", "ачивки", "мои достижения",
     )),
 )
@@ -29860,7 +31696,7 @@ async def _send_achievements(message: Message, user_id: int, own: bool) -> None:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+ачивки", "-ачивки")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+ачивки", "-ачивки")),
 )
 async def cmd_achievements_visibility(message: Message):
     if not _check_misc_access(message.from_user.id, "achievements"):
@@ -29875,7 +31711,7 @@ async def cmd_achievements_visibility(message: Message):
         await message.reply("🔒 Ваши ачивки скрыты от других.")
 
 
-ACHIEVEMENT_PIN_RE = re.compile(r"(?i)^закрепить\s+ачивку\s+(\S+)$")
+ACHIEVEMENT_PIN_RE = ru_text.rx(r"(?i)^закрепить\s+ачивку\s+(\S+)$")
 
 
 @router.message(
@@ -29906,7 +31742,7 @@ async def cmd_unpin_achievement(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ ачивок", "ачивки чата")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("топ ачивок", "ачивки чата")),
 )
 async def cmd_achievements_top(message: Message):
     if not _check_misc_access(message.from_user.id, "achievements"):
@@ -29985,7 +31821,7 @@ async def cmd_subscription_toggle(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("мои подписки", "мои сабы", "мои подписчики")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("мои подписки", "мои сабы", "мои подписчики")),
 )
 async def cmd_my_subscriptions(message: Message):
     if not _check_misc_access(message.from_user.id, "subscriptions"):
@@ -30014,7 +31850,7 @@ async def cmd_my_subscriptions(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("сабы чата", "топ сабов", "инфлюенсеры")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("сабы чата", "топ сабов", "инфлюенсеры")),
 )
 async def cmd_chat_subs_top(message: Message):
     if not _check_misc_access(message.from_user.id, "subscriptions"):
@@ -30060,7 +31896,7 @@ async def cmd_call_my_subs(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("кто онлайн", "кто в сети", "кто тут")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("кто онлайн", "кто в сети", "кто тут")),
 )
 async def cmd_who_online(message: Message):
     if not _check_misc_access(message.from_user.id, "who_online"):
@@ -30215,7 +32051,7 @@ async def cmd_motto(message: Message):
 # ---------- Гражданство (как в анкете Iris — значок 🏡 в /профиль) ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+гражданство", "-гражданство")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+гражданство", "-гражданство")),
 )
 async def cmd_citizenship(message: Message):
     is_citizen = message.text.strip().casefold() == "+гражданство"
@@ -30228,7 +32064,7 @@ async def cmd_citizenship(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("граждане", "все граждане")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("граждане", "все граждане")),
 )
 async def cmd_citizens_list(message: Message):
     rows = await db.list_citizen_rows(message.chat.id)
@@ -30411,7 +32247,7 @@ async def cmd_about_show(message: Message):
 # ---------- Видимость анкеты ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+анкета", "-анкета")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+анкета", "-анкета")),
 )
 async def cmd_anketa_visibility(message: Message):
     visible = message.text.strip().casefold() == "+анкета"
@@ -30425,7 +32261,7 @@ async def cmd_anketa_visibility(message: Message):
 # ---------- Карточка анкеты ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("анкета", "моя анкета")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("анкета", "моя анкета")),
 )
 async def cmd_anketa(message: Message):
     target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
@@ -30775,7 +32611,7 @@ async def cmd_marry_pair(message: Message):
     F.chat.type.in_({"group", "supergroup"}),
     # «!Развод» — написание из 20-го модуля Iris; «.развод» работал раньше и
     # остаётся, чтобы не переучивать чат.
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in (".развод", "!развод")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in (".развод", "!развод")),
 )
 async def cmd_divorce(message: Message):
     marriage = await db.get_marriage(message.chat.id, message.from_user.id)
@@ -30885,7 +32721,7 @@ async def cb_marriage_undo(callback: CallbackQuery):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("вернуть брак", "верни брак")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("вернуть брак", "верни брак")),
 )
 async def cmd_restore_marriage(message: Message):
     await message.reply(await _restore_marriage(message.chat.id, message.from_user.id))
@@ -31129,7 +32965,7 @@ async def cmd_their_marriage(message: Message):
 
 
 # ---------- «Браки {номер страницы}» ----------
-MARRIAGES_PAGE_RE = re.compile(r"(?i)^браки\s+(\d{1,4})$")
+MARRIAGES_PAGE_RE = ru_text.rx(r"(?i)^браки\s+(\d{1,4})$")
 
 
 @router.message(
@@ -31279,7 +33115,7 @@ async def cmd_divorce_departed(message: Message):
 # ---------- «!Сброс браков» (старший админ, с подтверждением) ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("!сброс браков", "сброс браков")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!сброс браков", "сброс браков")),
 )
 async def cmd_marriages_reset(message: Message):
     min_level = required_level("marriages_reset")
@@ -31348,7 +33184,7 @@ async def cb_marriages_reset_yes(callback: CallbackQuery):
 
 
 # ---------- «Брак цена продления {число}» (админ) ----------
-MARRIAGE_PRICE_RE = re.compile(r"(?i)^брак\s+цена\s+продления(?:\s+(\S+))?$")
+MARRIAGE_PRICE_RE = ru_text.rx(r"(?i)^брак\s+цена\s+продления(?:\s+(\S+))?$")
 
 
 @router.message(
@@ -31384,7 +33220,7 @@ async def cmd_marriage_renew_price(message: Message):
 
 
 # ---------- «Брак продлить {кол-во дней}» ----------
-MARRIAGE_EXTEND_RE = re.compile(r"(?i)^брак\s+продлить(?:\s+(\d{1,4}))?$")
+MARRIAGE_EXTEND_RE = ru_text.rx(r"(?i)^брак\s+продлить(?:\s+(\d{1,4}))?$")
 
 
 @router.message(
@@ -31451,7 +33287,7 @@ async def cmd_marriage_extend(message: Message):
 # ---------- «+Брак рейтинг» / «-Брак рейтинг» (админ) ----------
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("+брак рейтинг", "-брак рейтинг")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+брак рейтинг", "-брак рейтинг")),
 )
 async def cmd_marriage_rating_toggle(message: Message):
     min_level = required_level("marriage_rating_toggle")
@@ -31472,7 +33308,7 @@ async def cmd_marriage_rating_toggle(message: Message):
 
 
 # ---------- «Брак режим развода» (админ) ----------
-MARRIAGE_MODE_RE = re.compile(r"(?i)^брак\s+режим\s+развода(?:\s+(\S+))?$")
+MARRIAGE_MODE_RE = ru_text.rx(r"(?i)^брак\s+режим\s+развода(?:\s+(\S+))?$")
 _MARRIAGE_MODE_WORDS = {
     "авто": "auto", "автоматический": "auto", "вкл": "auto", "auto": "auto",
     "выкл": "off", "выключен": "off", "нет": "off", "off": "off",
@@ -32190,7 +34026,7 @@ async def cmd_call_emoji(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("сменить эмодзи", "случайный эмодзи", "changeme","чанджми")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("сменить эмодзи", "случайный эмодзи", "changeme","чанджми")),
 )
 async def cmd_call_emoji_random(message: Message):
     """Аналог /changeme — сменить позывной на случайный эмодзи из встроенного набора."""
@@ -32274,7 +34110,7 @@ async def cmd_unreg(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("-анрег", "рег", "регистрация")),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("-анрег", "рег", "регистрация")),
 )
 async def cmd_reg(message: Message):
     """Досрочно отменить свой анрег (обычно он и так снимается следующим сообщением)."""
@@ -32935,16 +34771,16 @@ async def club_members_text(chat_id: int, club_id: int, page: int) -> tuple[str,
     return text, InlineKeyboardMarkup(inline_keyboard=[nav])
 
 
-CLUB_CREATE_RE = re.compile(r"(?is)^создать\s+кружок\s+(.+)$")
-CLUB_EDIT_RE = re.compile(r"(?is)^кружок\s+(\d+)\s+изменить\s+(.+)$")
-CLUB_SET_HOME_RE = re.compile(r"(?i)^кружок\s+основа\s+(\d+)$")
-CLUB_DELETE_RE = re.compile(r"(?i)^удалить\s+кружок\s+(\d+)$")
-CLUB_JOIN_RE = re.compile(r"(?i)^(?:кружок\s+вступить\s+(\d+)|\+кружок\s+(\d+))$")
-CLUB_LEAVE_RE = re.compile(r"(?i)^(?:выйти\s+из\s+кружка\s+(\d+)|-кружок\s+(\d+))$")
-CLUB_LIST_RE = re.compile(r"(?i)^кружки(?:\s+(\d+))?$")
-CLUB_MY_RE = re.compile(r"(?i)^мои\s+кружки$")
-CLUB_MEMBERS_RE = re.compile(r"(?i)^участники\s+кружка\s+(\d+)$")
-CLUB_COINS_RE = re.compile(r"(?i)^кружок\s+(\d+)\s+коины\s+(-?\S+)$")
+CLUB_CREATE_RE = ru_text.rx(r"(?is)^создать\s+кружок\s+(.+)$")
+CLUB_EDIT_RE = ru_text.rx(r"(?is)^кружок\s+(\d+)\s+изменить\s+(.+)$")
+CLUB_SET_HOME_RE = ru_text.rx(r"(?i)^кружок\s+основа\s+(\d+)$")
+CLUB_DELETE_RE = ru_text.rx(r"(?i)^удалить\s+кружок\s+(\d+)$")
+CLUB_JOIN_RE = ru_text.rx(r"(?i)^(?:кружок\s+вступить\s+(\d+)|\+кружок\s+(\d+))$")
+CLUB_LEAVE_RE = ru_text.rx(r"(?i)^(?:выйти\s+из\s+кружка\s+(\d+)|-кружок\s+(\d+))$")
+CLUB_LIST_RE = ru_text.rx(r"(?i)^кружки(?:\s+(\d+))?$")
+CLUB_MY_RE = ru_text.rx(r"(?i)^мои\s+кружки$")
+CLUB_MEMBERS_RE = ru_text.rx(r"(?i)^участники\s+кружка\s+(\d+)$")
+CLUB_COINS_RE = ru_text.rx(r"(?i)^кружок\s+(\d+)\s+коины\s+(-?\S+)$")
 
 
 @router.message(
@@ -33337,24 +35173,24 @@ def _split_clan_name_and_description(raw: str) -> tuple[str, Optional[str]]:
     return name, description
 
 
-CLAN_CREATE_RE = re.compile(r"(?is)^создать\s+клан\s+(.+)$")
-CLAN_EDIT_RE = re.compile(r"(?is)^клан\s+изменить\s+(.+)$")
-CLAN_TITLE_SET_RE = re.compile(r"(?i)^\+клан\s+звание\s+(.+)$")
-CLAN_TITLE_UNSET_RE = re.compile(r"(?i)^-клан\s+звание$")
-CLAN_MOTTO_SET_RE = re.compile(r"(?i)^\+клан\s+девиз\s+(.+)$")
-CLAN_MOTTO_UNSET_RE = re.compile(r"(?i)^-клан\s+девиз$")
-CLAN_DELETE_RE = re.compile(r"(?i)^удалить\s+клан$")
-CLAN_DELETE_ADMIN_RE = re.compile(r"(?i)^!удалить\s+клан\s+(\d+)$")
-CLAN_JOIN_RE = re.compile(r"(?i)^(?:клан\s+вступить\s+(\d+)|\+клан\s+(\d+))$")
-CLAN_LEAVE_RE = re.compile(r"(?i)^(?:выйти\s+из\s+клана|-клан)$")
-CLAN_LIST_RE = re.compile(r"(?i)^кланы(?:\s+(\d+))?$")
-CLAN_TOP_RE = re.compile(r"(?i)^топ\s+кланов$")
-CLAN_MY_RE = re.compile(r"(?i)^мой\s+клан$")
-CLAN_MEMBERS_RE = re.compile(r"(?i)^участники\s+клана\s+(\d+)$")
-CLAN_WAR_CHALLENGE_RE = re.compile(r"(?i)^война\s+клана\s+(\d+)$")
-CLAN_WAR_YES_RE = re.compile(r"(?i)^война\s+да$")
-CLAN_WAR_NO_RE = re.compile(r"(?i)^война\s+нет$")
-CLAN_WAR_CANCEL_RE = re.compile(r"(?i)^война\s+отмена$")
+CLAN_CREATE_RE = ru_text.rx(r"(?is)^создать\s+клан\s+(.+)$")
+CLAN_EDIT_RE = ru_text.rx(r"(?is)^клан\s+изменить\s+(.+)$")
+CLAN_TITLE_SET_RE = ru_text.rx(r"(?i)^\+клан\s+звание\s+(.+)$")
+CLAN_TITLE_UNSET_RE = ru_text.rx(r"(?i)^-клан\s+звание$")
+CLAN_MOTTO_SET_RE = ru_text.rx(r"(?i)^\+клан\s+девиз\s+(.+)$")
+CLAN_MOTTO_UNSET_RE = ru_text.rx(r"(?i)^-клан\s+девиз$")
+CLAN_DELETE_RE = ru_text.rx(r"(?i)^удалить\s+клан$")
+CLAN_DELETE_ADMIN_RE = ru_text.rx(r"(?i)^!удалить\s+клан\s+(\d+)$")
+CLAN_JOIN_RE = ru_text.rx(r"(?i)^(?:клан\s+вступить\s+(\d+)|\+клан\s+(\d+))$")
+CLAN_LEAVE_RE = ru_text.rx(r"(?i)^(?:выйти\s+из\s+клана|-клан)$")
+CLAN_LIST_RE = ru_text.rx(r"(?i)^кланы(?:\s+(\d+))?$")
+CLAN_TOP_RE = ru_text.rx(r"(?i)^топ\s+кланов$")
+CLAN_MY_RE = ru_text.rx(r"(?i)^мой\s+клан$")
+CLAN_MEMBERS_RE = ru_text.rx(r"(?i)^участники\s+клана\s+(\d+)$")
+CLAN_WAR_CHALLENGE_RE = ru_text.rx(r"(?i)^война\s+клана\s+(\d+)$")
+CLAN_WAR_YES_RE = ru_text.rx(r"(?i)^война\s+да$")
+CLAN_WAR_NO_RE = ru_text.rx(r"(?i)^война\s+нет$")
+CLAN_WAR_CANCEL_RE = ru_text.rx(r"(?i)^война\s+отмена$")
 
 
 @router.message(
@@ -33687,8 +35523,8 @@ async def clan_members_page_cb(callback: CallbackQuery):
     await callback.answer()
 
 
-CLAN_TREASURY_DEPOSIT_RE = re.compile(r"(?i)^клан\s+пополнить\s+казну\s+(\S+)$")
-CLAN_TREASURY_WITHDRAW_RE = re.compile(r"(?i)^клан\s+взять\s+с\s+казны\s+(\S+)$")
+CLAN_TREASURY_DEPOSIT_RE = ru_text.rx(r"(?i)^клан\s+пополнить\s+казну\s+(\S+)$")
+CLAN_TREASURY_WITHDRAW_RE = ru_text.rx(r"(?i)^клан\s+взять\s+с\s+казны\s+(\S+)$")
 
 
 @router.message(
@@ -34894,15 +36730,15 @@ async def user_bookmarks_page_text(
     return text, InlineKeyboardMarkup(inline_keyboard=[nav])
 
 
-BOOKMARK_ADD_RE = re.compile(r"(?is)^\+закладка\s+(.+)$")
-BOOKMARK_VIEW_RE = re.compile(r"(?i)^закладка\s+(\d+)$")
-BOOKMARK_CHATBOOK_RE = re.compile(r"(?i)^чатбук(?:\s+(\d+))?$")
-BOOKMARK_MY_RE = re.compile(r"(?i)^мои\s+закладки(?:\s+(\d+))?$")
-BOOKMARK_OF_RE = re.compile(r"(?i)^закладки\s+")
-BOOKMARK_DELETE_RE = re.compile(r"(?i)^(?:удалить\s+закладку|-закладка)\s+(\d+)$")
-BOOKMARK_EXCLUDE_RE = re.compile(r"(?i)^(?:исключить\s+закладку|убрать\s+закладку)\s+(\d+)$")
-BOOKMARK_KLADMEN_RETURN_RE = re.compile(r"(?i)^(?:\+кладмен|вернуть\s+кладмена|освободить\s+кладмена)\b\s*(.*)$")
-BOOKMARK_KLADMEN_EXCLUDE_RE = re.compile(r"(?i)^(?:-кладмен|закрыть\s+кладмена|убрать\s+кладмена)\b\s*(.*)$")
+BOOKMARK_ADD_RE = ru_text.rx(r"(?is)^\+закладка\s+(.+)$")
+BOOKMARK_VIEW_RE = ru_text.rx(r"(?i)^закладка\s+(\d+)$")
+BOOKMARK_CHATBOOK_RE = ru_text.rx(r"(?i)^чатбук(?:\s+(\d+))?$")
+BOOKMARK_MY_RE = ru_text.rx(r"(?i)^мои\s+закладки(?:\s+(\d+))?$")
+BOOKMARK_OF_RE = ru_text.rx(r"(?i)^закладки\s+")
+BOOKMARK_DELETE_RE = ru_text.rx(r"(?i)^(?:удалить\s+закладку|-закладка)\s+(\d+)$")
+BOOKMARK_EXCLUDE_RE = ru_text.rx(r"(?i)^(?:исключить\s+закладку|убрать\s+закладку)\s+(\d+)$")
+BOOKMARK_KLADMEN_RETURN_RE = ru_text.rx(r"(?i)^(?:\+кладмен|вернуть\s+кладмена|освободить\s+кладмена)\b\s*(.*)$")
+BOOKMARK_KLADMEN_EXCLUDE_RE = ru_text.rx(r"(?i)^(?:-кладмен|закрыть\s+кладмена|убрать\s+кладмена)\b\s*(.*)$")
 
 
 @router.message(
@@ -35327,6 +37163,7 @@ async def main():
     await db.ensure_earning_activity_table()  # бонус / подработка / шапка
     await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_pets_table()              # личные питомцы
+    await db.ensure_voodoo_table()            # именные сувениры-куклы
     await db.ensure_seasons_table()           # месячный зачёт
     await db.ensure_timezone_column()
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)

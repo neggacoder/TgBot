@@ -78,6 +78,7 @@ aiogram (сработает тот, что зарегистрирован пер
 """
 from __future__ import annotations
 
+import ru_text
 import html
 import json
 import logging
@@ -941,15 +942,19 @@ async def _room_exists_for_pair(message: Message, room_key: str) -> bool:
 # РЕШЕНО: цены и шансы взяты из гайда дословно, без изменений.
 EGG_CATALOG: dict[str, dict] = {
     "common": {
-        "name": "🥚 Обычное яйцо", "price_sparks": 10_000, "price_stars": None,
+        "name": "🥚 Обычное яйцо", "price_sparks": 10_000,
         "weights": {"обычный": 70, "необычный": 20, "редкий": 8, "эпический": 1.5, "легендарный": 0.5},
     },
     "golden": {
-        "name": "🥚✨ Золотое яйцо", "price_sparks": 50_000, "price_stars": None,
+        "name": "🥚✨ Золотое яйцо", "price_sparks": 50_000,
         "weights": {"обычный": 2, "необычный": 13, "редкий": 45, "эпический": 38, "легендарный": 2},
     },
+    # Раньше стоило 25 звёзд Telegram, а оплата звёздами так и не была
+    # подключена — команда просто отвечала «пока нельзя», и лучшее яйцо было
+    # недостижимо. Звёзды убраны совсем; цена в искрах подобрана втрое дороже
+    # золотого, по разнице в шансах на эпического и легендарного питомца.
     "premium": {
-        "name": "🌟🥚 Премиум яйцо", "price_sparks": None, "price_stars": 25,
+        "name": "🌟🥚 Премиум яйцо", "price_sparks": 150_000,
         "weights": {"необычный": 5, "редкий": 25, "эпический": 60, "легендарный": 10},
     },
 }
@@ -1152,7 +1157,7 @@ async def cmd_pet_menu(message: Message, arg_rest: str) -> None:
             DIVIDER,
         ]
         for key, info in EGG_CATALOG.items():
-            price = f"{info['price_sparks']} искр" if info["price_sparks"] else f"{info['price_stars']} ⭐"
+            price = f"{info['price_sparks']} искр"
             lines.append(f"· <code>{key}</code> — {info['name']} ({price})")
         await message.reply("\n".join(lines))
         return
@@ -1184,13 +1189,6 @@ async def cmd_pet_buy_egg(message: Message, egg_key: str) -> None:
         await message.reply("Неизвестное яйцо. Варианты: common, golden, premium.")
         return
     egg = EGG_CATALOG[egg_key]
-
-    if egg["price_stars"] is not None:
-        await message.reply(
-            f"🌟 {egg['name']} покупается за {egg['price_stars']} звёзд — оплата звёздами "
-            f"пока не подключена к этой команде, обратитесь к разделу «отн прем»/«отн искры»."
-        )
-        return
 
     price = egg["price_sparks"]
     if pair["sparks"] < price:
@@ -4646,5 +4644,6 @@ async def spark_decay_loop(bot, interval_seconds: int = 3600) -> None:
 #     выдан всем бесплатно (rel2_pairs.premium = TRUE по умолчанию + разовый
 #     бэкафилл в db.ensure_rel2_tables(), см. РЕШЕНО там же).
 #   - Подарки, задания
-#   - Оплата премиум-яйца звёздами (сейчас «отн пт яйцо premium» лишь
-#     сообщает цену — нужна интеграция с Telegram Stars invoicing)
+#   - ~~Оплата премиум-яйца звёздами~~ — отменено: звёзды убраны, премиум-яйцо
+#     покупается за искры, как остальные два. Оплата Telegram Stars нигде
+#     больше не используется.

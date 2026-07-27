@@ -49,14 +49,23 @@ def test_все_команды_бизнеса_начинаются_со_слов
 
     # Формы с аргументами задаются регулярками — они тоже обязаны быть
     # привязаны к началу строки и к тому же слову.
-    patterns = [
-        bot_module.BUSINESS_BUY_RE, bot_module.BUSINESS_UPGRADE_RE,
-        bot_module.BUSINESS_COLLECT_RE, bot_module.BUSINESS_SELL_BOT_RE,
-        bot_module.BUSINESS_SELL_USER_RE, bot_module.BUSINESS_GIVE_RE,
-        bot_module.BUSINESS_REPAIR_RE,
+    # Проверяем ПОВЕДЕНИЕ, а не текст шаблона: шаблоны собираются через
+    # ru_text.rx и содержат классы [еЕёЁ] вместо голых букв, так что сравнивать
+    # их со строкой значило бы проверять способ записи, а не саму привязку.
+    samples = [
+        (bot_module.BUSINESS_BUY_RE, "купить shaurma"),
+        (bot_module.BUSINESS_UPGRADE_RE, "улучшить shaurma"),
+        (bot_module.BUSINESS_COLLECT_RE, "собрать"),
+        (bot_module.BUSINESS_SELL_BOT_RE, "продать shaurma"),
+        (bot_module.BUSINESS_SELL_USER_RE, "продать shaurma 100 @kto"),
+        (bot_module.BUSINESS_GIVE_RE, "передать shaurma @kto"),
+        (bot_module.BUSINESS_REPAIR_RE, "починить shaurma"),
     ]
-    for pattern in patterns:
-        assert pattern.pattern.startswith(r"(?i)^бизнес\s"), pattern.pattern
+    for pattern, tail in samples:
+        assert pattern.match(f"бизнес {tail}"), (
+            f"{pattern.pattern} не ловит «бизнес {tail}»")
+        assert not pattern.match(f"мой бизнес {tail}"), (
+            f"{pattern.pattern} срабатывает не с начала строки")
 
 
 def test_фразы_в_реестре_совпадают_с_реальными_командами():
@@ -72,7 +81,8 @@ def test_фразы_в_реестре_совпадают_с_реальными_�
 
 
 def test_закрепление_тоже_начинается_со_слова_бизнес():
-    assert bot_module.BUSINESS_PIN_RE.pattern.startswith(r"(?i)^бизнес\s")
+    assert bot_module.BUSINESS_PIN_RE.match("бизнес закрепить shaurma")
+    assert not bot_module.BUSINESS_PIN_RE.match("мой бизнес закрепить shaurma")
     for trigger in bot_module.BUSINESS_UNPIN_TRIGGERS:
         assert trigger.startswith("бизнес"), trigger
 

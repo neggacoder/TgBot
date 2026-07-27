@@ -449,6 +449,15 @@ def test_пустая_сетка_продаже_не_поддаётся(monkeypa
 
 # --- лёд --------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_pinned_item(monkeypatch):
+    """Применение предмета спрашивает, не закреплён ли он: закреплённый
+    усиливается впятеро (shop_effects.PIN_MULTIPLIER). Тесты этого файла
+    проверяют обычное поведение, поэтому закрепа нет."""
+    monkeypatch.setattr(bot_module.db, "get_profile_card",
+                        _returns({"pinned_item": None}), raising=False)
+
+
 def test_лёд_обновляет_свежесть(monkeypatch):
     said = []
     monkeypatch.setattr(bot_module.db, "list_inventory", _returns(

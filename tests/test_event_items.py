@@ -71,6 +71,10 @@ class _Spy:
         ))
         monkeypatch.setattr(bot_module, "display_name", _returns("Тестер"))
         monkeypatch.setattr(bot_module, "display_name_by_id", _returns("Сосед"))
+        # Применение предмета спрашивает, не закреплён ли он: закреплённый
+        # усиливается впятеро (shop_effects.PIN_MULTIPLIER). Здесь проверяется
+        # обычное поведение, поэтому закрепа нет.
+        monkeypatch.setattr(db, "get_profile_card", _returns({"pinned_item": None}))
 
     def message(self, text: str):
         from aiogram.types import Chat, Message, User

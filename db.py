@@ -13,6 +13,8 @@ from typing import Any, Optional
 
 import aiomysql
 
+import professions
+
 logger = logging.getLogger(__name__)
 
 _pool: Optional[aiomysql.Pool] = None
@@ -1046,7 +1048,7 @@ async def get_profile_card(chat_id: int, user_id: int) -> Optional[dict]:
     return await _fetchone(
         "SELECT title, motto, is_citizen, gender, city, about_text, anketa_visible, "
         "pinned_item, active_title, pinned_achievement, pinned_business, pinned_pet, "
-        "pinned_fish "
+        "pinned_fish, pinned_doll "
         "FROM profile_cards WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
@@ -7849,7 +7851,7 @@ async def list_coins_top(
         (chat_id,),
     )
     rows = await _fetchall(
-        "SELECT user_id, coins, star_level FROM economy_wallets "
+        "SELECT user_id, coins, star_level, total_farms FROM economy_wallets "
         "WHERE chat_id = %s AND coins > 0 "
         "ORDER BY coins DESC LIMIT %s OFFSET %s",
         (chat_id, limit, offset),
@@ -7926,6 +7928,8 @@ async def ensure_pets_table() -> None:
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
     await _add_column_if_missing("profile_cards", "pinned_pet", "VARCHAR(32) DEFAULT NULL")
+    # Закреплённая кукла вуду — id того, с кого она слеплена (см. voodoo_dolls).
+    await _add_column_if_missing("profile_cards", "pinned_doll", "BIGINT DEFAULT NULL")
     # ability = NULL значит «способность вида из каталога»; заполняется, только
     # когда хозяин платно меняет способность именно этому питомцу (см. pets.py
     # ability_reroll_price) — на вид в каталоге и на питомцев других хозяев
@@ -7940,10 +7944,103 @@ async def ensure_pets_table() -> None:
     # обнуляем на «сейчас» ниже — прокачка стартует с нуля с этого момента.
     await _add_column_if_missing("user_pets", "xp", "INT NOT NULL DEFAULT 0")
     await _add_column_if_missing("user_pets", "xp_tick_at", "DATETIME NULL")
+    # Прогулка: своя отметка, а не last_care_at — гулять и гладить должны
+    # ходить по отдельным откатам, иначе одно съедало бы другое.
+    await _add_column_if_missing("user_pets", "last_walk_at", "DATETIME NULL")
+    # Эволюция: флаг и вторая способность. Обе живут у КОНКРЕТНОГО питомца
+    # конкретного хозяина — вид в каталоге и питомцы других людей не меняются,
+    # как и при платной смене способности.
+    await _add_column_if_missing("user_pets", "evolved", "BOOL NOT NULL DEFAULT FALSE")
+    await _add_column_if_missing("user_pets", "ability2", "VARCHAR(32) NULL DEFAULT NULL")
     await _execute(
         "UPDATE user_pets SET xp_tick_at = %s WHERE xp_tick_at IS NULL",
         (datetime.utcnow(),),
     )
+    # Счётчик платных смен способности живёт в самой строке питомца, а её
+    # продажа удаляет. Здесь он переживает продажу — иначе продать и купить
+    # заново было бы дешёвым способом сбросить подорожавшие смены
+    # (см. remember_pet_rerolls).
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS pet_reroll_memory ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "pet_key VARCHAR(32) NOT NULL, "
+        "rerolls INT NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (chat_id, user_id, pet_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def ensure_voodoo_table() -> None:
+    """Куклы вуду — именные сувениры (крафт «кукла @кому»).
+
+    Своя таблица, а НЕ user_inventory, и это главное решение всей вещи: по
+    инвентарю ходят продажа, подарок, Медвежатник и лимит применений, и то,
+    чего там нет, они физически не достанут. Отдельный список запретов
+    пришлось бы дополнять при каждом новом способе отобрать предмет — а про
+    куклу такой способ просто не узнает.
+
+    Имя цели храним снимком: человек может уйти из чата, и подпись «Кукла
+    «12345»» вместо имени обесценила бы сувенир.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS voodoo_dolls ("
+        "chat_id BIGINT NOT NULL, "
+        "owner_id BIGINT NOT NULL, "
+        "target_id BIGINT NOT NULL, "
+        "target_name VARCHAR(128) NOT NULL, "
+        "created_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, owner_id, target_id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def add_voodoo_doll(chat_id: int, owner_id: int, target_id: int,
+                          target_name: str, now) -> bool:
+    """False — такая кукла уже есть. Дубликатов не плодим: сувенир именной,
+    а вторая копия того же человека ничего не добавляет."""
+    return bool(await _execute(
+        "INSERT IGNORE INTO voodoo_dolls "
+        "(chat_id, owner_id, target_id, target_name, created_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (chat_id, owner_id, target_id, target_name[:128], now),
+    ))
+
+
+async def set_pinned_doll(chat_id: int, user_id: int,
+                          target_id: Optional[int]) -> None:
+    await _execute(
+        "INSERT INTO profile_cards (chat_id, user_id, pinned_doll) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE pinned_doll = VALUES(pinned_doll)",
+        (chat_id, user_id, target_id),
+    )
+
+
+async def get_voodoo_doll(chat_id: int, owner_id: int,
+                          target_id: int) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT target_id, target_name, created_at FROM voodoo_dolls "
+        "WHERE chat_id = %s AND owner_id = %s AND target_id = %s",
+        (chat_id, owner_id, target_id),
+    )
+
+
+async def list_voodoo_dolls(chat_id: int, owner_id: int) -> list[dict]:
+    return await _fetchall(
+        "SELECT target_id, target_name, created_at FROM voodoo_dolls "
+        "WHERE chat_id = %s AND owner_id = %s ORDER BY created_at",
+        (chat_id, owner_id),
+    )
+
+
+async def count_voodoo_dolls_of(chat_id: int, target_id: int) -> int:
+    """Скольким людям вы приглянулись настолько, что с вас слепили куклу."""
+    row = await _fetchone(
+        "SELECT COUNT(*) AS cnt FROM voodoo_dolls "
+        "WHERE chat_id = %s AND target_id = %s",
+        (chat_id, target_id),
+    )
+    return int(row["cnt"]) if row else 0
 
 
 async def ensure_seasons_table() -> None:
@@ -8119,8 +8216,8 @@ async def delete_pet_spec(chat_id: int, key: str) -> bool:
 async def list_pets(chat_id: int, user_id: int) -> list[dict]:
     return await _fetchall(
         "SELECT pet_key, pet_name, hunger, mood, last_tick_at, last_fed_at, "
-        "last_care_at, bought_at, ability, ability_rerolls, xp, xp_tick_at "
-        "FROM user_pets "
+        "last_care_at, last_walk_at, bought_at, ability, ability2, evolved, "
+        "ability_rerolls, xp, xp_tick_at FROM user_pets "
         "WHERE chat_id = %s AND user_id = %s ORDER BY bought_at",
         (chat_id, user_id),
     )
@@ -8129,27 +8226,84 @@ async def list_pets(chat_id: int, user_id: int) -> list[dict]:
 async def get_pet(chat_id: int, user_id: int, key: str) -> Optional[dict]:
     return await _fetchone(
         "SELECT pet_key, pet_name, hunger, mood, last_tick_at, last_fed_at, "
-        "last_care_at, bought_at, ability, ability_rerolls, xp, xp_tick_at "
-        "FROM user_pets "
+        "last_care_at, last_walk_at, bought_at, ability, ability2, evolved, "
+        "ability_rerolls, xp, xp_tick_at FROM user_pets "
         "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
         (chat_id, user_id, key),
     )
 
 
-async def add_pet(chat_id: int, user_id: int, key: str, now) -> bool:
-    """Заводит питомца. False — такой у человека уже есть."""
+async def add_pet(chat_id: int, user_id: int, key: str, now,
+                  rerolls: int = 0) -> bool:
+    """Заводит питомца. False — такой у человека уже есть.
+
+    rerolls — сколько смен способности этому хозяину уже засчитано за этот вид
+    (см. recall_pet_rerolls). Переносится с прошлого владения, чтобы продажа
+    не работала как дешёвый сброс подорожавших смен.
+    """
     changed = await _execute(
         "INSERT IGNORE INTO user_pets "
-        "(chat_id, user_id, pet_key, hunger, mood, last_tick_at, bought_at, xp_tick_at) "
-        "VALUES (%s, %s, %s, 100, 100, %s, %s, %s)",
-        (chat_id, user_id, key, now, now, now),
+        "(chat_id, user_id, pet_key, hunger, mood, last_tick_at, bought_at, "
+        "xp_tick_at, ability_rerolls) "
+        "VALUES (%s, %s, %s, 100, 100, %s, %s, %s, %s)",
+        (chat_id, user_id, key, now, now, now, max(0, int(rerolls))),
     )
     return bool(changed)
 
 
+async def delete_pet(chat_id: int, user_id: int, key: str) -> bool:
+    """Убирает питомца у хозяина (продажа). False — его уже не было: значит
+    продажу успели провести параллельно, и деньги начислять НЕЛЬЗЯ."""
+    return bool(await _execute(
+        "DELETE FROM user_pets WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
+        (chat_id, user_id, key),
+    ))
+
+
+async def remember_pet_rerolls(chat_id: int, user_id: int, key: str,
+                               rerolls: int) -> None:
+    """Запоминает счётчик смен способности перед продажей питомца.
+
+    Отдельная таблица, потому что строка питомца при продаже удаляется, а
+    счётчик должен пережить продажу: смены дорожают в 1.5 раза каждая, и без
+    памяти продать+купить заново оказалось бы дешевле очередной смены (см.
+    pets.ability_reroll_price и pets.sell_price).
+
+    Только вверх: если человек продал прокачанного, а потом купил и продал
+    свежего, счётчик не должен откатиться назад.
+    """
+    await _execute(
+        "INSERT INTO pet_reroll_memory (chat_id, user_id, pet_key, rerolls) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE rerolls = GREATEST(rerolls, VALUES(rerolls))",
+        (chat_id, user_id, key, max(0, int(rerolls))),
+    )
+
+
+async def list_pet_owners(chat_id: int) -> list[int]:
+    """Все, у кого в этом чате есть хоть один питомец. Для раздачи корма:
+    остальным он мёртвый груз в инвентаре."""
+    rows = await _fetchall(
+        "SELECT DISTINCT user_id FROM user_pets WHERE chat_id = %s ORDER BY user_id",
+        (chat_id,),
+    )
+    return [int(r["user_id"]) for r in rows]
+
+
+async def recall_pet_rerolls(chat_id: int, user_id: int, key: str) -> int:
+    """Сколько смен способности числится за этим хозяином и видом. 0 — не
+    продавал такого раньше."""
+    row = await _fetchone(
+        "SELECT rerolls FROM pet_reroll_memory "
+        "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
+        (chat_id, user_id, key),
+    )
+    return int(row["rerolls"]) if row else 0
+
+
 async def set_pet_stats(chat_id: int, user_id: int, key: str,
                         hunger: int, mood: int, xp: int, now,
-                        fed_at=None, care_at=None) -> None:
+                        fed_at=None, care_at=None, walk_at=None) -> None:
     """Фиксирует сытость, настроение и опыт на момент now.
 
     xp — уже посчитанный вызывающим итог (пассивный прирост с прошлого раза
@@ -8165,6 +8319,9 @@ async def set_pet_stats(chat_id: int, user_id: int, key: str,
     if care_at is not None:
         sets.append("last_care_at = %s")
         args.append(care_at)
+    if walk_at is not None:
+        sets.append("last_walk_at = %s")
+        args.append(walk_at)
     args += [chat_id, user_id, key]
     await _execute(
         f"UPDATE user_pets SET {', '.join(sets)} "
@@ -8198,6 +8355,23 @@ async def set_pet_ability(chat_id: int, user_id: int, key: str,
         "UPDATE user_pets SET ability = %s, ability_rerolls = %s "
         "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
         (ability, rerolls, chat_id, user_id, key),
+    ))
+
+
+async def evolve_pet(chat_id: int, user_id: int, key: str,
+                     second_ability: str, now) -> bool:
+    """Отмечает питомца эволюционировавшим и выдаёт вторую способность.
+
+    Уровень обнуляется вместе с опытом: после эволюции прокачка начинается
+    заново и копится поверх удвоенной базы (см. pets.ability_percent).
+    Условие evolved = FALSE в запросе — защита от гонки: два «пет эволюция ...
+    да» подряд не должны выдать вторую способность дважды.
+    """
+    return bool(await _execute(
+        "UPDATE user_pets SET evolved = TRUE, ability2 = %s, xp = 0, "
+        "xp_tick_at = %s WHERE chat_id = %s AND user_id = %s AND pet_key = %s "
+        "AND evolved = FALSE",
+        (second_ability, now, chat_id, user_id, key),
     ))
 
 
@@ -9437,6 +9611,49 @@ async def decide_market_good(chat_id: int, good_id: int, approve: bool, admin_id
     return bool(rowcount)
 
 
+async def list_market_goods_of_user(seller_id: int) -> list[dict]:
+    """Товары человека ПО ВСЕМ ЧАТАМ — для управления в личке бота, где чат
+    неизвестен. Отсюда же берётся chat_id для кнопок, поэтому одинаковые ключи
+    в разных чатах не путаются."""
+    return await _fetchall(
+        "SELECT id, chat_id, item_key, name, emoji, description, price, status "
+        "FROM market_goods WHERE seller_id = %s AND status <> 'sold' "
+        "ORDER BY chat_id, id",
+        (seller_id,),
+    )
+
+
+async def get_market_good_of_user(good_id: int, seller_id: int) -> Optional[dict]:
+    """Товар по id, но только свой. Проверка владения — в самом запросе: в
+    личке chat_id приходит из кнопки, и доверять ему как признаку доступа
+    нельзя."""
+    return await _fetchone(
+        "SELECT id, chat_id, seller_id, item_key, name, emoji, description, "
+        "price, status FROM market_goods WHERE id = %s AND seller_id = %s",
+        (good_id, seller_id),
+    )
+
+
+async def set_market_good_price(good_id: int, seller_id: int, price: int) -> bool:
+    """Новая цена своего товара. Статус НЕ трогаем: в чатах с ручным режимом
+    пере-одобрение означало бы, что продавец, подняв цену, молча пропал
+    с витрины до реакции админа."""
+    return bool(await _execute(
+        "UPDATE market_goods SET price = %s WHERE id = %s AND seller_id = %s",
+        (max(1, int(price)), good_id, seller_id),
+    ))
+
+
+async def set_market_good_description(good_id: int, seller_id: int,
+                                      description: Optional[str]) -> bool:
+    """Описание своего товара. Название не меняется никогда — под ним товар
+    одобрили, и в инвентаре покупателей он значится именно так."""
+    return bool(await _execute(
+        "UPDATE market_goods SET description = %s WHERE id = %s AND seller_id = %s",
+        (description, good_id, seller_id),
+    ))
+
+
 async def remove_market_good(
     chat_id: int, item_key: str, seller_id: Optional[int] = None
 ) -> Optional[str]:
@@ -9639,6 +9856,11 @@ async def ensure_profession_tables() -> None:
     # Счётчик смен — под ачивку «Работяга». total_earned для этого не годится:
     # он в монетах, а шкала заработков со временем менялась.
     await _add_column_if_missing("profession_stats", "total_shifts", "INT NOT NULL DEFAULT 0")
+    # Метка последнего пересчёта энергии/настроения/здоровья. Своя, а не
+    # last_work_at: у того есть история с первой смены, и считать от неё
+    # значило бы выдать всем полную шкалу в день обновления. NULL у старых
+    # строк — отсчёт для них начнётся при первом обращении (_apply_stat_regen).
+    await _add_column_if_missing("profession_stats", "stats_tick_at", "DATETIME NULL")
     # Перерыв получил кулдаун: без него «!работа перерыв» жалась подряд и
     # держала энергию на сотне, из-за чего вся энергетическая механика была
     # декоративной — вместе с Аптечкой, бустом, улучшением «инструменты» и
@@ -9663,13 +9885,58 @@ async def ensure_profession_tables() -> None:
     )
 
 
+async def _apply_stat_regen(chat_id: int, user_id: int, row: dict) -> dict:
+    """Досчитывает восстановление энергии, настроения и здоровья за прошедшее
+    время (см. professions.py) и банкует результат.
+
+    Почему банкуем прямо здесь, а не считаем на лету, как у питомцев: значения
+    правят несколько мест относительным «energy + %s», и они брали бы из базы
+    устаревшее число, теряя всё накопленное восстановление. Пересчёт при
+    чтении держит хранимое значение свежим для всех, кто пишет.
+
+    Реже раза в час не пишем: при 4+ единицах в час меньший интервал не даёт
+    и одной целой единицы, а метку времени не двигаем — время не теряется,
+    оно просто копится до следующего обращения.
+    """
+    now = datetime.utcnow()
+    tick = row.get("stats_tick_at")
+    if tick is None:
+        # Строка из времён до появления столбца: начинаем отсчёт с этого
+        # момента, а не задним числом — иначе все разом получили бы полную
+        # шкалу в день обновления бота (та же история, что с опытом питомцев).
+        await _execute(
+            "UPDATE profession_stats SET stats_tick_at = %s "
+            "WHERE chat_id = %s AND user_id = %s",
+            (now, chat_id, user_id),
+        )
+        row["stats_tick_at"] = now
+        return row
+    hours = (now - tick).total_seconds() / 3600
+    if hours < 1:
+        return row
+    # Уровень считается нулевым, пока профессии нет: в базе prof_level равен
+    # единице и у тех, кто ещё никуда не устроился.
+    level = int(row.get("prof_level") or 0) if row.get("profession_key") else 0
+    per_hour = professions.regen_per_hour(level)
+    fresh = {name: professions.restored(int(row.get(name) or 0), hours, per_hour)
+             for name in ("energy", "mood", "health")}
+    await _execute(
+        "UPDATE profession_stats SET energy = %s, mood = %s, health = %s, "
+        "stats_tick_at = %s WHERE chat_id = %s AND user_id = %s",
+        (fresh["energy"], fresh["mood"], fresh["health"], now, chat_id, user_id),
+    )
+    row.update(fresh)
+    row["stats_tick_at"] = now
+    return row
+
+
 async def get_profession_stats(chat_id: int, user_id: int) -> dict:
     row = await _fetchone(
         "SELECT * FROM profession_stats WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
     if row:
-        return row
+        return await _apply_stat_regen(chat_id, user_id, row)
     await _execute(
         "INSERT IGNORE INTO profession_stats (chat_id, user_id) VALUES (%s, %s)",
         (chat_id, user_id),
@@ -10159,6 +10426,44 @@ async def add_inventory_item(chat_id: int, user_id: int, item_key: str, amount: 
         "ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)",
         (chat_id, user_id, item_key, amount),
     )
+
+
+async def add_inventory_item_bulk(chat_id: int, user_ids: list[int],
+                                  item_key: str, amount: int = 1) -> int:
+    """Кладёт предмет сразу многим. Возвращает, скольким выдали.
+
+    Один запрос вместо цикла из add_inventory_item: раздача идёт по всем
+    владельцам питомцев чата, и на сотне человек это сотня отдельных
+    обращений к базе внутри одного обработчика.
+    """
+    if not user_ids or amount <= 0:
+        return 0
+    values = ", ".join(["(%s, %s, %s, %s)"] * len(user_ids))
+    args: list = []
+    for user_id in user_ids:
+        args += [chat_id, int(user_id), item_key, int(amount)]
+    await _execute(
+        f"INSERT INTO user_inventory (chat_id, user_id, item_key, quantity) "
+        f"VALUES {values} "
+        "ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)",
+        tuple(args),
+    )
+    return len(user_ids)
+
+
+async def get_inventory_quantity(chat_id: int, user_id: int, item_key: str) -> int:
+    """Сколько штук предмета лежит у человека. 0 — нет вовсе.
+
+    Отдельно от list_inventory: массовому кормлению нужно знать запас корма
+    ДО начала раздачи, чтобы сказать «покормлено 3 из 5», а тянуть ради одного
+    числа весь инвентарь с двумя JOIN-ами незачем.
+    """
+    row = await _fetchone(
+        "SELECT quantity FROM user_inventory "
+        "WHERE chat_id = %s AND user_id = %s AND item_key = %s",
+        (chat_id, user_id, item_key),
+    )
+    return int(row["quantity"]) if row else 0
 
 
 async def remove_inventory_item(chat_id: int, user_id: int, item_key: str, amount: int = 1) -> bool:

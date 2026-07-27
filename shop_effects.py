@@ -56,6 +56,31 @@ PENDING_EFFECTS = frozenset({
 
 LUCKY_MULTIPLIER = 2
 
+# ----------------------------------------------------------------------------
+# ЗАКРЕП УСИЛИВАЕТ ПРЕДМЕТ. Раньше закреплённый предмет был чистым украшением
+# профиля — теперь он впятеро усиливает то, что предмет и так умеет. Закреп
+# один на человека, поэтому это осмысленный выбор, а не бесплатная прибавка.
+#
+# Что именно множится, зависит от типа эффекта — единого числа у предметов
+# нет, и притворяться, что есть, было бы враньём:
+#
+#   * отложенные (PENDING_EFFECTS) — PIN_MULTIPLIER зарядов вместо одного:
+#     пять поломок мимо, пять отражённых ограблений, пять удвоенных заработков;
+#   * щедрость — раздаёт и списывает в PIN_MULTIPLIER раз больше;
+#   * остальные — предмет расходуется раз в PIN_MULTIPLIER применений, то есть
+#     одной штуки хватает впятеро дольше. Починку или сброс кулдауна усилить
+#     нечем: бизнес либо цел, либо нет.
+#
+# ВА-БАНК из умножения суммы исключён намеренно (см. PIN_AMOUNT_EFFECTS):
+# «удвоить или потерять треть» в пятикратном размере — это либо ×10 к кошельку,
+# либо минус полтора кошелька, то есть уход в отрицательный баланс. Он идёт по
+# общему правилу расхода, как прочие бинарные.
+# ----------------------------------------------------------------------------
+PIN_MULTIPLIER = 5
+
+# Эффекты, у которых закреп множит САМУ СУММУ, а не число применений.
+PIN_AMOUNT_EFFECTS = frozenset({EFFECT_GENEROSITY})
+
 
 @dataclass(frozen=True)
 class ShopEffectItem:
@@ -208,6 +233,9 @@ ACTIVITY_FISHING = "fishing"
 ACTIVITY_TREASURE = "treasure"
 ACTIVITY_SIDE_JOB = "side_job"
 ACTIVITY_DAILY_BONUS = "daily_bonus"
+# Особое значение: прибавка идёт к ЛЮБОМУ занятию. Нужно Короне мастера —
+# перечислять шесть занятий шестью предметами было бы нелепо.
+ACTIVITY_ANY = "any"
 
 EFFECT_PASSIVE_BOOST = "passive_boost"
 EFFECT_DAILY_CASH = "daily_cash"
@@ -343,7 +371,85 @@ ACHIEVEMENT_ITEMS: tuple[AchievementItem, ...] = (
     ),
 )
 
-ACHIEVEMENT_BY_KEY: dict[str, AchievementItem] = {i.key: i for i in ACHIEVEMENT_ITEMS}
+# ----------------------------------------------------------------------------
+# КРАФТОВЫЕ ПРЕДМЕТЫ. Форма та же, что у предметов за ачивки, и это не
+# совпадение: «лежит в инвентаре и постоянно что-то даёт» здесь уже умеет
+# работать (passive_percent, perk_percent, has_perk), и крафту достаточно
+# попасть в тот же ACHIEVEMENT_BY_KEY, чтобы плюшки заработали без единой
+# правки в местах начисления.
+#
+# Заодно они автоматически попадают в REWARD_KEYS — значит их нельзя купить,
+# продать и подарить. Крафтовое зарабатывают, а не выменивают.
+#
+# Поле achievement пустое: за ачивку они не выдаются, получить их можно только
+# командой «крафт» (рецепты — в crafting.py).
+# ----------------------------------------------------------------------------
+EFFECT_EVOLUTION = "evolution"   # расходник эволюции питомца, сам ничего не делает
+
+CRAFT_ITEMS: tuple[AchievementItem, ...] = (
+    AchievementItem(
+        "otmychka", "Отмычка", "🗝", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — ваши ограбления удаются на 15% чаще",
+        perk=PERK_ROBBERY_ATTACK, perk_percent=15,
+        perk_text="ограбление удаётся на 15% чаще",
+    ),
+    AchievementItem(
+        "obereg", "Оберег", "🧿", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — вас грабят успешно на 20% реже",
+        perk=PERK_ROBBERY_DEFENSE, perk_percent=20,
+        perk_text="вас грабят успешно на 20% реже",
+    ),
+    AchievementItem(
+        "kompas", "Компас кладоискателя", "🧭", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — яма с кладом никогда не бывает пустой",
+        perk=PERK_NO_EMPTY_TREASURE,
+        perk_text="даже промах на раскопках приносит немного монет",
+    ),
+    AchievementItem(
+        "set_rybaka", "Сеть рыбака", "🕸", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — улов никогда не бывает пустым",
+        perk=PERK_NO_EMPTY_FISHING,
+        perk_text="улов никогда не бывает пустым",
+    ),
+    AchievementItem(
+        "termos", "Термос", "☕", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — смена отнимает на 25% меньше энергии",
+        perk=PERK_ENERGY_SAVE, perk_percent=25,
+        perk_text="смена отнимает на 25% меньше энергии",
+    ),
+    AchievementItem(
+        "amulet_serii", "Амулет серии", "🔥", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — серия активности не сгорает за один пропуск",
+        perk=PERK_STREAK_SHIELD,
+        perk_text="серия не сгорает за один пропущенный день",
+    ),
+    AchievementItem(
+        "elixir", "Эликсир эволюции", "🧪", "",
+        EFFECT_EVOLUTION,
+        "Крафт. Тратится на эволюцию питомца десятого уровня: "
+        "«пет эволюция {ключ}»",
+    ),
+    AchievementItem(
+        "korona_mastera", "Корона мастера", "👑", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — ВСЕ занятия приносят на 25% больше",
+        activity=ACTIVITY_ANY, percent=25,
+    ),
+)
+
+CRAFT_BY_KEY: dict[str, AchievementItem] = {i.key: i for i in CRAFT_ITEMS}
+
+# Крафтовые предметы лежат в том же справочнике, что и предметы за ачивки, —
+# см. комментарий выше.
+ACHIEVEMENT_BY_KEY: dict[str, AchievementItem] = {
+    i.key: i for i in ACHIEVEMENT_ITEMS + CRAFT_ITEMS
+}
 # Ачивка → предмет. Одна ачивка выдаёт максимум один предмет.
 ITEM_BY_ACHIEVEMENT: dict[str, AchievementItem] = {
     i.achievement: i for i in ACHIEVEMENT_ITEMS
@@ -371,7 +477,9 @@ def passive_percent(item_keys, activity: str) -> int:
     total = 0
     for key in item_keys:
         item = ACHIEVEMENT_BY_KEY.get(key)
-        if item and item.effect == EFFECT_PASSIVE_BOOST and item.activity == activity:
+        if item is None or item.effect != EFFECT_PASSIVE_BOOST:
+            continue
+        if item.activity == activity or item.activity == ACTIVITY_ANY:
             total += item.percent
     return total
 
@@ -429,7 +537,8 @@ def shop_rows() -> list[tuple[str, str, int, str, str]]:
     незачем.
     """
     return ([i.as_shop_row() for i in EFFECT_ITEMS]
-            + [i.as_shop_row() for i in ACHIEVEMENT_ITEMS])
+            + [i.as_shop_row() for i in ACHIEVEMENT_ITEMS]
+            + [i.as_shop_row() for i in CRAFT_ITEMS])
 
 
 def is_reward(item_key: str) -> bool:

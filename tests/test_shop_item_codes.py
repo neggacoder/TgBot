@@ -100,6 +100,9 @@ def inventory(monkeypatch):
     ]
     monkeypatch.setattr(bot_module.db, "list_inventory", _returns(items), raising=False)
     monkeypatch.setattr(bot_module.db, "get_item_usage_count", _returns(0), raising=False)
+    # Куклы вуду показываются в «инвентарь» отдельной строкой, хотя лежат не
+    # в инвентаре, а в своей таблице (см. db.ensure_voodoo_table).
+    monkeypatch.setattr(bot_module.db, "list_voodoo_dolls", _returns([]), raising=False)
     monkeypatch.setattr(bot_module, "display_name", _returns("Тестер"), raising=False)
     return items
 
@@ -122,6 +125,7 @@ def test_инвентарь_подсказывает_что_ключ_копир�
 
 def test_пустой_инвентарь_не_ломается(monkeypatch):
     monkeypatch.setattr(bot_module.db, "list_inventory", _returns([]), raising=False)
+    monkeypatch.setattr(bot_module.db, "list_voodoo_dolls", _returns([]), raising=False)
     monkeypatch.setattr(bot_module, "display_name", _returns("Тестер"), raising=False)
     msg, replies = _message("инвентарь")
     asyncio.run(bot_module.cmd_inventory(msg))

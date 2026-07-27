@@ -171,8 +171,12 @@ def test_is_reward_отличает_награды_от_товаров():
 
 @pytest.fixture
 def world(monkeypatch):
+    # pinned — закреплённый предмет: он усиливается впятеро (см.
+    # shop_effects.PIN_MULTIPLIER), поэтому его нужно уметь задавать в тестах.
+    # data — общее KV-хранилище, в нём живёт счётчик применений закрепа.
     state = {"inventory": [], "removed": [], "effects": [], "cooldowns_reset": 0,
-             "repaired": [], "businesses": []}
+             "repaired": [], "businesses": [], "pinned": None, "data": {},
+             "charges": []}
 
     async def list_inventory(chat_id, user_id):
         return list(state["inventory"])
@@ -183,6 +187,17 @@ def world(monkeypatch):
 
     async def add_item_effect(chat_id, user_id, effect, charges=1):
         state["effects"].append(effect)
+        state["charges"].append(charges)
+
+    async def get_profile_card(chat_id, user_id):
+        return {"pinned_item": state["pinned"]}
+
+    async def get_data(key):
+        value = state["data"].get(key)
+        return {"data_key": key, "data_value": value} if value is not None else None
+
+    async def set_data(key, value, updated_by=None):
+        state["data"][key] = value
 
     async def reset_earning_cooldowns(chat_id, user_id):
         state["cooldowns_reset"] += 1
@@ -204,6 +219,9 @@ def world(monkeypatch):
                         list_user_businesses, raising=False)
     monkeypatch.setattr(bot_module.db, "repair_business", repair_business, raising=False)
     monkeypatch.setattr(bot_module.db, "add_log", _noop, raising=False)
+    monkeypatch.setattr(bot_module.db, "get_profile_card", get_profile_card, raising=False)
+    monkeypatch.setattr(bot_module.db, "get_data", get_data, raising=False)
+    monkeypatch.setattr(bot_module.db, "set_data", set_data, raising=False)
     return state
 
 
@@ -376,3 +394,69 @@ def test_трофей_нельзя_использовать(trade):
     asyncio.run(bot_module.cmd_item_use(msg))
     assert not trade["touched"]
     assert "не «используют»" in replies[0]
+
+
+# --- закреп усиливает предмет впятеро --------------------------------------
+
+def test_закреплённый_отложенный_эффект_даёт_пять_зарядов(world):
+    world["inventory"] = [{"item_key": "talisman", "quantity": 1}]
+    world["pinned"] = "talisman"
+    _use("talisman")
+    assert world["charges"] == [SE.PIN_MULTIPLIER]
+
+
+def test_незакреплённый_отложенный_эффект_даёт_один_заряд(world):
+    world["inventory"] = [{"item_key": "talisman", "quantity": 1}]
+    _use("talisman")
+    assert world["charges"] == [1]
+
+
+def test_закреплённый_предмет_расходуется_раз_в_пять_применений(world):
+    """Смысл усиления для бинарных эффектов: одной штуки хватает впятеро
+    дольше. Умножать саму починку нечего — бизнес либо цел, либо нет."""
+    world["inventory"] = [{"item_key": "energetik", "quantity": 1}]
+    world["pinned"] = "energetik"
+    for _ in range(SE.PIN_MULTIPLIER - 1):
+        _use("energetik")
+    assert world["removed"] == [], "первые применения штуку не тратят"
+    assert world["cooldowns_reset"] == SE.PIN_MULTIPLIER - 1, "но эффект срабатывает каждый раз"
+    _use("energetik")
+    assert world["removed"] == ["energetik"], "пятое применение забирает штуку"
+
+
+def test_после_расхода_счёт_начинается_заново(world):
+    world["inventory"] = [{"item_key": "energetik", "quantity": 2}]
+    world["pinned"] = "energetik"
+    for _ in range(SE.PIN_MULTIPLIER + 1):
+        _use("energetik")
+    assert world["removed"] == ["energetik"], "шестое применение снова копит, а не тратит"
+
+
+def test_незакреплённый_предмет_тратится_сразу(world):
+    world["inventory"] = [{"item_key": "energetik", "quantity": 1}]
+    _use("energetik")
+    assert world["removed"] == ["energetik"]
+
+
+def test_вабанк_не_попадает_в_умножение_суммы():
+    """Иначе «удвоить или потерять треть» впятеро — это минус полтора кошелька,
+    то есть отрицательный баланс."""
+    assert SE.EFFECT_VABANK not in SE.PIN_AMOUNT_EFFECTS
+    assert SE.EFFECT_GENEROSITY in SE.PIN_AMOUNT_EFFECTS
+
+
+def test_закреп_не_трогает_предметы_без_эффекта():
+    """Усиливать нечего у хлама и трофеев — у них нет базовой способности."""
+    for key in ("fishka", "nosok", "medal_gold"):
+        assert SE.effect_of(key) in (None, "")
+
+
+def test_закреплённый_отложенный_эффект_не_усиливается_дважды(world):
+    """Заряды И медленный расход вместе дали бы 25 зарядов с одной штуки:
+    у каждого типа эффекта ровно одно усиление, а не два сразу."""
+    world["inventory"] = [{"item_key": "talisman", "quantity": 1}]
+    world["pinned"] = "talisman"
+    _use("talisman")
+    assert world["charges"] == [SE.PIN_MULTIPLIER]
+    assert world["removed"] == ["talisman"], (
+        "штука должна уйти сразу — усиление уже выдано зарядами")
