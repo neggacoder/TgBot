@@ -138,15 +138,3 @@ def pick_photo_url(
             return photo_url(folder, candidate, random.choice(files), base_url)
     return None
 
-
-def count_photos(folder: str) -> dict[str, int]:
-    """Сколько картинок у жеста по каждой корзине — для панели."""
-    return {pairing: len(list_photos(folder, pairing)) for pairing in STORAGE_PAIRINGS}
-
-
-def has_photos(folder: Optional[str]) -> bool:
-    """Есть ли у жеста хоть одна картинка. Панели нужно, чтобы честно
-    показывать «фото не залито», а не молча отправлять жест текстом."""
-    if not folder:
-        return False
-    return any(list_photos(folder, pairing) for pairing in STORAGE_PAIRINGS)

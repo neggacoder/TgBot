@@ -398,3 +398,33 @@ def test_чтение_настройки_подрезает_старое_зна�
     assert bot_module.cmd_cleanup_minutes() == bot_module.CMD_CLEANUP_MAX_MINUTES
     monkeypatch.setitem(bot_module.settings, "command_cleanup_minutes", "мусор")
     assert bot_module.cmd_cleanup_minutes() == bot_module.DEFAULT_CMD_CLEANUP_MINUTES
+
+
+# ---------------------------------------------------------------------------
+# Себяшки
+# ---------------------------------------------------------------------------
+
+def test_у_каждой_себяшки_есть_фразы():
+    """Себяшка с пустым списком выбрала бы фразу из ничего и упала бы."""
+    for action, phrases in bot_module._SELF_ACTIONS_DEFAULT.items():
+        assert phrases, f"у себяшки «{action}» нет ни одной фразы"
+
+
+def test_фразы_себяшек_подставляют_имя():
+    """Без {user} в чат уходит безличная строка, и непонятно, кто это сделал."""
+    for action, phrases in bot_module._SELF_ACTIONS_DEFAULT.items():
+        for phrase in phrases:
+            assert "{user}" in phrase, f"«{action}»: {phrase}"
+
+
+def test_себяшки_описаны_в_справке():
+    """Действие, которого нет в справке, никто не найдёт."""
+    import help_texts
+    text = " ".join(
+        sub["text"]
+        for sec in help_texts.build_help_sections("—", 24, 10).values()
+        for sub in sec["subsections"].values()
+    )
+    missing = [a for a in bot_module._SELF_ACTIONS_DEFAULT if f"[{a}" not in text]
+    # «вздрочнуть» намеренно не в справке — есть, но не рекламируется.
+    assert missing == ["вздрочнуть"], missing

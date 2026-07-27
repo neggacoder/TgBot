@@ -110,10 +110,6 @@ def success_chance(has_rabbit_paw: bool) -> int:
     return max(1, min(chance, 95))
 
 
-def roll_success(has_rabbit_paw: bool) -> bool:
-    return random.randint(1, 100) <= success_chance(has_rabbit_paw)
-
-
 def compute_steal_amount(victim_balance: int, has_gold_pig: bool) -> int:
     percent = random.randint(ROBBERY_MIN_PERCENT, ROBBERY_MAX_PERCENT)
     amount = victim_balance * percent / 100

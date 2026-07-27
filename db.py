@@ -1098,7 +1098,14 @@ async def set_citizenship(chat_id: int, user_id: int, is_citizen: bool) -> None:
     )
 
 
-async def list_citizens(chat_id: int) -> list[dict]:
+async def list_citizen_rows(chat_id: int) -> list[dict]:
+    """Граждане чата по порядку получения — для команды «граждане».
+
+    Раньше эта функция называлась list_citizens и ниже в файле объявлялась
+    вторая с тем же именем, но возвращающая set[int]. Побеждало последнее
+    объявление, и «граждане» падали на row["user_id"]: строкой оказывался
+    голый int. Разные задачи — разные имена.
+    """
     return await _fetchall(
         "SELECT user_id FROM profile_cards WHERE chat_id = %s AND is_citizen = 1 "
         "ORDER BY updated_at ASC",
@@ -2519,6 +2526,31 @@ async def count_rewards(chat_id: int, user_id: int) -> int:
         (chat_id, user_id),
     )
     return int(row["total"] if row else 0)
+
+
+async def list_reward_top(chat_id: int, limit: int = 10) -> list[dict]:
+    """Топ награждённых. Считается по СУММЕ степеней, а не по числу наград:
+    иначе десять первых степеней обходили бы один орден высшей."""
+    return await _fetchall(
+        "SELECT user_id, SUM(degree) AS weight, COUNT(*) AS total, MAX(degree) AS best "
+        "FROM rewards WHERE chat_id = %s GROUP BY user_id "
+        "ORDER BY weight DESC, best DESC LIMIT %s",
+        (chat_id, limit),
+    )
+
+
+async def last_reward_between(chat_id: int, awarded_by: int, user_id: int) -> Optional[datetime]:
+    """Когда этот человек последний раз награждал именно этого — для кулдауна.
+
+    Без него награда становится краном: она теперь приносит монеты и
+    репутацию, а выдать её можно сколько угодно раз подряд одному и тому же.
+    """
+    row = await _fetchone(
+        "SELECT MAX(created_at) AS last_at FROM rewards "
+        "WHERE chat_id = %s AND awarded_by = %s AND user_id = %s",
+        (chat_id, awarded_by, user_id),
+    )
+    return row["last_at"] if row and row["last_at"] else None
 
 
 async def get_reward(reward_id: int) -> Optional[dict]:
@@ -9255,6 +9287,264 @@ async def ensure_shop_tables() -> None:
         "PRIMARY KEY (chat_id, user_id, item_key)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+
+
+# ----------------------------------------------------------------------------
+# Рынок между участниками: свой товар у каждого, монополия на ключ.
+#
+# Товары живут ОТДЕЛЬНО от shop_items, хотя купленное попадает в тот же
+# инвентарь. Причина в том, что у товара рынка есть владелец, статус заявки и
+# решение администрации, а у товара магазина ничего этого нет: сложи их в одну
+# таблицу — и половина колонок всегда пустая, а витрина магазина начнёт
+# показывать чужие огурцы.
+#
+# Правила (комиссия, потолок цены) — в market.py.
+# ----------------------------------------------------------------------------
+async def ensure_market_tables() -> None:
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS market_goods ("
+        "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+        "chat_id BIGINT NOT NULL, "
+        "seller_id BIGINT NOT NULL, "
+        "item_key VARCHAR(64) NOT NULL, "
+        "name VARCHAR(64) NOT NULL, "
+        "emoji VARCHAR(16) NOT NULL DEFAULT '🧺', "
+        "description VARCHAR(255) NULL, "
+        "price INT NOT NULL, "
+        "sold INT NOT NULL DEFAULT 0, "
+        "earned BIGINT NOT NULL DEFAULT 0, "
+        # pending — ждёт решения, approved — торгуется. Отклонённые и снятые
+        # строки УДАЛЯЮТСЯ, а не помечаются: иначе они вечно держали бы за
+        # собой ключ через UNIQUE, и «огурцы» после отказа не завёл бы никто.
+        "status VARCHAR(16) NOT NULL DEFAULT 'pending', "
+        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "decided_at DATETIME NULL, "
+        "decided_by BIGINT NULL, "
+        # Монополия на товар: один ключ в чате — один продавец.
+        "UNIQUE KEY uniq_market_key (chat_id, item_key), "
+        "INDEX idx_market_seller (chat_id, seller_id), "
+        "INDEX idx_market_status (chat_id, status)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS market_settings ("
+        "chat_id BIGINT NOT NULL PRIMARY KEY, "
+        "mode VARCHAR(16) NOT NULL DEFAULT 'manual', "
+        "commission_percent DECIMAL(5,2) NOT NULL DEFAULT 10.00, "
+        "max_price INT NOT NULL DEFAULT 50000, "
+        "max_goods INT NOT NULL DEFAULT 3"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def get_market_settings(chat_id: int) -> dict:
+    row = await _fetchone("SELECT * FROM market_settings WHERE chat_id = %s", (chat_id,))
+    if row:
+        return row
+    await _execute("INSERT IGNORE INTO market_settings (chat_id) VALUES (%s)", (chat_id,))
+    return await _fetchone("SELECT * FROM market_settings WHERE chat_id = %s", (chat_id,))
+
+
+async def set_market_settings(
+    chat_id: int, mode: Optional[str] = None, commission_percent: Optional[float] = None,
+    max_price: Optional[int] = None, max_goods: Optional[int] = None,
+) -> None:
+    await get_market_settings(chat_id)
+    sets, params = [], []
+    if mode is not None:
+        sets.append("mode = %s"); params.append(mode)
+    if commission_percent is not None:
+        sets.append("commission_percent = %s"); params.append(commission_percent)
+    if max_price is not None:
+        sets.append("max_price = %s"); params.append(max_price)
+    if max_goods is not None:
+        sets.append("max_goods = %s"); params.append(max_goods)
+    if not sets:
+        return
+    params.append(chat_id)
+    await _execute(
+        f"UPDATE market_settings SET {', '.join(sets)} WHERE chat_id = %s", tuple(params)
+    )
+
+
+async def get_market_good(chat_id: int, item_key: str) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT * FROM market_goods WHERE chat_id = %s AND item_key = %s",
+        (chat_id, item_key),
+    )
+
+
+async def get_market_good_by_id(chat_id: int, good_id: int) -> Optional[dict]:
+    return await _fetchone(
+        "SELECT * FROM market_goods WHERE chat_id = %s AND id = %s", (chat_id, good_id)
+    )
+
+
+async def list_market_goods(chat_id: int, status: str = "approved") -> list[dict]:
+    return await _fetchall(
+        "SELECT * FROM market_goods WHERE chat_id = %s AND status = %s "
+        "ORDER BY price ASC, id ASC",
+        (chat_id, status),
+    )
+
+
+async def list_market_goods_of(chat_id: int, seller_id: int) -> list[dict]:
+    return await _fetchall(
+        "SELECT * FROM market_goods WHERE chat_id = %s AND seller_id = %s ORDER BY id",
+        (chat_id, seller_id),
+    )
+
+
+async def count_market_goods_of(chat_id: int, seller_id: int) -> int:
+    row = await _fetchone(
+        "SELECT COUNT(*) AS cnt FROM market_goods WHERE chat_id = %s AND seller_id = %s",
+        (chat_id, seller_id),
+    )
+    return int(row["cnt"]) if row else 0
+
+
+async def add_market_good(
+    chat_id: int, seller_id: int, item_key: str, name: str, price: int,
+    emoji: str = "🧺", description: Optional[str] = None, status: str = "pending",
+) -> Optional[int]:
+    """id заявки, либо None — ключ в этом чате уже занят (монополия)."""
+    rowcount = await _execute(
+        "INSERT IGNORE INTO market_goods "
+        "(chat_id, seller_id, item_key, name, emoji, description, price, status) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (chat_id, seller_id, item_key, name, emoji, description, price, status),
+    )
+    if not rowcount:
+        return None
+    row = await get_market_good(chat_id, item_key)
+    return int(row["id"]) if row else None
+
+
+async def decide_market_good(chat_id: int, good_id: int, approve: bool, admin_id: int) -> bool:
+    """Одобрить заявку либо удалить её. Отклонённая строка удаляется, чтобы
+    не держать ключ занятым (см. комментарий у таблицы)."""
+    if not approve:
+        rowcount = await _execute(
+            "DELETE FROM market_goods WHERE chat_id = %s AND id = %s AND status = 'pending'",
+            (chat_id, good_id),
+        )
+        return bool(rowcount)
+    rowcount = await _execute(
+        "UPDATE market_goods SET status = 'approved', decided_at = UTC_TIMESTAMP(), "
+        "decided_by = %s WHERE chat_id = %s AND id = %s AND status = 'pending'",
+        (admin_id, chat_id, good_id),
+    )
+    return bool(rowcount)
+
+
+async def remove_market_good(
+    chat_id: int, item_key: str, seller_id: Optional[int] = None
+) -> Optional[str]:
+    """Снять товар с рынка. seller_id — чтобы человек снимал только своё.
+
+    Возвращает "deleted" / "withdrawn" / None (товара не было).
+
+    Непроданный товар удаляется, и ключ освобождается. А вот у проданного
+    строку удалять НЕЛЬЗЯ: названия предметов в инвентаре резолвятся из этой
+    же таблицы (см. list_inventory), и после удаления у всех покупателей
+    «огурцы» превратились бы в голый ключ без названия и эмодзи. Хуже того,
+    ключ занял бы кто-то другой со своим товаром — и инвентарь начал бы
+    врать. Поэтому проданный товар просто уходит с витрины.
+    """
+    where = "chat_id = %s AND item_key = %s"
+    params = [chat_id, item_key]
+    if seller_id is not None:
+        where += " AND seller_id = %s"
+        params.append(seller_id)
+
+    row = await _fetchone(f"SELECT id, sold FROM market_goods WHERE {where}", tuple(params))
+    if row is None:
+        return None
+    if int(row["sold"]) > 0:
+        await _execute(
+            "UPDATE market_goods SET status = 'withdrawn' WHERE id = %s", (int(row["id"]),)
+        )
+        return "withdrawn"
+    await _execute("DELETE FROM market_goods WHERE id = %s", (int(row["id"]),))
+    return "deleted"
+
+
+async def relist_market_good(chat_id: int, good_id: int, price: int, status: str) -> None:
+    """Вернуть снятый товар на витрину — тем же продавцом и с новой ценой."""
+    await _execute(
+        "UPDATE market_goods SET status = %s, price = %s WHERE chat_id = %s AND id = %s",
+        (status, price, chat_id, good_id),
+    )
+
+
+async def record_market_sale(chat_id: int, good_id: int, quantity: int, earned: int) -> None:
+    await _execute(
+        "UPDATE market_goods SET sold = sold + %s, earned = earned + %s "
+        "WHERE chat_id = %s AND id = %s",
+        (quantity, earned, chat_id, good_id),
+    )
+
+
+async def market_purchase(
+    chat_id: int, buyer_id: int, seller_id: int, good_id: int, item_key: str,
+    quantity: int, total: int, to_seller: int, fee: int,
+) -> bool:
+    """Вся покупка одной транзакцией. False — у покупателя не хватило денег.
+
+    Отдельная функция, а не четыре вызова подряд из бота, по двум причинам —
+    тем же, по которым транзакцией обёрнут apply_robbery_success:
+
+      * деньги ходят между ДВУМЯ людьми плюс казна: оборвись цепочка
+        посередине, монеты either пропадут, either появятся из ниоткуда;
+      * списание идёт с проверкой «WHERE coins >= total» в самом UPDATE, а не
+        по прочитанному заранее балансу. Иначе две команды «рынок купить»
+        подряд обе проходят проверку и уводят кошелёк в минус: add_coins
+        нижнюю границу не стережёт.
+    """
+    await get_wallet(chat_id, buyer_id)
+    await get_wallet(chat_id, seller_id)
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await conn.begin()
+            try:
+                await cur.execute(
+                    "UPDATE economy_wallets SET coins = coins - %s "
+                    "WHERE chat_id = %s AND user_id = %s AND coins >= %s",
+                    (total, chat_id, buyer_id, total),
+                )
+                if cur.rowcount == 0:
+                    await conn.rollback()
+                    return False
+                await cur.execute(
+                    "UPDATE economy_wallets SET coins = coins + %s "
+                    "WHERE chat_id = %s AND user_id = %s",
+                    (to_seller, chat_id, seller_id),
+                )
+                if fee:
+                    await cur.execute(
+                        "INSERT INTO economy_settings (chat_id, chat_coins) VALUES (%s, %s) "
+                        "ON DUPLICATE KEY UPDATE chat_coins = chat_coins + VALUES(chat_coins)",
+                        (chat_id, fee),
+                    )
+                await cur.execute(
+                    "INSERT INTO user_inventory (chat_id, user_id, item_key, quantity) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)",
+                    (chat_id, buyer_id, item_key, quantity),
+                )
+                await cur.execute(
+                    "UPDATE market_goods SET sold = sold + %s, earned = earned + %s "
+                    "WHERE chat_id = %s AND id = %s",
+                    (quantity, to_seller, chat_id, good_id),
+                )
+                await conn.commit()
+                return True
+            except Exception:
+                await conn.rollback()
+                raise
+
+
 DEFAULT_TITLES: list[tuple] = [
     ("king", "👑 Король чата", 5000, None),
     ("richman", "💰 Магнат", 3000, None),
@@ -9349,6 +9639,19 @@ async def ensure_profession_tables() -> None:
     # Счётчик смен — под ачивку «Работяга». total_earned для этого не годится:
     # он в монетах, а шкала заработков со временем менялась.
     await _add_column_if_missing("profession_stats", "total_shifts", "INT NOT NULL DEFAULT 0")
+    # Перерыв получил кулдаун: без него «!работа перерыв» жалась подряд и
+    # держала энергию на сотне, из-за чего вся энергетическая механика была
+    # декоративной — вместе с Аптечкой, бустом, улучшением «инструменты» и
+    # привилегией Робота работяги.
+    await _add_column_if_missing("profession_stats", "last_break_at", "DATETIME NULL")
+    # Выгорание: смены подряд без единого перерыва. Обнуляется перерывом,
+    # бустом и Аптечкой.
+    await _add_column_if_missing("profession_stats", "shifts_since_break", "INT NOT NULL DEFAULT 0")
+    # «Собственный офис» — одна внеочередная смена в сутки.
+    await _add_column_if_missing("profession_stats", "last_office_day", "DATE NULL")
+    # Стажировка: у кого учится этот человек. Наставник получает процент с его
+    # смен, ученик — ускоренный опыт.
+    await _add_column_if_missing("profession_stats", "mentor_id", "BIGINT NULL")
     await _execute(
         "CREATE TABLE IF NOT EXISTS profession_upgrades ("
         "chat_id BIGINT NOT NULL, "
@@ -9375,7 +9678,8 @@ async def get_profession_stats(chat_id: int, user_id: int) -> dict:
         "chat_id": chat_id, "user_id": user_id, "profession_key": None,
         "prof_level": 1, "prof_xp": 0, "energy": 100, "mood": 100, "health": 100,
         "work_streak": 0, "last_work_at": None, "last_shift_day": None,
-        "total_earned": 0,
+        "total_earned": 0, "total_shifts": 0, "last_break_at": None,
+        "shifts_since_break": 0, "last_office_day": None, "mentor_id": None,
     }
 
 
@@ -9410,7 +9714,8 @@ async def update_profession_after_shift(
         "mood = GREATEST(0, LEAST(100, mood + %s)), "
         "health = GREATEST(0, LEAST(100, health + %s)), "
         "work_streak = %s, last_work_at = UTC_TIMESTAMP(), last_shift_day = %s, "
-        "total_earned = total_earned + %s, total_shifts = total_shifts + 1 "
+        "total_earned = total_earned + %s, total_shifts = total_shifts + 1, "
+        "shifts_since_break = shifts_since_break + 1 "
         "WHERE chat_id = %s AND user_id = %s",
         (xp_gain, energy_delta, mood_delta, health_delta, new_streak, shift_day,
          coins_earned, chat_id, user_id),
@@ -9418,25 +9723,83 @@ async def update_profession_after_shift(
     return await get_profession_stats(chat_id, user_id)
 
 
-async def set_profession_level(chat_id: int, user_id: int, level: int) -> None:
-    await _execute(
-        "UPDATE profession_stats SET prof_level = %s WHERE chat_id = %s AND user_id = %s",
-        (level, chat_id, user_id),
-    )
+async def take_profession_break(
+    chat_id: int, user_id: int, energy: int, now: datetime, touch_cooldown: bool = True
+) -> int:
+    """Перерыв: +energy и сброс выгорания. Возвращает новую энергию.
 
+    Отдых и обнуление shifts_since_break — одним запросом: это одно действие,
+    и «отдохнул, но выгорание осталось» было бы враньём.
 
-async def adjust_profession_energy(chat_id: int, user_id: int, delta: int) -> int:
+    touch_cooldown=False — для платных способов (буст, аптечка): они и нужны
+    затем, чтобы отдохнуть вне очереди, и запирать после них ещё и бесплатный
+    перерыв значило бы наказывать за трату денег.
+    """
     await get_profession_stats(chat_id, user_id)
+    stamp = ", last_break_at = %s" if touch_cooldown else ""
+    params: list = [energy]
+    if touch_cooldown:
+        params.append(now)
+    params += [chat_id, user_id]
     await _execute(
-        "UPDATE profession_stats SET energy = GREATEST(0, LEAST(100, energy + %s)) "
-        "WHERE chat_id = %s AND user_id = %s",
-        (delta, chat_id, user_id),
+        "UPDATE profession_stats SET energy = GREATEST(0, LEAST(100, energy + %s)), "
+        f"shifts_since_break = 0{stamp} WHERE chat_id = %s AND user_id = %s",
+        tuple(params),
     )
     row = await _fetchone(
         "SELECT energy FROM profession_stats WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
-    return int(row["energy"]) if row else 100
+    return int(row["energy"]) if row else 0
+
+
+async def count_profession_colleagues(chat_id: int, profession_key: str) -> int:
+    """Сколько человек в чате работают по этой профессии — для профсоюза."""
+    row = await _fetchone(
+        "SELECT COUNT(*) AS cnt FROM profession_stats "
+        "WHERE chat_id = %s AND profession_key = %s",
+        (chat_id, profession_key),
+    )
+    return int(row["cnt"]) if row else 0
+
+
+async def set_profession_mentor(chat_id: int, user_id: int, mentor_id: Optional[int]) -> None:
+    await get_profession_stats(chat_id, user_id)
+    await _execute(
+        "UPDATE profession_stats SET mentor_id = %s WHERE chat_id = %s AND user_id = %s",
+        (mentor_id, chat_id, user_id),
+    )
+
+
+async def count_profession_students(chat_id: int, mentor_id: int) -> int:
+    row = await _fetchone(
+        "SELECT COUNT(*) AS cnt FROM profession_stats WHERE chat_id = %s AND mentor_id = %s",
+        (chat_id, mentor_id),
+    )
+    return int(row["cnt"]) if row else 0
+
+
+async def use_profession_office(chat_id: int, user_id: int, day) -> bool:
+    """Внеочередная смена по «офису». False — сегодня уже использована.
+
+    Отметка ставится условием в самом UPDATE: иначе две команды подряд обе
+    прочитали бы «сегодня не использовано» и дали бы две лишние смены.
+    """
+    await get_profession_stats(chat_id, user_id)
+    rowcount = await _execute(
+        "UPDATE profession_stats SET last_office_day = %s "
+        "WHERE chat_id = %s AND user_id = %s "
+        "AND (last_office_day IS NULL OR last_office_day < %s)",
+        (day, chat_id, user_id, day),
+    )
+    return bool(rowcount)
+
+
+async def set_profession_level(chat_id: int, user_id: int, level: int) -> None:
+    await _execute(
+        "UPDATE profession_stats SET prof_level = %s WHERE chat_id = %s AND user_id = %s",
+        (level, chat_id, user_id),
+    )
 
 
 async def list_profession_top(chat_id: int, limit: int = 10) -> list[dict]:
@@ -9513,6 +9876,27 @@ DEFAULT_SHOP_ITEMS: list[tuple[str, str, int, str, str]] = [
     ("dragon", "Дракон", 9000, "Легендарный дракон", "🐉"),
     ("phoenix", "Феникс", 12000, "Мифическая птица", "🔥"),
 
+    # --- ХЛАМ (ключи собраны в JUNK_ITEM_KEYS ниже) --------------------------
+    # Дешёвый и намеренно бесполезный: ничего не делает, никуда не влияет.
+    # Смысл — в самом факте владения и в том, чтобы это было видно в профиле
+    # (закреп) и подарить другу. Отдельный ценовой этаж (1-25 i¢), чтобы хлам
+    # не мешался в витрине с настоящими товарами.
+    ("nosok", "Одинокий носок", 3, "Второго нет и не будет", "🧦"),
+    ("skrepka", "Погнутая скрепка", 2, "Когда-то что-то скрепляла", "📎"),
+    ("kamen", "Обычный камень", 1, "Просто камень. Ваш камень", "🪨"),
+    ("probka", "Пробка от бутылки", 4, "Хранит воспоминания о празднике", "🍾"),
+    ("fantik", "Фантик", 5, "Конфета была вкусная", "🍬"),
+    ("gvozd", "Ржавый гвоздь", 6, "Опасен для босых ног", "🔩"),
+    ("puzyr", "Пупырка", 12, "Полопать — бесценно", "🫧"),
+    ("kirpich", "Половина кирпича", 9, "Вторая половина где-то там", "🧱"),
+    ("banan_kozhura", "Кожура банана", 7, "Классика жанра", "🍌"),
+    ("pyl", "Комок пыли", 2, "Собран лично", "🌫"),
+    ("zhvachka", "Жёваная жвачка", 8, "Не спрашивайте, чья", "🫙"),
+    ("vilka", "Вилка без зубца", 11, "Три зубца — тоже вилка", "🍴"),
+    ("kartoshka", "Картофелина с лицом", 15, "Она на вас смотрит", "🥔"),
+    ("nitka", "Нитка", 3, "Просто нитка", "🧵"),
+    ("chek", "Выцветший чек", 5, "Что там было — уже не прочесть", "🧾"),
+
     # Новые предметы из таблицы
     ("bdsm_pletka", "Бдсм Плетка", 700, "Для ваших маленьких игровых затей", "🪢"),
     ("yabloko", "яблоко", 20, "Яблоко. Просто яблоко", "🍎"),
@@ -9529,6 +9913,17 @@ DEFAULT_SHOP_ITEMS: list[tuple[str, str, int, str, str]] = [
     ("magicwand", "Волшебная палочка", 3500, "Исполняет чудеса", "🪄"),
     ("treasure", "Сундук", 2000, "Полный сокровищ", "🪙"),
 ]
+# Хлам — намеренно бесполезные предметы. Список нужен коллекции «Барахольщик»
+# (см. collections_meta): собрать ВЕСЬ хлам — единственное, зачем он вообще
+# нужен. Ключи перечислены явно, а не выводятся по цене: подешевеет обычный
+# товар — и он молча попал бы в коллекцию.
+JUNK_ITEM_KEYS: tuple[str, ...] = (
+    "nosok", "skrepka", "kamen", "probka", "fantik", "gvozd", "puzyr",
+    "kirpich", "banan_kozhura", "pyl", "zhvachka", "vilka", "kartoshka",
+    "nitka", "chek",
+)
+
+
 async def seed_default_shop_items(chat_id: int) -> int:
     """Заполняет магазин чата базовыми товарами — только если он ещё
     совсем пуст (первое обращение к «магазин» в этом чате). Возвращает
@@ -9585,10 +9980,14 @@ async def reset_work_cooldown(chat_id: int, user_id: int) -> None:
 
 
 async def restore_profession_state(chat_id: int, user_id: int) -> None:
-    """Энергия, настроение и здоровье — обратно в 100 (предмет «Аптечка»)."""
+    """Энергия, настроение и здоровье — обратно в 100 (предмет «Аптечка»).
+
+    Выгорание снимается тоже: аптечка — самый дорогой способ прийти в себя,
+    и странно было бы, если бы после неё доход всё равно оставался урезанным.
+    """
     await _execute(
-        "UPDATE profession_stats SET energy = 100, mood = 100, health = 100 "
-        "WHERE chat_id = %s AND user_id = %s",
+        "UPDATE profession_stats SET energy = 100, mood = 100, health = 100, "
+        "shifts_since_break = 0 WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
 
@@ -9787,11 +10186,22 @@ async def remove_inventory_item(chat_id: int, user_id: int, item_key: str, amoun
 
 async def list_inventory(chat_id: int, user_id: int) -> list[dict]:
     """Инвентарь пользователя + описание из каталога (LEFT JOIN — предмет мог
-    быть удалён из магазина, но остаться у людей)."""
+    быть удалён из магазина, но остаться у людей).
+
+    Каталогов два: магазин чата и рынок участников. Купленный на рынке товар
+    лежит в этом же инвентаре, но строки в shop_items у него нет — без второго
+    JOIN он показывался бы голым ключом без названия и эмодзи. COALESCE, а не
+    выбор одного: ключи рынка и магазина не пересекаются (это проверяется при
+    подаче заявки), так что совпасть оба источника не могут.
+    """
     return await _fetchall(
-        "SELECT ui.item_key, ui.quantity, ui.acquired_at, si.name, si.description, si.emoji "
+        "SELECT ui.item_key, ui.quantity, ui.acquired_at, "
+        "       COALESCE(si.name, mg.name) AS name, "
+        "       COALESCE(si.description, mg.description) AS description, "
+        "       COALESCE(si.emoji, mg.emoji) AS emoji "
         "FROM user_inventory ui "
         "LEFT JOIN shop_items si ON si.chat_id = ui.chat_id AND si.item_key = ui.item_key "
+        "LEFT JOIN market_goods mg ON mg.chat_id = ui.chat_id AND mg.item_key = ui.item_key "
         "WHERE ui.chat_id = %s AND ui.user_id = %s ORDER BY ui.acquired_at DESC",
         (chat_id, user_id),
     )

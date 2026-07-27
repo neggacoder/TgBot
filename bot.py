@@ -70,6 +70,7 @@ import rest_rules
 import word_filter
 import robbery
 import fishing
+import market
 from activity_chart import (
     ACTIVITY_CHART_DAYS,
     ACTIVITY_CHART_MIN_DAYS,
@@ -1013,6 +1014,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
 
     "reward":            {"phrase": "наградить (ответом или @username/ID)",            "category": "Награды", "level": LEVEL_MODERATOR, "overridable": False},
     "reward_list":       {"phrase": "награды / мои награды", "category": "Награды", "level": 0},
+    "reward_top":        {"phrase": "топ наград / топ награждённых — самые заслуженные в чате", "category": "Награды", "level": 0},
     "reward_remove":     {"phrase": "снять награду (ответом или @username/ID)",        "category": "Награды", "level": LEVEL_ADMIN},
     "reward_remove_all": {"phrase": "снять все награды (ответом или @username/ID)",    "category": "Награды", "level": LEVEL_ADMIN},
 
@@ -1084,6 +1086,13 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "misc_ping":       {"phrase": "пинг / кинг / пиу / бот", "category": "Разное", "level": 0},
     "misc_say":        {"phrase": "!скажи [enter] {текст} / бот скажи {текст}", "category": "Разное", "level": 0},
     "misc_my_article": {"phrase": "моя статья", "category": "Разное", "level": 0},
+    "fun_ball":      {"phrase": "шар {вопрос} — магический шар", "category": "Разное", "level": 0},
+    "fun_horoscope": {"phrase": "гороскоп / мой гороскоп — шуточный гороскоп на сутки", "category": "Разное", "level": 0},
+    "fun_weather":   {"phrase": "погода / погода в чате — шуточная погода чата на сутки", "category": "Разное", "level": 0},
+    "fun_toast":     {"phrase": "тост — случайный тост", "category": "Разное", "level": 0},
+    "fun_excuse":    {"phrase": "отмазка / оправдание — генератор отмазок", "category": "Разное", "level": 0},
+    "fun_wisdom":    {"phrase": "мудрость — абсурдный афоризм", "category": "Разное", "level": 0},
+    "fun_rate":      {"phrase": "оценить {что угодно} — оценка по десятибалльной", "category": "Разное", "level": 0},
     "tts_say":         {"phrase": ".скажи {текст} — озвучивает текст голосовым сообщением (до 500 символов)", "category": "Разное", "level": 0},
 
     "photo_sdb":       {"phrase": ".сдб {участник} (ответом или @username/ID)", "category": "Фото", "level": 0},
@@ -1204,6 +1213,10 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "prof_top":     {"phrase": "!работа топ", "category": "Экономика", "level": 0},
     "prof_quit":    {"phrase": "!работа уволиться", "category": "Экономика", "level": 0},
     "prof_break":   {"phrase": "!работа перерыв", "category": "Экономика", "level": 0},
+    "prof_order":     {"phrase": "!работа заказ / !работа заказ взять — заказ дня: тройная оплата первому подходящему", "category": "Экономика", "level": 0},
+    "prof_together":  {"phrase": "!работа вместе @кому — смена в паре, обоим надбавка", "category": "Экономика", "level": 0},
+    "prof_mentor":    {"phrase": "!работа наставник @кому / !работа наставник - — стажировка", "category": "Экономика", "level": 0},
+    "prof_analytics": {"phrase": "!работа аналитика — где выгоднее работать (нужно улучшение «аналитика»)", "category": "Экономика", "level": 0},
     "prof_boost":   {"phrase": "!работа буст", "category": "Экономика", "level": 0},
     "robbery_run":     {"phrase": "!ограбить / !ограбить бинокль @username", "category": "Экономика", "level": 0},
     "robbery_stats":   {"phrase": "стата ограблений / моя стата ограблений", "category": "Экономика", "level": 0},
@@ -1241,6 +1254,8 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "pet_buy":         {"phrase": "пет купить {ключ}", "category": "Разное", "level": 0},
     "pet_care":        {"phrase": "пет кормить / пет гладить / пет поцеловать / пет назвать / пет закрепить / пет способность / пет способности", "category": "Разное", "level": 0},
     "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет", "category": "Экономика", "level": 0},
+    "market":          {"phrase": "рынок / рынок купить {ключ} [кол-во] / рынок заявка {ключ} {цена} {название} / рынок мои / рынок снять {ключ} — торговля между участниками", "category": "Экономика", "level": 0},
+    "market_manage":   {"phrase": "рынок заявки / рынок принять {номер} / рынок отклонить {номер} / рынок режим ручной|авто|отклонять / рынок комиссия {число} / рынок потолок {число} / рынок лимит {число}", "category": "Экономика", "level": LEVEL_ADMIN},
     "item_sabotage":   {"phrase": "саботаж @кому — сломать бизнес выбранного человека (предмет «Саботаж»)", "category": "Экономика", "level": 0},
     "item_kompromat":  {"phrase": "компромат @кому — поднять старую фразу человека картинкой-цитатой (предмет «Компромат»)", "category": "Экономика", "level": 0},
     "item_dossier":    {"phrase": "досье @кому — сводка по человеку: деньги, бизнесы, ограбления (предмет «Досье»)", "category": "Экономика", "level": 0},
@@ -9115,6 +9130,59 @@ _SELF_ACTIONS_DEFAULT: dict[str, list[str]] = {
     "вздрочнуть": [
         "{user} Раздрочил своего дружка до разврата",
     ],
+    # --- добавлено позже: раздел был честно тощим, восьми действий на целую
+    # механику мало. Это не «побольше текста», а сам её объём: каждая строка
+    # ниже — то, что человек реально увидит в чате.
+    "зевнуть": [
+        "{user} зевнул(а) так, что заразил(а) весь чат 🥱",
+        "{user} широко зевнул(а) и чуть не вывихнул(а) челюсть 🥱",
+        "{user} зевает третий раз подряд — кто-то явно не выспался 😪",
+    ],
+    "икать": [
+        "{user} икает уже пять минут — кто-то вспоминает 🫢",
+        "{user} икнул(а) на весь чат и виновато замолчал(а) 🫢",
+    ],
+    "покраснеть": [
+        "{user} залился(-лась) краской до самых ушей 🫠",
+        "{user} покраснел(а) и сделал(а) вид, что это от жары 😳",
+    ],
+    "задуматься": [
+        "{user} завис(ла), глядя в одну точку 🤔",
+        "{user} глубоко задумался(-лась) о смысле всего этого 🧐",
+        "{user} ушёл(ушла) в себя и обещал(а) вернуться 💭",
+    ],
+    "потянуться": [
+        "{user} потянулся(-лась) до хруста в спине 🙆",
+        "{user} размял(а) затёкшие плечи 💪",
+    ],
+    "поперхнуться": [
+        "{user} поперхнулся(-лась) чаем от увиденного ☕😵",
+        "{user} закашлялся(-лась), прочитав это 😳",
+    ],
+    "исчезнуть": [
+        "{user} растворился(-лась) в воздухе 🫥",
+        "{user} эффектно испарился(-лась), оставив только дым 💨",
+    ],
+    "появиться": [
+        "{user} возник(ла) из ниоткуда 🪄",
+        "{user} эффектно вышел(вышла) из тени 🌫",
+    ],
+    "объявить": [
+        "{user} торжественно откашлялся(-лась) и передумал(а) 📢",
+        "{user} собрался(-лась) сказать что-то важное… и промолчал(а) 🤐",
+    ],
+    "сдаться": [
+        "{user} поднял(а) руки и сдался(-лась) 🏳️",
+        "{user} тихо капитулировал(а) 🏳️",
+    ],
+    "обидеться": [
+        "{user} надул(а) губы и отвернулся(-лась) 😤",
+        "{user} демонстративно обиделся(-лась) на весь свет 😾",
+    ],
+    "гордиться": [
+        "{user} гордо выпрямился(-лась) и посмотрел(а) на всех свысока 😌",
+        "{user} явно собой доволен(довольна) ✨",
+    ],
 }
 
 # Живой кэш себяшек — заполняется в load_caches() из db.list_self_actions().
@@ -11682,6 +11750,230 @@ MY_ARTICLE_TEMPLATES = [
     "🧑‍⚖️ Суд постановил: {mention} — статья {code}, {title}",
     "🔒 Внимание, {mention} задержан(а) по статье {code}. {title}",
 ]
+
+
+# ============================================================================
+# Бесполезное, но весёлое. Ничего не считает, ни на что не влияет, ничего не
+# хранит — только выдаёт фразу. Отдельным блоком, чтобы это не приходилось
+# выковыривать из экономики, если однажды захочется выключить.
+#
+# Суточные (гороскоп, погода) стабильны в пределах дня: сеются от (кто, что,
+# дата), а не от текущего времени. Иначе гороскоп менялся бы при каждом
+# нажатии и перестал бы быть гороскопом. Своей таблицы для этого не нужно —
+# одинаковый seed даёт одинаковый ответ.
+# ============================================================================
+def _daily_pick(options: list, *seed_parts) -> object:
+    """Стабильный выбор на сутки: одинаковый seed — одинаковый ответ."""
+    rng = random.Random(str(seed_parts) + utc_today().isoformat())
+    return options[rng.randrange(len(options))]
+
+
+MAGIC_BALL_ANSWERS = [
+    "Бесспорно 🎱", "Даже не сомневайся", "Определённо да", "Можешь быть уверен",
+    "Скорее всего", "Хорошие перспективы", "Знаки говорят «да»", "Похоже на то",
+    "Пока неясно, попробуй ещё", "Спроси позже", "Лучше не рассказывать",
+    "Сейчас нельзя предсказать", "Сосредоточься и спроси опять",
+    "Даже не думай", "Мой ответ — нет", "По моим данным — нет",
+    "Перспективы не очень", "Весьма сомнительно",
+    "Абсолютно точно нет 🙅", "Шанс есть, но я бы не рассчитывал",
+    "Да, но ты пожалеешь", "Нет, и ты это знаешь",
+]
+
+HOROSCOPE_MOODS = [
+    "Звёзды советуют не вставать с дивана.",
+    "День удачен для сомнительных решений.",
+    "Сегодня вас поймут неправильно. Дважды.",
+    "Финансы поют романсы, но поют неплохо.",
+    "Удача рядом, но занята кем-то другим.",
+    "Отличный день, чтобы ничего не начинать.",
+    "Вселенная на вашей стороне, но у неё перерыв.",
+    "Сегодня всё получится. Не сегодня, но получится.",
+    "Ждите новостей. Скорее всего, из чата.",
+    "День требует решительности. Отложите его.",
+    "Кто-то о вас думает. Возможно, бухгалтерия.",
+    "Звёзды сошлись. Разойдутся к вечеру.",
+]
+HOROSCOPE_ADVICE = [
+    "Совет дня: не спорьте с администрацией.",
+    "Совет дня: молчание — тоже ответ.",
+    "Совет дня: проверьте кулдауны.",
+    "Совет дня: не берите кредит.",
+    "Совет дня: улыбнитесь, это всех насторожит.",
+    "Совет дня: доверяйте, но проверяйте инвентарь.",
+    "Совет дня: не рыбачьте на пустой желудок.",
+    "Совет дня: сегодня лучше не грабить.",
+]
+
+WEATHER_STATES = [
+    "☀️ ясно, но душно от разговоров",
+    "🌧 моросит сарказм",
+    "⛈ гроза в комментариях",
+    "🌫 туман, никто ничего не понял",
+    "❄️ похолодание в отношениях",
+    "🌪 локальные вихри флуда",
+    "🌈 после вчерашнего — радуга",
+    "🌤 переменная активность",
+    "🔥 жарко, кто-то опять начал спор",
+    "🌙 тишина, все спят",
+]
+
+TOASTS = [
+    "За тех, кто читает чат, но молчит! 🥂",
+    "Выпьем за администрацию — она всё видит. 🍷",
+    "За тех, кто в кулдауне! 🍻",
+    "За удачный клёв и полную сетку! 🐟",
+    "Чтоб инвентарь ломился, а кошелёк не пустел! 💰",
+    "За тех, кого не ограбили сегодня! 🥷",
+    "Чтобы бизнес не ломался, а ферма плодоносила! 🌾",
+    "За то, чтобы ва-банк однажды сыграл! 🃏",
+    "Поднимем за тех, кто всё ещё верит в биржу! 📈",
+]
+
+EXCUSE_WHO = [
+    "Я не виноват(а),", "Всё бы получилось, но", "Так вышло, потому что",
+    "Честно, я собирался(-лась), но", "Это не я — это",
+]
+EXCUSE_WHAT = [
+    "кот сел на клавиатуру", "интернет ушёл и не вернулся",
+    "телефон разрядился прямо в руках", "меня отвлекла биржа",
+    "я был(а) на кулдауне", "сработала страховка",
+    "бот съел моё сообщение", "я перепутал(а) чаты",
+    "это всё ретроградный Меркурий", "у меня закончилась энергия",
+    "меня ограбили по дороге", "я закопался(-лась) в поисках клада",
+]
+EXCUSE_END = [
+    "Больше не повторится.", "Так что я тут ни при чём.",
+    "Претензии — к звёздам.", "Все вопросы к администрации.",
+    "И вообще, это было давно.", "Считайте, что меня не было.",
+]
+
+WISDOM = [
+    "Тот, кто копит рыбу, однажды дождётся клёва. Или запаха.",
+    "Не откладывай на завтра то, что можно не делать вовсе.",
+    "Богат не тот, у кого много монет, а тот, у кого не спрашивают взаймы.",
+    "Кто рано встал — тот успел на ферму первым.",
+    "Молчание — золото. Но золото в этом чате падает и с биржи.",
+    "Если долго сидеть у реки, кулдаун всё равно не пройдёт быстрее.",
+    "Умный не тот, кто не проигрывает, а тот, кто не ставит ва-банк.",
+    "Всякая страховка кажется лишней ровно до одного случая.",
+    "Не буди спящего админа.",
+    "Дорогу осилит идущий, а кулдаун — ждущий.",
+]
+
+RATING_COMMENTS = [
+    "неплохо, но бывало и лучше", "крепкий середняк", "без комментариев",
+    "внезапно достойно", "я бы не рискнул(а)", "спорно, но красиво",
+    "это надо видеть", "звучит подозрительно", "одобряю",
+    "могло быть и хуже", "шедевр в своём роде", "ну такое",
+]
+
+RATE_RE = re.compile(r"(?i)^!?оценить\s+(.+)$")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(lambda t: bool(t) and bool(re.match(r"(?i)^!?шар\s+.+", (t or "").strip()))),
+)
+async def cmd_magic_ball(message: Message):
+    """«шар {вопрос}» — магический шар. В отличие от «данет» отвечает не
+    только да/нет, а с интонацией."""
+    if not _check_misc_access(message.from_user.id, "fun_ball"):
+        return
+    question = re.sub(r"(?i)^!?шар\s+", "", message.text.strip())
+    await message.reply(
+        f"🎱 <i>{html.escape(question[:200])}</i>\n"
+        f"<b>{random.choice(MAGIC_BALL_ANSWERS)}</b>"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("гороскоп", "!гороскоп", "мой гороскоп")),
+)
+async def cmd_horoscope(message: Message):
+    """Гороскоп на сутки — один и тот же при повторных нажатиях."""
+    if not _check_misc_access(message.from_user.id, "fun_horoscope"):
+        return
+    user_id = message.from_user.id
+    mood = _daily_pick(HOROSCOPE_MOODS, "mood", user_id)
+    advice = _daily_pick(HOROSCOPE_ADVICE, "advice", user_id)
+    luck = random.Random(f"luck{user_id}{utc_today().isoformat()}").randint(1, 100)
+    who = await display_name(message.chat.id, message.from_user)
+    await message.answer(
+        f"🔮 <b>Гороскоп на сегодня</b> — {who}\n{DIVIDER}\n"
+        f"{mood}\n{advice}\n\n🍀 Удача дня: <b>{luck}%</b>"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("погода", "!погода", "погода в чате")),
+)
+async def cmd_chat_weather(message: Message):
+    """Погода в чате — тоже на сутки, но общая для всех: это погода чата,
+    а не личная."""
+    if not _check_misc_access(message.from_user.id, "fun_weather"):
+        return
+    state = _daily_pick(WEATHER_STATES, "weather", message.chat.id)
+    degrees = random.Random(f"deg{message.chat.id}{utc_today().isoformat()}").randint(-30, 40)
+    await message.answer(
+        f"🌡 <b>Погода в чате</b>\n{state}\nТемпература общения: <b>{degrees:+d}°</b>"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("тост", "!тост")),
+)
+async def cmd_toast(message: Message):
+    if not _check_misc_access(message.from_user.id, "fun_toast"):
+        return
+    await message.answer(random.choice(TOASTS))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("отмазка", "!отмазка", "оправдание")),
+)
+async def cmd_excuse(message: Message):
+    """Собирается из трёх частей — так вариантов сотни, а не десяток."""
+    if not _check_misc_access(message.from_user.id, "fun_excuse"):
+        return
+    await message.reply(
+        f"🤥 {random.choice(EXCUSE_WHO)} {random.choice(EXCUSE_WHAT)}. "
+        f"{random.choice(EXCUSE_END)}"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("мудрость", "!мудрость")),
+)
+async def cmd_wisdom(message: Message):
+    if not _check_misc_access(message.from_user.id, "fun_wisdom"):
+        return
+    await message.answer(f"🧠 <i>{random.choice(WISDOM)}</i>")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(lambda t: bool(t) and bool(RATE_RE.match((t or "").strip()))),
+)
+async def cmd_rate(message: Message):
+    """«оценить {что угодно}» — оценка по десятибалльной, стабильная для
+    одного и того же текста: иначе одну и ту же вещь можно было бы
+    переоценивать, пока не понравится."""
+    if not _check_misc_access(message.from_user.id, "fun_rate"):
+        return
+    what = RATE_RE.match(message.text.strip()).group(1).strip()
+    rng = random.Random(what.casefold())
+    score = rng.randint(0, 10)
+    comment = RATING_COMMENTS[rng.randrange(len(RATING_COMMENTS))]
+    bar = "🟩" * score + "⬜" * (10 - score)
+    await message.reply(
+        f"📊 <b>{html.escape(what[:200])}</b>\n{bar}\n"
+        f"<b>{score}/10</b> — {comment}"
+    )
 
 
 @router.message(
@@ -16965,6 +17257,11 @@ async def _collection_progress(chat_id: int, user_id: int) -> dict:
     # своих питомцев, и без них коллекция была бы уже неполной.
     out["zoo"] = (len(owned_pets & set(specs)), len(specs))
 
+    # Хлам считаем по инвентарю: предметы обычные, спецэффектов у них нет,
+    # и единственный их смысл — собраться полностью.
+    inventory = {row["item_key"] for row in await db.list_inventory(chat_id, user_id)}
+    out["junk"] = (len(inventory & set(db.JUNK_ITEM_KEYS)), len(db.JUNK_ITEM_KEYS))
+
     titles = {row["title_key"] for row in await db.list_user_titles(chat_id, user_id)}
     streak = collections_meta.season_streak_keys(_current_season(), seasons.previous_of)
     got = sum(1 for key in streak
@@ -17396,6 +17693,522 @@ async def cmd_steal_item(message: Message):
         f"🗝 У вас украли предмет «{html.escape(stolen_name)}». "
         f"Работал медвежатник — от него не спасает ничего, кроме пустого инвентаря."
     )
+
+
+# ============================================================================
+# Рынок между участниками. Правила — в market.py, таблицы — в db.py.
+#
+# Участник заводит свой товар, администрация его подтверждает, и дальше в
+# этом чате им торгует только он. Купленное падает в обычный инвентарь.
+# ============================================================================
+MARKET_APPLY_RE = re.compile(r"(?i)^!?рынок\s+заявка\s+(\S+)\s+(\S+)\s+(.+)$")
+MARKET_BUY_RE = re.compile(r"(?i)^!?рынок\s+купить\s+(\S+)(?:\s+(\d+))?$")
+MARKET_WITHDRAW_RE = re.compile(r"(?i)^!?рынок\s+снять\s+(\S+)$")
+MARKET_DECIDE_RE = re.compile(r"(?i)^!?рынок\s+(принять|отклонить)\s+(\d+)$")
+MARKET_MODE_RE = re.compile(r"(?i)^!?рынок\s+режим\s+(ручной|авто|отклонять)$")
+MARKET_CFG_RE = re.compile(r"(?i)^!?рынок\s+(комиссия|потолок|лимит)\s+(\d+)$")
+
+
+def _market_settings(row: dict) -> market.Settings:
+    return market.Settings(
+        mode=row.get("mode") or market.DEFAULT_MODE,
+        commission_percent=float(row.get("commission_percent") or market.DEFAULT_COMMISSION),
+        max_price=int(row.get("max_price") or market.DEFAULT_MAX_PRICE),
+        max_goods=int(row.get("max_goods") or market.DEFAULT_MAX_GOODS),
+    )
+
+
+async def _market_key_taken(chat_id: int, key: str) -> str:
+    """Пустая строка — ключ свободен, иначе объяснение, чем он занят.
+
+    ⚠️ Проверка встроенных каталогов здесь не формальность. Магазин
+    досеивается функцией, которая молча пропускает уже существующие ключи
+    (см. db.seed_extra_shop_items). Пусти на рынок товар с ключом «talisman» —
+    и настоящий Талисман удачи в этом чате не появится уже никогда, причём
+    без единой ошибки в логах.
+    """
+    if key in shop_effects.BY_KEY or key in shop_effects.ACHIEVEMENT_BY_KEY:
+        return "Такой ключ занят предметом магазина."
+    if key in shop_effects.REWARD_BY_KEY or key in robbery.ROBBERY_ITEMS:
+        return "Такой ключ занят предметом бота."
+    if await db.get_shop_item(chat_id, key) is not None:
+        return "Такой ключ уже есть в магазине этого чата."
+    if await db.get_market_good(chat_id, key) is not None:
+        return "Этот товар в чате уже кто-то продаёт — ключ занят."
+    return ""
+
+
+async def _market_notify_request(
+    chat_id: int, good_id: int, seller: str, name: str, key: str,
+    price: int, chat_title: Optional[str],
+) -> bool:
+    """Отправляет заявку в чат уведомлений (settings.notify_chat_id) — туда же,
+    куда идут заявки на вступление и жалобы. False — чат не настроен.
+
+    Решение принимается кнопками, а не командой «рынок принять {номер}»:
+    команда ищет заявку по чату, в котором её написали, а нажимают её как раз
+    в ЧУЖОМ чате уведомлений. Поэтому id исходного чата едет в callback_data.
+    """
+    notify_chat_id = settings.get("notify_chat_id")
+    if not notify_chat_id:
+        return False
+    where = f" · чат: {html.escape(chat_title)}" if chat_title else ""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять",
+                             callback_data=f"mktok:{chat_id}:{good_id}"),
+        InlineKeyboardButton(text="🚫 Отклонить",
+                             callback_data=f"mktno:{chat_id}:{good_id}"),
+    ]])
+    try:
+        await bot.send_message(
+            chat_id=notify_chat_id,
+            message_thread_id=settings.get("notify_topic_id"),
+            text=(
+                f"🧺 <b>Заявка на рынок</b> №{good_id}{where}\n\n"
+                f"Продавец: {seller}\n"
+                f"Товар: {html.escape(name)} (<code>{html.escape(key)}</code>)\n"
+                f"Цена: {price} i¢"
+            ),
+            reply_markup=keyboard,
+        )
+        return True
+    except Exception:
+        logger.exception("Не удалось отправить заявку рынка в notify_chat_id")
+        return False
+
+
+async def _market_apply_decision(chat_id: int, good_id: int, approve: bool,
+                                 admin_id: int) -> Optional[dict]:
+    """Общее решение по заявке для команды и для кнопки. None — заявки уже нет.
+
+    Объявление о решении уходит в ИСХОДНЫЙ чат: продавец и покупатели живут
+    там, а не в чате уведомлений.
+    """
+    good = await db.get_market_good_by_id(chat_id, good_id)
+    if good is None or good["status"] != "pending":
+        return None
+    if not await db.decide_market_good(chat_id, good_id, approve, admin_id):
+        return None
+
+    await db.add_log(
+        "market_approve" if approve else "market_reject",
+        chat_id=chat_id, actor_id=admin_id,
+        target_id=int(good["seller_id"]), details=good["item_key"],
+    )
+    seller = await display_name_by_id(chat_id, int(good["seller_id"]))
+    if approve:
+        text = (f"✅ Заявка №{good_id} одобрена: {seller} торгует "
+                f"«{html.escape(good['name'])}» "
+                f"(<code>{html.escape(good['item_key'])}</code>) по {good['price']} i¢.")
+    else:
+        text = (f"🚫 Заявка №{good_id} отклонена. Ключ "
+                f"<code>{html.escape(good['item_key'])}</code> снова свободен.")
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception as exc:
+        log_suppressed("_market_apply_decision", exc)
+    await _dm_or_none(
+        int(good["seller_id"]),
+        f"{'✅ Ваш товар одобрен' if approve else '🚫 Ваша заявка отклонена'}: "
+        f"«{html.escape(good['name'])}»."
+    )
+    return good
+
+
+@router.callback_query(F.data.startswith("mktok:") | F.data.startswith("mktno:"))
+async def market_decide_cb(callback: CallbackQuery):
+    """Кнопки «Принять»/«Отклонить» под заявкой в чате уведомлений."""
+    if not has_level(callback.from_user.id, required_level("market_manage")):
+        await callback.answer("Разбирать заявки может только администрация.", show_alert=True)
+        return
+    action, chat_raw, good_raw = callback.data.split(":", maxsplit=2)
+    approve = action == "mktok"
+    good = await _market_apply_decision(
+        int(chat_raw), int(good_raw), approve, callback.from_user.id
+    )
+    if good is None:
+        await callback.answer("Заявку уже разобрали.", show_alert=True)
+        return
+    await callback.answer("✅ Принято" if approve else "🚫 Отклонено")
+    who = await display_name_by_id(int(chat_raw), int(good["seller_id"]))
+    try:
+        await callback.message.edit_text(
+            f"🧺 <b>Заявка на рынок</b> №{good_raw} — "
+            f"{'✅ принята' if approve else '🚫 отклонена'}\n\n"
+            f"Продавец: {who}\n"
+            f"Товар: {html.escape(good['name'])} "
+            f"(<code>{html.escape(good['item_key'])}</code>)\n"
+            f"Цена: {good['price']} i¢"
+        )
+    except Exception as exc:
+        log_suppressed("market_decide_cb", exc)
+
+
+def _market_line(good: dict, seller: str) -> str:
+    desc = f" — {html.escape(good['description'])}" if good.get("description") else ""
+    return (f"{good['emoji']} <b>{html.escape(good['name'])}</b> "
+            f"(<code>{html.escape(good['item_key'])}</code>) — "
+            f"{good['price']} i¢ · продавец: {seller}{desc}")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("рынок", "!рынок")),
+)
+async def cmd_market_show(message: Message):
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    chat_id = message.chat.id
+    goods = await db.list_market_goods(chat_id)
+    settings = _market_settings(await db.get_market_settings(chat_id))
+
+    lines = ["🧺 <b>Рынок чата</b>", DIVIDER]
+    if not goods:
+        lines.append("Пока никто ничего не продаёт.")
+    else:
+        for good in goods:
+            seller = await display_name_by_id(chat_id, int(good["seller_id"]))
+            lines.append(_market_line(good, seller))
+    lines.append("")
+    lines.append(f"Комиссия чата: {settings.commission_percent:.0f}% · "
+                 f"потолок цены: {settings.max_price} i¢")
+    # Режим показываем здесь же: иначе в чате с автоотклонением человек видит
+    # подсказку «подайте заявку» и получает отказ без единого предупреждения.
+    if settings.mode == market.MODE_AUTO_REJECT:
+        lines.append("🚫 Приём новых товаров закрыт.")
+    else:
+        if settings.mode == market.MODE_AUTO_ACCEPT:
+            lines.append("⚡ Заявки одобряются автоматически.")
+        lines.append("<code>рынок купить {ключ} [кол-во]</code> · "
+                     "<code>рынок заявка {ключ} {цена} {название}</code>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARKET_APPLY_RE.match(t.strip()))),
+)
+async def cmd_market_apply(message: Message):
+    """«рынок заявка {ключ} {цена} {название}» — попроситься торговать."""
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    m = MARKET_APPLY_RE.match(message.text.strip())
+    key, raw_price, name = m.group(1).casefold(), m.group(2), m.group(3).strip()
+
+    settings = _market_settings(await db.get_market_settings(chat_id))
+    if settings.mode == market.MODE_AUTO_REJECT:
+        await message.reply(
+            "🚫 Приём новых товаров в этом чате закрыт — уже одобренные "
+            "продолжают торговаться."
+        )
+        return
+
+    error = market.validate_key(key)
+    if error:
+        await message.reply(error)
+        return
+
+    # Свой же снятый с витрины товар возвращается той же командой: строка по
+    # нему осталась ради названий в инвентарях покупателей, поэтому обычная
+    # проверка занятости ключа отбила бы владельца от его собственного товара.
+    existing = await db.get_market_good(chat_id, key)
+    relisting = (existing is not None
+                 and int(existing["seller_id"]) == user_id
+                 and existing["status"] == "withdrawn")
+    if not relisting:
+        error = await _market_key_taken(chat_id, key)
+        if error:
+            await message.reply(error)
+            return
+    price = parse_amount(raw_price)
+    if price is None:
+        await message.reply("Не понял цену. Например: <code>рынок заявка ogurcy 500 Огурцы</code>")
+        return
+    error = market.validate_price(price, settings)
+    if error:
+        await message.reply(error)
+        return
+    if len(name) > market.NAME_MAX:
+        await message.reply(f"Название длиннее {market.NAME_MAX} символов.")
+        return
+
+    auto = settings.mode == market.MODE_AUTO_ACCEPT
+
+    if relisting:
+        await db.relist_market_good(
+            chat_id, int(existing["id"]), price,
+            "approved" if auto else "pending",
+        )
+        await db.add_log("market_relist", chat_id=chat_id, actor_id=user_id, details=key)
+        await message.answer(
+            f"🧺 Товар «{html.escape(existing['name'])}» "
+            f"(<code>{html.escape(key)}</code>) снова на витрине по {price} i¢."
+            + ("" if auto else "\nЖдёт решения администрации.")
+        )
+        return
+
+    mine = await db.count_market_goods_of(chat_id, user_id)
+    if mine >= settings.max_goods:
+        await message.reply(
+            f"У вас уже {mine} товаров — больше {settings.max_goods} в этом чате нельзя. "
+            f"Снимите лишний: <code>рынок снять {{ключ}}</code>."
+        )
+        return
+
+    good_id = await db.add_market_good(
+        chat_id, user_id, key, name, price,
+        status="approved" if auto else "pending",
+    )
+    if good_id is None:
+        await message.reply("Этот товар в чате уже кто-то продаёт — ключ занят.")
+        return
+
+    who = await display_name(chat_id, message.from_user)
+    if auto:
+        await db.add_log("market_auto_approve", chat_id=chat_id, actor_id=user_id, details=key)
+        await message.answer(
+            f"✅ {who} выходит на рынок: {html.escape(name)} "
+            f"(<code>{html.escape(key)}</code>) по {price} i¢.\n"
+            f"В чате включено автопринятие заявок."
+        )
+        return
+    await db.add_log("market_apply", chat_id=chat_id, actor_id=user_id, details=key)
+    delivered = await _market_notify_request(
+        chat_id, good_id, who, name, key, price, message.chat.title
+    )
+    if delivered:
+        await message.answer(
+            f"📝 Заявка №{good_id} отправлена администрации: «{html.escape(name)}» "
+            f"(<code>{html.escape(key)}</code>) по {price} i¢."
+        )
+        return
+    # Чат уведомлений не настроен — разбираем на месте, как раньше, иначе
+    # заявка просто зависла бы и о ней никто не узнал.
+    await message.answer(
+        f"📝 Заявка №{good_id} от {who}: продавать «{html.escape(name)}» "
+        f"(<code>{html.escape(key)}</code>) по {price} i¢.\n"
+        f"Администрация: <code>рынок принять {good_id}</code> или "
+        f"<code>рынок отклонить {good_id}</code>."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARKET_BUY_RE.match(t.strip()))),
+)
+async def cmd_market_buy(message: Message):
+    """«рынок купить {ключ} [кол-во]» — купить у другого участника."""
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    m = MARKET_BUY_RE.match(message.text.strip())
+    key = m.group(1).casefold()
+    quantity = int(m.group(2)) if m.group(2) else 1
+    if not 1 <= quantity <= market.BUY_MAX_QTY:
+        await message.reply(f"Количество — от 1 до {market.BUY_MAX_QTY} за раз.")
+        return
+
+    good = await db.get_market_good(chat_id, key)
+    if good is None or good["status"] != "approved":
+        await message.reply(f"На рынке нет товара «{html.escape(key)}».")
+        return
+    seller_id = int(good["seller_id"])
+    if seller_id == user_id:
+        await message.reply("Свой собственный товар покупать незачем.")
+        return
+
+    settings = _market_settings(await db.get_market_settings(chat_id))
+    total, to_seller, fee = market.split_payment(
+        int(good["price"]), quantity, settings.commission_percent
+    )
+    # Деньги, казна, инвентарь и счётчик продаж — одной транзакцией, с
+    # проверкой баланса внутри самого UPDATE (см. db.market_purchase).
+    # Читать баланс заранее и списывать отдельно нельзя: две команды подряд
+    # обе прошли бы проверку и увели кошелёк в минус.
+    if not await db.market_purchase(
+        chat_id, user_id, seller_id, int(good["id"]), key, quantity, total, to_seller, fee
+    ):
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Не хватает монет: нужно {total} i¢, у вас {int(wallet.get('coins') or 0)}."
+        )
+        return
+
+    await db.add_log("market_buy", chat_id=chat_id, actor_id=user_id,
+                     target_id=seller_id, details=f"{key}x{quantity}:{total}")
+
+    buyer = await display_name(chat_id, message.from_user)
+    seller = await display_name_by_id(chat_id, seller_id)
+    fee_part = f"\nКомиссия чата: {fee} i¢." if fee else ""
+    await message.answer(
+        f"🧺 {buyer} покупает у {seller}: {good['emoji']} "
+        f"<b>{html.escape(good['name'])}</b> × {quantity} за <b>{total}</b> i¢."
+        f"{fee_part}"
+    )
+    await _dm_or_none(
+        seller_id,
+        f"🧺 У вас купили «{html.escape(good['name'])}» × {quantity}. "
+        f"Вам зачислено {to_seller} i¢."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("рынок мои", "!рынок мои")),
+)
+async def cmd_market_mine(message: Message):
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    goods = await db.list_market_goods_of(message.chat.id, message.from_user.id)
+    if not goods:
+        await message.reply(
+            "У вас нет товаров на рынке. Подать заявку: "
+            "<code>рынок заявка {ключ} {цена} {название}</code>"
+        )
+        return
+    lines = ["🧺 <b>Ваши товары</b>", DIVIDER]
+    for good in goods:
+        state = "⏳ ждёт решения" if good["status"] == "pending" else "✅ торгуется"
+        lines.append(
+            f"{good['emoji']} <b>{html.escape(good['name'])}</b> "
+            f"(<code>{html.escape(good['item_key'])}</code>) — {good['price']} i¢ · {state}\n"
+            f"    продано: {good['sold']} шт., заработано: {good['earned']} i¢"
+        )
+    lines.append("\nСнять товар: <code>рынок снять {ключ}</code>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARKET_WITHDRAW_RE.match(t.strip()))),
+)
+async def cmd_market_withdraw(message: Message):
+    if not _check_misc_access(message.from_user.id, "market"):
+        return
+    key = MARKET_WITHDRAW_RE.match(message.text.strip()).group(1).casefold()
+    outcome = await db.remove_market_good(message.chat.id, key, message.from_user.id)
+    if outcome is None:
+        await message.reply(f"У вас нет товара «{html.escape(key)}» на рынке.")
+        return
+    await db.add_log("market_withdraw", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=key)
+    if outcome == "deleted":
+        await message.reply(
+            f"🧺 Товар «{html.escape(key)}» снят с рынка — ключ снова свободен."
+        )
+        return
+    # Проданный товар с витрины уходит, но строка остаётся: по ней в инвентаре
+    # покупателей резолвятся название и эмодзи (см. db.remove_market_good).
+    await message.reply(
+        f"🧺 Товар «{html.escape(key)}» снят с витрины. Ключ остаётся за вами — "
+        f"его уже купили, и у покупателей он должен остаться с нормальным "
+        f"названием. Вернуть в продажу: <code>рынок заявка {html.escape(key)} "
+        f"{{цена}} {{название}}</code>."
+    )
+
+
+# --- разбор заявок (администрация) ------------------------------------------
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("рынок заявки", "!рынок заявки")),
+)
+async def cmd_market_requests(message: Message):
+    if not has_level(message.from_user.id, required_level("market_manage")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Разбирать заявки может «{level_name(required_level('market_manage'))}» и выше."
+            )
+        return
+    goods = await db.list_market_goods(message.chat.id, status="pending")
+    if not goods:
+        await message.reply("Заявок нет.")
+        return
+    lines = ["📝 <b>Заявки на рынок</b>", DIVIDER]
+    for good in goods:
+        who = await display_name_by_id(message.chat.id, int(good["seller_id"]))
+        lines.append(
+            f"№{good['id']} — {who}: «{html.escape(good['name'])}» "
+            f"(<code>{html.escape(good['item_key'])}</code>) по {good['price']} i¢"
+        )
+    lines.append("\n<code>рынок принять {номер}</code> · <code>рынок отклонить {номер}</code>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARKET_DECIDE_RE.match(t.strip()))),
+)
+async def cmd_market_decide(message: Message):
+    if not has_level(message.from_user.id, required_level("market_manage")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Разбирать заявки может «{level_name(required_level('market_manage'))}» и выше."
+            )
+        return
+    m = MARKET_DECIDE_RE.match(message.text.strip())
+    approve = m.group(1).casefold() == "принять"
+    good_id = int(m.group(2))
+
+    # Та же функция, что и у кнопок в чате уведомлений: решение по заявке
+    # должно приводить к одному и тому же, откуда бы его ни приняли.
+    if await _market_apply_decision(
+        message.chat.id, good_id, approve, message.from_user.id
+    ) is None:
+        await message.reply(f"Заявки №{good_id} нет или она уже разобрана.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARKET_MODE_RE.match(t.strip()))),
+)
+async def cmd_market_mode(message: Message):
+    if not has_level(message.from_user.id, required_level("market_manage")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Настраивать рынок может «{level_name(required_level('market_manage'))}» и выше."
+            )
+        return
+    word = MARKET_MODE_RE.match(message.text.strip()).group(1).casefold()
+    mode = {"ручной": market.MODE_MANUAL, "авто": market.MODE_AUTO_ACCEPT,
+            "отклонять": market.MODE_AUTO_REJECT}[word]
+    await db.set_market_settings(message.chat.id, mode=mode)
+    await db.add_log("market_mode", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=mode)
+    await message.answer(f"⚙️ Режим заявок: <b>{market.MODE_LABEL[mode]}</b>.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(MARKET_CFG_RE.match(t.strip()))),
+)
+async def cmd_market_config(message: Message):
+    if not has_level(message.from_user.id, required_level("market_manage")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Настраивать рынок может «{level_name(required_level('market_manage'))}» и выше."
+            )
+        return
+    m = MARKET_CFG_RE.match(message.text.strip())
+    field, value = m.group(1).casefold(), int(m.group(2))
+    if field == "комиссия":
+        if not 0 <= value <= 50:
+            await message.reply("Комиссия — от 0 до 50%.")
+            return
+        await db.set_market_settings(message.chat.id, commission_percent=float(value))
+        await message.answer(f"⚙️ Комиссия рынка: <b>{value}%</b> с продажи в казну чата.")
+    elif field == "потолок":
+        if value <= 0:
+            await message.reply("Потолок цены должен быть больше нуля.")
+            return
+        await db.set_market_settings(message.chat.id, max_price=value)
+        await message.answer(f"⚙️ Потолок цены товара: <b>{value}</b> i¢.")
+    else:
+        if not 1 <= value <= 20:
+            await message.reply("Лимит товаров на человека — от 1 до 20.")
+            return
+        await db.set_market_settings(message.chat.id, max_goods=value)
+        await message.answer(f"⚙️ Товаров на одного человека: <b>{value}</b>.")
 
 
 # ----------------------------------------------------------------------------
@@ -20405,12 +21218,49 @@ PROFESSION_LEVEL_INCOME_BONUS = {lvl: (lvl - 1) * 0.10 for lvl in range(1, 11)}
 PROFESSION_WORK_COOLDOWN = timedelta(hours=1)
 
 PROFESSION_UPGRADES: dict[str, dict] = {
-    "инструменты": {"name": "Инструменты премиум", "price": 500,  "effect": "-50% расхода энергии"},
+    "инструменты": {"name": "Инструменты премиум", "price": 500,  "effect": "−50% расхода энергии"},
     "курсы":       {"name": "Курсы повышения",      "price": 800,  "effect": "+20% к доходу навсегда"},
-    "офис":        {"name": "Собственный офис",     "price": 1500, "effect": "Авто-работа 1 раз/день"},
+    "офис":        {"name": "Собственный офис",     "price": 1500, "effect": "одна внеочередная смена в сутки"},
     "стиль":       {"name": "Фирменный стиль",      "price": 300,  "effect": "+10% к шансу VIP-заказа"},
-    "аналитика":   {"name": "Аналитика рынка",       "price": 1000, "effect": "Показывает лучшую профессию для фарма"},
+    "аналитика":   {"name": "Аналитика рынка",       "price": 1000, "effect": "команда «!работа аналитика»"},
 }
+
+# --- энергия и выгорание ----------------------------------------------------
+# Перерыву нужен кулдаун. Без него «!работа перерыв» жалась подряд, энергия
+# всегда была на сотне, и вместе с ней теряли смысл Аптечка, «!работа буст»,
+# улучшение «инструменты» и привилегия Робота работяги: экономить было нечего.
+# 30 минут при часовом кулдауне смены — это два бесплатных перерыва между
+# сменами, то есть +40 энергии. Дешёвым профессиям хватает, дорогим (космонавт
+# — 40⚡) уже нет, и вот там начинают работать буст с Аптечкой.
+PROFESSION_BREAK_COOLDOWN = timedelta(minutes=30)
+PROFESSION_BREAK_ENERGY = 20
+
+# Выгорание: смены подряд без единого перерыва. Ограничитель по смыслу, а не
+# по энергии — иначе достаточно было бы купить «инструменты» и не отдыхать
+# никогда.
+BURNOUT_AFTER = 10
+BURNOUT_PENALTY = 40           # % от дохода
+BURNOUT_WARN_AT = 8
+
+# Профсоюз: чем больше в чате коллег по профессии, тем легче смена. Даёт повод
+# договариваться о выборе работы, а не брать поодиночке самую дорогую.
+UNION_MIN_MEMBERS = 5
+UNION_ENERGY_CUT = 20          # % расхода энергии
+
+# Напарники: смена вдвоём. Кулдаун и энергию тратят оба.
+PARTNER_BONUS = 25             # % к доходу обоим
+
+# Стажировка: наставнику — процент со смен ученика, ученику — быстрее опыт.
+MENTOR_MIN_LEVEL = 8
+MENTOR_MAX_STUDENTS = 3
+MENTOR_SHARE = 10              # % дохода ученика наставнику
+STUDENT_XP_BONUS = 50          # % к опыту ученика
+STUDENT_MAX_LEVEL = 5          # выпускается, дойдя до этого уровня
+
+# Заказы чата: раз в сутки чат просит человека определённой профессии.
+ORDER_REWARD_MULT = 3
+ORDER_VIP_MULT = 5
+ORDER_VIP_CHANCE = 10          # % базовый, «фирменный стиль» добавляет столько же
 
 
 def profession_level_from_xp(xp: int) -> int:
@@ -20429,9 +21279,15 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
 
     now = datetime.utcnow()
     last = stats.get("last_work_at")
+    office_note = ""
     if last and (now - last) < PROFESSION_WORK_COOLDOWN:
-        remaining = PROFESSION_WORK_COOLDOWN - (now - last)
-        return f"❌ НЕЗАЧЁТ! Следующая смена через {format_duration_ru(remaining)}."
+        # «Собственный офис» даёт одну внеочередную смену в сутки — до этого
+        # улучшение стоило 1500 i¢ и не делало ровно ничего.
+        if not await db.has_profession_upgrade(chat_id, user_id, "офис") \
+                or not await db.use_profession_office(chat_id, user_id, utc_today()):
+            remaining = PROFESSION_WORK_COOLDOWN - (now - last)
+            return f"❌ НЕЗАЧЁТ! Следующая смена через {format_duration_ru(remaining)}."
+        office_note = "🏢 Смена вне очереди — сработал собственный офис."
 
     prof = PROFESSIONS[prof_key]
     has_tools = await db.has_profession_upgrade(chat_id, user_id, "инструменты")
@@ -20441,6 +21297,11 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
     energy_save = await _item_perk(chat_id, user_id, shop_effects.PERK_ENERGY_SAVE)
     if energy_save:
         energy_cost = max(1, round(energy_cost * (100 - energy_save) / 100))
+    # Профсоюз: с коллегами по цеху смена даётся легче.
+    colleagues = await db.count_profession_colleagues(chat_id, prof_key)
+    union = colleagues >= UNION_MIN_MEMBERS
+    if union:
+        energy_cost = max(1, round(energy_cost * (100 - UNION_ENERGY_CUT) / 100))
 
     if stats["energy"] < energy_cost:
         return f"❌ Не хватает энергии ({stats['energy']}/{energy_cost}). Отдохните: «!работа перерыв»."
@@ -20454,6 +21315,17 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
 
     quality = random.uniform(0.8, 1.2)
     xp_gain = int(final_income / 10) + int(quality * 2)
+
+    # Выгорание: работать без остановки нельзя. Считаем ДО смены — на десятой
+    # подряд без перерыва доход уже урезан, а не после неё.
+    burnout = int(stats.get("shifts_since_break") or 0) >= BURNOUT_AFTER
+    if burnout:
+        final_income = max(1, round(final_income * (100 - BURNOUT_PENALTY) / 100))
+
+    # Стажировка: ученику быстрее опыт, наставнику — процент с его смен.
+    mentor_id = stats.get("mentor_id")
+    if mentor_id:
+        xp_gain = round(xp_gain * (100 + STUDENT_XP_BONUS) / 100)
 
     today = now.date()
     last_day = stats.get("last_shift_day")
@@ -20504,6 +21376,16 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
     final_income, work_passive = await _with_passive(
         chat_id, user_id, shop_effects.ACTIVITY_WORK, final_income)
     await db.add_coins(chat_id, user_id, final_income)
+
+    # Доля наставника — СВЕРХ дохода ученика, а не из него: иначе наставничество
+    # было бы для ученика налогом, и брать наставника стало бы невыгодно.
+    mentor_note = ""
+    if mentor_id:
+        share = max(1, round(final_income * MENTOR_SHARE / 100))
+        await db.add_coins(chat_id, int(mentor_id), share)
+        mentor_name = await display_name_by_id(chat_id, int(mentor_id))
+        mentor_note = f"\n🎓 Наставнику {mentor_name} перечислено {share} i¢."
+
     stats = await db.update_profession_after_shift(
         chat_id, user_id, xp_gain, final_income, energy_delta, mood_delta,
         health_delta, new_streak, today,
@@ -20522,6 +21404,12 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
         if new_level >= 10:
             await grant_achievement(chat_id, user_id, "prof_level10", announce=False)
 
+    # Ученик доучился — отпускаем сам, чтобы наставник не кормился с него вечно.
+    graduated = ""
+    if mentor_id and new_level >= STUDENT_MAX_LEVEL:
+        await db.set_profession_mentor(chat_id, user_id, None)
+        graduated = f"\n🎓 Стажировка окончена: {STUDENT_MAX_LEVEL} уровень достигнут."
+
     lines = [
         "💼 <b>Рабочая смена завершена!</b>",
         f"{prof['emoji']} Профессия: {prof['name']} ({new_level} уровень)",
@@ -20529,9 +21417,27 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
         f"⭐ Опыт: +{xp_gain} XP",
         f"⚡ Энергия: {stats['energy']}/100 · 🙂 Настроение: {stats['mood']}/100 · ❤️ Здоровье: {stats['health']}/100",
     ]
+    if office_note:
+        lines.append(office_note)
+    if union:
+        lines.append(f"🤝 Профсоюз ({colleagues} чел.): расход энергии ниже на {UNION_ENERGY_CUT}%.")
+    if burnout:
+        lines.append(
+            f"🥵 <b>Выгорание:</b> смен подряд без перерыва — "
+            f"{int(stats.get('shifts_since_break') or 0)}. Доход урезан на "
+            f"{BURNOUT_PENALTY}%, помогает «!работа перерыв»."
+        )
+    elif int(stats.get("shifts_since_break") or 0) >= BURNOUT_WARN_AT:
+        left = BURNOUT_AFTER - int(stats.get("shifts_since_break") or 0)
+        if left > 0:
+            lines.append(f"😮‍💨 Устали: ещё {left} смены без перерыва — и начнётся выгорание.")
     if event_text:
         lines.append(f"\n🎲 Событие: {event_text}")
+    if mentor_note:
+        lines.append(mentor_note)
     lines.append(level_up_text) if level_up_text else None
+    if graduated:
+        lines.append(graduated)
     return "\n".join(l for l in lines if l)
 
 def _is_prof_cmd(t: Optional[str], sub: str) -> bool:
@@ -20643,13 +21549,327 @@ async def cmd_prof_upgrade(message: Message):
     await message.reply(f"✅ Куплено: {up['name']} — {up['effect']}")
 
 
+# ----------------------------------------------------------------------------
+# Смена вдвоём, стажировка, заказы чата и аналитика.
+#
+# Всё это выросло из одной дыры: энергия ничего не значила, потому что
+# «!работа перерыв» жалась без кулдауна. Починив её, стало осмысленно и всё
+# остальное — профсоюз, выгорание, платные способы отдохнуть.
+# ----------------------------------------------------------------------------
+def _order_key(chat_id: int) -> str:
+    return f"prof_order:{chat_id}"
+
+
+async def _get_or_make_order(chat_id: int) -> dict:
+    """Заказ чата на сегодня. Заводится лениво, при первом обращении, — так
+    не нужен ещё один фоновый цикл ради одной записи в сутки."""
+    today = utc_today().isoformat()
+    row = await db.get_data(_order_key(chat_id))
+    if row:
+        try:
+            order = json.loads(row["data_value"])
+            if order.get("day") == today:
+                return order
+        except (ValueError, TypeError):
+            pass
+    order = {"day": today, "profession": random.choice(list(PROFESSIONS)), "taken_by": None}
+    await db.set_data(_order_key(chat_id), json.dumps(order, ensure_ascii=False))
+    return order
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "!работа заказ"),
+)
+async def cmd_prof_order(message: Message):
+    """Заказ дня: чат ищет человека определённой профессии."""
+    if not _check_misc_access(message.from_user.id, "prof_order"):
+        return
+    chat_id = message.chat.id
+    order = await _get_or_make_order(chat_id)
+    prof = PROFESSIONS[order["profession"]]
+    if order.get("taken_by"):
+        who = await display_name_by_id(chat_id, int(order["taken_by"]))
+        await message.reply(
+            f"📋 Сегодняшний заказ ({prof['emoji']} {prof['name']}) уже забрал {who}.\n"
+            f"Новый будет завтра."
+        )
+        return
+    await message.answer(
+        f"📋 <b>Заказ дня:</b> чату нужен {prof['emoji']} <b>{prof['name']}</b>!\n"
+        f"Оплата — в {ORDER_REWARD_MULT} раза больше обычной смены, "
+        f"забирает первый желающий с этой профессией.\n"
+        f"Взять: <code>!работа заказ взять</code>"
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "!работа заказ взять"),
+)
+async def cmd_prof_order_take(message: Message):
+    if not _check_misc_access(message.from_user.id, "prof_order"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    order = await _get_or_make_order(chat_id)
+    prof_key = order["profession"]
+    prof = PROFESSIONS[prof_key]
+
+    if order.get("taken_by"):
+        who = await display_name_by_id(chat_id, int(order["taken_by"]))
+        await message.reply(f"📋 Заказ уже забрал {who}. Новый будет завтра.")
+        return
+
+    stats = await db.get_profession_stats(chat_id, user_id)
+    if stats.get("profession_key") != prof_key:
+        await message.reply(
+            f"📋 Заказ нужен для профессии {prof['emoji']} {prof['name']} — "
+            f"у вас другая."
+        )
+        return
+
+    now = datetime.utcnow()
+    last = stats.get("last_work_at")
+    if last and (now - last) < PROFESSION_WORK_COOLDOWN:
+        remaining = PROFESSION_WORK_COOLDOWN - (now - last)
+        await message.reply(
+            f"📋 Заказ надо ещё отработать: следующая смена через "
+            f"{format_duration_ru(remaining)}."
+        )
+        return
+
+    # Занимаем заказ ДО начисления: иначе двое, нажавшие одновременно,
+    # успели бы забрать оплату оба.
+    order["taken_by"] = user_id
+    await db.set_data(_order_key(chat_id), json.dumps(order, ensure_ascii=False))
+
+    # «Фирменный стиль» — то самое улучшение, которое до сих пор не делало
+    # ничего: оно поднимает шанс, что заказ окажется VIP.
+    chance = ORDER_VIP_CHANCE
+    if await db.has_profession_upgrade(chat_id, user_id, "стиль"):
+        chance += ORDER_VIP_CHANCE
+    vip = random.randint(1, 100) <= chance
+    multiplier = ORDER_VIP_MULT if vip else ORDER_REWARD_MULT
+
+    base = random.randint(*prof["income"])
+    payout = max(1, base * multiplier)
+    await db.add_coins(chat_id, user_id, payout)
+    await db.update_profession_after_shift(
+        chat_id, user_id, int(payout / 10), payout, 0, 0, 0,
+        int(stats.get("work_streak") or 0), utc_today(),
+    )
+    await db.add_log("prof_order", chat_id=chat_id, actor_id=user_id,
+                     details=f"{prof_key}:{payout}")
+    await _check_coin_achievements(chat_id, user_id)
+
+    who = await display_name(chat_id, message.from_user)
+    head = "💎 <b>VIP-ЗАКАЗ!</b>" if vip else "📋 <b>Заказ выполнен!</b>"
+    await message.answer(
+        f"{head}\n{who} ({prof['emoji']} {prof['name']}) забирает "
+        f"<b>{payout}</b> i¢ — оплата ×{multiplier}."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: _is_prof_cmd(t, "вместе")),
+)
+async def cmd_prof_together(message: Message):
+    """«!работа вместе @кому» — смена в паре: обоим больше, но платят оба."""
+    if not _check_misc_access(message.from_user.id, "prof_together"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    target, _rest = await resolve_command_target(message, trigger_words=2)
+    if target is None and message.reply_to_message:
+        target = message.reply_to_message.from_user
+    if target is None or target.id is None or target.id == user_id:
+        await message.reply(
+            "Использование: <code>!работа вместе @кому</code> (или ответом на сообщение)."
+        )
+        return
+
+    mine = await db.get_profession_stats(chat_id, user_id)
+    theirs = await db.get_profession_stats(chat_id, target.id)
+    if not mine.get("profession_key") or not theirs.get("profession_key"):
+        await message.reply("Работать вместе могут только двое с профессиями.")
+        return
+
+    # Смена каждому считается обычным путём — это гарантирует, что кулдауны,
+    # энергия, выгорание и профсоюз применятся к обоим одинаково, без второй
+    # копии тех же правил.
+    first = await _profession_execute_work(chat_id, user_id)
+    if "НЕЗАЧЁТ" in first or "❌" in first:
+        await message.reply(f"Смена не вышла у вас:\n{first}")
+        return
+    second = await _profession_execute_work(chat_id, target.id)
+    if "НЕЗАЧЁТ" in second or "❌" in second:
+        await message.reply(
+            f"Напарник сейчас работать не может:\n{second}\n"
+            f"Ваша смена уже прошла — обычная, без надбавки."
+        )
+        return
+
+    # Надбавка за пару начисляется поверх обеих смен.
+    bonus_each = 0
+    for uid in (user_id, target.id):
+        stats = await db.get_profession_stats(chat_id, uid)
+        prof = PROFESSIONS[stats["profession_key"]]
+        bonus = max(1, round(sum(prof["income"]) / 2 * PARTNER_BONUS / 100))
+        await db.add_coins(chat_id, uid, bonus)
+        bonus_each = bonus
+    who = await display_name(chat_id, message.from_user)
+    partner = await display_name(chat_id, target)
+    await message.answer(
+        f"🤝 <b>Смена вдвоём!</b> {who} и {partner} отработали вместе — "
+        f"каждому надбавка +{bonus_each} i¢ ({PARTNER_BONUS}%)."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: _is_prof_cmd(t, "наставник")),
+)
+async def cmd_prof_mentor(message: Message):
+    """«!работа наставник @кому» — пойти в ученики. «!работа наставник -» — уйти."""
+    if not _check_misc_access(message.from_user.id, "prof_mentor"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    raw = message.text.strip().split(maxsplit=2)
+    if len(raw) > 2 and raw[2].strip() in ("-", "нет", "уйти"):
+        await db.set_profession_mentor(chat_id, user_id, None)
+        await message.reply("🎓 Вы больше ничей ученик.")
+        return
+
+    mine = await db.get_profession_stats(chat_id, user_id)
+    if not mine.get("profession_key"):
+        await message.reply("Сначала устройтесь на работу.")
+        return
+    if int(mine.get("prof_level") or 1) >= STUDENT_MAX_LEVEL:
+        await message.reply(
+            f"🎓 Стажировка — для новичков: она заканчивается на {STUDENT_MAX_LEVEL} уровне, "
+            f"а у вас уже {mine['prof_level']}."
+        )
+        return
+
+    target, _rest = await resolve_command_target(message, trigger_words=2)
+    if target is None and message.reply_to_message:
+        target = message.reply_to_message.from_user
+    if target is None or target.id is None or target.id == user_id:
+        await message.reply(
+            "Использование: <code>!работа наставник @кому</code> "
+            "(или ответом). Уйти от наставника: <code>!работа наставник -</code>"
+        )
+        return
+
+    theirs = await db.get_profession_stats(chat_id, target.id)
+    if int(theirs.get("prof_level") or 1) < MENTOR_MIN_LEVEL:
+        await message.reply(
+            f"🎓 Наставником может быть работник с {MENTOR_MIN_LEVEL} уровня — "
+            f"у него пока {theirs.get('prof_level') or 1}."
+        )
+        return
+    if await db.count_profession_students(chat_id, target.id) >= MENTOR_MAX_STUDENTS:
+        await message.reply(
+            f"🎓 У этого наставника уже {MENTOR_MAX_STUDENTS} учеников — больше не берёт."
+        )
+        return
+
+    await db.set_profession_mentor(chat_id, user_id, target.id)
+    student = await display_name(chat_id, message.from_user)
+    mentor = await display_name(chat_id, target)
+    await message.answer(
+        f"🎓 {student} идёт в ученики к {mentor}.\n"
+        f"Ученику +{STUDENT_XP_BONUS}% опыта, наставнику — {MENTOR_SHARE}% "
+        f"сверх каждой его смены. Стажировка кончится на {STUDENT_MAX_LEVEL} уровне."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "!работа аналитика"),
+)
+async def cmd_prof_analytics(message: Message):
+    """Улучшение «аналитика» наконец что-то делает: считает, где выгоднее."""
+    if not _check_misc_access(message.from_user.id, "prof_analytics"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if not await db.has_profession_upgrade(chat_id, user_id, "аналитика"):
+        up = PROFESSION_UPGRADES["аналитика"]
+        await message.reply(
+            f"📊 Нужна «{up['name']}» — <code>!работа улучшить аналитика</code> "
+            f"({up['price']} i¢)."
+        )
+        return
+
+    stats = await db.get_profession_stats(chat_id, user_id)
+    level = int(stats.get("prof_level") or 1)
+    level_bonus = 1 + PROFESSION_LEVEL_INCOME_BONUS.get(level, 0)
+    rows = []
+    for key, prof in PROFESSIONS.items():
+        avg = sum(prof["income"]) / 2 * level_bonus - prof["expense"]
+        # Ценность смены — доход на единицу энергии: энергия и есть то, чего
+        # не хватает, а не время (кулдаун у всех профессий одинаковый).
+        rows.append((avg / prof["energy"], avg, key, prof))
+    rows.sort(reverse=True)
+
+    lines = ["📊 <b>Аналитика рынка труда</b>", DIVIDER,
+             f"Расчёт для вашего {level} уровня, за вычетом расходов смены.", ""]
+    for i, (per_energy, avg, key, prof) in enumerate(rows[:5], start=1):
+        mark = " ← вы здесь" if key == stats.get("profession_key") else ""
+        lines.append(
+            f"{i}. {prof['emoji']} <b>{prof['name']}</b> — {avg:.0f} i¢ за смену, "
+            f"{per_energy:.0f} i¢ на единицу энергии{mark}"
+        )
+    current = stats.get("profession_key")
+    if current and current not in [r[2] for r in rows[:5]]:
+        prof = PROFESSIONS[current]
+        place = [r[2] for r in rows].index(current) + 1
+        lines.append(f"\nВаша ({prof['emoji']} {prof['name']}) — {place}-я по выгоде.")
+    lines.append("\nТребования по дням и монетам смотрите в «профессии».")
+    await message.answer("\n".join(lines))
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and t.strip().casefold() == "!работа перерыв"),
 )
 async def cmd_prof_break(message: Message):
-    new_energy = await db.adjust_profession_energy(message.chat.id, message.from_user.id, 20)
-    await message.reply(f"😌 Вы отдохнули. Энергия: {new_energy}/100.")
+    """Перерыв: +энергия и сброс выгорания, но не чаще раза в полчаса.
+
+    Кулдаун здесь — не придирка, а то, ради чего существует вся
+    энергетическая механика. Пока перерыв жался подряд, энергия всегда была
+    на сотне, и обесценивались разом Аптечка, «!работа буст», улучшение
+    «инструменты» и привилегия Робота работяги.
+    """
+    chat_id, user_id = message.chat.id, message.from_user.id
+    stats = await db.get_profession_stats(chat_id, user_id)
+    if not stats.get("profession_key"):
+        await message.reply(
+            "❌ У вас нет профессии — отдыхать не от чего. "
+            "<code>!работа устроиться {профессия}</code>"
+        )
+        return
+
+    now = datetime.utcnow()
+    last = stats.get("last_break_at")
+    if last and (now - last) < PROFESSION_BREAK_COOLDOWN:
+        remaining = PROFESSION_BREAK_COOLDOWN - (now - last)
+        await message.reply(
+            f"😴 Вы только что отдыхали. Следующий перерыв через "
+            f"{format_duration_ru(remaining)}.\n"
+            f"Нужно прямо сейчас — <code>!работа буст</code> (50 i¢) или "
+            f"⛑ аптечка из магазина."
+        )
+        return
+
+    was_burnt = int(stats.get("shifts_since_break") or 0) >= BURNOUT_AFTER
+    new_energy = await db.take_profession_break(
+        chat_id, user_id, PROFESSION_BREAK_ENERGY, now
+    )
+    text = f"😌 Вы отдохнули. Энергия: {new_energy}/100."
+    if was_burnt:
+        text += "\n🥵 Выгорание снято — доход снова полный."
+    await message.reply(text)
 
 
 @router.message(
@@ -20660,7 +21880,13 @@ async def cmd_prof_boost(message: Message):
     if not await spend_coins(message.chat.id, message.from_user.id, 50):
         await message.reply("Нужно 50 i¢ на энергетик.")
         return
-    new_energy = await db.adjust_profession_energy(message.chat.id, message.from_user.id, 30)
+    # Платный буст, в отличие от перерыва, кулдауна не имеет — он и есть
+    # способ отдохнуть вне очереди, за деньги. И выгорание он тоже снимает:
+    # иначе им нельзя было бы выйти из просадки, а перерыв ещё не готов.
+    new_energy = await db.take_profession_break(
+        message.chat.id, message.from_user.id, 30, datetime.utcnow(),
+        touch_cooldown=False,
+    )
     await message.reply(f"⚡ Энергетик выпит! Энергия: {new_energy}/100.")
 
 
@@ -21293,6 +22519,11 @@ async def cmd_shop_buy(message: Message):
         f"✅ Куплено: {item['emoji']} <b>{html.escape(item['name'])}</b>{qty_text} "
         f"за {total} i¢.{sale_text}{left_text}"
     )
+    # Покупка может достроить коллекцию «Барахольщик» — раньше коллекции после
+    # магазина не пересчитывались вовсе, потому что ни одна от него не зависела.
+    if item_key in db.JUNK_ITEM_KEYS:
+        await _check_collections(message.chat.id, message.from_user.id)
+
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
@@ -23982,6 +25213,43 @@ async def _handle_reward_degree_permission(message: Message, args: list[str]) ->
     )
 
 
+# --- что даёт награда -------------------------------------------------------
+# До этого «наградить» не влияло ни на что: медаль была строкой в профиле и
+# всё. Теперь она приносит монеты и репутацию по степени — и ровно поэтому у
+# неё появился кулдаун на пару «кто → кому»: выдаётся она руками, и без
+# ограничения двое награждали бы друг друга по кругу.
+#
+# Монеты умеренные: степень 8 (только владелец) даёт 8 000 i¢ — примерно как
+# восемь смен. Степень 1, доступная всем, — 1 000, то есть одна смена.
+REWARD_COINS_PER_DEGREE = 1_000
+REWARD_SAME_TARGET_COOLDOWN = timedelta(hours=24)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in ("топ наград", "топ награждённых", "топ награжденных")),
+)
+async def cmd_reward_top(message: Message):
+    """Топ награждённых — по сумме степеней, а не по числу медалей."""
+    if not _check_misc_access(message.from_user.id, "reward_top"):
+        return
+    rows = await db.list_reward_top(message.chat.id, limit=10)
+    if not rows:
+        await message.reply("В этом чате пока никого не награждали.")
+        return
+    lines = ["🏅 <b>Самые заслуженные</b>", DIVIDER]
+    medals = ("🥇", "🥈", "🥉")
+    for i, row in enumerate(rows):
+        who = await display_name_by_id(message.chat.id, int(row["user_id"]))
+        place = medals[i] if i < len(medals) else f"{i + 1}."
+        best = int(row["best"])
+        lines.append(
+            f"{place} {who} — наград: {int(row['total'])}, "
+            f"высшая: {reward_degree_emoji(best)} {best} степень"
+        )
+    await message.answer("\n".join(lines))
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("наградить", "!наградить")),
@@ -24008,22 +25276,20 @@ async def cmd_reward(message: Message):
 
     lines = remaining.split("\n", 1)
     first_line_tokens = lines[0].strip().split()
-    if len(first_line_tokens) < 2 or not first_line_tokens[1].isdigit() or not (1 <= int(first_line_tokens[1]) <= 8):
-        # Голый except здесь ловил бы и KeyboardInterrupt с SystemExit.
-        # Присваивание по индексу умеет падать ровно одним способом —
-        # когда второго слова нет, — его и ловим.
-        try:
-            first_line_tokens[1] = 1
-        except IndexError:
-            first_line_tokens.append(1)
-
-        # await message.reply(
-        #     "Использование: <code>наградить степень</code> (ответом на сообщение), "
-        #     "степень — число от 1 до 8. Причину заслуги можно указать следующей строкой.\n"
-        #     "Например:\n<code>наградить 5\nЗа помощь новичкам</code>"
-        # )
-        # return
-    degree = int(first_line_tokens[1])
+    if len(first_line_tokens) < 2:
+        # Степень не указали — по умолчанию первая, самая скромная.
+        degree = 1
+    elif not first_line_tokens[1].isdigit() or not (1 <= int(first_line_tokens[1]) <= 8):
+        # А вот указанную, но неверную степень молча подменять на первую
+        # нельзя: «наградить 99» тихо выдавало степень 1, и человек был
+        # уверен, что вручил высшую награду.
+        await message.reply(
+            "Степень награды — число от 1 до 8. Причину можно указать следующей строкой:\n"
+            "<code>наградить 5\nЗа помощь новичкам</code>"
+        )
+        return
+    else:
+        degree = int(first_line_tokens[1])
     reason = lines[1].strip() if len(lines) > 1 and lines[1].strip() else None
 
     if target.id == message.from_user.id:
@@ -24054,27 +25320,55 @@ async def cmd_reward(message: Message):
             )
         return
 
+    # Кулдаун на пару «кто → кому». Награда теперь приносит монеты и
+    # репутацию, а выдаётся вручную — без ограничения двое договорившихся
+    # награждали бы друг друга по кругу.
+    last_at = await db.last_reward_between(message.chat.id, message.from_user.id, target.id)
+    if last_at and (datetime.utcnow() - last_at) < REWARD_SAME_TARGET_COOLDOWN:
+        remaining_cd = REWARD_SAME_TARGET_COOLDOWN - (datetime.utcnow() - last_at)
+        await message.reply(
+            f"⏳ Вы уже награждали этого человека. Следующая награда от вас — "
+            f"через {format_duration_ru(remaining_cd)}."
+        )
+        return
+
     reward_id = await db.add_reward(message.chat.id, target.id, degree, reason, message.from_user.id)
     await db.add_log(
         "reward", chat_id=message.chat.id, actor_id=message.from_user.id,
         target_id=target.id, details=f"degree={degree} id={reward_id}",
     )
 
+    # Награда перестала быть просто записью: она даёт репутацию и монеты по
+    # степени. Раньше «наградить» не влияло вообще ни на что, и медаль была
+    # строкой в профиле.
+    payout = REWARD_COINS_PER_DEGREE * degree
+    rep_gain = degree
+    await db.add_coins(message.chat.id, target.id, payout)
+    new_rep = await db.change_reputation(
+        message.chat.id, message.from_user.id, target.id, rep_gain
+    )
+    await _check_coin_achievements(message.chat.id, target.id)
+
+    # Ачивки за награды — по лучшей степени и по их числу.
+    total_rewards = await db.count_rewards(message.chat.id, target.id)
+    if total_rewards >= 1:
+        await grant_achievement(message.chat.id, target.id, "rewarded_first", announce=False)
+    if total_rewards >= 5:
+        await grant_achievement(message.chat.id, target.id, "rewarded_5")
+    if degree >= 7:
+        await grant_achievement(message.chat.id, target.id, "rewarded_high")
+
     # Медаль в инвентарь за «наградить» больше не выдаётся: сама награда уже
     # видна в профиле и в списке наград, а лежащий рядом предмет ничего к
     # этому не добавлял. Ключи медалей при этом остались в списке
     # неторгуемых — см. shop_effects.REWARD_KEYS, там объяснено почему.
-    trophy_line = ""
-
-    # actor_name = await display_name(message.chat.id, message.from_user)
     target_name = await display_name(message.chat.id, target)
-    # reason_text = html.escape(reason) if reason else "не указана"
     emoji_degree = f"{reward_degree_emoji(degree)}{_subscript_number(degree)}"
-    await message.reply(
-        f"{emoji_degree} <b>Награда</b> {target_name} <b>вручена</b>{trophy_line}"
-        # f"👤 Выдал: {actor_name}\n"
-        # f"📝 Заслуга: {reason_text}"
-    )
+    lines = [f"{emoji_degree} <b>Награда</b> {target_name} <b>вручена</b>"]
+    if reason:
+        lines.append(f"📝 {html.escape(reason)}")
+    lines.append(f"💰 +{payout} i¢ · ⭐ репутация +{rep_gain} (стало {new_rep})")
+    await message.reply("\n".join(lines))
 
 
 REWARD_PAGE_SIZE = 10
@@ -26911,11 +28205,6 @@ def _digest_last_key(chat_id: int) -> str:
     return f"digestlast:{chat_id}"
 
 
-async def is_digest_enabled(chat_id: int) -> bool:
-    row = await db.get_data(_digest_key(chat_id))
-    return row is not None and row.get("data_value") == "1"
-
-
 async def build_weekly_digest(chat_id: int, days: int = WEEKLY_DIGEST_DAYS) -> Optional[str]:
     """Собирает текст сводки. None — если за период вообще ничего не было."""
     total_messages = await db.count_messages_since(chat_id, days)
@@ -28273,6 +29562,10 @@ async def cmd_reputation_reset(message: Message):
 # ---------- Ачивки: разовые достижения за активность и события ----------
 
 ACHIEVEMENTS: dict = {
+    # за награды чата («наградить»)
+    "rewarded_first": {"emoji": "🎗", "title": "Отмечен",      "desc": "получить первую награду чата"},
+    "rewarded_5":     {"emoji": "🏅", "title": "Заслуженный",  "desc": "получить 5 наград чата"},
+    "rewarded_high":  {"emoji": "🌟", "title": "Орденоносец",  "desc": "получить награду 7 степени или выше"},
     # за количество сообщений
     "msg_1":      {"emoji": "👶", "title": "Первое слово",     "desc": "написать первое сообщение в чате"},
     "msg_100":    {"emoji": "💬", "title": "Разговорился",     "desc": "100 сообщений"},
@@ -28322,6 +29615,7 @@ ACHIEVEMENTS: dict = {
     "collection_tycoon":  {"emoji": "🏢", "title": "Промышленник", "desc": "владеть всеми видами бизнеса"},
     "collection_empire":  {"emoji": "👑", "title": "Империя", "desc": "все бизнесы на 3 уровне"},
     "collection_zoo":     {"emoji": "🐾", "title": "Зоопарк", "desc": "завести всех питомцев"},
+    "collection_junk":    {"emoji": "🗑", "title": "Барахольщик", "desc": "собрать весь хлам из магазина"},
     "collection_dynasty": {"emoji": "🏆", "title": "Династия", "desc": "три сезона подряд в призах"},
     # Сезонные: выдаются только за место в месячном зачёте (см. seasons.py).
     "season_1":        {"emoji": "🥇", "title": "Чемпион сезона", "desc": "занять 1 место в месячном зачёте"},
@@ -28937,7 +30231,7 @@ async def cmd_citizenship(message: Message):
     F.text.func(lambda t: bool(t) and t.strip().casefold() in ("граждане", "все граждане")),
 )
 async def cmd_citizens_list(message: Message):
-    rows = await db.list_citizens(message.chat.id)
+    rows = await db.list_citizen_rows(message.chat.id)
     if not rows:
         await message.reply("🏡 В этом чате пока нет граждан.\n\nСтать гражданином: <code>+гражданство</code>")
         return
@@ -30396,392 +31690,6 @@ def relationship_status_lines(chat_id_hint: str, rel: dict, partner_name: str) -
         lines.append("📈 Достигнут максимальный уровень близости")
     lines.append(f"📅 Отношения начались: {fmt_date(started_at)}")
     return lines
-
-
-# ОТКЛЮЧЕНО: модуль «Отношения» полностью заменён relationships_v2 (см.
-# dp.include_router выше). Хендлер больше не зарегистрирован в router —
-# команда «отн» теперь целиком обрабатывается relationships_v2.cmd_rel2_word.
-# Код ниже оставлен как есть (не удалён) — на случай отката к старому модулю.
-async def cmd_relationship_word(message: Message):
-    """Единая точка входа для «отн»: без доп. слова — предложение/разрыв
-    с целью из ответа/ссылки; «отн действия» — список действий; «отн топ» —
-    топ пар чата."""
-    parts = message.text.strip().split(maxsplit=1)
-    sub = parts[1].strip().casefold() if len(parts) > 1 else ""
-
-    if sub == "действия":
-        await cmd_relationship_actions(message)
-        return
-    if sub == "топ":
-        await cmd_relationship_top(message)
-        return
-
-    actor = message.from_user
-    target = await resolve_relationship_target(message)
-    if target is None:
-        await message.reply(
-            "💞 Чтобы сделать предложение отношений, ответьте на сообщение человека "
-            "словом <b>отн</b> или отправьте <b>отн</b> с кликабельной ссылкой на него."
-        )
-        return
-
-    if target.id == actor.id:
-        await message.reply("Нельзя предложить отношения самому себе 🙂")
-        return
-    if target.is_bot:
-        await message.reply("Боты пока не встречаются 🤖")
-        return
-
-    existing_actor = await db.get_relationship(message.chat.id, actor.id)
-    if existing_actor and existing_actor["partner_id"] == target.id:
-        # «отн» ответом на текущего партнёра — разрыв (как «-отн»)
-        await _do_relationship_break(message, existing_actor)
-        return
-
-    if existing_actor:
-        partner_name = await display_name_by_id(message.chat.id, existing_actor["partner_id"])
-        await message.reply(f"Вы уже состоите в отношениях с {partner_name} 💞")
-        return
-
-    existing_target = await db.get_relationship(message.chat.id, target.id)
-    if existing_target:
-        target_name = await display_name(message.chat.id, target)
-        await message.reply(f"{target_name} уже состоит в отношениях 💞")
-        return
-
-    await db.create_relationship_request(message.chat.id, actor.id, target.id)
-    actor_name = await display_name(message.chat.id, actor)
-    target_name = await display_name(message.chat.id, target)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="💞 Принять", callback_data=f"rel_accept:{actor.id}:{target.id}"),
-            InlineKeyboardButton(text="💔 Отказать", callback_data=f"rel_decline:{actor.id}:{target.id}"),
-        ]]
-    )
-    await message.reply(
-        "💌 <b>Предложение отношений</b>\n\n"
-        f"{actor_name} предлагает {target_name} начать отношения 💞\n\n"
-        f"{target_name}, выберите свой ответ (или напишите <b>+отн</b>):",
-        reply_markup=kb,
-    )
-
-
-async def _do_relationship_break(message: Message, rel: dict) -> None:
-    partner_id = rel["partner_id"]
-    await db.delete_relationship(message.chat.id, message.from_user.id)
-    actor_name = await display_name(message.chat.id, message.from_user)
-    partner_name = await display_name_by_id(message.chat.id, partner_id)
-    await message.reply(f"💔 {actor_name} и {partner_name} больше не встречаются.")
-    await db.add_log(
-        "relationship_broken", chat_id=message.chat.id,
-        actor_id=message.from_user.id, target_id=partner_id,
-    )
-
-
-# ОТКЛЮЧЕНО: часть старого модуля «Отношения» (см. пометку у cmd_relationship_word).
-async def accept_relationship_button(callback: CallbackQuery):
-    try:
-        _, proposer_id_s, target_id_s = (callback.data or "").split(":")
-        proposer_id, target_id = int(proposer_id_s), int(target_id_s)
-    except (TypeError, ValueError):
-        await callback.answer("Это предложение повреждено или устарело.", show_alert=True)
-        return
-
-    if callback.from_user.id != target_id:
-        await callback.answer("Это предложение адресовано не вам 🙂", show_alert=True)
-        return
-
-    chat_id = callback.message.chat.id
-
-    request = await db.get_latest_relationship_request(chat_id, target_id)
-    if not request or request["from_user_id"] != proposer_id:
-        await callback.answer("Это предложение уже неактуально.", show_alert=True)
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        return
-
-    if await db.get_relationship(chat_id, proposer_id) or await db.get_relationship(chat_id, target_id):
-        await db.delete_relationship_request(chat_id, proposer_id, target_id)
-        await callback.answer("Похоже, кто-то из вас уже успел вступить в отношения 💞", show_alert=True)
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        return
-
-    if not await db.create_relationship(chat_id, proposer_id, target_id):
-        await callback.answer("Похоже, кто-то из вас уже успел вступить в отношения 💞", show_alert=True)
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        return
-
-    await db.clear_relationship_requests_for(chat_id, target_id)
-    await db.clear_relationship_requests_for(chat_id, proposer_id)
-
-    proposer_name = await display_name_by_id(chat_id, proposer_id)
-    target_name = await display_name_by_id(chat_id, target_id)
-    try:
-        await callback.message.edit_text(f"💞🎉 {proposer_name} и {target_name} теперь в отношениях! Поздравляем!")
-    except TelegramBadRequest:
-        pass
-    await db.add_log("relationship_created", chat_id=chat_id, actor_id=proposer_id, target_id=target_id)
-    await callback.answer("Поздравляем! 🎉")
-
-
-# ОТКЛЮЧЕНО: часть старого модуля «Отношения» (см. пометку у cmd_relationship_word).
-async def decline_relationship_button(callback: CallbackQuery):
-    try:
-        _, proposer_id_s, target_id_s = (callback.data or "").split(":")
-        proposer_id, target_id = int(proposer_id_s), int(target_id_s)
-    except (TypeError, ValueError):
-        await callback.answer("Это предложение повреждено или устарело.", show_alert=True)
-        return
-
-    if callback.from_user.id != target_id:
-        await callback.answer("Это предложение адресовано не вам 🙂", show_alert=True)
-        return
-
-    chat_id = callback.message.chat.id
-    await db.delete_relationship_request(chat_id, proposer_id, target_id)
-
-    actor_name = await display_name_by_id(chat_id, proposer_id)
-    target_name = await display_name_by_id(chat_id, target_id)
-    try:
-        await callback.message.edit_text(f"💔 {target_name} отказал(а) {actor_name}.")
-    except TelegramBadRequest:
-        pass
-    await db.add_log("relationship_declined", chat_id=chat_id, actor_id=proposer_id, target_id=target_id)
-    await callback.answer("Предложение отклонено")
-
-
-# ОТКЛЮЧЕНО: «+отн» теперь обрабатывает relationships_v2.cmd_rel2_accept_word.
-async def cmd_relationship_accept(message: Message):
-    actor = message.from_user
-    request = await db.get_latest_relationship_request(message.chat.id, actor.id)
-    if not request:
-        await message.reply("У вас нет предложений отношений, ожидающих ответа 🙂")
-        return
-
-    proposer_id = request["from_user_id"]
-
-    if await db.get_relationship(message.chat.id, actor.id) or await db.get_relationship(message.chat.id, proposer_id):
-        await db.delete_relationship_request(message.chat.id, proposer_id, actor.id)
-        await message.reply("Похоже, кто-то из вас уже успел вступить в отношения 💞")
-        return
-
-    if not await db.create_relationship(message.chat.id, proposer_id, actor.id):
-        await message.reply("Похоже, кто-то из вас уже успел вступить в отношения 💞")
-        return
-
-    await db.clear_relationship_requests_for(message.chat.id, actor.id)
-    await db.clear_relationship_requests_for(message.chat.id, proposer_id)
-
-    proposer_name = await display_name_by_id(message.chat.id, proposer_id)
-    actor_name = await display_name(message.chat.id, actor)
-    await message.reply(f"💞🎉 {proposer_name} и {actor_name} теперь в отношениях! Поздравляем!")
-    await db.add_log(
-        "relationship_created", chat_id=message.chat.id, actor_id=proposer_id, target_id=actor.id,
-    )
-
-
-# ОТКЛЮЧЕНО: «-отн» теперь обрабатывает relationships_v2.cmd_rel2_break_word.
-async def cmd_relationship_break(message: Message):
-    rel = await db.get_relationship(message.chat.id, message.from_user.id)
-    if not rel:
-        await message.reply("Вы пока ни с кем не в отношениях 🙂")
-        return
-    await _do_relationship_break(message, rel)
-
-
-def _is_relationship_status_command(t: Optional[str]) -> bool:
-    if not t or not t.strip():
-        return False
-    words = t.strip().casefold().split()
-    return len(words) >= 2 and words[0] == "статус" and words[1] == "отн"
-
-
-# ОТКЛЮЧЕНО: аналог — «отн я» (relationships_v2.cmd_rel2_me).
-async def cmd_relationship_status(message: Message):
-    rest = message.text.strip().split(maxsplit=2)
-    # rest = ["статус", "отн", (опционально ссылка/текст)]
-    target = None
-    if len(rest) > 2 or message.reply_to_message:
-        target = await resolve_relationship_target(message)
-    subject = target if target is not None else message.from_user
-
-    if subject.is_bot:
-        await message.reply("У ботов отношений не бывает 🤖")
-        return
-
-    rel = await db.get_relationship(message.chat.id, subject.id)
-    if not rel:
-        if target is None:
-            await message.reply(
-                "Вы пока ни с кем не в отношениях. Ответьте на сообщение человека словом "
-                "<b>отн</b>, чтобы сделать предложение."
-            )
-        else:
-            subject_name = await display_name(message.chat.id, subject)
-            await message.reply(f"{subject_name} пока ни с кем не в отношениях.")
-        return
-
-    subject_name = await display_name(message.chat.id, subject)
-    partner_name = await display_name_by_id(message.chat.id, rel["partner_id"])
-    lines = [f"💞 <b>Отношения — {subject_name}</b>", DIVIDER]
-    lines += relationship_status_lines(str(message.chat.id), rel, partner_name)
-    await message.reply("\n".join(lines))
-
-
-async def cmd_relationship_actions(message: Message):
-    lines = ["🎭 <b>Действия в отношениях</b>", DIVIDER,
-             "Работают ответом на сообщение партнёра и начисляют очки близости:"]
-    for action, points in REL_ACTION_POINTS.items():
-        sign = "+" if points >= 0 else ""
-        only_partner = " (только с партнёром)" if action in REL_ONLY_PARTNER_ACTIONS else ""
-        lines.append(f"・{action} — {sign}{points} очк.{only_partner}")
-    lines.append("")
-    lines.append("Действия без пометки работают на ком угодно (просто эффект), но очки")
-    lines.append("близости начисляются, только если цель — ваш текущий партнёр.")
-    await message.reply("\n".join(lines))
-
-
-RELATIONSHIPS_PAGE_SIZE = 10
-
-
-async def relationships_page(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
-    page = max(page, 0)
-    rows, total = await db.list_relationships(
-        chat_id, limit=RELATIONSHIPS_PAGE_SIZE, offset=page * RELATIONSHIPS_PAGE_SIZE
-    )
-    if not rows and page:
-        page = 0
-        rows, total = await db.list_relationships(chat_id, limit=RELATIONSHIPS_PAGE_SIZE)
-    if not rows:
-        return (
-            "💞 <b>Топ пар чата</b>\n\nПока нет ни одной пары.\n"
-            "Ответьте на сообщение человека словом <b>отн</b>, чтобы стать первой!",
-            None,
-        )
-
-    lines = []
-    for index, rel in enumerate(rows, start=page * RELATIONSHIPS_PAGE_SIZE + 1):
-        first = await display_name_by_id(chat_id, rel["user1_id"])
-        second = await display_name_by_id(chat_id, rel["user2_id"])
-        level_name = relationship_level_name(rel["level"])
-        lines.append(f"{index}. {first} 💞 {second} · <b>{rel['points']}</b> очк. · {level_name}")
-
-    pages = (total + RELATIONSHIPS_PAGE_SIZE - 1) // RELATIONSHIPS_PAGE_SIZE
-    text = f"💞 <b>Топ пар чата — {total}</b>\n\n" + "\n".join(lines)
-    if pages == 1:
-        return text, None
-
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"relationships_page:{page - 1}"))
-    buttons.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
-    if page + 1 < pages:
-        buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"relationships_page:{page + 1}"))
-    return text, InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-async def cmd_relationship_top(message: Message):
-    text, keyboard = await relationships_page(message.chat.id, 0)
-    await message.reply(text, reply_markup=keyboard)
-
-
-# ОТКЛЮЧЕНО: аналог — «отн список» (relationships_v2.paginate_rel2_list).
-async def paginate_relationships(callback: CallbackQuery):
-    try:
-        page = int((callback.data or "").split(":", maxsplit=1)[1])
-    except (IndexError, ValueError):
-        await callback.answer("Не удалось открыть эту страницу.", show_alert=True)
-        return
-    text, keyboard = await relationships_page(callback.message.chat.id, page)
-    try:
-        await callback.message.edit_text(text, reply_markup=keyboard)
-    except TelegramBadRequest:
-        pass
-    await callback.answer()
-
-
-async def award_relationship_points(chat_id: int, actor_id: int, target_id: int, action: str) -> Optional[str]:
-    """Если actor и target — текущая пара, начисляет очки за действие и
-    возвращает текст об уровне, если он повысился (иначе None). Ничего не
-    делает, если пара не является текущими партнёрами."""
-    points_delta = REL_ACTION_POINTS.get(action)
-    if points_delta is None:
-        return None
-    rel = await db.get_relationship(chat_id, actor_id)
-    if not rel or rel["partner_id"] != target_id:
-        return None
-
-    old_level = rel["level"]
-    new_points = max(rel["points"] + points_delta, 0)
-    new_level = relationship_level_index(new_points)
-    await db.set_relationship_progress(chat_id, actor_id, target_id, new_points, new_level)
-
-    if new_level > old_level:
-        return f"🏵 Уровень отношений повышен до «{relationship_level_name(new_level)}»!"
-    return None
-
-
-# ОТКЛЮЧЕНО: партнёрские действия (комплимент/подарок/свидание) были частью
-# старого модуля «Отношения» и его очков близости — в relationships_v2 такого
-# отдельного набора действий нет (см. вместо этого «дом действие», «отн пт
-# действие», «ребенок действие»).
-async def handle_relationship_only_action(message: Message):
-    action = (message.text.strip().split() or [""])[0].casefold()
-
-    target_user, _remaining = await resolve_command_target(message)
-    if target_user is None and message.reply_to_message:
-        target_user = message.reply_to_message.from_user
-    if target_user is None:
-        await message.reply(
-            "Ответьте этой командой на сообщение партнёра, "
-            "либо укажите @username или ID сразу после действия."
-        )
-        return
-    if target_user.id is None:
-        await message.reply(
-            f"Не удалось найти @{html.escape(target_user.username or '')} — бот его ещё не видел в этом чате. "
-            "Попробуйте ответом на его сообщение, если оно есть."
-        )
-        return
-
-    if target_user.id == message.from_user.id:
-        await message.reply("Действие направлено на самого себя? Пожалуй, воздержимся 🙂")
-        return
-    if target_user.is_bot:
-        await message.reply("Боты пока не участвуют в отношениях 🤖")
-        return
-
-    rel = await db.get_relationship(message.chat.id, message.from_user.id)
-    if not rel or rel["partner_id"] != target_user.id:
-        await message.reply(f"Это действие доступно только с вашим текущим партнёром по отношениям 💞")
-        return
-
-    actor_name = await display_name_link(message.chat.id, message.from_user)
-    target_name = await display_name_link(message.chat.id, target_user)
-    phrase = random.choice(REL_ONLY_PARTNER_ACTIONS[action]).format(actor=actor_name, target=target_name)
-
-    level_up_text = await award_relationship_points(
-        message.chat.id, message.from_user.id, target_user.id, action
-    )
-    if level_up_text:
-        phrase += f"\n\n{level_up_text}"
-
-    if message.reply_to_message:
-        await message.answer(phrase, reply_to_message_id=message.reply_to_message.message_id)
-    else:
-        await message.answer(phrase)
-    await db.add_log(
-        f"relationship_{action}", chat_id=message.chat.id,
-        actor_id=message.from_user.id, target_id=target_user.id,
-    )
 
 
 # ============================================================================
@@ -33113,14 +34021,6 @@ def _clan_back_kb(clan_id: int) -> InlineKeyboardMarkup:
     )
 
 
-async def clan_menu_open(chat_id: int, clan_id: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
-    clan = await db.get_clan(chat_id, clan_id)
-    if clan is None:
-        return "Клан уже не существует.", None
-    text = await clan_info_text(chat_id, clan)
-    return text, None  # роль подставляется в вызывающем коде (нужен viewer_id)
-
-
 async def _open_clan_menu(callback: CallbackQuery, clan_id: int):
     chat_id = callback.message.chat.id
     clan = await db.get_clan(chat_id, clan_id)
@@ -34404,6 +35304,7 @@ async def main():
     await db.ensure_racing_stats_table()
     await db.ensure_profession_tables()
     await db.ensure_shop_tables()
+    await db.ensure_market_tables()
     await db.ensure_lootbox_tables()
     await db.ensure_robbery_tables()
     await db.ensure_auto_delete_table()

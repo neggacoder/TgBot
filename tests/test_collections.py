@@ -90,7 +90,7 @@ def test_цепочка_переходит_через_январь():
 @pytest.fixture
 def world(monkeypatch):
     state = {"businesses": [], "pets": [], "titles": [], "granted": [],
-             "achievements": [], "announced": []}
+             "achievements": [], "announced": [], "inventory": []}
 
     async def list_user_businesses(chat_id, user_id):
         return list(state["businesses"])
@@ -100,6 +100,11 @@ def world(monkeypatch):
 
     async def list_user_titles(chat_id, user_id):
         return [{"title_key": k} for k in state["titles"]]
+
+    async def list_inventory(chat_id, user_id):
+        # Коллекция «Барахольщик» считается по инвентарю: хлам — обычные
+        # предметы магазина, спецэффектов у них нет.
+        return [{"item_key": k} for k in state["inventory"]]
 
     async def grant_title(chat_id, user_id, key):
         if key in state["granted"]:
@@ -117,6 +122,7 @@ def world(monkeypatch):
     monkeypatch.setattr(bot_module.db, "list_user_businesses", list_user_businesses, raising=False)
     monkeypatch.setattr(bot_module.db, "list_pets", list_pets, raising=False)
     monkeypatch.setattr(bot_module.db, "list_user_titles", list_user_titles, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_inventory", list_inventory, raising=False)
     monkeypatch.setattr(bot_module.db, "grant_title", grant_title, raising=False)
     monkeypatch.setattr(bot_module.db, "add_title_if_missing", _noop, raising=False)
     monkeypatch.setattr(bot_module.db, "add_log", _noop, raising=False)
@@ -222,3 +228,37 @@ def test_коллекционный_титул_нельзя_купить():
     import inspect
     src = inspect.getsource(bot_module._check_collections)
     assert "add_title_if_missing(collection.title_key, collection.title_name)" in src
+
+
+# --- хлам -------------------------------------------------------------------
+
+def test_барахольщик_считает_только_хлам(world):
+    """Обычные товары магазина в коллекцию попадать не должны."""
+    import db as db_module
+    world["inventory"] = list(db_module.JUNK_ITEM_KEYS[:3]) + ["korona", "diamond"]
+    done, total = _progress(world)["junk"]
+    assert (done, total) == (3, len(db_module.JUNK_ITEM_KEYS))
+
+
+def test_барахольщик_собирается_полностью(world):
+    import db as db_module
+    world["inventory"] = list(db_module.JUNK_ITEM_KEYS)
+    done, total = _progress(world)["junk"]
+    assert done == total
+
+
+def test_ключи_хлама_есть_в_магазине():
+    """Ключ в списке, но не в витрине — коллекцию нельзя собрать в принципе."""
+    import db as db_module
+    shop = {row[0] for row in db_module.DEFAULT_SHOP_ITEMS}
+    missing = [k for k in db_module.JUNK_ITEM_KEYS if k not in shop]
+    assert not missing, missing
+
+
+def test_хлам_дешевле_обычных_товаров():
+    """У хлама свой ценовой этаж — иначе он мешается в витрине с настоящими."""
+    import db as db_module
+    prices = {row[0]: row[2] for row in db_module.DEFAULT_SHOP_ITEMS}
+    junk_max = max(prices[k] for k in db_module.JUNK_ITEM_KEYS)
+    normal_min = min(p for k, p in prices.items() if k not in db_module.JUNK_ITEM_KEYS)
+    assert junk_max < normal_min, (junk_max, normal_min)

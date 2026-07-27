@@ -141,25 +141,6 @@ def test_медали_остались_неторгуемыми():
         assert SE.is_reward(key), key
 
 
-@pytest.mark.parametrize("degree, key", [
-    (1, "medal_bronze"), (2, "medal_bronze"),
-    (3, "medal_silver"), (4, "medal_silver"),
-    (5, "medal_gold"), (6, "medal_gold"),
-    (7, "order_star"), (8, "order_star"),
-])
-def test_трофей_по_степени_награды(degree, key):
-    trophy = SE.trophy_for_degree(degree)
-    assert trophy is not None and trophy.key == key
-
-
-def test_чем_выше_степень_тем_весомее_трофей():
-    keys = [SE.trophy_for_degree(d).key for d in range(1, 9)]
-    # порядок не убывает: значения меняются только вверх по списку REWARD_ITEMS
-    order = [item.key for item in SE.REWARD_ITEMS]
-    indexes = [order.index(k) for k in keys]
-    assert indexes == sorted(indexes)
-
-
 def test_витрина_не_показывает_неоплатную_цену_трофея():
     """Иначе в магазине висело бы «999999999 i¢» — цена-заглушка, которая
     нужна схеме, но человеку ничего не говорит."""

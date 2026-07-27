@@ -444,6 +444,18 @@ def test_наградить_выдаёт_награду(monkeypatch):
     monkeypatch.setattr(bot_module.db, "seed_extra_shop_items", _noop, raising=False)
     monkeypatch.setattr(bot_module.db, "add_inventory_item", _noop, raising=False)
 
+    # Награда больше не просто запись: она даёт монеты, репутацию и ачивки,
+    # и на пару «кто → кому» есть суточный кулдаун.
+    async def _zero(*a, **k):
+        return 0
+
+    monkeypatch.setattr(bot_module.db, "last_reward_between", _noop)
+    monkeypatch.setattr(bot_module.db, "add_coins", _noop)
+    monkeypatch.setattr(bot_module.db, "change_reputation", _zero)
+    monkeypatch.setattr(bot_module.db, "count_rewards", _zero)
+    monkeypatch.setattr(bot_module, "_check_coin_achievements", _noop)
+    monkeypatch.setattr(bot_module, "grant_achievement", _noop)
+
     target = User(id=999, is_bot=False, first_name="Цель")
     replied = Message(message_id=2, date=datetime.now(), chat=Chat(id=CHAT_ID, type="supergroup"),
                       from_user=target, text="привет")

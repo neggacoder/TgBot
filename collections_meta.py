@@ -52,6 +52,11 @@ COLLECTIONS: tuple[Collection, ...] = (
         "🐾 Зоопарк", "collection_zoo",
     ),
     Collection(
+        "junk", "Барахольщик", "🗑",
+        "Собрать весь хлам из магазина — весь бесполезный, в этом и смысл",
+        "🗑 Барахольщик", "collection_junk",
+    ),
+    Collection(
         "dynasty", "Династия", "🏆",
         f"Попасть в призы {SEASON_STREAK} сезона подряд",
         "🏆 Династия", "collection_dynasty",

@@ -219,9 +219,13 @@ def test_робот_снижает_расход_энергии(monkeypatch):
     """20 энергии у уборщика: с роботом (−25%) хватает 15, без него — нет."""
     monkeypatch.setattr(bot_module, "is_account_frozen", _returns(False))
     monkeypatch.setattr(bot_module.db, "has_profession_upgrade", _returns(False))
+    # Профсоюз выключен (коллег меньше порога) — иначе он тоже срезал бы
+    # расход энергии, и тест перестал бы проверять именно Робота.
+    monkeypatch.setattr(bot_module.db, "count_profession_colleagues", _returns(1))
     monkeypatch.setattr(bot_module.db, "get_profession_stats", _returns({
         "profession_key": "уборщик", "energy": 16, "mood": 100, "health": 100,
         "prof_level": 1, "work_streak": 0, "last_work_at": None, "last_shift_day": None,
+        "shifts_since_break": 0, "mentor_id": None, "total_shifts": 0,
     }))
 
     monkeypatch.setattr(bot_module.db, "list_inventory", _returns(_inventory()))

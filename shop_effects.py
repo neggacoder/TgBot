@@ -417,16 +417,6 @@ def perks_of(item_key: str) -> str:
     return item.perk_text if item and item.perk_text else ""
 
 
-def trophy_for_degree(degree: int) -> Optional[RewardItem]:
-    """Какой трофей полагается за награду такой степени. None — степень ниже
-    самой мелкой (в норме такого нет: степени начинаются с 1)."""
-    best: Optional[RewardItem] = None
-    for item in REWARD_ITEMS:
-        if degree >= item.min_degree:
-            best = item
-    return best
-
-
 def shop_rows() -> list[tuple[str, str, int, str, str]]:
     """Всё, что нужно досеять в магазин: полезное и предметы за ачивки.
 

@@ -133,3 +133,45 @@ def test_пустой_период_не_ломается():
     # limit=0 — строк нет; функция обязана вернуть текст, а не упасть
     text = asyncio.run(build())
     assert isinstance(text, str) and text
+
+
+# ---------------------------------------------------------------------------
+# Гражданство: две разные выборки — два разных имени
+# ---------------------------------------------------------------------------
+
+def test_граждане_и_топ_берут_разные_функции():
+    """В db.py жили ДВА объявления list_citizens: одно возвращало list[dict]
+    по порядку получения (для команды «граждане»), другое — set[int] для
+    отметки 🏠 в топе. Побеждало последнее, и «граждане» падали с
+    TypeError: 'int' object is not subscriptable — то есть команда была
+    сломана в продакшене, а тесты этого не видели.
+    """
+    import io
+    import os
+
+    # Читаем ФАЙЛ, а не объекты: в этом модуле db.list_citizens подменён
+    # заглушкой, и inspect вернул бы исходник мока.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "db.py"), encoding="utf-8").read()
+
+    assert src.count("async def list_citizens(") == 1, "имя снова задвоено"
+    assert src.count("async def list_citizen_rows(") == 1
+
+    rows_src = src[src.index("async def list_citizen_rows("):]
+    rows_src = rows_src[:rows_src.index("\n\nasync def")]
+    set_src = src[src.index("async def list_citizens("):]
+    set_src = set_src[:set_src.index("\n\nasync def")]
+
+    # «граждане» нужен порядок получения гражданства
+    assert "ORDER BY updated_at" in rows_src
+    # топу нужно быстрое «этот человек — гражданин?»
+    assert "return {" in set_src
+
+
+def test_команда_граждане_ждёт_словари():
+    """Если кто-то снова переключит команду на set-версию, строка row["user_id"]
+    сломается ровно так же, как ломалась до починки."""
+    import inspect
+    src = inspect.getsource(bot_module.cmd_citizens_list)
+    assert "list_citizen_rows" in src
+    assert 'row["user_id"]' in src
