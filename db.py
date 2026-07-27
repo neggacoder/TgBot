@@ -1035,6 +1035,9 @@ async def ensure_profile_cards_table() -> None:
     await _add_column_if_missing("profile_cards", "pinned_item", "VARCHAR(64) DEFAULT NULL")
     await _add_column_if_missing("profile_cards", "pinned_achievement", "VARCHAR(64) DEFAULT NULL")
     await _add_column_if_missing("profile_cards", "pinned_business", "VARCHAR(32) DEFAULT NULL")
+    # Закреплённая рыба — id строки в fishing_net, а не ключ вида: хвастаются
+    # КОНКРЕТНЫМ экземпляром со своим весом, а не «щукой вообще».
+    await _add_column_if_missing("profile_cards", "pinned_fish", "BIGINT DEFAULT NULL")
     # Если таблица уже существовала с gender ENUM — конвертируем в VARCHAR.
     await _execute("ALTER TABLE profile_cards MODIFY gender VARCHAR(8) DEFAULT NULL")
 
@@ -1042,9 +1045,18 @@ async def ensure_profile_cards_table() -> None:
 async def get_profile_card(chat_id: int, user_id: int) -> Optional[dict]:
     return await _fetchone(
         "SELECT title, motto, is_citizen, gender, city, about_text, anketa_visible, "
-        "pinned_item, active_title, pinned_achievement, pinned_business, pinned_pet "
+        "pinned_item, active_title, pinned_achievement, pinned_business, pinned_pet, "
+        "pinned_fish "
         "FROM profile_cards WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
+    )
+
+
+async def set_pinned_fish(chat_id: int, user_id: int, fish_id: Optional[int]) -> None:
+    await _execute(
+        "INSERT INTO profile_cards (chat_id, user_id, pinned_fish) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE pinned_fish = VALUES(pinned_fish)",
+        (chat_id, user_id, fish_id),
     )
 
 
@@ -2167,6 +2179,20 @@ async def list_daily_counts_for_user(chat_id: int, user_id: int, since_day) -> l
     )
 
 
+async def list_today_active_users(chat_id: int, day, limit: int = 200) -> list[dict]:
+    """Кто сегодня писал в чат — по посуточным счётчикам message_daily.
+
+    Порядок по числу сообщений: если получателей окажется больше лимита,
+    отсечь логичнее самых молчаливых, а не случайных.
+    """
+    return await _fetchall(
+        "SELECT user_id, message_count FROM message_daily "
+        "WHERE chat_id = %s AND day = %s AND message_count > 0 "
+        "ORDER BY message_count DESC LIMIT %s",
+        (chat_id, day, limit),
+    )
+
+
 async def list_daily_counts_for_chat(chat_id: int, since_day) -> list[dict]:
     """Посуточные счётчики сообщений ВСЕГО чата (сумма по всем участникам) с
     since_day по сегодня — то же самое, что list_daily_counts_for_user, но
@@ -2980,6 +3006,21 @@ async def list_recent_messages(chat_id: int, limit: int = 10) -> list[dict]:
     )
     rows.reverse()
     return rows
+
+
+async def list_recent_messages_by_user(chat_id: int, user_id: int, limit: int = 50) -> list[dict]:
+    """Последние сохранённые фразы одного человека — для «компромата».
+
+    Глубина ограничена сверху не этим limit'ом, а RECENT_MESSAGES_KEEP: лента
+    подрезается до последних 200 строк НА ЧАТ, поэтому в живом чате «старая»
+    фраза — это в лучшем случае вчерашняя. Обещать большего нельзя.
+    """
+    return await _fetchall(
+        "SELECT message_id, text, created_at FROM recent_messages "
+        "WHERE chat_id = %s AND user_id = %s AND text IS NOT NULL AND text <> '' "
+        "ORDER BY id DESC LIMIT %s",
+        (chat_id, user_id, limit),
+    )
 
 
 async def list_recent_messages_after(chat_id: int, after_id: int, limit: int = 50) -> list[dict]:
@@ -6730,47 +6771,138 @@ async def ensure_fishing_tables() -> None:
         "INDEX idx_fishing_best (chat_id, best_catch DESC)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    # Рекорд по ВЕСУ — отдельно от денежного. Денежный (best_catch) остаётся
+    # как есть: он уже накоплен в живых чатах, и переписывать его весом
+    # значило бы обнулить всем рекорды задним числом.
+    await _add_column_if_missing("fishing_stats", "best_weight", "INT NOT NULL DEFAULT 0")
+    await _add_column_if_missing("fishing_stats", "best_weight_species", "VARCHAR(32) NULL")
+    # Сетка: рыба хранится ПОШТУЧНО, у каждой свой вес и своё время поимки —
+    # от него считается свежесть (см. fishing.freshness).
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS fishing_net ("
+        "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "species_key VARCHAR(32) NOT NULL, "
+        "grams INT NOT NULL, "
+        "caught_at DATETIME NOT NULL, "
+        "INDEX idx_net_owner (chat_id, user_id, id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
 
 
 async def get_fishing_stats(chat_id: int, user_id: int) -> dict:
     row = await _fetchone(
-        "SELECT last_fish_at, total_catches, best_catch, best_catch_name "
+        "SELECT last_fish_at, total_catches, best_catch, best_catch_name, "
+        "       best_weight, best_weight_species "
         "FROM fishing_stats WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
     if row:
         return row
-    return {"last_fish_at": None, "total_catches": 0, "best_catch": 0, "best_catch_name": None}
+    return {"last_fish_at": None, "total_catches": 0, "best_catch": 0,
+            "best_catch_name": None, "best_weight": 0, "best_weight_species": None}
 
 
-async def record_catch(
-    chat_id: int, user_id: int, amount: int, catch_name: str, now: datetime
+async def record_catch_weight(
+    chat_id: int, user_id: int, grams: int, species_key: str, now: datetime
 ) -> dict:
-    """Записывает улов и возвращает обновлённую статистику.
-
-    Рекорд обновляется через GREATEST/CASE прямо в запросе: два одновременных
-    заброса не должны затирать рекорд друг друга.
-    """
+    """Записывает заброс и рекорд ПО ВЕСУ — рыба при этом уходит в сетку, а не
+    в монеты, поэтому денежного рекорда здесь нет (он обновляется при продаже,
+    см. record_catch_price)."""
     await _execute(
         "INSERT INTO fishing_stats (chat_id, user_id, last_fish_at, total_catches, "
-        "                           best_catch, best_catch_name) "
+        "                           best_weight, best_weight_species) "
         "VALUES (%s, %s, %s, 1, %s, %s) "
         "ON DUPLICATE KEY UPDATE "
         "  last_fish_at = VALUES(last_fish_at), "
         "  total_catches = total_catches + 1, "
-        "  best_catch_name = CASE WHEN VALUES(best_catch) > best_catch "
-        "                         THEN VALUES(best_catch_name) ELSE best_catch_name END, "
-        "  best_catch = GREATEST(best_catch, VALUES(best_catch))",
-        (chat_id, user_id, now, amount, catch_name),
+        "  best_weight_species = CASE WHEN VALUES(best_weight) > best_weight "
+        "                             THEN VALUES(best_weight_species) "
+        "                             ELSE best_weight_species END, "
+        "  best_weight = GREATEST(best_weight, VALUES(best_weight))",
+        (chat_id, user_id, now, grams, species_key),
     )
     return await get_fishing_stats(chat_id, user_id)
 
 
+async def record_catch_price(chat_id: int, user_id: int, amount: int, catch_name: str) -> None:
+    """Денежный рекорд — обновляется в момент ПРОДАЖИ рыбы из сетки.
+
+    Отдельно от record_catch_weight и без счётчика уловов: продажа — это не
+    заброс, и увеличивать total_catches она не должна.
+    """
+    await _execute(
+        "INSERT INTO fishing_stats (chat_id, user_id, best_catch, best_catch_name) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE "
+        "  best_catch_name = CASE WHEN VALUES(best_catch) > best_catch "
+        "                         THEN VALUES(best_catch_name) ELSE best_catch_name END, "
+        "  best_catch = GREATEST(best_catch, VALUES(best_catch))",
+        (chat_id, user_id, amount, catch_name),
+    )
+
+
+# --- сетка ------------------------------------------------------------------
+async def list_net(chat_id: int, user_id: int) -> list[dict]:
+    """Рыба в сетке, от старой к новой — в том же порядке её видит человек,
+    и по этому же порядку он называет номера в «сетка продать {N}»."""
+    return await _fetchall(
+        "SELECT id, species_key, grams, caught_at FROM fishing_net "
+        "WHERE chat_id = %s AND user_id = %s ORDER BY id ASC",
+        (chat_id, user_id),
+    )
+
+
+async def add_to_net(chat_id: int, user_id: int, species_key: str,
+                     grams: int, now: datetime) -> int:
+    await _execute(
+        "INSERT INTO fishing_net (chat_id, user_id, species_key, grams, caught_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (chat_id, user_id, species_key, grams, now),
+    )
+    row = await _fetchone(
+        "SELECT id FROM fishing_net WHERE chat_id = %s AND user_id = %s "
+        "ORDER BY id DESC LIMIT 1",
+        (chat_id, user_id),
+    )
+    return int(row["id"]) if row else 0
+
+
+async def remove_from_net(chat_id: int, user_id: int, fish_id: int) -> bool:
+    """True — рыба была на месте и удалена. Проверка владельца прямо в WHERE:
+    id глобальный, и без неё чужую рыбу можно было бы продать по номеру."""
+    rowcount = await _execute(
+        "DELETE FROM fishing_net WHERE id = %s AND chat_id = %s AND user_id = %s",
+        (fish_id, chat_id, user_id),
+    )
+    return bool(rowcount)
+
+
+async def refresh_net(chat_id: int, user_id: int, now: datetime) -> int:
+    """«Лёд»: отсчёт свежести начинается заново для всей рыбы в сетке."""
+    return await _execute(
+        "UPDATE fishing_net SET caught_at = %s WHERE chat_id = %s AND user_id = %s",
+        (now, chat_id, user_id),
+    )
+
+
 async def list_fishing_top(chat_id: int, limit: int = 10) -> list[dict]:
     return await _fetchall(
-        "SELECT user_id, best_catch, best_catch_name, total_catches FROM fishing_stats "
+        "SELECT user_id, best_catch, best_catch_name, total_catches, "
+        "       best_weight, best_weight_species FROM fishing_stats "
         "WHERE chat_id = %s AND best_catch > 0 "
         "ORDER BY best_catch DESC, total_catches DESC LIMIT %s",
+        (chat_id, limit),
+    )
+
+
+async def list_fishing_weight_top(chat_id: int, limit: int = 10) -> list[dict]:
+    """Рекорды по весу — «кто вытащил самую тяжёлую»."""
+    return await _fetchall(
+        "SELECT user_id, best_weight, best_weight_species, total_catches "
+        "FROM fishing_stats WHERE chat_id = %s AND best_weight > 0 "
+        "ORDER BY best_weight DESC, total_catches DESC LIMIT %s",
         (chat_id, limit),
     )
 
@@ -7030,6 +7162,12 @@ async def ensure_stock_market_tables() -> None:
         "dividend_percent DECIMAL(6,2) NOT NULL DEFAULT 5.00"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    # Выключатель биржи на чат. Выключенная биржа именно ЗАМОРАЖИВАЕТСЯ:
+    # stock_market_loop пропускает такой чат целиком, поэтому курс не ползёт
+    # и дивиденды не копятся, а уже купленные акции лежат нетронутыми до
+    # включения обратно. last_change_at при этом не трогаем — иначе после
+    # включения цикл досчитывал бы все пропущенные часы разом.
+    await _add_column_if_missing("stock_settings", "enabled", "BOOL NOT NULL DEFAULT TRUE")
     # История курса для графика в веб-панели. Точка пишется при каждом
     # изменении цены (плановом и ручном); старше STOCK_HISTORY_KEEP_DAYS
     # чистится фоновым циклом бота.
@@ -7308,6 +7446,21 @@ async def get_stock_settings(chat_id: int) -> dict:
         return row
     await _execute("INSERT IGNORE INTO stock_settings (chat_id) VALUES (%s)", (chat_id,))
     return await _fetchone("SELECT * FROM stock_settings WHERE chat_id = %s", (chat_id,))
+
+
+async def is_stock_enabled(chat_id: int) -> bool:
+    """Включена ли биржа в этом чате. Отдельная функция, а не чтение поля из
+    get_stock_settings на месте: проверка нужна в пяти местах (четыре команды
+    и фоновый цикл), и дублировать приведение к bool в каждом не хочется."""
+    row = await get_stock_settings(chat_id)
+    return bool(row["enabled"]) if row else True
+
+
+async def set_stock_enabled(chat_id: int, enabled: bool) -> None:
+    await get_stock_settings(chat_id)      # заводит строку, если её ещё нет
+    await _execute(
+        "UPDATE stock_settings SET enabled = %s WHERE chat_id = %s", (enabled, chat_id)
+    )
 
 
 async def set_stock_settings(

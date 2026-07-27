@@ -26,16 +26,33 @@ EFFECT_REPAIR = "repair"        # починить сломанный бизне
 EFFECT_REFRESH = "refresh"      # сбросить кулдауны ферма/рыбалка/клад
 EFFECT_WORK_REFRESH = "work_refresh"   # сбросить кулдаун смены
 EFFECT_HEAL = "heal"            # восстановить энергию/настроение/здоровье
-# Единственный эффект, которому нужна цель И аргумент, поэтому у него своя
-# команда, а не общее «использовать» (см. bot.py).
+# Эффекты со своей командой вместо общего «использовать» (см. bot.py): им
+# нужна цель или реплай, а «использовать {ключ} @кому» занято одним аргументом.
 EFFECT_STEAL_ITEM = "steal_item"
+EFFECT_SABOTAGE = "sabotage"      # сломать бизнес выбранного человека
+EFFECT_KOMPROMAT = "kompromat"    # поднять старую фразу человека из ленты чата
+EFFECT_DOSSIER = "dossier"        # досье: чем человек занимался в последнее время
+EFFECT_MEGAPHONE = "megaphone"    # закрепить своё сообщение в чате
+
+# Своя команда есть у всех перечисленных: общий «использовать» их не берёт.
+OWN_COMMAND_EFFECTS = frozenset({
+    EFFECT_STEAL_ITEM, EFFECT_SABOTAGE, EFFECT_KOMPROMAT,
+    EFFECT_DOSSIER, EFFECT_MEGAPHONE,
+})
+EFFECT_ICE = "ice"              # обновить свежесть всей рыбы в сетке
+EFFECT_EVENT_TICKET = "event_ticket"   # запустить событие чата прямо сейчас
+EFFECT_VABANK = "vabank"        # удвоить кошелёк или потерять треть
+EFFECT_GENEROSITY = "generosity"  # раздать монеты всем, кто сегодня писал
 # Откладывается и ждёт своего случая (хранится в user_item_effects):
 EFFECT_LUCKY = "lucky"          # следующий заработок — вдвое больше
 EFFECT_SHIELD = "shield"        # следующая поломка бизнеса не случится
 EFFECT_FREE_UPGRADE = "free_upgrade"   # следующий апгрейд бизнеса бесплатно
+EFFECT_MIRROR = "mirror"        # следующее ограбление отражается на грабителя
 
 # Отложенные эффекты — те, что не срабатывают на месте, а ждут события.
-PENDING_EFFECTS = frozenset({EFFECT_LUCKY, EFFECT_SHIELD, EFFECT_FREE_UPGRADE})
+PENDING_EFFECTS = frozenset({
+    EFFECT_LUCKY, EFFECT_SHIELD, EFFECT_FREE_UPGRADE, EFFECT_MIRROR,
+})
 
 LUCKY_MULTIPLIER = 2
 
@@ -87,6 +104,55 @@ EFFECT_ITEMS: tuple[ShopEffectItem, ...] = (
         "medvezhatnik", "Медвежатник", "🗝", 75_000, EFFECT_STEAL_ITEM,
         "Крадёт ОДИН выбранный предмет у выбранного человека. "
         "Использовать: «медвежатник @кому {ключ предмета}»",
+    ),
+    # --- предметы, которые создают событие на весь чат --------------------
+    # В отличие от всего, что выше, эти видит не только владелец: смысл в
+    # моменте, который происходит у всех на глазах, а не в тихой прибавке
+    # к проценту.
+    ShopEffectItem(
+        "lyod", "Лёд", "🧊", 3_500, EFFECT_ICE,
+        "Пересыпает сетку льдом: вся рыба в ней снова свежая, отсчёт порчи "
+        "начинается заново. Можно спокойно ждать «Клёва»",
+    ),
+    ShopEffectItem(
+        "zerkalo", "Зеркало", "🪞", 18_000, EFFECT_MIRROR,
+        "Ближайшее ограбление против вас отражается: крадут не у вас, "
+        "а у самого грабителя. Бот объявит это в чат",
+    ),
+    ShopEffectItem(
+        "bilet", "Билет на ивент", "🎪", 30_000, EFFECT_EVENT_TICKET,
+        "Запускает случайное событие чата прямо сейчас, не дожидаясь "
+        "расписания. Действует на весь чат",
+    ),
+    ShopEffectItem(
+        "vabank", "Ва-банк", "🃏", 5_000, EFFECT_VABANK,
+        "Орёл или решка на весь кошелёк: удвоить или потерять треть. "
+        "Результат бот объявляет в чат",
+    ),
+    ShopEffectItem(
+        "shchedrost", "Щедрость", "🎁", 40_000, EFFECT_GENEROSITY,
+        "Раздаёт по чуть-чуть всем, кто сегодня писал в чат, — от вашего "
+        "имени и с объявлением поимённо",
+    ),
+    ShopEffectItem(
+        "sabotazh", "Саботаж", "🧨", 22_000, EFFECT_SABOTAGE,
+        "Ломает бизнес выбранного человека — если у него нет страховки. "
+        "Использовать: «саботаж @кому»",
+    ),
+    ShopEffectItem(
+        "kompromat", "Компромат", "💣", 15_000, EFFECT_KOMPROMAT,
+        "Поднимает случайную старую фразу человека из ленты чата и публикует "
+        "её картинкой-цитатой. Использовать: «компромат @кому»",
+    ),
+    ShopEffectItem(
+        "dosye", "Досье", "🕵️", 12_000, EFFECT_DOSSIER,
+        "Показывает, чем человек занимался в последнее время: заработки, "
+        "ограбления, покупки. Использовать: «досье @кому»",
+    ),
+    ShopEffectItem(
+        "megafon", "Мегафон", "📢", 25_000, EFFECT_MEGAPHONE,
+        "Закрепляет ваше сообщение в чате на час. Использовать: «мегафон» "
+        "ответом на своё сообщение",
     ),
 )
 
@@ -147,6 +213,30 @@ EFFECT_PASSIVE_BOOST = "passive_boost"
 EFFECT_DAILY_CASH = "daily_cash"
 
 
+# --- постоянные привилегии --------------------------------------------------
+# Вторая, «неарифметическая» сила предмета за ачивку. Работает всё время,
+# пока предмет лежит в инвентаре: нажимать ничего не надо, тратиться нечему
+# (потерять предмет за ачивку вообще нельзя — см. REWARD_KEYS).
+#
+# Смысл в том, чтобы ачивку хотелось добыть не ради «+20% к ферме», которых
+# никто не замечает, а ради заметной привилегии. Числа держим скромными:
+# привилегия вечная и накапливается с остальными предметами.
+PERK_ROBBERY_DEFENSE = "robbery_defense"   # −N% к шансу, что ограбят ВАС
+PERK_ROBBERY_ATTACK = "robbery_attack"     # +N% к шансу вашего ограбления
+PERK_FAIL_LOSS_CUT = "fail_loss_cut"       # −N% к потере при провале ограбления
+PERK_ENERGY_SAVE = "energy_save"           # −N% к расходу энергии и настроения
+PERK_FARM_COOLDOWN = "farm_cooldown"       # −N% к кулдауну фермы
+PERK_NO_EMPTY_FISHING = "no_empty_fishing"  # улов не бывает пустым
+PERK_NO_EMPTY_TREASURE = "no_empty_treasure"  # яма не бывает пустой
+PERK_BREAK_RESIST = "break_resist"         # −N% к шансу поломки бизнеса
+PERK_STREAK_SHIELD = "streak_shield"       # серия не сгорает за один пропуск
+
+# Привилегии-переключатели: у них нет процента, важен сам факт наличия.
+FLAG_PERKS = frozenset({
+    PERK_NO_EMPTY_FISHING, PERK_NO_EMPTY_TREASURE, PERK_STREAK_SHIELD,
+})
+
+
 @dataclass(frozen=True)
 class AchievementItem:
     key: str
@@ -158,6 +248,9 @@ class AchievementItem:
     activity: Optional[str] = None   # для пассивной прибавки — к чему она
     percent: int = 0                 # на сколько процентов поднимает
     shifts: int = 0                  # для разовой выплаты — во сколько смен
+    perk: Optional[str] = None       # постоянная привилегия (см. PERK_*)
+    perk_percent: int = 0            # её сила; у FLAG_PERKS не используется
+    perk_text: str = ""              # как привилегия объясняется человеку
 
     def as_shop_row(self) -> tuple[str, str, int, str, str]:
         # Как и медали: в магазине предмет виден, но неоплатен — получить его
@@ -169,56 +262,84 @@ ACHIEVEMENT_ITEMS: tuple[AchievementItem, ...] = (
     AchievementItem(
         "robot_worker", "Робот работяги", "🤖", "work_20",
         EFFECT_PASSIVE_BOOST,
-        "Пока в инвентаре — смены приносят на 20% больше. Ачивка «Работяга»",
+        "Пока в инвентаре — смены приносят на 20% больше, а энергии тратят "
+        "на четверть меньше. Ачивка «Работяга»",
         activity=ACTIVITY_WORK, percent=20,
+        perk=PERK_ENERGY_SAVE, perk_percent=25,
+        perk_text="смена отнимает на 25% меньше энергии",
     ),
     AchievementItem(
         "traktor", "Трактор", "🚜", "farm_100",
         EFFECT_PASSIVE_BOOST,
-        "Пока в инвентаре — ферма приносит на 20% больше. Ачивка «Фермер»",
+        "Пока в инвентаре — ферма приносит на 20% больше, а ждать её на 15% "
+        "меньше. Ачивка «Фермер»",
         activity=ACTIVITY_FARM, percent=20,
+        perk=PERK_FARM_COOLDOWN, perk_percent=15,
+        perk_text="кулдаун фермы короче на 15%",
     ),
     AchievementItem(
         "snasti", "Счастливые снасти", "🎣", "fish_100",
         EFFECT_PASSIVE_BOOST,
-        "Пока в инвентаре — рыбалка приносит на 20% больше. Ачивка «Рыбак»",
+        "Пока в инвентаре — рыбалка приносит на 20% больше и никогда не "
+        "остаётся пустой. Ачивка «Рыбак»",
         activity=ACTIVITY_FISHING, percent=20,
+        perk=PERK_NO_EMPTY_FISHING,
+        perk_text="улов никогда не бывает пустым",
     ),
     AchievementItem(
         "karta", "Старая карта", "🗺", "treasure_10",
         EFFECT_PASSIVE_BOOST,
-        "Пока в инвентаре — найденный клад на 20% больше. Ачивка «Кладоискатель»",
+        "Пока в инвентаре — найденный клад на 20% больше, а неудачная копка "
+        "всё равно что-то приносит. Ачивка «Кладоискатель»",
         activity=ACTIVITY_TREASURE, percent=20,
+        perk=PERK_NO_EMPTY_TREASURE,
+        perk_text="даже промах на раскопках приносит немного монет",
     ),
     AchievementItem(
         "yashchik", "Ящик инструментов", "🧰", "sidejob_50",
         EFFECT_PASSIVE_BOOST,
-        "Пока в инвентаре — подработка приносит на 20% больше. Ачивка «Мастер на все руки»",
+        "Пока в инвентаре — подработка приносит на 20% больше, а бизнес "
+        "ломается на 20% реже. Ачивка «Мастер на все руки»",
         activity=ACTIVITY_SIDE_JOB, percent=20,
+        perk=PERK_BREAK_RESIST, perk_percent=20,
+        perk_text="бизнес ломается на 20% реже",
     ),
     AchievementItem(
         "ogon", "Вечный огонь", "🔥", "streak_30",
         EFFECT_PASSIVE_BOOST,
-        "Пока в инвентаре — ежедневный бонус на 20% больше. Ачивка «Месяц подряд»",
+        "Пока в инвентаре — ежедневный бонус на 20% больше, а серия переживает "
+        "один пропущенный день. Ачивка «Месяц подряд»",
         activity=ACTIVITY_DAILY_BONUS, percent=20,
+        perk=PERK_STREAK_SHIELD,
+        perk_text="серия не сгорает за один пропущенный день",
     ),
     AchievementItem(
         "portfel", "Портфель карьериста", "💼", "prof_level10",
         EFFECT_DAILY_CASH,
-        "Раз в сутки выдаёт столько, сколько приносят 4 смены. Ачивка «Карьерист»",
+        "Раз в сутки выдаёт столько, сколько приносят 4 смены. Пока в "
+        "инвентаре — вас на 15% реже грабят. Ачивка «Карьерист»",
         shifts=4,
+        perk=PERK_ROBBERY_DEFENSE, perk_percent=15,
+        perk_text="шанс, что вас ограбят, ниже на 15%",
     ),
     AchievementItem(
         "slitok", "Золотой слиток", "💎", "coins_100000",
         EFFECT_DAILY_CASH,
-        "Раз в сутки выдаёт столько, сколько приносят 8 смен. Ачивка «Магнат»",
+        "Раз в сутки выдаёт столько, сколько приносят 8 смен. Пока в "
+        "инвентаре — при провале ограбления теряете на четверть меньше. "
+        "Ачивка «Магнат»",
         shifts=8,
+        perk=PERK_FAIL_LOSS_CUT, perk_percent=25,
+        perk_text="при провале ограбления теряете на 25% меньше",
     ),
     AchievementItem(
         "otmychka", "Мастер-отмычка", "🗝", "lootbox_master",
         EFFECT_DAILY_CASH,
-        "Раз в сутки выдаёт столько, сколько приносят 3 смены. Ачивка «Азартный»",
+        "Раз в сутки выдаёт столько, сколько приносят 3 смены. Пока в "
+        "инвентаре — ваши ограбления удаются на 10% чаще. Ачивка «Азартный»",
         shifts=3,
+        perk=PERK_ROBBERY_ATTACK, perk_percent=10,
+        perk_text="ваши ограбления удаются на 10% чаще",
     ),
 )
 
@@ -253,6 +374,47 @@ def passive_percent(item_keys, activity: str) -> int:
         if item and item.effect == EFFECT_PASSIVE_BOOST and item.activity == activity:
             total += item.percent
     return total
+
+
+def perk_percent(item_keys, perk: str) -> int:
+    """Суммарная сила привилегии от предметов, лежащих в инвентаре.
+
+    Складывается по той же причине, что и passive_percent: разные предметы —
+    разные заслуги. Сейчас на каждую привилегию приходится ровно один
+    предмет, так что сумма из одного слагаемого.
+    """
+    total = 0
+    for key in item_keys:
+        item = ACHIEVEMENT_BY_KEY.get(key)
+        if item and item.perk == perk:
+            total += item.perk_percent
+    return total
+
+
+def has_perk(item_keys, perk: str) -> bool:
+    """Для привилегий-переключателей (FLAG_PERKS), где процента нет."""
+    return any(
+        (ACHIEVEMENT_BY_KEY.get(key) or _NO_ITEM).perk == perk for key in item_keys
+    )
+
+
+class _NoItem:
+    perk = None
+
+
+_NO_ITEM = _NoItem()
+
+
+def perks_of(item_key: str) -> str:
+    """Человеческое описание привилегии предмета — пустая строка, если её нет.
+
+    Нужно, чтобы инвентарь показывал привилегию из КАТАЛОГА, а не из строки
+    магазина: описания в shop_items засеваются один раз и при обновлении
+    бота у старых чатов не переписываются (add_shop_item пропускает
+    существующие ключи), то есть остались бы прежними навсегда.
+    """
+    item = ACHIEVEMENT_BY_KEY.get(item_key)
+    return item.perk_text if item and item.perk_text else ""
 
 
 def trophy_for_degree(degree: int) -> Optional[RewardItem]:

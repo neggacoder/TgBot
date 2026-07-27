@@ -206,34 +206,49 @@ def test_подкоманды_не_считаются_предложением()
 # ---------------------------------------------------------------------------
 
 def test_улов_всегда_чего_то_стоит():
+    """Теперь улов — вид и вес (см. fishing.py), а цена считается от веса."""
+    import fishing
+
     for _ in range(300):
-        _emoji, name, amount = bot_module.roll_catch()
-        assert amount >= 1 and name
+        species = fishing.roll_species()
+        grams = fishing.roll_grams(species)
+        assert species.min_grams <= grams <= species.max_grams
+        assert fishing.base_price(species, grams) >= 1
 
 
-def test_рыбалка_ставит_кулдаун_до_начисления(monkeypatch):
-    """Порядок важен: упади запись улова — человек останется без монет, но не
+def test_рыбалка_ставит_кулдаун_до_попадания_в_сетку(monkeypatch):
+    """Порядок важен: упади запись улова — человек останется без рыбы, но не
     с возможностью забрасывать удочку в цикле."""
+    import fishing
+
     order = []
 
     monkeypatch.setattr(bot_module.db, "get_fishing_stats",
                         _returns({"last_fish_at": None, "total_catches": 0,
-                                  "best_catch": 0, "best_catch_name": None}))
+                                  "best_catch": 0, "best_catch_name": None,
+                                  "best_weight": 0, "best_weight_species": None}))
+    # Хлам уходит сразу в монеты и в сетку не попадает — для проверки порядка
+    # нужен настоящий улов.
+    monkeypatch.setattr(fishing, "roll_species",
+                        lambda no_junk=False: fishing.BY_KEY["okun"])
 
-    async def record_catch(chat_id, user_id, amount, name, now):
+    async def record_weight(chat_id, user_id, grams, species_key, now):
         order.append("cooldown")
-        return {"total_catches": 1, "best_catch": amount, "best_catch_name": name}
+        return {"total_catches": 1, "best_weight": grams,
+                "best_weight_species": species_key}
 
-    async def add_coins(chat_id, user_id, amount):
-        order.append("coins")
-        return amount
+    async def add_to_net(chat_id, user_id, species_key, grams, now):
+        order.append("net")
+        return 1
 
-    monkeypatch.setattr(bot_module.db, "record_catch", record_catch)
-    monkeypatch.setattr(bot_module.db, "add_coins", add_coins)
+    monkeypatch.setattr(bot_module.db, "record_catch_weight", record_weight)
+    monkeypatch.setattr(bot_module.db, "add_to_net", add_to_net)
+    monkeypatch.setattr(bot_module.db, "list_net", _returns([]))
+    monkeypatch.setattr(bot_module.db, "get_profile_card", _returns(None))
 
     text = asyncio.run(bot_module._fishing_execute(CHAT_ID, USER_ID))
-    assert order == ["cooldown", "coins"], order
-    assert "i¢" in text
+    assert order == ["cooldown", "net"], order
+    assert "окунь" in text
 
 
 def test_рыбалка_на_кулдауне_не_начисляет(monkeypatch):
@@ -244,7 +259,8 @@ def test_рыбалка_на_кулдауне_не_начисляет(monkeypatc
     async def boom(*a, **k):
         raise AssertionError("на кулдауне ничего начислять нельзя")
 
-    monkeypatch.setattr(bot_module.db, "record_catch", boom)
+    monkeypatch.setattr(bot_module.db, "record_catch_weight", boom)
+    monkeypatch.setattr(bot_module.db, "add_to_net", boom)
     monkeypatch.setattr(bot_module.db, "add_coins", boom)
 
     text = asyncio.run(bot_module._fishing_execute(CHAT_ID, USER_ID))
