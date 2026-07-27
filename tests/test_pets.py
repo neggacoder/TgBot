@@ -153,14 +153,24 @@ def world(monkeypatch):
             return False
         state["pets"][key] = {"pet_key": key, "pet_name": None, "hunger": 100,
                               "mood": 100, "last_tick_at": ts, "last_fed_at": None,
-                              "last_care_at": None, "bought_at": ts}
+                              "last_care_at": None, "bought_at": ts,
+                              "ability": None, "ability_rerolls": 0,
+                              "xp": 0, "xp_tick_at": ts}
         return True
 
-    async def set_pet_stats(chat_id, user_id, key, hunger, mood, ts,
+    async def set_pet_ability(chat_id, user_id, key, ability, rerolls):
+        row = state["pets"].get(key)
+        if row is None:
+            return False
+        row["ability"] = ability
+        row["ability_rerolls"] = rerolls
+        return True
+
+    async def set_pet_stats(chat_id, user_id, key, hunger, mood, xp, ts,
                             fed_at=None, care_at=None):
-        state["stats"].append({"key": key, "hunger": hunger, "mood": mood})
+        state["stats"].append({"key": key, "hunger": hunger, "mood": mood, "xp": xp})
         row = state["pets"][key]
-        row.update(hunger=hunger, mood=mood, last_tick_at=ts)
+        row.update(hunger=hunger, mood=mood, last_tick_at=ts, xp=xp, xp_tick_at=ts)
         if fed_at:
             row["last_fed_at"] = fed_at
         if care_at:
@@ -191,6 +201,7 @@ def world(monkeypatch):
                      ("get_pet", get_pet), ("add_pet", add_pet),
                      ("set_pet_stats", set_pet_stats), ("set_pinned_pet", set_pinned_pet),
                      ("rename_pet", _noop), ("add_log", _noop),
+                     ("set_pet_ability", set_pet_ability),
                      ("ensure_pet_catalog", _returns(0)),
                      ("list_pet_catalog", list_pet_catalog)]:
         monkeypatch.setattr(bot_module.db, name, fn, raising=False)
@@ -325,6 +336,84 @@ def test_описание_неизвестной_способности_пуст
     assert P.ability_text(P.ABILITY_NONE) == ""
 
 
+def test_цена_смены_способности_не_ниже_пола():
+    assert P.ability_reroll_price(0, 0) == P.ABILITY_REROLL_FLOOR
+    assert P.ability_reroll_price(100, 0) == P.ABILITY_REROLL_FLOOR
+
+
+def test_цена_смены_способности_растёт_от_цены_вида():
+    cheap = P.ability_reroll_price(10_000, 0)
+    expensive = P.ability_reroll_price(90_000, 0)
+    assert expensive > cheap
+
+
+def test_цена_смены_способности_растёт_с_каждой_сменой():
+    prices = [P.ability_reroll_price(30_000, n) for n in range(4)]
+    assert prices == sorted(prices) and len(set(prices)) == len(prices)
+
+
+
+# --- уровень питомца ---------------------------------------------------------
+
+def test_порогов_ровно_по_числу_уровней():
+    assert len(P.LEVEL_XP_THRESHOLDS) == P.MAX_PET_LEVEL
+    assert P.LEVEL_XP_THRESHOLDS[0] == 0
+    assert list(P.LEVEL_XP_THRESHOLDS) == sorted(P.LEVEL_XP_THRESHOLDS)
+
+
+def test_уровень_по_опыту_растёт_монотонно():
+    assert P.level_for_xp(0) == 1
+    assert P.level_for_xp(-5) == 1, "отрицательного опыта не бывает, но не должно падать"
+    for threshold, level in zip(P.LEVEL_XP_THRESHOLDS, range(1, P.MAX_PET_LEVEL + 1)):
+        assert P.level_for_xp(threshold) == level
+        if threshold:
+            assert P.level_for_xp(threshold - 1) == level - 1
+
+
+def test_опыт_не_растёт_выше_порога_макс_уровня():
+    assert P.xp_now(0, 1_000_000) == P.LEVEL_XP_THRESHOLDS[-1]
+    assert P.level_for_xp(P.xp_now(0, 1_000_000)) == P.MAX_PET_LEVEL
+
+
+def test_разовая_прибавка_тоже_капается_потолком():
+    """Иначе цифра в базе росла бы бесконечно и после макс. уровня — молча,
+    без влияния на уровень, но нарушая заявленный инвариант."""
+    assert P.xp_add(P.LEVEL_XP_THRESHOLDS[-1], P.XP_BONUS_FEED) == P.LEVEL_XP_THRESHOLDS[-1]
+    assert P.xp_add(0, -5) == 0, "отрицательной прибавки не бывает"
+
+
+def test_опыт_без_времени_не_меняется():
+    assert P.xp_now(123, 0) == 123
+    assert P.xp_now(123, -5) == 123, "часы бота и базы могут разъехаться"
+
+
+def test_прогресс_уровня_считает_от_начала_уровня():
+    threshold = P.LEVEL_XP_THRESHOLDS[2]   # начало уровня 3
+    level, gained, needed = P.level_progress(threshold + 10)
+    assert level == 3
+    assert gained == 10
+    assert needed == P.LEVEL_XP_THRESHOLDS[3] - threshold
+
+
+def test_прогресс_на_макс_уровне_не_делит_на_ноль():
+    level, gained, needed = P.level_progress(P.LEVEL_XP_THRESHOLDS[-1] + 500)
+    assert level == P.MAX_PET_LEVEL
+    assert needed == gained   # бар просто полон, а не N/0
+
+
+def test_бонус_способности_растёт_с_уровнем_и_на_первом_нулевой():
+    assert P.level_ability_bonus(1) == 0
+    assert P.level_ability_bonus(0) == 0, "уровня ниже первого не бывает"
+    assert P.level_ability_bonus(P.MAX_PET_LEVEL) > P.level_ability_bonus(5) > 0
+
+
+def test_текст_способности_на_уровне_учитывает_бонус():
+    base = P.ability_text("farm")
+    boosted = P.ability_text_at_level("farm", P.MAX_PET_LEVEL)
+    assert base != boosted
+    assert str(P.ABILITY_BY_KEY["farm"].percent + P.level_ability_bonus(P.MAX_PET_LEVEL)) in boosted
+
+
 def test_способность_работает_только_у_сытого_и_довольного():
     """Смысл всей механики: перестал ухаживать — потерял выгоду."""
     assert P.is_active(100, 100)
@@ -379,6 +468,123 @@ def test_компаньон_замедляет_падение_настроени
     _h, plain = bot_module._pet_now(row)
     _h2, slowed = bot_module._pet_now(row, mood_slowdown=50)
     assert slowed > plain, "с компаньоном настроение должно падать медленнее"
+
+
+# --- смена способности своего питомца ---------------------------------------
+
+def _ability_num(key):
+    return next(i for i, a in enumerate(P.ABILITIES, start=1) if a.key == key)
+
+
+def test_способность_без_номера_только_показывает_цену(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    before = world["coins"]
+    msg, replies = _message("пет способность хомяк")
+    asyncio.run(bot_module.cmd_pet_ability_reroll(msg))
+    assert world["coins"] == before, "без номера деньги не должны списываться"
+    assert world["pets"]["homyak"]["ability"] is None, "без номера способность не меняется"
+    assert "стоит" in replies[0]
+
+
+def test_смена_способности_списывает_и_меняет_бонус(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))  # farm
+    before = world["coins"]
+    num = _ability_num("discount_shop")
+    msg, replies = _message(f"пет способность хомяк {num}")
+    asyncio.run(bot_module.cmd_pet_ability_reroll(msg))
+    assert world["pets"]["homyak"]["ability"] == "discount_shop"
+    price = P.ability_reroll_price(P.BY_KEY["homyak"].price, 0)
+    assert world["coins"] == before - price
+    assert asyncio.run(bot_module._pet_bonus(CHAT_ID, ME, "farm")) == 0, \
+        "старая способность вида больше не должна давать бонус"
+    assert asyncio.run(bot_module._pet_bonus(CHAT_ID, ME, "discount_shop")) == \
+        P.ABILITY_BY_KEY["discount_shop"].percent
+
+
+def test_повторная_смена_дороже(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    num1 = _ability_num("discount_shop")
+    asyncio.run(bot_module.cmd_pet_ability_reroll(_message(f"пет способность хомяк {num1}")[0]))
+    before = world["coins"]
+    num2 = _ability_num("lootbox")
+    asyncio.run(bot_module.cmd_pet_ability_reroll(_message(f"пет способность хомяк {num2}")[0]))
+    price_first = P.ability_reroll_price(P.BY_KEY["homyak"].price, 0)
+    price_second = P.ability_reroll_price(P.BY_KEY["homyak"].price, 1)
+    assert world["coins"] == before - price_second
+    assert price_second > price_first, "вторая смена ЭТОГО питомца должна быть дороже первой"
+
+
+def test_нельзя_задублировать_способность_у_другого_питомца(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))  # farm
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить кот")[0]))    # daily_bonus
+    num = _ability_num("farm")
+    msg, replies = _message(f"пет способность кот {num}")
+    asyncio.run(bot_module.cmd_pet_ability_reroll(msg))
+    assert world["pets"]["kot"]["ability"] is None, "бонус одного вида не должен удваиваться"
+    assert "складываются" in replies[0]
+
+
+def test_смена_способности_не_трогает_вид_в_каталоге(world):
+    """Другие хозяева того же вида и сам вид в каталоге не должны меняться."""
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    num = _ability_num("lootbox")
+    asyncio.run(bot_module.cmd_pet_ability_reroll(_message(f"пет способность хомяк {num}")[0]))
+    specs = asyncio.run(bot_module._pet_specs(CHAT_ID))
+    assert specs["homyak"].ability == "farm"
+
+
+# --- уровень: команды -------------------------------------------------------
+
+def test_кормление_даёт_опыт(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    assert world["pets"]["homyak"]["xp"] == 0
+    asyncio.run(bot_module.cmd_pet_feed(_message("пет кормить хомяк")[0]))
+    assert world["pets"]["homyak"]["xp"] == P.XP_BONUS_FEED
+
+
+def test_ласка_тоже_даёт_опыт(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    asyncio.run(bot_module.cmd_pet_care(_message("пет гладить хомяк")[0]))
+    assert world["pets"]["homyak"]["xp"] == P.XP_BONUS_CARE
+
+
+def test_повторное_кормление_в_откате_опыт_не_копит(world):
+    """Заблокированное действие не должно быть дырой для бесконечного опыта."""
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    asyncio.run(bot_module.cmd_pet_feed(_message("пет кормить хомяк")[0]))
+    xp_after_first = world["pets"]["homyak"]["xp"]
+    asyncio.run(bot_module.cmd_pet_feed(_message("пет кормить хомяк")[0]))
+    assert world["pets"]["homyak"]["xp"] == xp_after_first
+
+
+def test_повышение_уровня_объявляется_в_ответе(world, monkeypatch):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    world["pets"]["homyak"]["xp"] = P.LEVEL_XP_THRESHOLDS[1] - P.XP_BONUS_FEED
+    msg, replies = _message("пет кормить хомяк")
+    asyncio.run(bot_module.cmd_pet_feed(msg))
+    assert bot_module._pet_level(world["pets"]["homyak"]) == 2
+    assert "Новый уровень" in replies[0]
+
+
+def test_прокачанный_питомец_даёт_бонус_больше_базового(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))  # farm
+    world["pets"]["homyak"]["xp"] = P.LEVEL_XP_THRESHOLDS[-1]
+    bonus = asyncio.run(bot_module._pet_bonus(CHAT_ID, ME, "farm"))
+    assert bonus == P.ABILITY_BY_KEY["farm"].percent + P.level_ability_bonus(P.MAX_PET_LEVEL)
+
+
+def test_опыт_растёт_пассивно_от_времени(world):
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    world["pets"]["homyak"]["xp_tick_at"] = datetime.utcnow() - timedelta(hours=10)
+    assert bot_module._pet_xp_now(world["pets"]["homyak"]) == P.XP_PER_HOUR * 10
+
+
+def test_старый_питомец_не_прыгает_на_макс_уровень(world):
+    """xp_tick_at — своя метка, отдельная от last_tick_at покупки: у мигрированных
+    строк её выставляют на «сейчас» отдельно, а не считают с даты покупки."""
+    asyncio.run(bot_module.cmd_pet_buy(_message("пет купить хомяк")[0]))
+    world["pets"]["homyak"]["last_tick_at"] = datetime.utcnow() - timedelta(days=90)
+    assert bot_module._pet_level(world["pets"]["homyak"]) == 1
 
 
 # --- настройка вида питомца из панели --------------------------------------

@@ -92,12 +92,121 @@ ABILITIES: tuple[Ability, ...] = (
 ABILITY_BY_KEY: dict[str, Ability] = {a.key: a for a in ABILITIES}
 
 
+# ----------------------------------------------------------------------------
+# Смена способности своего питомца — платный слив, а не бесплатная перепрошивка.
+# Меняется способность ОДНОГО конкретного питомца конкретного хозяина: вид в
+# каталоге и питомцы других владельцев не трогаются (см. user_pets.ability —
+# override поверх способности вида).
+# ----------------------------------------------------------------------------
+ABILITY_REROLL_SHARE = 0.30       # доля от цены вида — первая смена
+ABILITY_REROLL_FLOOR = 1_000      # даже у дешёвых видов смена не бесплатна
+ABILITY_REROLL_MULTIPLIER = 1.5   # каждая следующая смена ЭТОГО питомца дороже
+
+
+def ability_reroll_price(catalog_price: int, rerolls_done: int) -> int:
+    """Цена смены способности. Растёт с каждой сменой у этого питомца —
+    иначе можно было бы перебирать способности за бесценок, пока не выпадет
+    самая выгодная, и деньги никуда бы не девались."""
+    base = max(ABILITY_REROLL_FLOOR, int(catalog_price * ABILITY_REROLL_SHARE))
+    return int(base * (ABILITY_REROLL_MULTIPLIER ** max(0, int(rerolls_done))))
+
+
+# ----------------------------------------------------------------------------
+# УРОВЕНЬ ПИТОМЦА. Растёт сам по себе от времени — забытый питомец всё равно
+# прокачивается, просто медленно; кормёжка и ласка (в пределах их обычных
+# откатов) дают разовую прибавку сверху и растят быстрее. Чем выше уровень,
+# тем сильнее СПОСОБНОСТЬ (см. level_ability_bonus) — сам питомец не меняется.
+#
+# Опыт хранится числом и растёт лениво по прошедшим часам, как копилка
+# бизнеса, только не падает и не имеет фонового цикла — так же, как сытость
+# и настроение, только в другую сторону.
+# ----------------------------------------------------------------------------
+MAX_PET_LEVEL = 10
+XP_PER_HOUR = 1          # пассивный прирост — просто оттого, что питомец есть
+XP_BONUS_FEED = 6        # разовая прибавка за кормление (раз в FEED_COOLDOWN_MINUTES)
+XP_BONUS_CARE = 4        # разовая прибавка за поглаживание/поцелуй (раз в CARE_COOLDOWN_MINUTES)
+LEVEL_XP_BASE = 80       # опыта нужно на 2 уровень
+LEVEL_XP_GROWTH = 1.35   # во сколько раз дороже каждый следующий уровень
+LEVEL_ABILITY_STEP = 2   # +N процентных пунктов к базовому проценту способности за уровень выше первого
+
+
+def _build_level_thresholds() -> tuple[int, ...]:
+    """Порог опыта для каждого уровня (индекс 0 — уровень 1, порог 0)."""
+    thresholds = [0]
+    need = float(LEVEL_XP_BASE)
+    total = 0.0
+    for _ in range(2, MAX_PET_LEVEL + 1):
+        total += need
+        thresholds.append(int(total))
+        need *= LEVEL_XP_GROWTH
+    return tuple(thresholds)
+
+
+# Посчитан один раз при импорте — как ABILITIES и PETS рядом, а не заново на
+# каждый вызов level_for_xp.
+LEVEL_XP_THRESHOLDS: tuple[int, ...] = _build_level_thresholds()
+
+
+def level_for_xp(xp: int) -> int:
+    level = 1
+    for i, threshold in enumerate(LEVEL_XP_THRESHOLDS[1:], start=2):
+        if xp < threshold:
+            break
+        level = i
+    return level
+
+
+def level_progress(xp: int) -> tuple[int, int, int]:
+    """(уровень, опыт с начала уровня, опыт нужный на следующий уровень).
+
+    На максимальном уровне «нужно» и «набрано» равны — прогресс-бар просто
+    полон, а не делится на ноль.
+    """
+    level = level_for_xp(xp)
+    floor = LEVEL_XP_THRESHOLDS[level - 1]
+    if level >= MAX_PET_LEVEL:
+        gained = xp - floor
+        return level, gained, gained
+    ceiling = LEVEL_XP_THRESHOLDS[level]
+    return level, xp - floor, ceiling - floor
+
+
+def xp_now(stored_xp: int, hours: float) -> int:
+    """Опыт прямо сейчас — растёт сам по себе, без действий хозяина.
+
+    Капается порогом максимального уровня: цифра в базе не обязана расти
+    бесконечно, если хозяин месяцами не заходит."""
+    gained = int(XP_PER_HOUR * hours) if hours > 0 else 0
+    return xp_add(stored_xp, gained)
+
+
+def xp_add(stored_xp: int, bonus: int) -> int:
+    """Разовая прибавка опыта (кормёжка, ласка) с тем же потолком, что и у
+    пассивного роста — иначе прокачанный питомец копил бы в базе бесконечно
+    растущее число, просто не влияющее на уровень."""
+    return min(max(0, int(stored_xp)) + max(0, int(bonus)), LEVEL_XP_THRESHOLDS[-1])
+
+
+def level_ability_bonus(level: int) -> int:
+    """Прибавка в процентных ПУНКТАХ к базовому проценту способности."""
+    return LEVEL_ABILITY_STEP * max(0, int(level) - 1)
+
+
 def ability_text(key: str) -> str:
     """Человеческое описание способности. Пустая строка — способности нет."""
     ability = ABILITY_BY_KEY.get(key or "")
     if ability is None:
         return ""
     return ability.description.format(p=ability.percent)
+
+
+def ability_text_at_level(key: str, level: int) -> str:
+    """То же самое, но с процентом, прокачанным до этого уровня — для
+    описания уже ЗАВЕДЁННОГО питомца, а не вида в каталоге."""
+    ability = ABILITY_BY_KEY.get(key or "")
+    if ability is None:
+        return ""
+    return ability.description.format(p=ability.percent + level_ability_bonus(level))
 
 
 def is_active(hunger: int, mood: int) -> bool:

@@ -1220,7 +1220,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "pet_admin":       {"phrase": "пет удалить {ключ} — убрать вид питомца из каталога", "category": "Разное", "level": LEVEL_ADMIN},
     "pet_list":        {"phrase": "пет / питомцы — свои питомцы, пет каталог — кого можно завести", "category": "Разное", "level": 0},
     "pet_buy":         {"phrase": "пет купить {ключ}", "category": "Разное", "level": 0},
-    "pet_care":        {"phrase": "пет кормить / пет гладить / пет поцеловать / пет назвать / пет закрепить", "category": "Разное", "level": 0},
+    "pet_care":        {"phrase": "пет кормить / пет гладить / пет поцеловать / пет назвать / пет закрепить / пет способность / пет способности", "category": "Разное", "level": 0},
     "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет", "category": "Экономика", "level": 0},
     "business_equip":  {"phrase": "бизнес оснащение [ключ] / бизнес оснастить {бизнес} {что}", "category": "Экономика", "level": 0},
     "business_raid":   {"phrase": "налёт [@кому] / бизнес налёт — обнести чужую копилку", "category": "Экономика", "level": 0},
@@ -7380,7 +7380,8 @@ async def handle_user_message(message: Message):
         return
 
     if is_admin(user_id) and not in_test_mode:
-        await message.answer("Вы админ. Напишите «админка» для настройки бота.")
+        await message.answer("Вы админ. Напишите «админка» для настройки бота.",
+                             reply_markup=private_menu_kb(user_id))
         return
 
     if not settings_configured():
@@ -15473,6 +15474,9 @@ PET_FEED_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+(?:кормить|покорми
 PET_CARE_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+(гладить|погладить|поцеловать|целовать)(?:\s+(\S+))?$")
 PET_PIN_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+закрепить\s+(\S+)$")
 PET_UNPIN_TRIGGERS = {"пет открепить", "питомец открепить", "петы открепить"}
+PET_ABILITY_RE = re.compile(rf"(?i)^!?{PET_WORD}\s+способность\s+(\S+)(?:\s+(\d+))?$")
+PET_ABILITY_LIST_TRIGGERS = {"пет способности", "питомец способности", "петы способности",
+                             "!пет способности", "!питомец способности", "!петы способности"}
 
 
 async def _pet_lucky(chat_id: int, user_id: int, amount: int, ability: str) -> int:
@@ -15515,15 +15519,28 @@ async def _pet_bonus(chat_id: int, user_id: int, ability: str) -> int:
     total = 0
     for row in rows:
         spec = specs.get(row["pet_key"])
-        if spec is None or spec.ability != ability:
+        if spec is None:
+            continue
+        current = _effective_ability(row, spec)
+        if current != ability:
             continue
         hunger, mood = _pet_now(row)
         if not pets_catalog.is_active(hunger, mood):
             continue
-        found = pets_catalog.ABILITY_BY_KEY.get(spec.ability)
+        found = pets_catalog.ABILITY_BY_KEY.get(current)
         if found is not None:
-            total += found.percent
+            total += found.percent + pets_catalog.level_ability_bonus(_pet_level(row))
     return total
+
+
+def _effective_ability(row: dict, spec) -> str:
+    """Способность питомца У ЭТОГО хозяина: своя, если её меняли за деньги
+    (row['ability'] — override, см. пет способность), иначе — способность
+    вида из каталога. NULL/пусто в row означает «override не задан»."""
+    override = row.get("ability")
+    if override:
+        return override
+    return spec.ability if spec else pets_catalog.ABILITY_NONE
 
 
 # Настройки видов питомцев в конкретном чате: выключен ли вид и есть ли
@@ -15586,6 +15603,24 @@ def _pet_hours(row: dict) -> float:
     return max(0.0, (datetime.utcnow() - last).total_seconds() / 3600)
 
 
+def _pet_xp_hours(row: dict) -> float:
+    """Отдельная метка от _pet_hours: xp_tick_at не имеет истории с покупки
+    питомца (см. миграцию в db.ensure_pets_table) — считать опыт от
+    last_tick_at выдало бы старым питомцам мгновенный максимальный уровень."""
+    last = row.get("xp_tick_at")
+    if not last:
+        return 0.0
+    return max(0.0, (datetime.utcnow() - last).total_seconds() / 3600)
+
+
+def _pet_xp_now(row: dict) -> int:
+    return pets_catalog.xp_now(int(row.get("xp") or 0), _pet_xp_hours(row))
+
+
+def _pet_level(row: dict) -> int:
+    return pets_catalog.level_for_xp(_pet_xp_now(row))
+
+
 def _pet_now(row: dict, mood_slowdown: int = 0) -> tuple[int, int]:
     """Сытость и настроение ПРЯМО СЕЙЧАС, с учётом прошедшего времени.
 
@@ -15622,12 +15657,21 @@ async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
     for row in rows:
         spec = specs.get(row["pet_key"])
         hunger, mood = _pet_now(row, slowdown)
-        line = (f"{_pet_display(row, spec)} (<code>{row['pet_key']}</code>)\n"
+        xp = _pet_xp_now(row)
+        level, gained, needed = pets_catalog.level_progress(xp)
+        level_label = (f"MAX" if level >= pets_catalog.MAX_PET_LEVEL
+                       else f"{level}/{pets_catalog.MAX_PET_LEVEL}")
+        line = (f"{_pet_display(row, spec)} (<code>{row['pet_key']}</code>) "
+                f"— ⭐ ур. {level_label}\n"
                 f"   🍽 {pets_catalog.bar(hunger)} {hunger}   "
                 f"😊 {pets_catalog.bar(mood)} {mood}   {pets_catalog.state_text(hunger, mood)}")
+        if level < pets_catalog.MAX_PET_LEVEL:
+            progress = round(100 * gained / needed) if needed else 100
+            line += f"\n   📈 {pets_catalog.bar(progress)} {gained}/{needed} опыта"
         # Способность и то, работает ли она сейчас: иначе непонятно, зачем
-        # вообще кормить.
-        text = pets_catalog.ability_text(spec.ability) if spec else ""
+        # вообще кормить. Процент — уже с прибавкой за уровень.
+        ability_key = _effective_ability(row, spec) if spec else ""
+        text = pets_catalog.ability_text_at_level(ability_key, level) if ability_key else ""
         if text:
             works = "✅" if pets_catalog.is_active(hunger, mood) else "💤 спит"
             line += f"\n   ✨ {text} — {works}"
@@ -15637,7 +15681,11 @@ async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
                       "<code>пет гладить {ключ}</code> · "
                       "<code>пет поцеловать {ключ}</code>",
                   "<code>пет назвать {ключ} {имя}</code> · "
-                  "<code>пет закрепить {ключ}</code>"]
+                  "<code>пет закрепить {ключ}</code>",
+                  "<code>пет способность {ключ} {номер}</code> — сменить "
+                  "способность за i¢, список номеров: <code>пет способности</code>",
+                  "⭐ Уровень растёт сам по себе со временем, кормёжка и "
+                  "ласка ускоряют."]
     return "\n".join(lines)
 
 
@@ -15776,10 +15824,16 @@ async def cmd_pet_feed(message: Message):
         return
     hunger, mood = _pet_now(row)
     hunger = pets_catalog.gain(hunger, pets_catalog.FEED_GAIN)
+    level_before = _pet_level(row)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_FEED)
     await db.set_pet_stats(message.chat.id, message.from_user.id, spec.key,
-                           hunger, mood, now, fed_at=now)
-    await message.reply(f"🍽 {_pet_display(row)} накормлен(а). Сытость: "
-                        f"{pets_catalog.bar(hunger)} {hunger}")
+                           hunger, mood, xp, now, fed_at=now)
+    text = (f"🍽 {_pet_display(row)} накормлен(а). Сытость: "
+           f"{pets_catalog.bar(hunger)} {hunger}")
+    level_after = pets_catalog.level_for_xp(xp)
+    if level_after > level_before:
+        text += f"\n⭐ Новый уровень: {level_after}!"
+    await message.reply(text)
 
 
 @router.message(
@@ -15806,11 +15860,17 @@ async def cmd_pet_care(message: Message):
     hunger, mood = _pet_now(row)
     kiss = verb.startswith(("поцел", "целов"))
     mood = pets_catalog.gain(mood, pets_catalog.KISS_GAIN if kiss else pets_catalog.PET_GAIN)
+    level_before = _pet_level(row)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_CARE)
     await db.set_pet_stats(message.chat.id, message.from_user.id, spec.key,
-                           hunger, mood, now, care_at=now)
+                           hunger, mood, xp, now, care_at=now)
     action = "поцеловали" if kiss else "погладили"
-    await message.reply(f"💞 Вы {action} {_pet_display(row)} — {spec.sound}. "
-                        f"Настроение: {pets_catalog.bar(mood)} {mood}")
+    text = (f"💞 Вы {action} {_pet_display(row)} — {spec.sound}. "
+           f"Настроение: {pets_catalog.bar(mood)} {mood}")
+    level_after = pets_catalog.level_for_xp(xp)
+    if level_after > level_before:
+        text += f"\n⭐ Новый уровень: {level_after}!"
+    await message.reply(text)
 
 
 @router.message(
@@ -15860,6 +15920,111 @@ async def cmd_pet_unpin(message: Message):
         return
     await db.set_pinned_pet(message.chat.id, message.from_user.id, None)
     await message.reply("📌 Питомец больше не показывается в профиле.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and t.strip().casefold() in PET_ABILITY_LIST_TRIGGERS),
+)
+async def cmd_pet_abilities_list(message: Message):
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    lines = ["🐾 <b>Способности</b> — номер для "
+             "<code>пет способность {ключ} {номер}</code>", DIVIDER,
+             "0. Без способности"]
+    for i, ability in enumerate(pets_catalog.ABILITIES, start=1):
+        lines.append(f"{i}. <b>{ability.name}</b> — "
+                     f"{ability.description.format(p=ability.percent)}")
+    await message.reply("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(PET_ABILITY_RE.match(t.strip()))),
+)
+async def cmd_pet_ability_reroll(message: Message):
+    """Платная смена способности СВОЕГО питомца — вид в каталоге и питомцы
+    других хозяев того же вида не трогаются (см. _effective_ability)."""
+    if not _check_misc_access(message.from_user.id, "pet_care"):
+        return
+    match = PET_ABILITY_RE.match(message.text.strip())
+    chat_id, user_id = message.chat.id, message.from_user.id
+    key_raw = match.group(1)
+    if match.group(2) is None and key_raw.isdigit():
+        # «пет способность 5» — похоже, что номер способности приняли за
+        # ключ (как в «пет кормить» без ключа для единственного питомца).
+        # Ключ у нас обязателен, потому что без него неясно, это ключ или
+        # номер — поэтому явно подсказываем, а не отвечаем «нет такого».
+        await message.reply(
+            "Нужен ключ питомца: <code>пет способность {ключ} [номер]</code> — "
+            f"например, <code>пет способность кот</code> покажет цену, а "
+            f"<code>пет способность кот {key_raw}</code> сменит на способность №{key_raw}."
+        )
+        return
+    spec, row = await _pick_pet(message, key_raw)
+    if spec is None:
+        return
+    rerolls = int(row.get("ability_rerolls") or 0)
+    price = pets_catalog.ability_reroll_price(spec.price, rerolls)
+    level = _pet_level(row)
+    current_text = (pets_catalog.ability_text_at_level(_effective_ability(row, spec), level)
+                    or "без способности")
+    # Без номера — только показать цену и текущую способность, деньги не
+    # трогаем: цену нужно узнать ДО того, как она спишется, а не после.
+    if match.group(2) is None:
+        await message.reply(
+            f"{_pet_display(row, spec)}: сейчас — {current_text}.\n"
+            f"Смена стоит <b>{price}</b> i¢ (дальше дороже).\n"
+            f"Список способностей и номеров: <code>пет способности</code>\n"
+            f"Сменить: <code>пет способность {spec.key} {{номер}}</code>"
+        )
+        return
+    choice = int(match.group(2))
+    if choice > len(pets_catalog.ABILITIES):
+        await message.reply(f"Нужен номер от 0 до {len(pets_catalog.ABILITIES)} — "
+                            f"список: <code>пет способности</code>.")
+        return
+    new_ability = (pets_catalog.ABILITY_NONE if choice == 0
+                   else pets_catalog.ABILITIES[choice - 1].key)
+    current = _effective_ability(row, spec)
+    if new_ability == current:
+        await message.reply(f"У {_pet_display(row, spec)} уже эта способность.")
+        return
+    # Бонусы одного вида не должны складываться дважды у одного игрока —
+    # иначе выгоднее было бы не разнообразить питомцев, а перевести всех на
+    # одну способность.
+    if new_ability != pets_catalog.ABILITY_NONE:
+        specs = await _pet_specs(chat_id)
+        for other in await db.list_pets(chat_id, user_id):
+            if other["pet_key"] == spec.key:
+                continue
+            if _effective_ability(other, specs.get(other["pet_key"])) == new_ability:
+                ability_name = pets_catalog.ABILITY_BY_KEY[new_ability].name
+                await message.reply(
+                    f"Способность «{ability_name}» уже есть у другого вашего "
+                    f"питомца — одинаковые способности не складываются."
+                )
+                return
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    if not await spend_coins(chat_id, user_id, price):
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Недостаточно монет: смена способности стоит <b>{price}</b> i¢, "
+            f"а у вас {wallet.get('coins', 0)} i¢."
+        )
+        return
+    if not await db.set_pet_ability(chat_id, user_id, spec.key, new_ability, rerolls + 1):
+        await db.add_coins(chat_id, user_id, price)   # гонка — деньги назад
+        await message.reply("Не удалось сменить способность — попробуйте ещё раз.")
+        return
+    await db.add_log("pet_ability_reroll", chat_id=chat_id, actor_id=user_id,
+                     details=f"{spec.key}:{new_ability}:{price}")
+    new_text = ("без способности" if new_ability == pets_catalog.ABILITY_NONE
+                else pets_catalog.ability_text_at_level(new_ability, level))
+    await message.reply(f"✨ {_pet_display(row, spec)} теперь: {new_text}\n"
+                        f"Списано {price} i¢.")
 
 
 @router.callback_query(F.data.startswith("profile_pets:"))
@@ -15941,7 +16106,8 @@ async def _show_pet_item_menu(message: Message, state: FSMContext, key: str) -> 
     )
 
 
-@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_pets))
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_pets),
+                F.text != BTN_BACK, F.text != BTN_PET_ADD)
 async def cfg_pet_pick(message: Message, state: FSMContext):
     """Выбор питомца из списка — кнопка подписана «эмодзи название»."""
     label = (message.text or "").strip()
@@ -16069,7 +16235,9 @@ async def cfg_pet_edit_value(message: Message, state: FSMContext):
     _pet_settings.pop(key, None)
     await db.add_log("pet_edited", chat_id=_pets_admin_chat_id(),
                      actor_id=message.from_user.id, details=f"{key}:{field}")
-    await message.answer("✅ Сохранено.")
+    note = ("\n\nТем, кто уже сменил способность за i¢ (<code>пет способность</code>), "
+            "это не поменяет — у них своя, поверх вида." if field == "ability" else "")
+    await message.answer(f"✅ Сохранено.{note}")
     await _show_pet_item_menu(message, state, key)
 
 
@@ -23517,7 +23685,8 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
             hunger, mood = _pet_now(pet_row)
             given = pet_row.get("pet_name")
             shown = f"{pet_spec.title} «{html.escape(given)}»" if given else pet_spec.title
-            lines.append(f"🐾 Питомец: {shown} — {pets_catalog.state_text(hunger, mood)}")
+            level = _pet_level(pet_row)
+            lines.append(f"🐾 Питомец: {shown} — ⭐{level} — {pets_catalog.state_text(hunger, mood)}")
     if card and card.get("pinned_business"):
         # Бизнес мог быть продан или передан уже после закрепления — тогда
         # строку просто не рисуем, а не показываем чужое. Уровень и состояние

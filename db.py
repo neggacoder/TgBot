@@ -7733,10 +7733,32 @@ async def ensure_pets_table() -> None:
         "last_fed_at DATETIME NULL, "
         "last_care_at DATETIME NULL, "
         "bought_at DATETIME NOT NULL, "
+        "ability VARCHAR(32) NULL DEFAULT NULL, "
+        "ability_rerolls INT NOT NULL DEFAULT 0, "
+        "xp INT NOT NULL DEFAULT 0, "
+        "xp_tick_at DATETIME NULL, "
         "PRIMARY KEY (chat_id, user_id, pet_key)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
     await _add_column_if_missing("profile_cards", "pinned_pet", "VARCHAR(32) DEFAULT NULL")
+    # ability = NULL значит «способность вида из каталога»; заполняется, только
+    # когда хозяин платно меняет способность именно этому питомцу (см. pets.py
+    # ability_reroll_price) — на вид в каталоге и на питомцев других хозяев
+    # это не влияет.
+    await _add_column_if_missing("user_pets", "ability", "VARCHAR(32) NULL DEFAULT NULL")
+    await _add_column_if_missing("user_pets", "ability_rerolls", "INT NOT NULL DEFAULT 0")
+    # Уровень растёт от xp, а xp — лениво по часам с xp_tick_at (см. pets.py
+    # xp_now). Специально СВОЯ метка времени, а не last_tick_at: у него уже
+    # есть история с покупки питомца, и завести уровень от неё значило бы
+    # мгновенно выдать всем старым питомцам максимальный уровень в день
+    # обновления бота. Поэтому у существующих строк метку старта опыта
+    # обнуляем на «сейчас» ниже — прокачка стартует с нуля с этого момента.
+    await _add_column_if_missing("user_pets", "xp", "INT NOT NULL DEFAULT 0")
+    await _add_column_if_missing("user_pets", "xp_tick_at", "DATETIME NULL")
+    await _execute(
+        "UPDATE user_pets SET xp_tick_at = %s WHERE xp_tick_at IS NULL",
+        (datetime.utcnow(),),
+    )
 
 
 async def ensure_seasons_table() -> None:
@@ -7912,7 +7934,8 @@ async def delete_pet_spec(chat_id: int, key: str) -> bool:
 async def list_pets(chat_id: int, user_id: int) -> list[dict]:
     return await _fetchall(
         "SELECT pet_key, pet_name, hunger, mood, last_tick_at, last_fed_at, "
-        "last_care_at, bought_at FROM user_pets "
+        "last_care_at, bought_at, ability, ability_rerolls, xp, xp_tick_at "
+        "FROM user_pets "
         "WHERE chat_id = %s AND user_id = %s ORDER BY bought_at",
         (chat_id, user_id),
     )
@@ -7921,7 +7944,8 @@ async def list_pets(chat_id: int, user_id: int) -> list[dict]:
 async def get_pet(chat_id: int, user_id: int, key: str) -> Optional[dict]:
     return await _fetchone(
         "SELECT pet_key, pet_name, hunger, mood, last_tick_at, last_fed_at, "
-        "last_care_at, bought_at FROM user_pets "
+        "last_care_at, bought_at, ability, ability_rerolls, xp, xp_tick_at "
+        "FROM user_pets "
         "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
         (chat_id, user_id, key),
     )
@@ -7931,23 +7955,25 @@ async def add_pet(chat_id: int, user_id: int, key: str, now) -> bool:
     """Заводит питомца. False — такой у человека уже есть."""
     changed = await _execute(
         "INSERT IGNORE INTO user_pets "
-        "(chat_id, user_id, pet_key, hunger, mood, last_tick_at, bought_at) "
-        "VALUES (%s, %s, %s, 100, 100, %s, %s)",
-        (chat_id, user_id, key, now, now),
+        "(chat_id, user_id, pet_key, hunger, mood, last_tick_at, bought_at, xp_tick_at) "
+        "VALUES (%s, %s, %s, 100, 100, %s, %s, %s)",
+        (chat_id, user_id, key, now, now, now),
     )
     return bool(changed)
 
 
 async def set_pet_stats(chat_id: int, user_id: int, key: str,
-                        hunger: int, mood: int, now,
+                        hunger: int, mood: int, xp: int, now,
                         fed_at=None, care_at=None) -> None:
-    """Фиксирует сытость и настроение на момент now.
+    """Фиксирует сытость, настроение и опыт на момент now.
 
-    Отметки о кормлении и ласке ставятся только если переданы: одно действие
-    не должно сбрасывать откат другого.
+    xp — уже посчитанный вызывающим итог (пассивный прирост с прошлого раза
+    плюс бонус за действие, см. pets.xp_now): здесь просто банкуется, как
+    и hunger/mood. Отметки о кормлении и ласке ставятся только если переданы:
+    одно действие не должно сбрасывать откат другого.
     """
-    sets = ["hunger = %s", "mood = %s", "last_tick_at = %s"]
-    args: list = [max(0, int(hunger)), max(0, int(mood)), now]
+    sets = ["hunger = %s", "mood = %s", "last_tick_at = %s", "xp = %s", "xp_tick_at = %s"]
+    args: list = [max(0, int(hunger)), max(0, int(mood)), now, max(0, int(xp)), now]
     if fed_at is not None:
         sets.append("last_fed_at = %s")
         args.append(fed_at)
@@ -7968,6 +7994,26 @@ async def rename_pet(chat_id: int, user_id: int, key: str, name: Optional[str]) 
         "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
         (name, chat_id, user_id, key),
     )
+
+
+async def set_pet_ability(chat_id: int, user_id: int, key: str,
+                          ability: str, rerolls: int) -> bool:
+    """Индивидуальная способность питомца — только у этого хозяина.
+
+    ability здесь никогда не NULL: «сбросить к способности вида» этой
+    командой не делают, а явный выбор «без способности» тоже сохраняется
+    как значение (pets.ABILITY_NONE), а не NULL — NULL означает «override
+    не задан», а не «выбрано отсутствие способности».
+
+    Возвращает, задело ли обновление строку — деньги уже списаны к этому
+    моменту, и по False вызывающий обязан их вернуть (гонка: питомца
+    отпустили между чтением и списанием).
+    """
+    return bool(await _execute(
+        "UPDATE user_pets SET ability = %s, ability_rerolls = %s "
+        "WHERE chat_id = %s AND user_id = %s AND pet_key = %s",
+        (ability, rerolls, chat_id, user_id, key),
+    ))
 
 
 async def set_pinned_pet(chat_id: int, user_id: int, key: Optional[str]) -> None:
