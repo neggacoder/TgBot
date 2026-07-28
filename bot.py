@@ -90,6 +90,7 @@ import pets as pets_catalog
 import pins
 import professions
 import ru_text
+from dataclasses import dataclass
 import shop_effects
 from quote_render import QuoteMessage, render_quote
 from quote_render import assets as quote_assets
@@ -16511,7 +16512,7 @@ async def _pet_bonus(chat_id: int, user_id: int, ability: str) -> int:
     # активности остальных, иначе панда не могла бы вытянуть загрустившую
     # компанию, ради чего она и заводится.
     pinned_key = await _pinned_pet_key(chat_id, user_id)
-    slowdown = _pet_mood_slowdown(rows, specs, pinned_key)
+    aura = _pet_aura(rows, specs, pinned_key)
     # Закреплённому питомцу способность засыпает позже — это его слот
     # экипировки (см. pins.PET_LOW_STAT). Карточку читаем один раз на весь
     # проход, а не по разу на питомца.
@@ -16522,7 +16523,7 @@ async def _pet_bonus(chat_id: int, user_id: int, ability: str) -> int:
             continue
         if ability not in _effective_abilities(row, spec):
             continue
-        hunger, mood = _pet_now(row, slowdown)
+        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
         if not _pet_is_active(row, hunger, mood, pinned_key):
             continue
         total += pets_catalog.ability_percent(
@@ -16531,6 +16532,9 @@ async def _pet_bonus(chat_id: int, user_id: int, ability: str) -> int:
 
 
 ABILITY_PET_MOOD = "pet_mood"
+ABILITY_PET_HUNGER = "pet_hunger"
+ABILITY_PET_XP = "pet_xp"
+ABILITY_PET_WALK = "pet_walk"
 
 
 def _pet_is_active(row: dict, hunger: int, mood: int,
@@ -16555,6 +16559,65 @@ async def _pinned_pet_key(chat_id: int, user_id: int) -> Optional[str]:
     return (card or {}).get("pinned_pet")
 
 
+def _pet_family_bonus(rows: list[dict], specs: dict, ability: str,
+                      pinned_key: Optional[str] = None) -> int:
+    """Сила способности, которая действует на ВСЕХ питомцев хозяина сразу.
+
+    Таких четыре: «Компаньон» (настроение), «Хозяйственный» (сытость),
+    «Наставник» (опыт) и «Следопыт» (монеты с прогулки). Считаются они
+    одинаково, поэтому и код один: разойдись он на четыре копии, однажды
+    одна из них забыла бы про эволюцию или про закреп.
+
+    Рекурсии здесь нет намеренно: сам носитель проверяется по состоянию БЕЗ
+    поблажки — иначе он поддерживал бы сам себя, и вопрос «работает ли он» не
+    имел бы однозначного ответа.
+    """
+    total = 0
+    found = pets_catalog.ABILITY_BY_KEY.get(ability)
+    if found is None:
+        return 0
+    for row in rows:
+        spec = specs.get(row["pet_key"])
+        if spec is None or ability not in _effective_abilities(row, spec):
+            continue
+        hunger, mood = _pet_now(row)          # без поблажки — см. докстринг
+        if not _pet_is_active(row, hunger, mood, pinned_key):
+            continue
+        total += pets_catalog.ability_percent(
+            ability, _pet_level(row), evolved=bool(row.get("evolved")))
+    return total
+
+
+@dataclass(frozen=True)
+class PetAura:
+    """Что способности ваших питомцев дают ВСЕМ вашим питомцам сразу.
+
+    Одной структурой, а не россыпью процентов по аргументам: таких способностей
+    уже четыре, и следующая иначе потребовала бы править сигнатуру кормёжки,
+    ласки и прогулки разом — а забыть одну из трёх проще простого.
+    """
+    mood: int = 0      # «Компаньон» — настроение падает медленнее
+    hunger: int = 0    # «Хозяйственный» — сытость падает медленнее
+    xp: int = 0        # «Наставник» — опыт растёт быстрее
+    walk: int = 0      # «Следопыт» — больше монет с прогулки
+
+    def xp_gain(self, base: int) -> int:
+        return base + base * max(0, self.xp) // 100
+
+    def walk_coins(self, base: int) -> int:
+        return base + base * max(0, self.walk) // 100
+
+
+def _pet_aura(rows: list[dict], specs: dict,
+              pinned_key: Optional[str] = None) -> PetAura:
+    return PetAura(
+        mood=_pet_family_bonus(rows, specs, ABILITY_PET_MOOD, pinned_key),
+        hunger=_pet_family_bonus(rows, specs, ABILITY_PET_HUNGER, pinned_key),
+        xp=_pet_family_bonus(rows, specs, ABILITY_PET_XP, pinned_key),
+        walk=_pet_family_bonus(rows, specs, ABILITY_PET_WALK, pinned_key),
+    )
+
+
 def _pet_mood_slowdown(rows: list[dict], specs: dict,
                        pinned_key: Optional[str] = None) -> int:
     """На сколько процентов медленнее падает настроение у всех питомцев хозяина.
@@ -16570,23 +16633,16 @@ def _pet_mood_slowdown(rows: list[dict], specs: dict,
     по его состоянию БЕЗ поблажки. Иначе панда поддерживала бы сама себя, и
     вопрос «работает ли она» не имел бы однозначного ответа.
     """
-    total = 0
-    ability = pets_catalog.ABILITY_BY_KEY.get(ABILITY_PET_MOOD)
-    if ability is None:
-        return 0
-    for row in rows:
-        spec = specs.get(row["pet_key"])
-        if spec is None or ABILITY_PET_MOOD not in _effective_abilities(row, spec):
-            continue
-        hunger, mood = _pet_now(row)          # без поблажки — см. докстринг
-        if not _pet_is_active(row, hunger, mood, pinned_key):
-            continue
-        total += pets_catalog.ability_percent(
-            ABILITY_PET_MOOD, _pet_level(row), evolved=bool(row.get("evolved")))
-    return total
+    return _pet_family_bonus(rows, specs, ABILITY_PET_MOOD, pinned_key)
 
 
-async def _pet_slowdown_for(chat_id: int, user_id: int) -> int:
+def _pet_hunger_slowdown(rows: list[dict], specs: dict,
+                         pinned_key: Optional[str] = None) -> int:
+    """«Хозяйственный» (лебедь за брак): сытость всех падает медленнее."""
+    return _pet_family_bonus(rows, specs, ABILITY_PET_HUNGER, pinned_key)
+
+
+async def _pet_aura_for(chat_id: int, user_id: int) -> "PetAura":
     """То же самое, но когда строк питомцев под рукой нет (поштучные команды).
 
     Ошибку глотаем по той же причине, что и в _pet_bonus: поблажка — приятная
@@ -16595,12 +16651,12 @@ async def _pet_slowdown_for(chat_id: int, user_id: int) -> int:
     try:
         rows = await db.list_pets(chat_id, user_id)
         if not rows:
-            return 0
-        return _pet_mood_slowdown(rows, await _pet_specs(chat_id),
-                                  await _pinned_pet_key(chat_id, user_id))
+            return PetAura()
+        return _pet_aura(rows, await _pet_specs(chat_id),
+                         await _pinned_pet_key(chat_id, user_id))
     except Exception as exc:
-        log_suppressed("_pet_slowdown_for", exc)
-        return 0
+        log_suppressed("_pet_aura_for", exc)
+        return PetAura()
 
 
 def _effective_abilities(row: dict, spec) -> tuple[str, ...]:
@@ -16646,6 +16702,12 @@ async def _pet_specs(chat_id: int) -> dict:
             # молча становились бесполезными: в каталоге эффект есть, а
             # в объекте — ABILITY_NONE по умолчанию.
             ability=row.get("ability") or pets_catalog.ABILITY_NONE,
+            # За какую ачивку выдаётся — только у встроенных: админ наградных
+            # видов не заводит, и хранить это в БД незачем. Без переноса
+            # наградный питомец, прочитанный из каталога, оказался бы обычным
+            # покупным — ровно как когда-то терялась способность.
+            achievement=(pets_catalog.BY_KEY.get(row["pet_key"])
+                         or pets_catalog.Pet("", "", "", 0, "")).achievement,
         )
         # Выключатель и потолок численности живут только в базе (их правит
         # панель), поэтому кладём их рядом со спецификацией, а не в саму
@@ -16701,7 +16763,8 @@ def _pet_level(row: dict) -> int:
     return pets_catalog.level_for_xp(_pet_xp_now(row))
 
 
-def _pet_now(row: dict, mood_slowdown: int = 0) -> tuple[int, int]:
+def _pet_now(row: dict, mood_slowdown: int = 0,
+             hunger_slowdown: int = 0) -> tuple[int, int]:
     """Сытость и настроение ПРЯМО СЕЙЧАС, с учётом прошедшего времени.
 
     mood_slowdown — на сколько процентов медленнее падает настроение
@@ -16710,10 +16773,11 @@ def _pet_now(row: dict, mood_slowdown: int = 0) -> tuple[int, int]:
     """
     hours = _pet_hours(row)
     mood_hours = hours * (100 - max(0, min(mood_slowdown, 90))) / 100
+    hunger_hours = hours * (100 - max(0, min(hunger_slowdown, 90))) / 100
     stored_hunger = int(row.get("hunger") or 0)
-    hunger = (pets_catalog.hunger_now_evolved(stored_hunger, hours)
+    hunger = (pets_catalog.hunger_now_evolved(stored_hunger, hunger_hours)
               if row.get("evolved")
-              else pets_catalog.hunger_now(stored_hunger, hours))
+              else pets_catalog.hunger_now(stored_hunger, hunger_hours))
     return hunger, pets_catalog.mood_now(int(row.get("mood") or 0), mood_hours)
 
 
@@ -16743,11 +16807,11 @@ async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
                 else "🐾 У этого человека пока нет питомцев.")
     specs = await _pet_specs(chat_id)
     pinned_key = await _pinned_pet_key(chat_id, user_id)
-    slowdown = _pet_mood_slowdown(rows, specs, pinned_key)
+    aura = _pet_aura(rows, specs, pinned_key)
     lines = [f"🐾 <b>Питомцы</b> — {len(rows)}", DIVIDER]
     for row in rows:
         spec = specs.get(row["pet_key"])
-        hunger, mood = _pet_now(row, slowdown)
+        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
         xp = _pet_xp_now(row)
         level, gained, needed = pets_catalog.level_progress(xp)
         level_label = (f"MAX" if level >= pets_catalog.MAX_PET_LEVEL
@@ -16821,7 +16885,13 @@ async def cmd_pets_catalog(message: Message):
     specs = await _pet_specs(message.chat.id)
     lines = ["🐾 <b>Питомцы</b> — кого можно завести", DIVIDER]
     for spec in sorted(specs.values(), key=lambda s: s.price):
-        mark = " ✅ уже есть" if spec.key in owned else f" — {spec.price} i¢"
+        if spec.key in owned:
+            mark = " ✅ уже есть"
+        elif getattr(spec, "achievement", ""):
+            info = ACHIEVEMENTS.get(spec.achievement) or {}
+            mark = f" 🏅 за ачивку «{info.get('title') or spec.achievement}»"
+        else:
+            mark = f" — {spec.price} i¢"
         lines.append(f"{spec.title} (<code>{spec.key}</code>){mark}")
         text = pets_catalog.ability_text(spec.ability)
         if text:
@@ -16859,6 +16929,14 @@ async def cmd_pet_buy(message: Message):
     spec = await _pet_spec(chat_id, raw_key)
     if spec is None:
         await message.reply("Такого питомца нет — посмотрите <code>пет каталог</code>.")
+        return
+    if spec.by_achievement:
+        info = ACHIEVEMENTS.get(spec.achievement) or {}
+        await message.reply(
+            f"{spec.title} не продаётся — его выдают за ачивку "
+            f"«{info.get('title') or spec.achievement}»"
+            + (f" ({info['desc']})." if info.get("desc") else ".")
+        )
         return
     if await db.get_pet(chat_id, user_id, spec.key):
         await message.reply(f"{spec.title} у вас уже есть.")
@@ -16966,7 +17044,7 @@ def _pet_no_food_text() -> str:
 
 
 async def _feed_pet(chat_id: int, user_id: int, spec, row: dict,
-                    now: datetime, slowdown: int = 0) -> Optional[tuple[int, int, int]]:
+                    now: datetime, aura: "PetAura" = None) -> Optional[tuple[int, int, int]]:
     """Одно кормление: тратит корм и банкует статы.
 
     Возвращает (сытость, уровень до, уровень после) или None — корма не
@@ -16978,14 +17056,15 @@ async def _feed_pet(chat_id: int, user_id: int, spec, row: dict,
     тем же порядком, каким при покупке питомца сначала списываются деньги,
     а потом возвращаются при неудаче.
     """
+    aura = aura or PetAura()
     if not await db.remove_inventory_item(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY):
         return None
     # Поблажка «Компаньона» обязана участвовать здесь: настроение отсюда
     # БАНКУЕТСЯ, и посчитанное без неё стёрло бы её накопленный эффект.
-    hunger, mood = _pet_now(row, slowdown)
+    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
     hunger = pets_catalog.gain(hunger, pets_catalog.FEED_GAIN)
     level_before = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_FEED)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.XP_BONUS_FEED))
     try:
         await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
                                now, fed_at=now)
@@ -17013,16 +17092,18 @@ def _care_past(verb: str) -> str:
 
 
 async def _care_pet(chat_id: int, user_id: int, spec, row: dict, verb: str,
-                    now: datetime, slowdown: int = 0) -> tuple[int, int, int]:
+                    now: datetime, aura: "PetAura" = None) -> tuple[int, int, int]:
     """Одна ласка: (настроение, уровень до, уровень после). Ласка бесплатна —
     платить нужно за еду, а не за внимание.
 
-    slowdown — поблажка «Компаньона»: настроение отсюда банкуется, и посчитать
-    его без неё значило бы стирать её при каждой ласке."""
-    hunger, mood = _pet_now(row, slowdown)
+    aura — способности, действующие на всех ваших питомцев (см. PetAura):
+    настроение отсюда БАНКУЕТСЯ, и посчитать его без поблажки значило бы
+    стирать её при каждой ласке."""
+    aura = aura or PetAura()
+    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
     mood = pets_catalog.gain(mood, _care_gain(verb))
     level_before = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.XP_BONUS_CARE)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.XP_BONUS_CARE))
     await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
                            now, care_at=now)
     return mood, level_before, pets_catalog.level_for_xp(xp)
@@ -17075,9 +17156,9 @@ async def cmd_pet_feed_all(message: Message):
     if not pairs:
         return
     now = datetime.utcnow()
-    slowdown = _pet_mood_slowdown(
-        [row for row, _ in pairs], {spec.key: spec for _, spec in pairs},
-        await _pinned_pet_key(chat_id, user_id))
+    aura = _pet_aura([row for row, _ in pairs],
+                     {spec.key: spec for _, spec in pairs},
+                     await _pinned_pet_key(chat_id, user_id))
     waiting: list[tuple[object, timedelta]] = []
     hungry: list[tuple[dict, object]] = []
     for row, spec in pairs:
@@ -17092,7 +17173,7 @@ async def cmd_pet_feed_all(message: Message):
     fed: list[tuple[dict, object, tuple[int, int, int]]] = []
     unfed = 0
     for i, (row, spec) in enumerate(hungry):
-        result = await _feed_pet(chat_id, user_id, spec, row, now, slowdown)
+        result = await _feed_pet(chat_id, user_id, spec, row, now, aura)
         if result is None:
             # Корм кончился — остальных кормить нечем, дальше идти незачем.
             unfed = len(hungry) - i
@@ -17132,9 +17213,9 @@ async def cmd_pet_care_all(message: Message):
     if not pairs:
         return
     now = datetime.utcnow()
-    slowdown = _pet_mood_slowdown(
-        [row for row, _ in pairs], {spec.key: spec for _, spec in pairs},
-        await _pinned_pet_key(chat_id, user_id))
+    aura = _pet_aura([row for row, _ in pairs],
+                     {spec.key: spec for _, spec in pairs},
+                     await _pinned_pet_key(chat_id, user_id))
     waiting: list[tuple[object, timedelta]] = []
     done: list[tuple[dict, object, tuple[int, int, int]]] = []
     for row, spec in pairs:
@@ -17143,7 +17224,8 @@ async def cmd_pet_care_all(message: Message):
             waiting.append((spec, left))
             continue
         done.append((row, spec,
-                     await _care_pet(chat_id, user_id, spec, row, verb, now, slowdown)))
+                     await _care_pet(chat_id, user_id, spec, row, verb, now,
+                                     aura)))
     if not done:
         await message.reply("😊 Все ваши питомцы уже довольны.\n" + _pet_waiting_line(waiting))
         return
@@ -17173,9 +17255,9 @@ async def cmd_pet_feed(message: Message):
         await message.reply(f"🍽 {spec.name} пока сыт — покормить снова через "
                             f"{format_duration_ru(left)}.")
         return
-    slowdown = await _pet_slowdown_for(message.chat.id, message.from_user.id)
+    aura = await _pet_aura_for(message.chat.id, message.from_user.id)
     result = await _feed_pet(message.chat.id, message.from_user.id, spec, row,
-                            datetime.utcnow(), slowdown)
+                            datetime.utcnow(), aura)
     if result is None:
         await message.reply(_pet_no_food_text())
         return
@@ -17209,10 +17291,10 @@ async def cmd_pet_care(message: Message):
         await message.reply(f"😊 {spec.name} уже доволен(а) — ещё раз через "
                             f"{format_duration_ru(left)}.")
         return
-    slowdown = await _pet_slowdown_for(message.chat.id, message.from_user.id)
+    aura = await _pet_aura_for(message.chat.id, message.from_user.id)
     mood, level_before, level_after = await _care_pet(
         message.chat.id, message.from_user.id, spec, row, verb,
-        datetime.utcnow(), slowdown)
+        datetime.utcnow(), aura)
     text = (f"💞 Вы {_care_past(verb)} {_pet_display(row, spec)} — {spec.sound}. "
             f"Настроение: {pets_catalog.bar(mood)} {mood}")
     if level_after > level_before:
@@ -17255,18 +17337,18 @@ def _pet_walk_left(row: dict) -> Optional[timedelta]:
 
 
 async def _walk_pet(chat_id: int, user_id: int, spec, row: dict, now: datetime,
-                    slowdown: int) -> tuple[str, int]:
+                    aura: "PetAura") -> tuple[str, int]:
     """Одна прогулка: (что рассказать, сколько монет). Монеты 0 — принесён предмет.
 
     Питомец тратит немного сытости и получает настроение: гулять ему нравится,
     но нагуливается и аппетит — иначе прогулка была бы бесплатным источником
     монет, не связанным с кормом.
     """
-    hunger, mood = _pet_now(row, slowdown)
+    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
     hunger = max(0, hunger - pets_catalog.WALK_HUNGER_COST)
     mood = pets_catalog.gain(mood, pets_catalog.WALK_MOOD_GAIN)
     level = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), pets_catalog.WALK_XP_BONUS)
+    xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.WALK_XP_BONUS))
     await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp, now,
                            walk_at=now)
     finds = pets_catalog.walk_finds(spec.key)
@@ -17279,8 +17361,8 @@ async def _walk_pet(chat_id: int, user_id: int, spec, row: dict, now: datetime,
         item = await db.get_shop_item(chat_id, find.item_key)
         name = f"{item['emoji']} {html.escape(item['name'])}" if item else find.item_key
         return f"{find.text} — {name}", 0
-    coins = pets_catalog.walk_coins(
-        level, random.randint(pets_catalog.WALK_COINS_MIN, pets_catalog.WALK_COINS_MAX))
+    coins = aura.walk_coins(pets_catalog.walk_coins(
+        level, random.randint(pets_catalog.WALK_COINS_MIN, pets_catalog.WALK_COINS_MAX)))
     await db.add_coins(chat_id, user_id, coins)
     return f"нагулял(а) <b>{coins}</b> i¢", coins
 
@@ -17299,8 +17381,8 @@ async def cmd_pet_walk_all(message: Message):
         return
     now = datetime.utcnow()
     pinned_key = await _pinned_pet_key(chat_id, user_id)
-    slowdown = _pet_mood_slowdown([row for row, _ in pairs],
-                                  {spec.key: spec for _, spec in pairs}, pinned_key)
+    aura = _pet_aura([row for row, _ in pairs],
+                     {spec.key: spec for _, spec in pairs}, pinned_key)
     waiting: list[tuple[object, timedelta]] = []
     lines: list[str] = []
     tired: list[str] = []
@@ -17309,11 +17391,11 @@ async def cmd_pet_walk_all(message: Message):
         if left is not None:
             waiting.append((spec, left))
             continue
-        hunger, mood = _pet_now(row, slowdown)
+        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
         if not _pet_is_active(row, hunger, mood, pinned_key):
             tired.append(spec.name)
             continue
-        told, _coins = await _walk_pet(chat_id, user_id, spec, row, now, slowdown)
+        told, _coins = await _walk_pet(chat_id, user_id, spec, row, now, aura)
         lines.append(f"{_pet_display(row, spec)} {told}")
     if not lines:
         parts = ["🚶 Гулять сейчас некому."]
@@ -17348,14 +17430,14 @@ async def cmd_pet_walk(message: Message):
         await message.reply(f"🚶 {spec.name} уже нагулялся(-ась) — снова через "
                             f"{format_duration_ru(left)}.")
         return
-    slowdown = await _pet_slowdown_for(chat_id, user_id)
-    hunger, mood = _pet_now(row, slowdown)
+    aura = await _pet_aura_for(chat_id, user_id)
+    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
     if not _pet_is_active(row, hunger, mood, await _pinned_pet_key(chat_id, user_id)):
         await message.reply(f"😔 {spec.name} никуда не пойдёт — сначала покормите "
                             f"и приласкайте.")
         return
-    told, _coins = await _walk_pet(chat_id, user_id, spec, row, now := datetime.utcnow(),
-                                  slowdown)
+    told, _coins = await _walk_pet(chat_id, user_id, spec, row,
+                                   datetime.utcnow(), aura)
     await message.reply(
         f"🚶 {_pet_display(row, spec)} сходил(а) погулять и {told}.\n"
         f"Следующая прогулка — через {pets_catalog.WALK_COOLDOWN_HOURS} ч."
@@ -17560,6 +17642,10 @@ async def cmd_pet_sell(message: Message):
     chat_id, user_id = message.chat.id, message.from_user.id
     spec, row = await _pick_pet(message, match.group(1))
     if spec is None:
+        return
+    if spec.by_achievement:
+        await message.reply(f"{spec.title} не продаётся — это знак отличия, "
+                            f"а не имущество.")
         return
     price = pets_catalog.sell_price(spec.price)
     level = _pet_level(row)
@@ -27787,8 +27873,8 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
         # Питомца могли отпустить уже после закрепления — тогда строки просто
         # нет, а не «закреплён неизвестно кто».
         if pet_row and pet_spec:
-            hunger, mood = _pet_now(
-                pet_row, await _pet_slowdown_for(chat_id, target.id))
+            _aura = await _pet_aura_for(chat_id, target.id)
+            hunger, mood = _pet_now(pet_row, _aura.mood, _aura.hunger)
             given = pet_row.get("pet_name")
             shown = f"{pet_spec.title} «{html.escape(given)}»" if given else pet_spec.title
             level = _pet_level(pet_row)
@@ -31525,6 +31611,20 @@ async def grant_achievement(
             logger.exception("Не удалось начислить бонус монет за ачивку %s", code)
     # За часть ачивок положен ПРЕДМЕТ — выдаём тем же путём, что монеты
     # и титул: достижение одно, а следствий у него несколько.
+    # Питомец за ачивку — как предмет за ачивку: выдаётся сам, купить нельзя.
+    pet_spec = pets_catalog.PET_BY_ACHIEVEMENT.get(code)
+    if pet_spec is not None:
+        try:
+            await db.ensure_pet_catalog(chat_id, pets_catalog.PETS)
+            if not await db.get_pet(chat_id, user_id, pet_spec.key):
+                await db.add_pet(chat_id, user_id, pet_spec.key, datetime.utcnow())
+                await db.add_log("pet_achievement", chat_id=chat_id, actor_id=user_id,
+                                 details=f"{pet_spec.key}:{code}")
+        except Exception as exc:
+            # Питомец — приятная надбавка к ачивке, а не сама ачивка: сбой
+            # выдачи не должен отменять само достижение.
+            log_suppressed("grant_achievement_pet", exc)
+
     item = shop_effects.ITEM_BY_ACHIEVEMENT.get(code)
     if item is not None:
         try:

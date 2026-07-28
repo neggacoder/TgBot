@@ -1394,3 +1394,98 @@ def test_у_каждого_встроенного_вида_есть_во_что_
 def test_заведённый_админом_вид_не_эволюционирует():
     """Кем вырастет чужой зверь, придумать за администрацию мы не можем."""
     assert P.evolution_of("ezhik") is None
+
+
+# --- полнота каталога -------------------------------------------------------
+
+def test_у_каждой_способности_есть_свой_питомец():
+    """Способность без питомца — строка в списке, которую никак не получить."""
+    covered = {p.ability for p in P.PETS}
+    осиротевшие = [a.key for a in P.ABILITIES if a.key not in covered]
+    assert not осиротевшие, f"эти способности нельзя завести: {осиротевшие}"
+
+
+def test_способности_не_повторяются_у_разных_видов():
+    """Два вида на одну способность обесценивают дешёвого: смысла брать
+    дорогого нет, а бонусы у одного хозяина ещё и складываются."""
+    abilities = [p.ability for p in P.PETS]
+    дубли = sorted({a for a in abilities if abilities.count(a) > 1})
+    assert not дубли, f"способность закреплена за несколькими видами: {дубли}"
+
+
+def test_синонимы_ведут_на_существующие_виды():
+    for alias, key in P.ALIASES.items():
+        assert key in P.BY_KEY, f"синоним «{alias}» ведёт в никуда: {key}"
+
+
+def test_синонимы_понимают_оба_написания_ё():
+    """Словарь синонимов сравнивается с нормализованным ключом — запись через
+    ё без нормализации была бы недостижима обоими написаниями."""
+    for alias in P.ALIASES:
+        assert P.resolve(alias) is not None, alias
+        assert P.resolve(alias.replace("ё", "е")) is not None, alias
+
+
+def test_цены_и_звуки_заполнены_у_всех():
+    for spec in P.PETS:
+        assert spec.price > 0 and spec.sound and spec.emoji, spec.key
+
+
+# --- питомцы за ачивки ------------------------------------------------------
+
+def test_наградные_питомцы_помечены():
+    награда = [p for p in P.PETS if p.by_achievement]
+    assert награда, "нет ни одного питомца за ачивку"
+    for spec in награда:
+        assert spec.achievement, spec.key
+        assert spec.ability != P.ABILITY_NONE, spec.key
+
+
+def test_ачивка_выдаёт_не_больше_одного_питомца():
+    codes = [p.achievement for p in P.PETS if p.by_achievement]
+    assert len(codes) == len(set(codes))
+    assert set(P.PET_BY_ACHIEVEMENT) == set(codes)
+
+
+def test_наградные_ачивки_существуют():
+    """Питомец за несуществующую ачивку недостижим навсегда."""
+    for code in P.PET_BY_ACHIEVEMENT:
+        assert code in bot_module.ACHIEVEMENTS, code
+
+
+def test_наградного_питомца_не_купить(world):
+    msg, replies = _message("пет купить единорог")
+    asyncio.run(bot_module.cmd_pet_buy(msg))
+    assert "edinorog" not in world["pets"]
+    assert world["coins"] == 100_000
+    assert "за ачивку" in replies[0]
+
+
+def test_наградного_питомца_не_продать(world):
+    asyncio.run(bot_module.db.add_pet(CHAT_ID, ME, "edinorog", datetime.utcnow()))
+    before = world["coins"]
+    msg, replies = _message("пет продать единорог да")
+    asyncio.run(bot_module.cmd_pet_sell(msg))
+    assert "edinorog" in world["pets"], "знак отличия не имущество"
+    assert world["coins"] == before
+    assert "не продаётся" in replies[0]
+
+
+def test_каталог_показывает_что_питомец_за_ачивку(world):
+    msg, replies = _message("пет каталог")
+    asyncio.run(bot_module.cmd_pets_catalog(msg))
+    assert "за ачивку" in replies[0]
+
+
+def test_способности_ауры_действуют_на_всех():
+    """Наставник, Хозяйственный и Следопыт — как Компаньон: работают на всех
+    питомцев хозяина, а не на себя."""
+    for key in ("pet_mood", "pet_hunger", "pet_xp", "pet_walk"):
+        assert key in P.ABILITY_BY_KEY, key
+
+
+def test_аура_считает_проценты():
+    aura = bot_module.PetAura(xp=50, walk=50)
+    assert aura.xp_gain(10) == 15
+    assert aura.walk_coins(200) == 300
+    assert bot_module.PetAura().xp_gain(10) == 10

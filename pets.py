@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import ru_text
+
 MAX_STAT = 100
 
 # За сколько единиц в час падают сытость и настроение.
@@ -108,6 +110,42 @@ WALK_FINDS: dict[str, tuple[WalkFind, ...]] = {
                 WalkFind("нашёл(ла) в траве цветок", "cvetok")),
     "drakon":  (WalkFind("притащил(а) что-то блестящее из своей заначки", "zvezda"),
                 WalkFind("нашёл(ла) настоящий алмаз. Маленький", "diamond")),
+    "svinka":  (WalkFind("вырыл(а) картофелину размером с голову", "kartoshka"),
+                WalkFind("нашёл(ла) вместо трюфеля обычный камень", "kamen")),
+    "muravey": (WalkFind("приволок гвоздь. Втрое тяжелее себя", "gvozd"),
+                WalkFind("притащил хлебную крошку — по его меркам, буханку", "pechenka")),
+    "pchela":  (WalkFind("облетел(а) весь двор и принёс(ла) цветок", "cvetok"),
+                WalkFind("нашёл(ла) чью-то жвачку. Липко", "zhvachka")),
+    "volnistiy": (WalkFind("выпросил(а) у кого-то печенье", "pechenka"),
+                  WalkFind("притащил(а) фантик и очень им гордится", "fantik")),
+    "osminog": (WalkFind("вытащил(а) со дна пробку от бутылки", "probka"),
+                WalkFind("принёс(ла) со дна что-то блестящее", "fishka")),
+    "yashcherka": (WalkFind("грелся(-ась) на кирпиче и утащил(а) его с собой", "kirpich"),
+                   WalkFind("нашёл(ла) в песке погнутую скрепку", "skrepka")),
+    "cherepaha": (WalkFind("ходил(а) полдня и принёс(ла) камень", "kamen"),
+                  WalkFind("не спеша доставил(а) цветок", "cvetok")),
+    "mysh":    (WalkFind("прилетел(а) с чужим шариком", "sharik"),
+                WalkFind("нашёл(ла) в темноте что-то блестящее", "zvezda")),
+    "enot":    (WalkFind("выполоскал(а) в луже чей-то носок", "nosok"),
+                WalkFind("стащил(а) из мусорки целый бургер", "burger")),
+    "akula":   (WalkFind("принёс(ла) со дна старую вилку", "vilka"),
+                WalkFind("вынес(ла) на берег кольцо. Чьё-то", "ring")),
+    "vydra":   (WalkFind("приплыл(а) с камнем — своим любимым", "kamen"),
+                WalkFind("нашёл(ла) на дне монетку", "fishka")),
+    "ulitka":  (WalkFind("полз(ла) шесть часов и принёс(ла) нитку", "nitka"),
+                WalkFind("доставил(а) пылинку. Очень старался(-ась)", "pyl")),
+    "sova":    (WalkFind("принёс(ла) в когтях звезду. Не спрашивайте какую", "zvezda"),
+                WalkFind("подобрал(а) чей-то чек", "chek")),
+    "martyshka": (WalkFind("стащил(а) банан, кожуру принёс(ла) вам", "banan_kozhura"),
+                  WalkFind("выиграл(а) где-то фишку", "fishka")),
+    "olenenok": (WalkFind("вышел(ла) из леса с цветком в зубах", "cvetok"),
+                 WalkFind("принёс(ла) кем-то потерянную медаль", "medal")),
+    "edinorog": (WalkFind("принёс(ла) звезду. Настоящую, кажется", "zvezda"),
+                 WalkFind("оставил(а) после себя цветок неизвестного вида", "cvetok")),
+    "tirex":    (WalkFind("притащил(а) кубок. Вместе с постаментом", "kubok"),
+                 WalkFind("выкопал(а) что-то очень старое и блестящее", "diamond")),
+    "lebed":    (WalkFind("принёс(ла) кольцо со дна пруда", "ring"),
+                 WalkFind("подобрал(а) на берегу цветок", "cvetok")),
 }
 
 # Для видов, заведённых админом, своего списка нет — берём общий.
@@ -204,6 +242,13 @@ ABILITIES: tuple[Ability, ...] = (
     Ability("lootbox",        "Нюхач",         "+{p}% к шансу редкого приза из лутбокса", 20),
     Ability("reputation",     "Обаяшка",       "+{p}% к получаемой репутации", 25),
     Ability("pet_mood",       "Компаньон",     "настроение всех ваших питомцев падает на {p}% медленнее", 30),
+    # --- работают на других ваших питомцев (как «Компаньон») ---
+    # Способности питомцев ЗА АЧИВКИ. Своими они сделаны намеренно: каждая
+    # способность закреплена ровно за одним видом, и выдать наградному зверю
+    # чужую значило бы обесценить того, кого за неё платили.
+    Ability("pet_hunger",     "Хозяйственный", "сытость всех ваших питомцев падает на {p}% медленнее", 30),
+    Ability("pet_xp",         "Наставник",     "опыт всех ваших питомцев растёт на {p}% быстрее", 50),
+    Ability("pet_walk",       "Следопыт",      "+{p}% к монетам с прогулки", 50),
 )
 
 ABILITY_BY_KEY: dict[str, Ability] = {a.key: a for a in ABILITIES}
@@ -360,6 +405,26 @@ EVOLUTIONS: dict[str, Evolution] = {
     "lisa":    Evolution("Кицунэ", "✨"),
     "panda":   Evolution("Великая панда", "👑"),
     "drakon":  Evolution("Дракон", "🐲"),
+    # Свинка → Царь-бомба: шутка, но с ней зверь становится самым громким в
+    # чате, а способность у него — искать клады.
+    "svinka":     Evolution("Царь-бомба", "💣"),
+    "muravey":    Evolution("Муравей-солдат", "🏗"),
+    "pchela":     Evolution("Королева улья", "👑"),
+    "volnistiy":  Evolution("Ведущий", "🎙"),
+    "osminog":    Evolution("Кракен", "🦑"),
+    "yashcherka": Evolution("Крокодил", "🐊"),
+    "cherepaha":  Evolution("Черепаха-гора", "🗿"),
+    "mysh":       Evolution("Вампир", "🧛"),
+    "enot":       Evolution("Енот-джентльмен", "🎩"),
+    "akula":      Evolution("Мегалодон", "🌊"),
+    "vydra":      Evolution("Выдра-мастер", "🔧"),
+    "ulitka":     Evolution("Улитка-крепость", "🏰"),
+    "sova":       Evolution("Филин", "🦅"),
+    "martyshka":  Evolution("Горилла", "🦍"),
+    "olenenok":   Evolution("Золоторогий олень", "✨"),
+    "edinorog":   Evolution("Аликорн", "🌈"),
+    "tirex":      Evolution("Владыка мела", "☄️"),
+    "lebed":      Evolution("Лебедь-хранитель", "🕊"),
 }
 
 
@@ -418,6 +483,14 @@ class Pet:
     price: int
     sound: str      # чем отвечает на ласку
     ability: str = ABILITY_NONE
+    # Код ачивки, за которую вид выдаётся. Пусто — обычный, покупается за i¢.
+    # Наградного не купить и не продать: это знак отличия, а не расходник —
+    # ровно то же правило, что у предметов за ачивки (shop_effects).
+    achievement: str = ""
+
+    @property
+    def by_achievement(self) -> bool:
+        return bool(self.achievement)
 
     @property
     def title(self) -> str:
@@ -426,20 +499,70 @@ class Pet:
 
 # Способность у каждого своя и по характеру: пёс сторожит, лиса наводит,
 # панда успокаивает остальных. Так её не нужно запоминать отдельно.
+# У КАЖДОЙ способности ровно один вид — так, взглянув на зверя, сразу понимаешь,
+# зачем он, и ни один не остаётся «тем же самым, только дороже». Проверяется
+# тестом: способность без питомца — это строка в списке, которую никак не
+# получить, а два питомца на одну способность обесценивают дешёвого.
 PETS: tuple[Pet, ...] = (
-    Pet("homyak",  "Хомяк",    "🐹",  8_000, "пыхтит",             "farm"),
-    Pet("popugay", "Попугай",  "🦜", 12_000, "повторяет за вами",  "discount_shop"),
-    Pet("kot",     "Кот",      "🐈", 15_000, "мурчит",             "daily_bonus"),
-    Pet("pes",     "Пёс",      "🐕", 15_000, "виляет хвостом",     "guard_raid"),
-    Pet("lisa",    "Лиса",     "🦊", 30_000, "хитро щурится",      "attack_raid"),
-    Pet("panda",   "Панда",    "🐼", 45_000, "жуёт бамбук",        "pet_mood"),
-    Pet("drakon",  "Дракончик", "🐉", 90_000, "дымит ноздрями",     "boss_damage"),
+    # --- было ---
+    Pet("homyak",   "Хомяк",     "🐹",  8_000, "пыхтит",              "farm"),
+    Pet("popugay",  "Попугай",   "🦜", 12_000, "повторяет за вами",   "discount_shop"),
+    Pet("kot",      "Кот",       "🐈", 15_000, "мурчит",              "daily_bonus"),
+    Pet("pes",      "Пёс",       "🐕", 15_000, "виляет хвостом",      "guard_raid"),
+    Pet("lisa",     "Лиса",      "🦊", 30_000, "хитро щурится",       "attack_raid"),
+    Pet("panda",    "Панда",     "🐼", 45_000, "жуёт бамбук",         "pet_mood"),
+    Pet("drakon",   "Дракончик", "🐉", 90_000, "дымит ноздрями",      "boss_damage"),
+    # --- добыча и труд ---
+    Pet("svinka",   "Свинка",    "🐷",  6_000, "хрюкает",             "treasure"),
+    Pet("muravey",  "Муравей",   "🐜",  9_000, "тащит что-то втрое тяжелее себя", "work"),
+    Pet("pchela",   "Пчела",     "🐝", 11_000, "гудит по делу",       "side_job"),
+    Pet("volnistiy", "Волнистый попугайчик", "🦚", 10_000, "трещит без умолку", "hat"),
+    Pet("osminog",  "Осьминог",  "🐙", 35_000, "меняет цвет",         "fishing"),
+    # --- защита ---
+    Pet("yashcherka", "Ящерка",  "🦎", 18_000, "отбрасывает хвост и убегает", "guard_robbery"),
+    Pet("cherepaha", "Черепаха", "🐢", 20_000, "молчит внушительно",  "guard_break"),
+    # --- нападение ---
+    Pet("mysh",     "Летучая мышь", "🦇", 26_000, "висит вниз головой", "attack_robbery"),
+    Pet("enot",     "Енот",      "🦝", 28_000, "полощет добычу в луже", "robbery_loot"),
+    Pet("akula",    "Акулёнок",  "🦈", 40_000, "делает вид, что не голоден", "raid_loot"),
+    # --- экономия ---
+    Pet("vydra",    "Выдра",     "🦦", 16_000, "стучит камнем по ракушке", "discount_repair"),
+    Pet("ulitka",   "Улитка",    "🐌", 14_000, "никуда не спешит",    "discount_upgrade"),
+    # --- прочее ---
+    Pet("sova",     "Сова",      "🦉", 22_000, "ухает",               "lootbox"),
+    Pet("martyshka", "Мартышка", "🐒", 24_000, "корчит рожи",         "casino_win"),
+    Pet("olenenok", "Оленёнок",  "🦌", 30_000, "смотрит большими глазами", "reputation"),
+    # --- за ачивки: не купить ни за какие деньги ---
+    Pet("edinorog", "Единорог", "🦄", 150_000, "фыркает радугой",
+        "pet_xp", achievement="collection_zoo"),
+    Pet("tirex",    "Тираннозавр", "🦖", 200_000, "рычит так, что дрожит чат",
+        "pet_walk", achievement="msg_50000"),
+    Pet("lebed",    "Лебедь", "🦢", 120_000, "изгибает шею",
+        "pet_hunger", achievement="married"),
 )
+
+# Ачивка → питомец. Одна ачивка выдаёт максимум одного (как у предметов).
+PET_BY_ACHIEVEMENT: dict[str, Pet] = {p.achievement: p for p in PETS if p.achievement}
 
 BY_KEY: dict[str, Pet] = {p.key: p for p in PETS}
 
 ALIASES: dict[str, str] = {
     "кот": "kot", "котик": "kot", "кошка": "kot",
+    "свинка": "svinka", "свинья": "svinka", "поросёнок": "svinka", "хрюша": "svinka",
+    "муравей": "muravey", "муравьишка": "muravey",
+    "пчела": "pchela", "пчёлка": "pchela",
+    "попугайчик": "volnistiy", "волнистый": "volnistiy", "волнистик": "volnistiy",
+    "осьминог": "osminog", "осьминожка": "osminog",
+    "ящерка": "yashcherka", "ящерица": "yashcherka",
+    "черепаха": "cherepaha", "черепашка": "cherepaha",
+    "мышь": "mysh", "летучая мышь": "mysh", "нетопырь": "mysh",
+    "енот": "enot", "енотик": "enot", "полоскун": "enot",
+    "акула": "akula", "акулёнок": "akula",
+    "выдра": "vydra", "выдрёнок": "vydra",
+    "улитка": "ulitka", "улиточка": "ulitka",
+    "сова": "sova", "совёнок": "sova", "совушка": "sova",
+    "мартышка": "martyshka", "обезьяна": "martyshka", "обезьянка": "martyshka",
+    "оленёнок": "olenenok", "олень": "olenenok",
     "пёс": "pes", "пес": "pes", "собака": "pes", "щенок": "pes",
     "хомяк": "homyak", "хома": "homyak",
     "попугай": "popugay", "птица": "popugay",
@@ -449,15 +572,18 @@ ALIASES: dict[str, str] = {
 }
 
 
+# Синонимы в е-написании: искать по ним будем нормализованным ключом, и
+# запись через ё оказалась бы недостижима обоими написаниями сразу. Ровно эта
+# ошибка была в наборах триггеров бота — см. ru_text.
+_ALIASES_NORM: dict[str, str] = {ru_text.yo(k): v for k, v in ALIASES.items()}
+
+
 def resolve(raw: Optional[str]) -> Optional[Pet]:
-    """Питомец по ключу или по-русски. None — не нашли."""
+    """Питомец по ключу или по-русски, не различая е и ё. None — не нашли."""
     if not raw:
         return None
-    key = " ".join(raw.strip().casefold().replace("ё", "е").split())
-    # В ALIASES ключи записаны как есть, поэтому «ё» ищем и в исходном виде.
-    return BY_KEY.get(ALIASES.get(key)
-                      or ALIASES.get(raw.strip().casefold())
-                      or key)
+    key = " ".join(ru_text.yo(raw.strip().casefold()).split())
+    return BY_KEY.get(_ALIASES_NORM.get(key) or key)
 
 
 def decayed(value: int, hours: float, per_hour: int) -> int:
