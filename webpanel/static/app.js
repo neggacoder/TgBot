@@ -1103,6 +1103,7 @@ $$(".nav-btn").forEach((btn) => {
     if (view === "complaints") loadComplaintTargets();
     if (view === "actions") { loadActions(); loadGestures(); loadProposeActions(); }
     if (view === "cmdtree") { loadCommandTree(); loadRewardLevels(); }
+    if (view === "chatsettings") loadChatSettings();
     // Лента живёт только на своей вкладке: иначе SSE-соединение и опрос БД
     // продолжались бы всё время, пока панель просто открыта.
     if (view === "send") loadFeed(); else closeFeedStream();
@@ -3872,3 +3873,84 @@ document.addEventListener("keydown", (e) => {
 });
 
 boot();
+
+// ===== Настройки чата ======================================================
+// Форма собирается из ответа API: панель не знает ни про банк, ни про рынок.
+// Появилась настройка в chat_settings.py — появилась и здесь, править нечего.
+
+async function loadChatSettings() {
+  const select = $("#chatsettings-chat");
+  if (!select.options.length) {
+    const { chats } = await api("/api/chats");
+    select.innerHTML = chats
+      .map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`)
+      .join("");
+    select.addEventListener("change", renderChatSettings);
+  }
+  await renderChatSettings();
+}
+
+async function renderChatSettings() {
+  const chatId = $("#chatsettings-chat").value;
+  const out = $("#chatsettings-out");
+  if (!chatId) { out.innerHTML = ""; return; }
+  out.innerHTML = skeleton(3);
+  try {
+    const { groups } = await api(`/api/chat-settings?chat_id=${chatId}`);
+    out.innerHTML = groups.map(chatSettingsGroup).join("");
+    $$("#chatsettings-out [data-setting]").forEach((el) =>
+      el.addEventListener("change", () => saveChatSetting(el)));
+  } catch (e) {
+    out.innerHTML = `<div class="card error">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function chatSettingsGroup(group) {
+  const rows = group.settings.map(chatSettingField).join("");
+  return `<section class="card"><h2>${escapeHtml(group.group)}</h2>${rows}</section>`;
+}
+
+function chatSettingField(s) {
+  const off = s.can_edit ? "" : " disabled";
+  let input;
+  if (s.kind === "bool") {
+    const checked = s.value ? " checked" : "";
+    input = `<input type="checkbox" data-setting="${s.key}"${checked}${off}>`;
+  } else if (s.kind === "choice") {
+    const options = s.choices
+      .map((c) => `<option value="${escapeHtml(c.value)}"${c.value === s.value ? " selected" : ""}>${escapeHtml(c.label)}</option>`)
+      .join("");
+    input = `<select data-setting="${s.key}"${off}>${options}</select>`;
+  } else {
+    input = `<input type="number" step="any" data-setting="${s.key}" value="${s.value}"${off}
+      min="${s.minimum}" max="${s.maximum}">`;
+  }
+  const notes = [];
+  if (s.hint) notes.push(escapeHtml(s.hint));
+  if (s.global) notes.push("Действует во ВСЕХ чатах.");
+  if (!s.can_edit) notes.push(`Нужен уровень «${escapeHtml(s.level_name)}».`);
+  const note = notes.length ? `<div class="muted">${notes.join(" ")}</div>` : "";
+  return `<div class="setting-row"><label>${escapeHtml(s.title)}${input}</label>${note}</div>`;
+}
+
+async function saveChatSetting(el) {
+  const chatId = $("#chatsettings-chat").value;
+  const value = el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value;
+  try {
+    await api("/api/chat-settings", {
+      method: "POST",
+      body: { chat_id: Number(chatId), key: el.dataset.setting, value: String(value) },
+    });
+    // В app.js нет глобального toast() — есть say(селектор, текст, kind),
+    // который пишет в конкретный элемент на странице. Свой toast заводить
+    // не стали: молча несуществующая функция уронила бы вкладку только в
+    // браузере, тесты этого не видят.
+    say("#chatsettings-msg", "Сохранено");
+  } catch (e) {
+    say("#chatsettings-msg", e.message, "err");
+    // Значение не доехало — перерисовываем, чтобы в поле не осталось то,
+    // чего в базе нет: иначе человек уверен, что настроил, а бот работает
+    // по-старому.
+    await renderChatSettings();
+  }
+}

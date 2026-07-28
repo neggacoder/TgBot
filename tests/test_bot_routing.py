@@ -622,3 +622,53 @@ def test_приложение_не_срабатывает_в_группе():
 def test_упоминание_слова_в_разговоре_не_триггерит():
     taken = handlers_for(message(text="скачал приложение вчера", chat_type="private"))
     assert "cmd_webapp" not in taken
+
+
+# --- декоратор приклеен к тому, что задумано --------------------------------
+#
+# «Бизнес собрать» перестал работать целиком, и никакой тест этого не увидел:
+# между @router.message(...) и cmd_business_collect однажды вставили служебную
+# функцию. aiogram зарегистрировал обработчиком её — она ждёт (chat_id,
+# user_id), а получает Message, — а настоящий обработчик остался вообще без
+# декоратора. Ошибка ловится только чтением исходника: код синтаксически
+# безупречен, импортируется молча и падает уже в чате.
+
+_EVENT_ARGS = {"message", "callback", "query", "event", "update"}
+_HANDLER_DECORATORS = ("router.message", "router.callback_query",
+                       "router.chat_member", "router.inline_query",
+                       "router.my_chat_member")
+
+
+def _routed_functions(module):
+    """(имя функции, имя первого аргумента) для всего, что навешено на router."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(module))
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if ast.unparse(decorator).startswith(_HANDLER_DECORATORS):
+                args = [a.arg for a in node.args.args]
+                out.append((node.name, args[0] if args else None))
+                break
+    return out
+
+
+def test_обработчики_принимают_событие_а_не_чужие_аргументы():
+    """Первый аргумент обработчика — само событие. Функция, ждущая chat_id,
+    в этой роли не работает никогда, и заметно это только в чате."""
+    routed = _routed_functions(bot_module)
+    assert routed, "не нашли ни одного обработчика — сломался разбор, а не код"
+    чужие = [f"{name}(первый аргумент: {first})"
+             for name, first in routed if first not in _EVENT_ARGS]
+    assert not чужие, "декоратор навешен на служебную функцию: " + ", ".join(чужие)
+
+
+def test_сбор_дохода_с_бизнеса_зарегистрирован():
+    """Именно эта команда и потерялась. Закрепляем поимённо: общий сторож
+    выше поймал бы подмену, но не полное исчезновение обработчика."""
+    names = {name for name, _ in _routed_functions(bot_module)}
+    assert "cmd_business_collect" in names
+    assert "_pinned_business_self_repair" not in names

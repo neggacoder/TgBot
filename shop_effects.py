@@ -258,10 +258,12 @@ PERK_NO_EMPTY_FISHING = "no_empty_fishing"  # улов не бывает пус�
 PERK_NO_EMPTY_TREASURE = "no_empty_treasure"  # яма не бывает пустой
 PERK_BREAK_RESIST = "break_resist"         # −N% к шансу поломки бизнеса
 PERK_STREAK_SHIELD = "streak_shield"       # серия не сгорает за один пропуск
+PERK_FARM_NO_PESTS = "farm_no_pests"       # на грядки не садятся вредители
 
 # Привилегии-переключатели: у них нет процента, важен сам факт наличия.
 FLAG_PERKS = frozenset({
     PERK_NO_EMPTY_FISHING, PERK_NO_EMPTY_TREASURE, PERK_STREAK_SHIELD,
+    PERK_FARM_NO_PESTS,
 })
 
 
@@ -360,8 +362,16 @@ ACHIEVEMENT_ITEMS: tuple[AchievementItem, ...] = (
         perk=PERK_FAIL_LOSS_CUT, perk_percent=25,
         perk_text="при провале ограбления теряете на 25% меньше",
     ),
+    # Ключ — «master_otmychka», а не «otmychka»: последний занят КРАФТОВОЙ
+    # «Отмычкой» (CRAFT_ITEMS ниже), и она же им названа в рецепте
+    # crafting.RECIPES. Раньше оба предмета стояли под одним ключом, а
+    # ACHIEVEMENT_BY_KEY собирается из ACHIEVEMENT_ITEMS + CRAFT_ITEMS —
+    # крафтовая шла второй и молча затирала эту. Любой поиск по ключу отдавал
+    # крафтовую версию, поэтому заслуживший ачивку «Азартный» терял суточную
+    # выплату, а из двух строк засева магазина одну отбрасывал UNIQUE-ключ.
+    # Переименована именно наградная: у крафтовой ключ завязан на рецепт.
     AchievementItem(
-        "otmychka", "Мастер-отмычка", "🗝", "lootbox_master",
+        "master_otmychka", "Мастер-отмычка", "🗝", "lootbox_master",
         EFFECT_DAILY_CASH,
         "Раз в сутки выдаёт столько, сколько приносят 3 смены. Пока в "
         "инвентаре — ваши ограбления удаются на 10% чаще. Ачивка «Азартный»",
@@ -440,6 +450,16 @@ CRAFT_ITEMS: tuple[AchievementItem, ...] = (
         EFFECT_PASSIVE_BOOST,
         "Крафт. Пока в инвентаре — ВСЕ занятия приносят на 25% больше",
         activity=ACTIVITY_ANY, percent=25,
+    ),
+    # Единственный крафт, который собирают из выращенного, а не из купленного:
+    # огород замыкается сам на себя — вырастил подсолнух, сделал пугало,
+    # растишь спокойнее.
+    AchievementItem(
+        "pugalo", "Пугало", "🎭", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — на ваши грядки не садятся вредители",
+        perk=PERK_FARM_NO_PESTS,
+        perk_text="вредители обходят ваш огород стороной",
     ),
 )
 

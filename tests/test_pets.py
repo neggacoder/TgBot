@@ -504,7 +504,12 @@ def test_каждая_способность_реально_подключена
     """
     import inspect
     import shop_effects as SE
-    src = inspect.getsource(bot_module)
+    import game_actions
+    # Смотрим оба модуля: правила питомцев уехали в game_actions (панель не
+    # может импортировать bot.py — подняла бы второго бота), и способность,
+    # подключённая там, подключена по-настоящему. Ограничься сторож одним
+    # bot.py — он объявил бы «безделушкой» работающего «Компаньона».
+    src = inspect.getsource(bot_module) + inspect.getsource(game_actions)
     activities = {v for k, v in vars(SE).items() if k.startswith("ACTIVITY_")}
     # Третий способ — именованная константа (ABILITY_PET_MOOD = "pet_mood"):
     # ключ участвует в логике, просто не литералом в месте вызова. Само по себе

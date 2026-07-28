@@ -69,8 +69,11 @@ import relationships_v2
 import rest_rules
 import word_filter
 import robbery
+import black_market
+import farming
 import fishing
 import market
+import collectors
 from activity_chart import (
     ACTIVITY_CHART_DAYS,
     ACTIVITY_CHART_MIN_DAYS,
@@ -88,6 +91,9 @@ import businesses as business_catalog
 import crafting
 import pets as pets_catalog
 import pins
+# Игровые действия и правила питомцев: их зовёт и бот, и веб-панель, которой
+# bot.py импортировать нельзя — она подняла бы второго бота.
+import game_actions
 import professions
 import ru_text
 from dataclasses import dataclass
@@ -117,9 +123,10 @@ _WARN_LIMIT_DEFAULT = int(os.getenv("WARN_LIMIT", "3"))
 WARN_LIMIT = _WARN_LIMIT_DEFAULT
 
 # Модуль «Дуэли»: исход для проигравшего по умолчанию — кик (как у Iris).
-# Live-настройка из settings.duel_outcome (см. WARN_LIMIT выше), редактируется
-# командой «дуэли исход ...» прямо в чате.
-DUEL_OUTCOME: str = "kick"
+# Своей переменной у него нет: значение читается из settings["duel_outcome"] в
+# момент применения (см. _apply_duel_outcome). Так правка с сайта доезжает до
+# чата вместе с перечиткой settings, а не после перезапуска бота, — и следующей
+# настройке не придётся заводить свой отдельный кэш и свою же дырку.
 
 # Срок действия варна по умолчанию, если он не указан явно в команде
 # («варн 30д спам» — на 30 дней; просто «варн спам» — на этот дефолт).
@@ -762,7 +769,7 @@ async def load_caches() -> None:
     global pending_complaints_count, reward_degree_level_overrides, user_registry
     global custom_level_names, admin_icon, owner_role_view
     global HELP_RP_ACTIONS_TEXT, _RP_ACTION_ALL_KEYS, _PROPOSE_ACTION_ALL_KEYS
-    global WARN_LIMIT, ROLE_RESERVE_TIMEOUT_HOURS, TIMER_LIMIT, DUEL_OUTCOME
+    global WARN_LIMIT, ROLE_RESERVE_TIMEOUT_HOURS, TIMER_LIMIT
 
     # РП-действия / синонимы / себяшки — раньше константы, теперь редактируются
     # через веб-панель (см. prompt_admin_website.md, раздел 2). Обновляем
@@ -842,7 +849,6 @@ async def load_caches() -> None:
     )
     TIMER_LIMIT = settings.get("timer_limit")
     TIMER_LIMIT = int(TIMER_LIMIT) if TIMER_LIMIT is not None else _TIMER_LIMIT_DEFAULT
-    DUEL_OUTCOME = settings.get("duel_outcome") or "kick"
 
     custom_responses = {r["user_id"]: r["message"] for r in await db.list_custom_responses()}
     command_level_overrides = await db.list_command_levels()
@@ -1106,11 +1112,11 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "complaints":      {"phrase": "жалоба (в личке) / раздел «🚨 Жалобы» в админке", "category": "Модерация", "level": LEVEL_MODERATOR},
     "mod_themes":      {"phrase": "!темы / названия рангов / +иконка модераторов", "category": "Настройка", "level": LEVEL_SENIOR},
     "cmd_cleanup_set": {"phrase": "чистка команд {минуты} (0 — выкл.)", "category": "Настройка", "level": LEVEL_SENIOR},
-    "webapp":         {"phrase": "приложение (в личке боту) — мини-приложение Telegram: профиль, пара, семья, клан кнопками", "category": "Разное", "level": 0},
+    "webapp":         {"phrase": "приложение / /app (в личке боту) — мини-приложение Telegram: профиль, пара, семья, клан кнопками", "category": "Разное", "level": 0},
     "timezone_set":   {"phrase": "часовой пояс {GMT+3 | Москва | Europe/Moscow | +3} — пояс чата; «время» / «часовой пояс» — посмотреть", "category": "Настройка", "level": LEVEL_SENIOR},
     "call_all":        {"phrase": "созыв / хуйланы_сюда / хуйланысюда / калл [текст] ", "category": "Созывы", "level": LEVEL_MODERATOR},
     "call_admins":     {"phrase": "калладминс / созыв админов [текст]", "category": "Созывы", "level": LEVEL_MODERATOR},
-    "call_stop":       {"phrase": "стоп / стой / отмена", "category": "Созывы", "level": LEVEL_MODERATOR},
+    "call_stop":       {"phrase": "стоп / стой / отмена / остановить призыв", "category": "Созывы", "level": LEVEL_MODERATOR},
     "unreg":           {"phrase": "анрег [текст]",   "category": "Созывы", "level": 0},
     "reg":             {"phrase": "-анрег / рег",     "category": "Созывы", "level": 0},
     "my_unreg":        {"phrase": "мой анрег",        "category": "Созывы", "level": 0},
@@ -1150,7 +1156,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "misc_who":        {"phrase": "!кто {текст} / бот кто {текст}", "category": "Разное", "level": 0},
     "misc_ping":       {"phrase": "пинг / кинг / пиу / бот", "category": "Разное", "level": 0},
     "misc_say":        {"phrase": "!скажи [enter] {текст} / бот скажи {текст}", "category": "Разное", "level": 0},
-    "misc_my_article": {"phrase": "моя статья", "category": "Разное", "level": 0},
+    "misc_my_article": {"phrase": "моя статья / моя статья дня / статья дня", "category": "Разное", "level": 0},
     "fun_ball":      {"phrase": "шар {вопрос} — магический шар", "category": "Разное", "level": 0},
     "fun_horoscope": {"phrase": "гороскоп / мой гороскоп — шуточный гороскоп на сутки", "category": "Разное", "level": 0},
     "fun_weather":   {"phrase": "погода / погода в чате — шуточная погода чата на сутки", "category": "Разное", "level": 0},
@@ -1177,7 +1183,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "fishing_run":     {"phrase": "рыбалка (синонимы: рыбачить, рыбка, удочка) — раз в 2 часа", "category": "Экономика", "level": 0},
     "fishing_top":     {"phrase": "топ уловов / топ рыбаков / топ по весу — рекорды рыбалки чата", "category": "Экономика", "level": 0},
     "fishing_net":     {"phrase": "сетка / сетка продать [номер] / сетка выпустить {номер} / закрепить рыбу {номер} / открепить рыбу — хранение и продажа улова", "category": "Экономика", "level": 0},
-    "treasure_dig":    {"phrase": "клад / копать — общий клад чата, кто нашёл тот и забрал", "category": "Экономика", "level": 0},
+    "treasure_dig":    {"phrase": "клад / копать / искать клад — общий клад чата, кто нашёл тот и забрал", "category": "Экономика", "level": 0},
     "treasure_info":   {"phrase": "клад инфа — сколько накопилось и шанс находки", "category": "Экономика", "level": 0},
     "farm_balance":    {"phrase": "монеты / баланс", "category": "Экономика", "level": 0},
     "casino_roulette":  {"phrase": "рулетка {ставка} {цвет} — казино: красное/чёрное x2, зелёное x14", "category": "Экономика", "level": 0},
@@ -1201,13 +1207,18 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "bank_withdraw": {"phrase": "!банк снять — забрать созревший вклад", "category": "Экономика", "level": 0},
     "bank_credit":   {"phrase": "!банк кредит {сумма} — взять кредит", "category": "Экономика", "level": 0},
     "bank_repay":    {"phrase": "!банк погасить {сумма} — погасить долг по кредиту", "category": "Экономика", "level": 0},
-    "bank_manage":   {"phrase": "банк ставка/кредит комиссия/пеня/срок/мин вклад — настройка банка", "category": "Экономика", "level": LEVEL_ADMIN},
+    "bank_manage":   {"phrase": "банк ставка/кредит комиссия/пеня/срок/коллектор/взыскание/мин вклад — настройка банка", "category": "Экономика", "level": LEVEL_ADMIN},
     "bank_auto_reject_toggle": {"phrase": "+банк автоотказ-кредит / -банк автоотказ-кредит", "category": "Экономика", "level": OWNER_LEVEL},
     "bank_blacklist_manage": {"phrase": "банк чс добавить/удалить/список (ответом или @username/ID)", "category": "Экономика", "level": LEVEL_ADMIN},
     "shop_manage":     {"phrase": "магазин добавить/удалить/вкл/выкл", "category": "Экономика", "level": LEVEL_ADMIN},
     "shop_buy":        {"phrase": "магазин купить {ключ}", "category": "Экономика", "level": 0},
+    # Синоним объявлен ОТДЕЛЬНОЙ формой через « / », а не спрятан в пояснение:
+    # из фразы собирается индекс автоочистки, и «чёрный рынок» иначе остался
+    # бы тем, на что бот реагирует, но чего не убирает за собой.
+    "black_market":     {"phrase": "лавка / чёрный рынок — ассортимент дня", "category": "Экономика", "level": 0},
+    "black_market_buy": {"phrase": "лавка купить {ключ} [количество]", "category": "Экономика", "level": 0},
     "inventory_view":  {"phrase": "инвентарь / мой инвентарь", "category": "Экономика", "level": 0},
-    "gift_item":       {"phrase": "магазин подарить {ключ} (ответом или @username/ID)", "category": "Экономика", "level": 0},
+    "gift_item":       {"phrase": "магазин подарить {ключ} [сколько] (ответом или @username/ID)", "category": "Экономика", "level": 0},
     "lootbox_info":    {"phrase": "!лутбокс — список редкостей и ваши боксы", "category": "Экономика", "level": 0},
     "lootbox_buy":     {"phrase": "!лутбокс купить {редкость} [количество]", "category": "Экономика", "level": 0},
     "lootbox_open":    {"phrase": "!лутбокс открыть {редкость} [количество]", "category": "Экономика", "level": 0},
@@ -1300,27 +1311,27 @@ COMMAND_REGISTRY: dict[str, dict] = {
     # уже существующих команд сдвигать нельзя, по ним раздают права («дк 181»).
     "titles_my":       {"phrase": "мои титулы — только свои титулы, с листанием", "category": "Экономика", "level": 0},
     "prof_catalog":    {"phrase": "профессии — каталог: доход, требования, расход", "category": "Экономика", "level": 0},
-    "daily_bonus":     {"phrase": "бонус — ежедневный бонус, растёт за дни подряд", "category": "Экономика", "level": 0},
+    "daily_bonus":     {"phrase": "бонус / ежедневный бонус — ежедневный бонус, растёт за дни подряд", "category": "Экономика", "level": 0},
     "side_job":        {"phrase": "подработка — мелкая работа раз в 45 минут", "category": "Экономика", "level": 0},
-    "hat_round":       {"phrase": "шапка — пустить шапку по чату, скидываются кнопкой", "category": "Экономика", "level": 0},
-    "business_catalog": {"phrase": "бизнесы / бизнес каталог — цены, доход, потолки, апгрейды", "category": "Экономика", "level": 0},
-    "business_mine":   {"phrase": "бизнес / бизнес мой — свои бизнесы и что в копилках", "category": "Экономика", "level": 0},
+    "hat_round":       {"phrase": "шапка / шапка по кругу — пустить шапку по чату, скидываются кнопкой", "category": "Экономика", "level": 0},
+    "business_catalog": {"phrase": "бизнесы / бизнес каталог / бизнес список — цены, доход, потолки, апгрейды", "category": "Экономика", "level": 0},
+    "business_mine":   {"phrase": "бизнес / бизнес мой / бизнес мои — свои бизнесы и что в копилках", "category": "Экономика", "level": 0},
     "business_buy":    {"phrase": "бизнес купить {ключ}", "category": "Экономика", "level": 0},
     "business_collect": {"phrase": "бизнес собрать [ключ] — забрать доход, с налогом", "category": "Экономика", "level": 0},
     "business_upgrade": {"phrase": "бизнес улучшить {ключ}", "category": "Экономика", "level": 0},
     "business_sell":   {"phrase": "бизнес продать {ключ} [цена @кому] — боту или игроку", "category": "Экономика", "level": 0},
     "business_transfer": {"phrase": "бизнес передать {ключ} @кому", "category": "Экономика", "level": 0},
     "business_repair": {"phrase": "бизнес починить {ключ} — после поломки", "category": "Экономика", "level": 0},
-    "business_pin":    {"phrase": "бизнес закрепить {ключ} / бизнес открепить — показывать в профиле", "category": "Экономика", "level": 0},
+    "business_pin":    {"phrase": "бизнес закрепить {ключ} / бизнес открепить / бизнес снять закреп — показывать в профиле", "category": "Экономика", "level": 0},
     # Во фразе перечислены ВСЕ рабочие формы: по ним команду опознают
     # автоочистка и права, и форма, забытая здесь, эту привязку теряет молча.
     "pet_admin":       {"phrase": "пет удалить {ключ} — убрать вид питомца из каталога", "category": "Разное", "level": LEVEL_ADMIN},
-    "pet_list":        {"phrase": "пет / питомцы — свои питомцы, пет каталог — кого можно завести", "category": "Разное", "level": 0},
+    "pet_list":        {"phrase": "пет / питомцы — свои питомцы / пет каталог / пет магазин / пет список — кого можно завести", "category": "Разное", "level": 0},
     "pet_buy":         {"phrase": "пет купить {ключ} / пет продать {ключ}", "category": "Разное", "level": 0},
-    "pet_care":        {"phrase": "пет кормить / пет гладить / пет обнять / пет поцеловать / пет гулять (можно «все» вместо ключа) / пет корм — купить корма / пет назвать / пет закрепить / пет способность / пет способности", "category": "Разное", "level": 0},
-    "craft":           {"phrase": "крафты — список рецептов / крафт {ключ} — что нужно / крафт {ключ} да — собрать / крафт кукла @кому — именной сувенир / куклы — своя коллекция / закрепить куклу @кому — показывать в профиле", "category": "Экономика", "level": 0},
-    "pet_food_grant":  {"phrase": "пет раздать — выдать всем владельцам питомцев по 10 корма (раз в неделю)", "category": "Разное", "level": LEVEL_ADMIN},
-    "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет", "category": "Экономика", "level": 0},
+    "pet_care":        {"phrase": "пет кормить [ключ] / пет покормить [ключ] / пет гладить [ключ] / пет погладить [ключ] / пет обнять [ключ] / пет обнимать [ключ] / пет поцеловать [ключ] / пет целовать [ключ] / пет гулять [ключ] / пет погулять [ключ] / пет прогулка [ключ] (везде можно «все» вместо ключа) / пет корм [сколько] — купить корма / пет назвать {ключ} {имя} / пет закрепить {ключ} / пет открепить / пет эволюция {ключ} / пет способность {ключ} / пет способности", "category": "Разное", "level": 0},
+    "craft":           {"phrase": "крафты — список рецептов / крафт {ключ} — что нужно / крафт {ключ} да — собрать / крафт кукла @кому — именной сувенир / куклы — своя коллекция / открепить куклу / закрепить куклу @кому — показывать в профиле", "category": "Экономика", "level": 0},
+    "pet_food_grant":  {"phrase": "пет раздать [корм] — выдать всем владельцам питомцев по 10 корма (раз в неделю)", "category": "Разное", "level": LEVEL_ADMIN},
+    "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет (раз в 10 часов)", "category": "Экономика", "level": 0},
     "market":          {"phrase": "рынок / рынок купить {ключ} [кол-во] / рынок заявка {ключ} {цена} {название} / рынок мои / рынок снять {ключ} / рынок цена {ключ} {число} / рынок описание {ключ} {текст} — торговля между участниками", "category": "Экономика", "level": 0},
     "market_manage":   {"phrase": "рынок заявки / рынок принять {номер} / рынок отклонить {номер} / рынок режим ручной|авто|отклонять / рынок комиссия {число} / рынок потолок {число} / рынок лимит {число}", "category": "Экономика", "level": LEVEL_ADMIN},
     "item_sabotage":   {"phrase": "саботаж @кому — сломать бизнес выбранного человека (предмет «Саботаж»)", "category": "Экономика", "level": 0},
@@ -1333,6 +1344,13 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "season_status":   {"phrase": "сезон / сезоны / сезон {ГГГГ-ММ} — зачёт месяца и его итоги", "category": "Экономика", "level": 0},
     "boss_status":     {"phrase": "босс / боссы — кто сейчас в чате и какие бывают", "category": "Экономика", "level": 0},
     "boss_toggle":     {"phrase": "+босс / -босс / босс призвать {название}", "category": "Экономика", "level": LEVEL_ADMIN},
+    # Огород. Во фразах перечислены ВСЕ рабочие формы: по ним команду опознают
+    # автоочистка и права, и форма, забытая здесь, эту привязку теряет молча.
+    "farm_garden":     {"phrase": "грядки / огород / ферма грядки / ферма погода — свой участок, погода, вредители", "category": "Экономика", "level": 0},
+    "farm_crops":      {"phrase": "культуры / ферма культуры — что можно вырастить", "category": "Экономика", "level": 0},
+    "farm_plant":      {"phrase": "ферма посадить {культура} [сколько]", "category": "Экономика", "level": 0},
+    "farm_harvest":    {"phrase": "ферма собрать / собрать урожай — забрать всё поспевшее", "category": "Экономика", "level": 0},
+    "farm_help":       {"phrase": "ферма помочь @кому — прогнать саранчу с чужих грядок", "category": "Экономика", "level": 0},
 }
 
 
@@ -1343,44 +1361,6 @@ COMMAND_REGISTRY: dict[str, dict] = {
 # словаря номера у существующих не съезжают.
 COMMAND_IDS: dict[str, int] = {key: index + 1 for index, key in enumerate(COMMAND_REGISTRY.keys())}
 COMMAND_ID_TO_KEY: dict[int, str] = {command_id: key for key, command_id in COMMAND_IDS.items()}
-def _extract_trigger_words(phrase: str) -> set[str]:
-    words = set()
-    for alt in re.split(r"\s*/\s*", phrase):
-        alt = alt.strip()
-        if not alt:
-            continue
-        first = alt.split()[0].strip("[]{}«»").casefold()
-        if first and not first.startswith("{"):
-            words.add(first)
-    return words
-
-
-COMMAND_TRIGGER_WORDS: set[str] = set()
-for _entry in COMMAND_REGISTRY.values():
-    COMMAND_TRIGGER_WORDS |= _extract_trigger_words(_entry["phrase"])
-COMMAND_TRIGGER_WORDS |= {
-    "рест", "аноним", "жалоба", "жалобы", "сайт", "аккаунт", "мой", "моя",
-    "приложение",
-    "названия", "предложить", "предложения", "рп", "право", "дк",
-    "команды", "дерево", "помощь", "хелп", "перевод", "перевести",
-    "профиль",
-}
-# Набор сравнивается с нормализованным входом (ru_text.yo), поэтому и сам
-# обязан быть в е-написании: иначе «чёрное» и «налёт» стали бы недостижимы
-# ОБА, а не только в одном написании. Нормализуем один раз здесь, а не при
-# каждом сравнении.
-COMMAND_TRIGGER_WORDS = {ru_text.yo(_word) for _word in COMMAND_TRIGGER_WORDS}
-
-
-def is_command_like(text: Optional[str]) -> bool:
-    if not text or not text.strip():
-        return False
-    first_word = (text.strip().split() or [""])[0].casefold()
-    if first_word.startswith(("!", ".", "+", "-", "&", "[")):
-        return True
-    return ru_text.yo(first_word) in COMMAND_TRIGGER_WORDS
-
-
 DEFAULT_CMD_CLEANUP_MINUTES = 15
 # Потолок настройки: Telegram не позволяет боту удалять сообщения старше 48
 # часов, и всё, что дольше, просто тихо не удалялось бы.
@@ -1452,48 +1432,197 @@ def cmd_cleanup_minutes() -> int:
 # НЕТ: с него начинаются сами команды («-мут», «-чат», «-варн»), и, приняв его
 # за прозу, разбор терял бы их целиком (см. is_command_like — там дефис тоже
 # признак команды).
-_PHRASE_STOP_PREFIXES = ("{", "[", "(", "«", "—", "…")
+#
+# «@кому» — такой же плейсхолдер, как «{ключ}», просто записанный без скобок:
+# в чате на его месте стоит живой @username. Не остановись разбор здесь,
+# «досье @кому» требовало бы дословного «@кому», и команда стала бы
+# неопознаваемой — а с ней и все «саботаж/компромат/медвежатник @кому».
+_PHRASE_STOP_PREFIXES = ("{", "[", "(", "«", "—", "…", "@")
 
 
-def _phrase_prefixes(phrase: str) -> list[tuple[str, ...]]:
-    """Ведущие буквальные слова каждой формы команды из её фразы в реестре."""
-    out: list[tuple[str, ...]] = []
+# Признаки того, что за словами формы идут аргументы: плейсхолдер ({ключ},
+# [ключ], @кому) или пояснение про цель («ответом», «@username»). Форму без
+# них узнаём ЦЕЛИКОМ, а не по началу: «дерево» — команда, «дерево красивое» —
+# разговор. У форм с аргументами так нельзя — «помощь ачивки» и «право 181»
+# без хвоста не команды вовсе.
+_ARG_STOP_PREFIXES = ("{", "[", "@")
+_ARG_HINTS = ("{", "@username", "ответом", "ссылк")
+
+
+def _phrase_forms(phrase: str) -> list[tuple[tuple[str, ...], bool]]:
+    """Формы команды из её фразы: слова и «идут ли за ними аргументы»."""
+    out: list[tuple[tuple[str, ...], bool]] = []
     # Делим по « / » с пробелами: без них «@username/ID» внутри пояснения
     # развалилось бы на две мнимые формы команды.
     for alt in re.split(r"\s+/\s+", phrase):
         words: list[str] = []
+        tail = ""
         for word in alt.strip().split():
             token = word.casefold()
             if not token or token.startswith(_PHRASE_STOP_PREFIXES):
+                tail = token
                 break
             words.append(token)
-        if words:
-            out.append(tuple(words))
+        if not words:
+            continue
+        low = alt.casefold()
+        out.append((tuple(words), tail.startswith(_ARG_STOP_PREFIXES)
+                    or any(hint in low for hint in _ARG_HINTS)))
     return out
 
 
-# Первое слово формы -> список (порядок в реестре, ключ команды, слова формы).
-_COMMAND_PREFIX_INDEX: dict[str, list[tuple[int, str, tuple[str, ...]]]] = {}
+def _phrase_prefixes(phrase: str) -> list[tuple[str, ...]]:
+    """Ведущие буквальные слова каждой формы команды из её фразы в реестре."""
+    return [prefix for prefix, _ in _phrase_forms(phrase)]
+
+
+def _yo_prefix(prefix: tuple[str, ...]) -> tuple[str, ...]:
+    """Форма команды в е-написании — в таком же виде, как приходит вход.
+
+    Сравнивать нормализованный вход с ненормализованным индексом нельзя: форма
+    «налёт» оказалась бы недостижима ОБА написания сразу, а не одно (см.
+    ru_text). Нормализуем один раз при сборке, а не при каждом сравнении.
+    """
+    return tuple(ru_text.yo(word) for word in prefix)
+
+
+# Первое слово формы -> список (порядок в реестре, ключ, слова, есть ли аргументы).
+_COMMAND_PREFIX_INDEX: dict[str, list[tuple[int, str, tuple[str, ...], bool]]] = {}
 for _order, (_key, _entry) in enumerate(COMMAND_REGISTRY.items()):
-    for _prefix in _phrase_prefixes(_entry["phrase"]):
-        _COMMAND_PREFIX_INDEX.setdefault(_prefix[0], []).append((_order, _key, _prefix))
+    for _prefix, _open in _phrase_forms(_entry["phrase"]):
+        _prefix = _yo_prefix(_prefix)
+        _COMMAND_PREFIX_INDEX.setdefault(_prefix[0], []).append((_order, _key, _prefix, _open))
+
+
+# Слова, которыми бот зовёт одну и ту же команду, но в реестре записано лишь
+# одно из них. Обработчик понимает «петы кормить» и «фарма», а разбор для
+# автоочистки — нет: во фразе перечислено «пет» и «ферма», а синонимы спрятаны
+# в скобках как проза. Перечислять 4 синонима × 15 глаголов во фразе нельзя —
+# её читают люди; поэтому приводим ПЕРВОЕ СЛОВО к тому написанию, которое в
+# реестре есть.
+#
+# Обычные русские слова в списке («рыбка», «удочка», «питомец») безопасны:
+# форма без аргументов требует совпадения целиком, поэтому «рыбка моя, привет»
+# превращается в «рыбалка моя, привет» и не совпадает ни с чем.
+_FIRST_WORD_SYNONYMS: dict[str, str] = {
+    "петы": "пет", "питомец": "пет", "питомцы": "пет",
+    "фарма": "ферма", "фармить": "ферма",
+    "рыбачить": "рыбалка", "рыбка": "рыбалка", "удочка": "рыбалка",
+    "садок": "сетка",
+    "халтура": "подработка", "шабашка": "подработка",
+    "мини": "приложение", "апп": "приложение",
+    "дейлик": "бонус",
+    "рецепты": "крафты",
+    "коллекция": "коллекции",
+    "скинемся": "шапка",
+    "кукла": "куклы",
+    "алл": "созыв", "all": "созыв", "call": "созыв",
+    "stopcall": "стоп",
+}
+
+
+def _command_words(text: str) -> list[str]:
+    """Слова ПЕРВОЙ строки сообщения, в е-написании.
+
+    Первой строки, а не всего текста: у «о себе» и «названия рангов» значение
+    пишут со следующей строки, и по всему тексту форма без аргументов уже не
+    совпала бы сама с собой.
+    """
+    head = text.strip().split("\n", 1)[0]
+    words = [ru_text.yo(word.casefold()) for word in head.split()]
+    if words:
+        words[0] = _FIRST_WORD_SYNONYMS.get(words[0], words[0])
+    return words
+
+
+def _form_matches(words: list[str], prefix: tuple[str, ...], open_form: bool) -> bool:
+    if open_form:
+        return len(prefix) <= len(words) and tuple(words[: len(prefix)]) == prefix
+    return tuple(words) == prefix
 
 
 def resolve_command_key(text: Optional[str]) -> Optional[str]:
     """Ключ команды по тексту сообщения — или None, если опознать не удалось."""
     if not text:
         return None
-    words = [w.casefold() for w in text.strip().split()]
+    words = _command_words(text)
     if not words:
         return None
     best: Optional[tuple[int, int, str]] = None   # (-длина, порядок, ключ)
-    for order, key, prefix in _COMMAND_PREFIX_INDEX.get(words[0], ()):
-        if len(prefix) > len(words) or tuple(words[: len(prefix)]) != prefix:
+    for order, key, prefix, open_form in _COMMAND_PREFIX_INDEX.get(words[0], ()):
+        if not _form_matches(words, prefix, open_form):
             continue
         candidate = (-len(prefix), order, key)
         if best is None or candidate < best:
             best = candidate
     return best[2] if best else None
+
+
+# Команды, которых нет в COMMAND_REGISTRY (их не раздают правами), но которые
+# автоочистка всё равно должна узнавать. Формат — как у фраз реестра, через
+# « / », и плейсхолдер писать обязательно: без него форма считается полной, и
+# «помощь ачивки» перестанет опознаваться. Пишем ПОЛНУЮ форму, а не первое
+# слово: «мой» сам по себе не команда, и как триггер он съедал бы любую фразу,
+# начинающуюся с «мой …».
+_EXTRA_COMMAND_PHRASES = (
+    "аноним", "жалоба", "жалобы", "сайт", "аккаунт", "приложение",
+    "команды", "дерево", "профиль",
+    "рест {срок}", "рп {текст}", "право {номер}", "дк {номер}",
+    "помощь {запрос}", "хелп {запрос}",
+    "перевод {сумма}", "перевести {сумма}",
+    "предложить {что}", "предложения {страница}",
+    "названия рангов",
+    "мой анрег / мой брак / мой гороскоп / мой днр / мой день рождения",
+    "мой инвентарь / мой клан / мой логин / мой пол / мой рейтинг / мой рынок",
+    "мой стрик / мой титул / мой эмодзи",
+    "моя анкета / моя репутация / моя роль / моя статья / моя стата ограблений",
+    "смена роли",
+    "мои закладки [страница] / мои кружки / мои куклы / мои награды",
+    "мои подписки / мои подписчики / мои сабы / мои товары",
+)
+
+# Тот же индекс, что и у resolve_command_key, плюс формы выше. Ключ команды
+# здесь не нужен — важно только, команда это или живая речь.
+_CLEANUP_PREFIX_INDEX: dict[str, list[tuple[tuple[str, ...], bool]]] = {}
+for _forms in (
+    [(_prefix, _open) for _entries in _COMMAND_PREFIX_INDEX.values()
+     for _, _, _prefix, _open in _entries],
+    [(_yo_prefix(_p), _open) for _phrase in _EXTRA_COMMAND_PHRASES
+     for _p, _open in _phrase_forms(_phrase)],
+):
+    for _prefix, _open in _forms:
+        _CLEANUP_PREFIX_INDEX.setdefault(_prefix[0], []).append((_prefix, _open))
+
+
+# «/» здесь же: слэш-команды Telegram («/app», «/site») — команды по самой
+# своей природе, и обычная речь с него не начинается.
+_SIGIL_RE = re.compile(r"^[!.+\-&\[/][0-9a-zа-яё]")
+
+
+def is_command_like(text: Optional[str]) -> bool:
+    """Похоже ли сообщение на команду — по этому решают, чистить ли его.
+
+    Считаем командой только сообщение, целиком начинающееся с известной формы,
+    а не с её первого слова: «не в норме» — команда, а «не хочу тя учить» —
+    разговор, и раньше бот молча удалял второе. Ошибиться в эту сторону дорого
+    (пропадает живая переписка), в обратную — нет: неопознанная команда просто
+    полежит в чате общий срок.
+    """
+    if not text or not text.strip():
+        return False
+    words = _command_words(text)
+    if not words:
+        return False
+    # Служебный знак в начале слова — сам по себе признак команды: так пишут
+    # «!орёл», «-мут», «+чат», и перечислять все их формы в реестре никто не
+    # обязан. Но только если сразу за знаком идёт буква или цифра: «...», «-»
+    # и одинокий «+» — это тире в диалоге и «плюсую», а не команды.
+    if _SIGIL_RE.match(words[0]):
+        return True
+    return any(
+        _form_matches(words, prefix, open_form)
+        for prefix, open_form in _CLEANUP_PREFIX_INDEX.get(words[0], ())
+    )
 
 
 def is_cleanup_targetable(command_key: str) -> bool:
@@ -4400,7 +4529,7 @@ async def refresh_self_caches() -> None:
 # этому ключу, а бот раз в PANEL_RELOAD_INTERVAL секунд проверяет его и, если
 # оно изменилось, перечитывает кэши. Так правки из панели применяются в чатах
 # без перезапуска. (Флаг общий для РП и себяшек — перечитать оба дёшево.)
-PANEL_ACTION_RELOAD_KEY = "panel_action_reload"
+PANEL_ACTION_RELOAD_KEY = db.PANEL_RELOAD_KEY  # ключ общий с панелью, см. db
 PANEL_RELOAD_INTERVAL = 10  # секунд
 
 
@@ -9886,37 +10015,12 @@ def _extract_leading_duration(text: str, skip_words: int = 0) -> tuple[Optional[
     return None, (rest or None)
 
 
-def _plural_ru(n: int, one: str, few: str, many: str) -> str:
-    """Верное русское склонение числительного: 1 день, 2 дня, 5 дней и т.п."""
-    n_abs = abs(n)
-    if 11 <= n_abs % 100 <= 14:
-        return many
-    last = n_abs % 10
-    if last == 1:
-        return one
-    if 2 <= last <= 4:
-        return few
-    return many
-
-
-def format_duration_ru(td: timedelta) -> str:
-    """Человекочитаемая длительность вроде «2 дня 3 часа» или «45 минут» —
-    полными словами (день/час/минута/секунда), а не однобуквенными кодами.
-    Показывает два самых крупных ненулевых разряда, чтобы не загромождать вывод."""
-    total_seconds = int(td.total_seconds())
-    if total_seconds <= 0:
-        return "0 секунд"
-    days, rem = divmod(total_seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-    units = [
-        (days, "день", "дня", "дней"),
-        (hours, "час", "часа", "часов"),
-        (minutes, "минута", "минуты", "минут"),
-        (seconds, "секунда", "секунды", "секунд"),
-    ]
-    parts = [f"{value} {_plural_ru(value, one, few, many)}" for value, one, few, many in units if value]
-    return " ".join(parts[:2]) if parts else "0 секунд"
+# Склонение и «сколько осталось» уехали в game_actions вместе с кормёжкой:
+# кулдаун там надо показывать теми же словами, что и здесь. Ссылками, а не
+# переписыванием шести десятков вызовов: имя format_duration_ru живёт в боте
+# с самого начала, и массовая замена только добавила бы шума в историю.
+_plural_ru = game_actions._plural_ru
+format_duration_ru = game_actions.format_left
 
 
 def compact_elapsed_ru(dt: datetime) -> str:
@@ -11240,8 +11344,8 @@ async def cb_roulette_cancel(callback: CallbackQuery):
 # У каждого участника чата не может быть больше одной незавершённой дуэли
 # одновременно (см. db.get_user_active_duel) — так исключается путаница,
 # какая именно дуэль имеется в виду в командах без явного id.
-# При проигрыше применяется настраиваемый исход (DUEL_OUTCOME, см. «дуэли
-# исход ...» ниже) — как и у русской рулетки/rp-модуля, то же самое можно
+# При проигрыше применяется настраиваемый исход (settings["duel_outcome"], см.
+# «дуэли исход ...» ниже и настройку duel.outcome в панели) — как и у русской рулетки/rp-модуля, то же самое можно
 # было бы продублировать триггерами, но здесь это встроенная настройка.
 # ============================================================================
 
@@ -11338,9 +11442,15 @@ async def _end_duel(chat_id: int, duel: dict, winner_id: int, loser_id: int) -> 
 
 
 async def _apply_duel_outcome(chat_id: int, loser_id: int) -> str:
-    """Применяет DUEL_OUTCOME к проигравшему. Возвращает готовую строку-описание
-    результата для итогового сообщения о дуэли."""
-    outcome = DUEL_OUTCOME
+    """Применяет настроенный исход к проигравшему. Возвращает готовую
+    строку-описание результата для итогового сообщения о дуэли.
+
+    Исход берём из живого словаря settings ПРЯМО СЕЙЧАС, а не из глобальной
+    переменной, заполненной на старте: settings перечитывается по флагу из
+    панели (panel_action_reload_loop), а отдельная переменная — только в
+    load_caches(). Пока читали её, исход, выставленный на сайте, доезжал до
+    чата лишь после перезапуска бота."""
+    outcome = settings.get("duel_outcome") or "kick"
     if outcome == "0":
         return "Наказание за проигрыш отключено — соперник остаётся в чате."
     if outcome == "kick":
@@ -11742,8 +11852,10 @@ async def cmd_duel_outcome_set(message: Message):
             "<code>дуэли исход мут навсегда</code>"
         )
         return
-    global DUEL_OUTCOME
-    DUEL_OUTCOME = code
+    # Правим и живой словарь настроек: из него исход читается при каждом
+    # проигрыше, а перечитку settings из базы бот делает только по флагу из
+    # панели — без этой строки своя же команда применилась бы не сразу.
+    settings["duel_outcome"] = code
     await db.save_setting("duel_outcome", code)
     await db.add_log("duel_outcome_changed", actor_id=message.from_user.id, details=code)
     await message.answer(f"✅ Исход проигрыша в дуэли: «{DUEL_OUTCOME_LABELS[code]}».")
@@ -13668,6 +13780,24 @@ def wallet_stars(wallet: dict) -> int:
     return farm_star_progress(int(wallet.get("total_farms") or 0))[0]
 
 
+def debt_note(coins: int) -> str:
+    """Короткая пометка о долге для карточек. Пусто, если баланс не в минусе.
+
+    Минус в экономике бывает ровно от одного — принудительного взыскания по
+    кредиту (см. _seize_debt). Свой кошелёк это объясняет подробно, но в
+    профиле и в досье строка «В кошельке: −50 000 i¢» стояла голой: свою
+    цифру человек хотя бы может пойти и посмотреть в кошельке, а про чужую
+    в досье узнать неоткуда вовсе — она читается как поломка бота.
+
+    Одна функция на оба места, потому что формулировка тут важнее длины:
+    разъехавшись, две копии объяснили бы одно и то же по-разному.
+    """
+    if coins >= 0:
+        return ""
+    сумма = f"{-coins:,}".replace(",", " ")   # тысячи пробелом, как в кошельке
+    return f"🚨 Долг: {сумма} i¢ — взыскан по просроченному кредиту."
+
+
 def farm_star_line(total_farms: int) -> str:
     """Строка звёздности с полосой прогресса — одна на все места, где она
     показывается: раньше в кошельке было голое «фармов всего: N», по которому
@@ -13766,12 +13896,21 @@ async def cmd_farm_run(message: Message):
 async def _farm_balance_text(chat_id: int, user_id: int) -> str:
     wallet = await db.get_wallet(chat_id, user_id)
     total_farms = int(wallet.get("total_farms") or 0)
+    coins = int(wallet.get("coins", 0))
     lines = [
         "👛 <b>Ваш кошелёк</b>",
         DIVIDER,
-        f"☢️ Коины: <b>{wallet.get('coins', 0)}</b> i¢",
+        f"☢️ Коины: <b>{coins}</b> i¢",
         f"{farm_star_line(total_farms)} (фармов всего: {total_farms})",
     ]
+    if coins < 0:
+        # Взыскание (_seize_debt) списывает долг с баланса целиком, даже уводя
+        # его в минус — без этой строки человек видит "-500 i¢" и не понимает,
+        # ни откуда цифра, ни что теперь можно, ни кончится ли это когда-нибудь.
+        lines.append(
+            f"🚨 Долг: <b>{-coins}</b> i¢ взыскан по кредиту. Пока баланс "
+            f"отрицательный, покупать нельзя, а любой заработок идёт в счёт "
+            f"долга — как выйдете в ноль, всё закончится само.")
     last_farm_at = wallet.get("last_farm_at")
     if last_farm_at:
         remaining = FARM_COOLDOWN - (datetime.utcnow() - last_farm_at)
@@ -13866,6 +14005,410 @@ async def paginate_farm_top(callback: CallbackQuery):
     except TelegramBadRequest:
         pass
     await callback.answer()
+
+
+# ============================================================================
+# 🌱 ОГОРОД — грядки, погода, вредители. Правила и числа — в farming.py.
+#
+# Ферма выше остаётся как была: быстрые монеты одной командой. Огород рядом —
+# про другое: там впервые в боте нужно ВЫБРАТЬ (что сажать, когда вернуться)
+# и там растут вещи, которые до сих пор доставались только за монеты — корм
+# питомцам и подсолнух для крафта.
+#
+# Питомцы работают на грядках своими СУЩЕСТВУЮЩИМИ способностями, а не новыми:
+# правило «одна способность — один вид» уже стоит, и заводить трёх новых
+# зверей ради огорода значило бы обесценить тех, за кого платили. Свинка ищет
+# трюфели (кладоискатель), пчела опыляет (подработка), муравей ускоряет рост
+# (смена) — сила берётся из того же процента, что и в их основном занятии.
+# ============================================================================
+FARM_PET_HARVEST_ABILITY = "side_job"    # 🐝 пчела — больше урожая
+FARM_PET_SPEED_ABILITY = "work"          # 🐜 муравей — быстрее растёт
+FARM_PET_TRUFFLE_ABILITY = "treasure"    # 🐷 свинка — шанс на трюфель
+
+
+@dataclass(frozen=True)
+class FarmAura:
+    """Что питомцы дают огороду. Одной структурой по той же причине, что и
+    PetAura: способностей уже три, и четвёртая иначе потребовала бы править
+    посадку и сбор по отдельности — а забыть одну из двух проще простого."""
+    harvest: int = 0    # + к урожаю при сборе
+    speed: int = 0      # + к скорости роста при посадке
+    truffle: int = 0    # шанс трюфеля в процентах
+
+
+async def _farm_aura(chat_id: int, user_id: int) -> FarmAura:
+    """Все три способности за ОДНУ выборку питомцев.
+
+    Через _pet_bonus по разу на способность это был бы тройной поход в базу
+    (питомцы + каталог + карточка) на каждый показ грядок — ровно та причина,
+    по которой рядом появилась PetAura.
+
+    Ошибку глотаем, как и в _pet_bonus: питомец на грядке — приятная добавка,
+    и упавший запрос не должен ломать посадку.
+    """
+    try:
+        rows = await db.list_pets(chat_id, user_id)
+        if not rows:
+            return FarmAura()
+        specs = await game_actions._pet_specs(chat_id)
+        pinned_key = await game_actions._pinned_pet_key(chat_id, user_id)
+    except Exception as exc:
+        log_suppressed("_farm_aura", exc)
+        return FarmAura()
+    aura = game_actions._pet_aura(rows, specs, pinned_key)
+    percent = game_actions._pet_ability_sums(rows, specs, pinned_key, aura, (
+        FARM_PET_HARVEST_ABILITY, FARM_PET_SPEED_ABILITY, FARM_PET_TRUFFLE_ABILITY))
+    return FarmAura(
+        harvest=percent[FARM_PET_HARVEST_ABILITY],
+        speed=percent[FARM_PET_SPEED_ABILITY],
+        truffle=percent[FARM_PET_TRUFFLE_ABILITY],
+    )
+
+
+def farm_weather(chat_id: int) -> farming.Weather:
+    """Погода этого чата на сегодня. Не хранится — выводится из даты."""
+    return farming.weather_for(chat_id, utc_today())
+
+
+async def _farm_plot_count(chat_id: int, user_id: int) -> int:
+    """Сколько у человека грядок. Считается от звёздности — той самой, которая
+    упиралась в потолок и после этого не значила ничего."""
+    return farming.plots_for(wallet_stars(await db.get_wallet(chat_id, user_id)))
+
+
+def _farm_plot_line(row: dict, now: datetime) -> str:
+    """Одна грядка в списке: что растёт и что с ним происходит."""
+    crop = farming.BY_KEY.get(row["crop_key"])
+    if crop is None:
+        return f"{row['slot'] + 1}. неизвестная культура «{html.escape(str(row['crop_key']))}»"
+    ready = row["ready_at"]
+    head = f"{row['slot'] + 1}. {crop.emoji} {crop.name}"
+    if farming.is_perished(crop, ready, now):
+        return f"{head} — 🥀 сгнила, забирать нечего. Сбор освободит грядку."
+    if not farming.is_ready(now, ready):
+        left = format_duration_ru(ready - now)
+        tail = f"{head} — поспеет через {left}"
+    else:
+        gone = farming.perish_at(crop, ready)
+        if gone is not None:
+            tail = f"{head} — ✅ готова, пропадёт через {format_duration_ru(gone - now)}"
+        else:
+            tail = f"{head} — ✅ готова"
+    if farming.pests_visible(row.get("pest_at"), now):
+        loss = farming.pest_loss_percent(row.get("pest_at"), now)
+        tail += f"\n   🦗 саранча съела {loss}% — «ферма помочь» от соседа её прогонит"
+    return tail
+
+
+async def _farm_garden_text(chat_id: int, user_id: int) -> str:
+    weather = farm_weather(chat_id)
+    aura = await _farm_aura(chat_id, user_id)
+    rows = await db.list_farm_plots(chat_id, user_id)
+    # Кошелёк читаем ОДИН раз: и число грядок, и «сколько до следующей» растут
+    # из одной и той же звёздности, и два запроса за ней разошлись бы.
+    stars = wallet_stars(await db.get_wallet(chat_id, user_id))
+    total = farming.plots_for(stars)
+    now = datetime.utcnow()
+
+    lines = [
+        "🌱 <b>Ваш огород</b>",
+        DIVIDER,
+        f"{weather.emoji} <b>{weather.name}.</b> {weather.text}",
+        f"🪴 Грядок: {len(rows)}/{total}",
+    ]
+    need = farming.plots_next_star(stars)
+    if need:
+        lines.append(f"   ещё одна грядка — через {need} ⭐ звёздности")
+    lines.append(DIVIDER)
+    if rows:
+        lines += [_farm_plot_line(row, now) for row in rows]
+    else:
+        lines.append("Пусто. «ферма культуры» — что можно посадить.")
+    if len(rows) < total:
+        lines.append(f"\nСвободных грядок: {total - len(rows)}. "
+                     f"Посадить: <code>ферма посадить картошка</code>")
+    bonus = []
+    if aura.speed:
+        bonus.append(f"🐜 муравей ускоряет рост на {aura.speed}%")
+    if aura.harvest:
+        bonus.append(f"🐝 пчела прибавляет {aura.harvest}% к урожаю")
+    if aura.truffle:
+        bonus.append(f"🐷 свинка ищет трюфель ({aura.truffle}% за грядку)")
+    if bonus:
+        lines.append("\n" + "\n".join(bonus))
+    return "\n".join(lines)
+
+
+FARM_GARDEN_TRIGGERS = {"грядки", "ферма грядки", "огород"}
+FARM_CROPS_TRIGGERS = {"ферма культуры", "культуры"}
+FARM_WEATHER_TRIGGERS = {"ферма погода"}
+FARM_HARVEST_TRIGGERS = {"ферма собрать", "собрать урожай"}
+FARM_PLANT_RE = ru_text.rx(r"(?i)^ферма\s+посадить\s+(\S+)(?:\s+(\d+))?$")
+FARM_HELP_RE = ru_text.rx(r"(?i)^ферма\s+помочь\b")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in FARM_GARDEN_TRIGGERS),
+)
+async def cmd_farm_garden(message: Message):
+    if not _check_misc_access(message.from_user.id, "farm_garden"):
+        return
+    await message.answer(await _farm_garden_text(message.chat.id, message.from_user.id))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in FARM_WEATHER_TRIGGERS),
+)
+async def cmd_farm_weather(message: Message):
+    if not _check_misc_access(message.from_user.id, "farm_garden"):
+        return
+    weather = farm_weather(message.chat.id)
+    await message.answer(
+        f"{weather.emoji} <b>{weather.name}</b>\n{weather.text}\n\n"
+        "Погода одна на весь чат и меняется раз в сутки. Скорость роста задаёт "
+        "погода дня ПОСАДКИ, размер урожая — погода дня СБОРА."
+    )
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in FARM_CROPS_TRIGGERS),
+)
+async def cmd_farm_crops(message: Message):
+    if not _check_misc_access(message.from_user.id, "farm_crops"):
+        return
+    event = await get_active_event(message.chat.id)
+    lines = ["🌾 <b>Что можно вырастить</b>", DIVIDER]
+    for crop in farming.CROPS:
+        head = f"{crop.emoji} <b>{crop.name}</b> — семена {crop.seed_price} i¢"
+        if crop.event_only and event is None:
+            head += " · <i>только во время ивента</i>"
+        lines.append(head)
+        lines.append(f"   растёт {crop.grow_hours} ч, даёт {crop.yield_min}–{crop.yield_max} шт")
+        if crop.perishable:
+            lines.append(f"   ⏳ пропадёт через {crop.perish_hours} ч после созревания")
+        lines.append(f"   <i>{crop.hint}</i>")
+    lines += [
+        DIVIDER,
+        "Посадить: <code>ферма посадить {культура}</code>",
+        "Свой участок: <code>грядки</code>",
+    ]
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(FARM_PLANT_RE.match(t.strip()))),
+)
+async def cmd_farm_plant(message: Message):
+    """«ферма посадить клубника [сколько]» — занять свободные грядки."""
+    if not _check_misc_access(message.from_user.id, "farm_plant"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    match = FARM_PLANT_RE.match(message.text.strip())
+    crop = farming.resolve(match.group(1))
+    if crop is None:
+        await message.reply(
+            "Не знаю такой культуры. Список — <code>ферма культуры</code>."
+        )
+        return
+    if crop.event_only and await get_active_event(chat_id) is None:
+        await message.reply(
+            f"{crop.emoji} {crop.name} растёт только когда в чате идёт ивент. "
+            "Что идёт сейчас — «ивенты»."
+        )
+        return
+
+    rows = await db.list_farm_plots(chat_id, user_id)
+    total = await _farm_plot_count(chat_id, user_id)
+    free = [slot for slot in range(total) if slot not in {r["slot"] for r in rows}]
+    if not free:
+        await message.reply(
+            f"Все {total} грядок заняты. Соберите урожай («ферма собрать») "
+            "или дождитесь, пока поспеет."
+        )
+        return
+    want = min(int(match.group(2) or 1), len(free))
+    if want < 1:
+        await message.reply("Сажать по нулю грядок — это не садоводство.")
+        return
+
+    cost = crop.seed_price * want
+    if not await spend_coins(chat_id, user_id, cost):
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Не хватает монет: семена стоят {cost} i¢, у вас "
+            f"{int(wallet.get('coins') or 0)} i¢."
+        )
+        return
+
+    weather = farm_weather(chat_id)
+    aura = await _farm_aura(chat_id, user_id)
+    # Пугало (крафт из своего же урожая) снимает вредителей совсем.
+    protected = bool(await _item_perk(chat_id, user_id, shop_effects.PERK_FARM_NO_PESTS))
+    chance = farming.pest_chance(weather, protected)
+    now = datetime.utcnow()
+    ready = farming.ready_at(crop, now, weather, aura.speed)
+
+    planted = 0
+    for slot in free[:want]:
+        pest_at = None
+        if chance and random.randint(1, 100) <= chance:
+            pest_at = farming.pest_moment(now, ready, random.random())
+        if await db.plant_farm_crop(chat_id, user_id, slot, crop.key, now, ready, pest_at):
+            planted += 1
+    if not planted:
+        # Грядки успели занять между проверкой и вставкой — деньги возвращаем.
+        await db.add_coins(chat_id, user_id, cost)
+        await message.reply("Грядки уже заняты — семена не тронуты.")
+        return
+    if planted < want:
+        await db.add_coins(chat_id, user_id, crop.seed_price * (want - planted))
+
+    lines = [
+        f"{crop.emoji} Посажено: <b>{crop.name}</b> ×{planted} "
+        f"(−{crop.seed_price * planted} i¢)",
+        f"{weather.emoji} {weather.name}: поспеет через {format_duration_ru(ready - now)}",
+    ]
+    if aura.speed:
+        lines.append(f"🐜 Муравей ускорил рост на {aura.speed}%.")
+    if crop.perishable:
+        lines.append(f"⏳ Не забудьте забрать: через {crop.perish_hours} ч после "
+                     "созревания пропадёт.")
+    if protected:
+        lines.append("🎭 Пугало на месте — вредители не сядут.")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in FARM_HARVEST_TRIGGERS),
+)
+async def cmd_farm_harvest(message: Message):
+    """«ферма собрать» — забрать всё, что поспело, разом.
+
+    Разом, а не по грядке: грядок до семи, и семь одинаковых команд подряд —
+    это не игра, а работа. Неготовые грядки просто остаются расти.
+    """
+    if not _check_misc_access(message.from_user.id, "farm_harvest"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    rows = await db.list_farm_plots(chat_id, user_id)
+    now = datetime.utcnow()
+    ripe = [r for r in rows
+            if farming.BY_KEY.get(r["crop_key"]) and farming.is_ready(now, r["ready_at"])]
+    if not ripe:
+        if rows:
+            soonest = min(r["ready_at"] for r in rows)
+            await message.reply(
+                "Пока нечего собирать. Ближайшая грядка поспеет через "
+                f"{format_duration_ru(soonest - now)}."
+            )
+        else:
+            await message.reply(
+                "Огород пуст. «ферма культуры» — что можно посадить."
+            )
+        return
+
+    weather = farm_weather(chat_id)
+    aura = await _farm_aura(chat_id, user_id)
+    await db.seed_extra_shop_items(chat_id, farming.SHOP_ITEMS, is_active=False)
+
+    lines = [f"🧺 <b>Урожай</b> · {weather.emoji} {weather.name}", DIVIDER]
+    truffles = 0
+    for row in ripe:
+        crop = farming.BY_KEY[row["crop_key"]]
+        await db.clear_farm_plot(chat_id, user_id, row["slot"])
+        if farming.is_perished(crop, row["ready_at"], now):
+            lines.append(f"🥀 {crop.name} сгнила — забрали поздно.")
+            continue
+        loss = farming.pest_loss_percent(row.get("pest_at"), now)
+        units = farming.harvest_units(
+            crop, random.randint(crop.yield_min, crop.yield_max),
+            weather, aura.harvest, loss)
+        if units:
+            await db.add_inventory_item(chat_id, user_id, crop.item_key, units)
+            line = f"{crop.emoji} {crop.item_name} ×{units}"
+        else:
+            line = f"{crop.emoji} {crop.name} — не осталось ничего"
+        if loss:
+            line += f" (🦗 саранча съела {loss}%)"
+        lines.append(line)
+        if aura.truffle and farming.truffle_found(aura.truffle, random.randint(1, 100)):
+            truffles += 1
+
+    if truffles:
+        coins = farming.TRUFFLE_COINS * truffles
+        await db.add_coins(chat_id, user_id, coins)
+        lines.append(f"\n🐷 Свинка вырыла трюфель ×{truffles}: +{coins} i¢")
+    if weather.yield_percent:
+        znak = "+" if weather.yield_percent > 0 else ""
+        lines.append(f"\n{weather.emoji} Погода дня сбора: {znak}{weather.yield_percent}% к урожаю")
+    if aura.harvest:
+        lines.append(f"🐝 Пчела прибавила {aura.harvest}%")
+    lines.append("\nПродать урожай: <code>магазин продать {ключ}</code>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(FARM_HELP_RE.match(t.strip()))),
+)
+async def cmd_farm_help(message: Message):
+    """«ферма помочь @кому» — прогнать саранчу с чужих грядок.
+
+    Первое в боте взаимодействие, где чужому ПОМОГАЮТ, а не отбирают: урожай
+    остаётся хозяину целиком, сосед получает монеты просто за то, что пришёл.
+    """
+    if not _check_misc_access(message.from_user.id, "farm_help"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    target = await _target_for_item(
+        message,
+        "Использование: <code>ферма помочь @кому</code> (или ответом на его сообщение).",
+    )
+    if target is None:
+        return
+    if target.id == user_id:
+        await message.reply("Свою саранчу прогоняйте сами — за это не платят.")
+        return
+
+    now = datetime.utcnow()
+    last = await db.get_farm_help_at(chat_id, user_id)
+    if last and now - last < farming.HELP_COOLDOWN:
+        left = farming.HELP_COOLDOWN - (now - last)
+        await message.reply(
+            f"Помогать можно раз в {format_duration_ru(farming.HELP_COOLDOWN)}. "
+            f"Следующий раз через {format_duration_ru(left)}."
+        )
+        return
+
+    cleared = await db.clear_farm_pests(chat_id, target.id, now)
+    target_name = await display_name(chat_id, target)
+    if not cleared:
+        await message.reply(
+            f"На грядках {target_name} сейчас чисто — прогонять некого."
+        )
+        return
+    await db.record_farm_help(chat_id, user_id, now)
+    await db.add_coins(chat_id, user_id, farming.HELP_REWARD_COINS)
+    helper_name = await display_name(chat_id, message.from_user)
+    await message.answer(
+        f"🦗 {helper_name} прогнал(а) саранчу с грядок {target_name} "
+        f"({cleared} шт). Урожай остался хозяину, помощнику "
+        f"+{farming.HELP_REWARD_COINS} i¢."
+    )
 
 
 # ============================================================================
@@ -14730,7 +15273,7 @@ async def _close_hat_later(chat_id: int, message_id: int) -> None:
             # Доплата из казны чата — только в пределах того, что там есть.
             treasury = await db.get_chat_coins(chat_id)
             # «Зазывала» (питомец) поднимает собранное шапкой.
-            zazyvala = await _pet_bonus(chat_id, round_["owner_id"], "hat")
+            zazyvala = await game_actions._pet_bonus(chat_id, round_["owner_id"], "hat")
             if zazyvala:
                 extra = total * zazyvala // 100
                 if extra:
@@ -15123,10 +15666,6 @@ async def cmd_business_buy(message: Message):
     )
 
 
-@router.message(
-    F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and bool(BUSINESS_COLLECT_RE.match(t.strip()))),
-)
 async def _pinned_business_self_repair(chat_id: int, user_id: int) -> Optional[str]:
     """Закреплённый бизнес чинится сам, но не чаще раза в сутки.
 
@@ -15168,6 +15707,10 @@ async def _pinned_business_self_repair(chat_id: int, user_id: int) -> Optional[s
         return None
 
 
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BUSINESS_COLLECT_RE.match(t.strip()))),
+)
 async def cmd_business_collect(message: Message):
     if not _check_misc_access(message.from_user.id, "business_collect"):
         return
@@ -15257,7 +15800,7 @@ async def cmd_business_upgrade(message: Message):
         return
 
     cost = item.upgrade_cost(level + 1)
-    prorab = await _pet_bonus(chat_id, user_id, "discount_upgrade")
+    prorab = await game_actions._pet_bonus(chat_id, user_id, "discount_upgrade")
     if prorab:
         cost = max(1, cost - cost * prorab // 100)
     # «Бизнес-план» (предмет магазина) оплачивает апгрейд за вас. Заряд
@@ -15765,7 +16308,7 @@ async def businesses_loop() -> None:
                                 chat_id, int(row["user_id"]), row["business_key"]):
                             chance *= business_catalog.GEAR_BREAK_FACTOR
                         # «Механик» (питомец) тоже бережёт технику.
-                        mehanik = await _pet_bonus(chat_id, int(row["user_id"]), "guard_break")
+                        mehanik = await game_actions._pet_bonus(chat_id, int(row["user_id"]), "guard_break")
                         if mehanik:
                             chance *= (100 - mehanik) / 100
                         # «Ящик инструментов» (ачивка «Мастер на все руки») —
@@ -15936,7 +16479,7 @@ async def _do_repair(chat_id: int, user_id: int, key: str) -> tuple[bool, str]:
         return False, "🧊 Ваш счёт заморожен администрацией — ремонт недоступен."
 
     cost = business_catalog.repair_cost(item, int(row["level"]))
-    remontnik = await _pet_bonus(chat_id, user_id, "discount_repair")
+    remontnik = await game_actions._pet_bonus(chat_id, user_id, "discount_repair")
     if remontnik:
         cost = max(1, cost - cost * remontnik // 100)
     if not await spend_coins(chat_id, user_id, cost):
@@ -16274,7 +16817,7 @@ async def cb_boss_hit(callback: CallbackQuery):
                             boss_catalog.DAMAGE_SPREAD_MAX),
     )
     # «Боевой» (питомец) бьёт вместе с хозяином.
-    boevoy = await _pet_bonus(chat_id, user_id, "boss_damage")
+    boevoy = await game_actions._pet_bonus(chat_id, user_id, "boss_damage")
     if boevoy:
         dealt += dealt * boevoy // 100
 
@@ -16480,142 +17023,35 @@ async def _pet_lucky(chat_id: int, user_id: int, amount: int, ability: str) -> i
     лутбоксы), и повторять три строки в каждом — верный способ однажды
     забыть одно из них.
     """
-    percent = await _pet_bonus(chat_id, user_id, ability)
+    percent = await game_actions._pet_bonus(chat_id, user_id, ability)
     percent += await _pin_bonus(chat_id, user_id, ability)
     if not percent:
         return amount
     return amount + amount * percent // 100
 
 
-async def _pet_bonus(chat_id: int, user_id: int, ability: str) -> int:
-    """Прибавка в процентах от питомцев с этой способностью.
-
-    Считаются ТОЛЬКО сытые и довольные (pets.is_active): в этом и смысл
-    ухода — перестал кормить, потерял выгоду. Складывается, если питомцев
-    с одной способностью несколько.
-
-    Ошибку глотаем: способность питомца — приятный бонус, а не основа
-    начисления, и упавший запрос не должен ронять саму ферму или налёт.
-    """
-    if not ability:
-        return 0
-    try:
-        rows = await db.list_pets(chat_id, user_id)
-        if not rows:
-            return 0
-        specs = await _pet_specs(chat_id)
-    except Exception as exc:
-        log_suppressed("_pet_bonus", exc)
-        return 0
-
-    # «Компаньон» замедляет падение настроения — учитываем его ДО проверки
-    # активности остальных, иначе панда не могла бы вытянуть загрустившую
-    # компанию, ради чего она и заводится.
-    pinned_key = await _pinned_pet_key(chat_id, user_id)
-    aura = _pet_aura(rows, specs, pinned_key)
-    # Закреплённому питомцу способность засыпает позже — это его слот
-    # экипировки (см. pins.PET_LOW_STAT). Карточку читаем один раз на весь
-    # проход, а не по разу на питомца.
-    total = 0
-    for row in rows:
-        spec = specs.get(row["pet_key"])
-        if spec is None:
-            continue
-        if ability not in _effective_abilities(row, spec):
-            continue
-        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-        if not _pet_is_active(row, hunger, mood, pinned_key):
-            continue
-        total += pets_catalog.ability_percent(
-            ability, _pet_level(row), evolved=bool(row.get("evolved")))
-    return total
-
-
-ABILITY_PET_MOOD = "pet_mood"
-ABILITY_PET_HUNGER = "pet_hunger"
-ABILITY_PET_XP = "pet_xp"
-ABILITY_PET_WALK = "pet_walk"
-
-
-def _pet_is_active(row: dict, hunger: int, mood: int,
-                   pinned_key: Optional[str]) -> bool:
-    """Работает ли способность этого питомца прямо сейчас.
-
-    У закреплённого порог ниже обычного: закреп — слот экипировки, и его
-    смысл в том, что закреплённому прощается пропущенная кормёжка. Не
-    «никогда не засыпает» — ухаживать всё равно надо.
-    """
-    if pinned_key and row.get("pet_key") == pinned_key:
-        return hunger >= pins.PET_LOW_STAT and mood >= pins.PET_LOW_STAT
-    return pets_catalog.is_active(hunger, mood)
-
-
-async def _pinned_pet_key(chat_id: int, user_id: int) -> Optional[str]:
-    try:
-        card = await db.get_profile_card(chat_id, user_id)
-    except Exception as exc:
-        log_suppressed("_pinned_pet_key", exc)
-        return None
-    return (card or {}).get("pinned_pet")
-
-
-def _pet_family_bonus(rows: list[dict], specs: dict, ability: str,
-                      pinned_key: Optional[str] = None) -> int:
-    """Сила способности, которая действует на ВСЕХ питомцев хозяина сразу.
-
-    Таких четыре: «Компаньон» (настроение), «Хозяйственный» (сытость),
-    «Наставник» (опыт) и «Следопыт» (монеты с прогулки). Считаются они
-    одинаково, поэтому и код один: разойдись он на четыре копии, однажды
-    одна из них забыла бы про эволюцию или про закреп.
-
-    Рекурсии здесь нет намеренно: сам носитель проверяется по состоянию БЕЗ
-    поблажки — иначе он поддерживал бы сам себя, и вопрос «работает ли он» не
-    имел бы однозначного ответа.
-    """
-    total = 0
-    found = pets_catalog.ABILITY_BY_KEY.get(ability)
-    if found is None:
-        return 0
-    for row in rows:
-        spec = specs.get(row["pet_key"])
-        if spec is None or ability not in _effective_abilities(row, spec):
-            continue
-        hunger, mood = _pet_now(row)          # без поблажки — см. докстринг
-        if not _pet_is_active(row, hunger, mood, pinned_key):
-            continue
-        total += pets_catalog.ability_percent(
-            ability, _pet_level(row), evolved=bool(row.get("evolved")))
-    return total
-
-
-@dataclass(frozen=True)
-class PetAura:
-    """Что способности ваших питомцев дают ВСЕМ вашим питомцам сразу.
-
-    Одной структурой, а не россыпью процентов по аргументам: таких способностей
-    уже четыре, и следующая иначе потребовала бы править сигнатуру кормёжки,
-    ласки и прогулки разом — а забыть одну из трёх проще простого.
-    """
-    mood: int = 0      # «Компаньон» — настроение падает медленнее
-    hunger: int = 0    # «Хозяйственный» — сытость падает медленнее
-    xp: int = 0        # «Наставник» — опыт растёт быстрее
-    walk: int = 0      # «Следопыт» — больше монет с прогулки
-
-    def xp_gain(self, base: int) -> int:
-        return base + base * max(0, self.xp) // 100
-
-    def walk_coins(self, base: int) -> int:
-        return base + base * max(0, self.walk) // 100
-
-
-def _pet_aura(rows: list[dict], specs: dict,
-              pinned_key: Optional[str] = None) -> PetAura:
-    return PetAura(
-        mood=_pet_family_bonus(rows, specs, ABILITY_PET_MOOD, pinned_key),
-        hunger=_pet_family_bonus(rows, specs, ABILITY_PET_HUNGER, pinned_key),
-        xp=_pet_family_bonus(rows, specs, ABILITY_PET_XP, pinned_key),
-        walk=_pet_family_bonus(rows, specs, ABILITY_PET_WALK, pinned_key),
-    )
+# Правила питомцев переехали в game_actions — панель зовёт их напрямую, не
+# поднимая второго бота. Здесь остаются только имена, которые зовут снаружи
+# по-старому: тесты команд обращаются к ним как bot_module.имя. Это ссылки на
+# те же объекты, а не копии, иначе вернулась бы ровно та вторая правда, ради
+# которой переезд и затевался.
+#
+# Псевдоним заводится ТОЛЬКО под живого читателя. Мёртвый опаснее, чем кажется:
+# здесь стоял псевдоним ключа способности «Компаньона», которого никто не
+# читал, — а сторож «каждая способность реально подключена» ищет имя константы
+# регуляркой и требует больше одного вхождения. Строка вида «ИМЯ =
+# game_actions.ИМЯ» содержит его дважды, то есть удовлетворяет сторожа сама
+# собой: способность можно было отключить целиком, и он бы не заметил. По той
+# же причине сами имена этих констант здесь не упоминаются даже в тексте —
+# сторож считает вхождения по всему исходнику, комментарии не исключение.
+PetAura = game_actions.PetAura
+_pet_specs = game_actions._pet_specs
+_pet_bonus = game_actions._pet_bonus
+_pet_now = game_actions._pet_now
+_pet_level = game_actions._pet_level
+_pet_xp_now = game_actions._pet_xp_now
+_effective_ability = game_actions._effective_ability
+_effective_abilities = game_actions._effective_abilities
 
 
 def _pet_mood_slowdown(rows: list[dict], specs: dict,
@@ -16633,233 +17069,7 @@ def _pet_mood_slowdown(rows: list[dict], specs: dict,
     по его состоянию БЕЗ поблажки. Иначе панда поддерживала бы сама себя, и
     вопрос «работает ли она» не имел бы однозначного ответа.
     """
-    return _pet_family_bonus(rows, specs, ABILITY_PET_MOOD, pinned_key)
-
-
-def _pet_hunger_slowdown(rows: list[dict], specs: dict,
-                         pinned_key: Optional[str] = None) -> int:
-    """«Хозяйственный» (лебедь за брак): сытость всех падает медленнее."""
-    return _pet_family_bonus(rows, specs, ABILITY_PET_HUNGER, pinned_key)
-
-
-async def _pet_aura_for(chat_id: int, user_id: int) -> "PetAura":
-    """То же самое, но когда строк питомцев под рукой нет (поштучные команды).
-
-    Ошибку глотаем по той же причине, что и в _pet_bonus: поблажка — приятная
-    добавка, а не основа расчёта, и упавший запрос не должен ломать кормёжку.
-    """
-    try:
-        rows = await db.list_pets(chat_id, user_id)
-        if not rows:
-            return PetAura()
-        return _pet_aura(rows, await _pet_specs(chat_id),
-                         await _pinned_pet_key(chat_id, user_id))
-    except Exception as exc:
-        log_suppressed("_pet_aura_for", exc)
-        return PetAura()
-
-
-def _effective_abilities(row: dict, spec) -> tuple[str, ...]:
-    """Все способности питомца: своя (или вида) плюс вторая, если он
-    эволюционировал. Считаются обе — в этом и смысл эволюции."""
-    out = [_effective_ability(row, spec)]
-    second = row.get("ability2")
-    if second and second != pets_catalog.ABILITY_NONE:
-        out.append(second)
-    return tuple(a for a in out if a and a != pets_catalog.ABILITY_NONE)
-
-
-def _effective_ability(row: dict, spec) -> str:
-    """Способность питомца У ЭТОГО хозяина: своя, если её меняли за деньги
-    (row['ability'] — override, см. пет способность), иначе — способность
-    вида из каталога. NULL/пусто в row означает «override не задан»."""
-    override = row.get("ability")
-    if override:
-        return override
-    return spec.ability if spec else pets_catalog.ABILITY_NONE
-
-
-# Настройки видов питомцев в конкретном чате: выключен ли вид и есть ли
-# потолок численности. Заполняется _pet_specs(), читается покупкой.
-_pet_settings: dict[str, dict] = {}
-
-
-async def _pet_specs(chat_id: int) -> dict:
-    """Каталог питомцев чата: встроенные из pets.py плюс заведённые админом.
-
-    Живёт в БД, потому что админ может создать своего питомца в панели;
-    встроенные при каждом обращении досеиваются, чтобы новые из кода доезжали
-    и в чаты, где каталог уже есть.
-    """
-    await db.ensure_pet_catalog(chat_id, pets_catalog.PETS)
-    out: dict = {}
-    settings_by_key = _pet_settings
-    for row in await db.list_pet_catalog(chat_id):
-        spec = pets_catalog.Pet(
-            key=row["pet_key"], name=row["name"], emoji=row["emoji"],
-            price=int(row["price"]), sound=row["sound"],
-            # Без этого способность терялась при чтении из базы и все питомцы
-            # молча становились бесполезными: в каталоге эффект есть, а
-            # в объекте — ABILITY_NONE по умолчанию.
-            ability=row.get("ability") or pets_catalog.ABILITY_NONE,
-            # За какую ачивку выдаётся — только у встроенных: админ наградных
-            # видов не заводит, и хранить это в БД незачем. Без переноса
-            # наградный питомец, прочитанный из каталога, оказался бы обычным
-            # покупным — ровно как когда-то терялась способность.
-            achievement=(pets_catalog.BY_KEY.get(row["pet_key"])
-                         or pets_catalog.Pet("", "", "", 0, "")).achievement,
-        )
-        # Выключатель и потолок численности живут только в базе (их правит
-        # панель), поэтому кладём их рядом со спецификацией, а не в саму
-        # неизменяемую Pet — она описывает вид, а не его настройку в чате.
-        out[row["pet_key"]] = spec
-        settings_by_key[row["pet_key"]] = {
-            "is_active": bool(row.get("is_active", True)),
-            "max_count": row.get("max_count"),
-        }
-    return out
-
-
-async def _pet_spec(chat_id: int, raw: Optional[str]):
-    """Питомец по ключу или по-русски, с учётом созданных админом."""
-    if not raw:
-        return None
-    specs = await _pet_specs(chat_id)
-    key = " ".join(raw.strip().casefold().split())
-    if key in specs:
-        return specs[key]
-    # Русские названия: сначала встроенные синонимы, потом по самому названию.
-    builtin = pets_catalog.resolve(raw)
-    if builtin is not None and builtin.key in specs:
-        return specs[builtin.key]
-    for spec in specs.values():
-        if spec.name.casefold() == key:
-            return spec
-    return None
-
-
-def _pet_hours(row: dict) -> float:
-    last = row.get("last_tick_at")
-    if not last:
-        return 0.0
-    return max(0.0, (datetime.utcnow() - last).total_seconds() / 3600)
-
-
-def _pet_xp_hours(row: dict) -> float:
-    """Отдельная метка от _pet_hours: xp_tick_at не имеет истории с покупки
-    питомца (см. миграцию в db.ensure_pets_table) — считать опыт от
-    last_tick_at выдало бы старым питомцам мгновенный максимальный уровень."""
-    last = row.get("xp_tick_at")
-    if not last:
-        return 0.0
-    return max(0.0, (datetime.utcnow() - last).total_seconds() / 3600)
-
-
-def _pet_xp_now(row: dict) -> int:
-    return pets_catalog.xp_now(int(row.get("xp") or 0), _pet_xp_hours(row))
-
-
-def _pet_level(row: dict) -> int:
-    return pets_catalog.level_for_xp(_pet_xp_now(row))
-
-
-def _pet_now(row: dict, mood_slowdown: int = 0,
-             hunger_slowdown: int = 0) -> tuple[int, int]:
-    """Сытость и настроение ПРЯМО СЕЙЧАС, с учётом прошедшего времени.
-
-    mood_slowdown — на сколько процентов медленнее падает настроение
-    («Компаньон»). Передаётся снаружи, чтобы расчёт остался синхронным:
-    он зовётся в отрисовке списков и в профиле.
-    """
-    hours = _pet_hours(row)
-    mood_hours = hours * (100 - max(0, min(mood_slowdown, 90))) / 100
-    hunger_hours = hours * (100 - max(0, min(hunger_slowdown, 90))) / 100
-    stored_hunger = int(row.get("hunger") or 0)
-    hunger = (pets_catalog.hunger_now_evolved(stored_hunger, hunger_hours)
-              if row.get("evolved")
-              else pets_catalog.hunger_now(stored_hunger, hunger_hours))
-    return hunger, pets_catalog.mood_now(int(row.get("mood") or 0), mood_hours)
-
-
-def _pet_display(row: dict, spec=None) -> str:
-    """Как питомец называется в тексте. spec можно передать снаружи, чтобы
-    не ходить в каталог второй раз; без него берётся встроенный, а для
-    заведённого админом — просто ключ.
-
-    Эволюционировавший показывается НОВЫМ обликом: ради него эволюцию и
-    делают, и видеть в списке прежнего хомяка было бы обидно."""
-    spec = spec or pets_catalog.BY_KEY.get(row["pet_key"])
-    grown = pets_catalog.evolution_of(row["pet_key"]) if row.get("evolved") else None
-    if grown is not None:
-        base = f"{grown.emoji} {grown.name}"
-    else:
-        base = spec.title if spec else row["pet_key"]
-    given = row.get("pet_name")
-    return f"{base} «{html.escape(given)}»" if given else base
-
-
-async def _pets_text(chat_id: int, user_id: int, own: bool) -> str:
-    rows = await db.list_pets(chat_id, user_id)
-    if not rows:
-        return ("🐾 <b>Питомцы</b>\n\nПока ни одного.\n"
-                "Каталог — <code>пет каталог</code>, купить — "
-                "<code>пет купить {ключ}</code>." if own
-                else "🐾 У этого человека пока нет питомцев.")
-    specs = await _pet_specs(chat_id)
-    pinned_key = await _pinned_pet_key(chat_id, user_id)
-    aura = _pet_aura(rows, specs, pinned_key)
-    lines = [f"🐾 <b>Питомцы</b> — {len(rows)}", DIVIDER]
-    for row in rows:
-        spec = specs.get(row["pet_key"])
-        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-        xp = _pet_xp_now(row)
-        level, gained, needed = pets_catalog.level_progress(xp)
-        level_label = (f"MAX" if level >= pets_catalog.MAX_PET_LEVEL
-                       else f"{level}/{pets_catalog.MAX_PET_LEVEL}")
-        line = (f"{_pet_display(row, spec)} (<code>{row['pet_key']}</code>) "
-                f"— ⭐ ур. {level_label}\n"
-                f"   🍽 {pets_catalog.bar(hunger)} {hunger}   "
-                f"😊 {pets_catalog.bar(mood)} {mood}   {pets_catalog.state_text(hunger, mood)}")
-        if level < pets_catalog.MAX_PET_LEVEL:
-            progress = round(100 * gained / needed) if needed else 100
-            line += f"\n   📈 {pets_catalog.bar(progress)} {gained}/{needed} опыта"
-        # Способности и то, работают ли они сейчас: иначе непонятно, зачем
-        # вообще кормить. Процент — уже с прибавкой за уровень, а у
-        # эволюционировавшего ещё и с удвоенной базой. Способностей может быть
-        # две — вторая появляется как раз с эволюцией.
-        evolved = bool(row.get("evolved"))
-        works = "✅" if _pet_is_active(row, hunger, mood, pinned_key) else "💤 спит"
-        for ability_key in (_effective_abilities(row, spec) if spec else ()):
-            found = pets_catalog.ABILITY_BY_KEY.get(ability_key)
-            if found is None:
-                continue
-            percent = pets_catalog.ability_percent(ability_key, level, evolved)
-            line += f"\n   ✨ {found.description.format(p=percent)} — {works}"
-        if evolved:
-            line += "\n   🌟 Эволюционировал(а)"
-        lines.append(line)
-    if own:
-        food = await db.get_inventory_quantity(chat_id, user_id,
-                                               pets_catalog.FOOD_ITEM_KEY)
-        lines += ["", f"{pets_catalog.FOOD_ITEM_EMOJI} Корма у вас: {food} "
-                      f"(одно кормление — один корм, "
-                      f"<code>пет корм 10</code>)",
-                  "<code>пет кормить {ключ}</code> · "
-                  "<code>пет гладить {ключ}</code> · "
-                  "<code>пет обнять {ключ}</code> · "
-                  "<code>пет поцеловать {ключ}</code>",
-                  "<code>пет гулять {ключ}</code> — питомец принесёт находку "
-                  f"(раз в {pets_catalog.WALK_COOLDOWN_HOURS} ч)",
-                  "<code>пет кормить все</code> · <code>пет обнять все</code> · "
-                  "<code>пет гулять все</code> — сразу всем",
-                  "<code>пет назвать {ключ} {имя}</code> · "
-                  "<code>пет закрепить {ключ}</code>",
-                  "<code>пет продать {ключ}</code> — вернуть половину цены",
-                  "<code>пет способность {ключ} {номер}</code> — сменить "
-                  "способность за i¢, список номеров: <code>пет способности</code>",
-                  "⭐ Уровень растёт сам по себе со временем, кормёжка и "
-                  "ласка ускоряют."]
-    return "\n".join(lines)
+    return game_actions._pet_family_bonus(rows, specs, game_actions.ABILITY_PET_MOOD, pinned_key)
 
 
 @router.message(
@@ -16870,8 +17080,9 @@ async def cmd_pets_mine(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_list"):
         return
     target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
-    await message.reply(await _pets_text(message.chat.id, target.id,
-                                         own=target.id == message.from_user.id))
+    result = await game_actions.my_pets_text(
+        message.chat.id, target.id, own=target.id == message.from_user.id)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -16881,32 +17092,9 @@ async def cmd_pets_mine(message: Message):
 async def cmd_pets_catalog(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_list"):
         return
-    owned = {r["pet_key"] for r in await db.list_pets(message.chat.id, message.from_user.id)}
-    specs = await _pet_specs(message.chat.id)
-    lines = ["🐾 <b>Питомцы</b> — кого можно завести", DIVIDER]
-    for spec in sorted(specs.values(), key=lambda s: s.price):
-        if spec.key in owned:
-            mark = " ✅ уже есть"
-        elif getattr(spec, "achievement", ""):
-            info = ACHIEVEMENTS.get(spec.achievement) or {}
-            mark = f" 🏅 за ачивку «{info.get('title') or spec.achievement}»"
-        else:
-            mark = f" — {spec.price} i¢"
-        lines.append(f"{spec.title} (<code>{spec.key}</code>){mark}")
-        text = pets_catalog.ability_text(spec.ability)
-        if text:
-            lines.append(f"   ✨ {text}")
-    lines += [
-        "",
-        f"Сытость падает на {pets_catalog.HUNGER_PER_HOUR} в час, "
-        f"настроение — на {pets_catalog.MOOD_PER_HOUR}. Кормите и гладьте.",
-        f"{pets_catalog.FOOD_ITEM_EMOJI} Кормление тратит корм — "
-        f"{pets_catalog.FOOD_ITEM_PRICE} i¢ за штуку "
-        f"(<code>пет корм 10</code>). Ласка бесплатна.",
-        "Купить: <code>пет купить {ключ}</code>, "
-        "продать обратно за половину: <code>пет продать {ключ}</code>",
-    ]
-    await message.reply("\n".join(lines))
+    result = await game_actions.catalog_text(
+        message.chat.id, message.from_user.id, achievement_info=ACHIEVEMENTS.get)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -16916,226 +17104,27 @@ async def cmd_pets_catalog(message: Message):
 async def cmd_pet_buy(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_buy"):
         return
-    chat_id, user_id = message.chat.id, message.from_user.id
     raw_key = PET_BUY_RE.match(message.text.strip()).group(1)
-    # Корм — товар, а не вид питомца, но наши же подсказки зовут его «корм»,
-    # и «пет купить корм» напрашивается само. Отвечать «такого питомца нет»
-    # на осмысленную просьбу — худшее, что тут можно сделать.
-    if raw_key.casefold() in (pets_catalog.FOOD_ITEM_KEY, "корм", "корма", "еда", "еду"):
-        await message.reply(f"{pets_catalog.FOOD_ITEM_EMOJI} Корм покупается так: "
-                            f"<code>пет корм 10</code> "
-                            f"({pets_catalog.FOOD_ITEM_PRICE} i¢ за штуку).")
-        return
-    spec = await _pet_spec(chat_id, raw_key)
-    if spec is None:
-        await message.reply("Такого питомца нет — посмотрите <code>пет каталог</code>.")
-        return
-    if spec.by_achievement:
-        info = ACHIEVEMENTS.get(spec.achievement) or {}
-        await message.reply(
-            f"{spec.title} не продаётся — его выдают за ачивку "
-            f"«{info.get('title') or spec.achievement}»"
-            + (f" ({info['desc']})." if info.get("desc") else ".")
-        )
-        return
-    if await db.get_pet(chat_id, user_id, spec.key):
-        await message.reply(f"{spec.title} у вас уже есть.")
-        return
-    # Вид могли временно выключить или ограничить численность (панель).
-    conf = _pet_settings.get(spec.key) or {}
-    if not conf.get("is_active", True):
-        await message.reply(f"{spec.title} сейчас недоступен — заходите позже.")
-        return
-    limit = conf.get("max_count")
-    if limit is not None:
-        taken = await db.count_pet_owners(chat_id, spec.key)
-        if taken >= int(limit):
-            await message.reply(
-                f"{spec.title} разобрали: их в чате всего {limit}, "
-                f"и все уже нашли хозяев."
-            )
-            return
-    if await is_account_frozen(chat_id, user_id):
-        await message.reply("🧊 Ваш счёт заморожен администрацией.")
-        return
-    if not await spend_coins(chat_id, user_id, spec.price):
-        wallet = await db.get_wallet(chat_id, user_id)
-        await message.reply(
-            f"Недостаточно монет: {spec.name} стоит <b>{spec.price}</b> i¢, "
-            f"а у вас {wallet.get('coins', 0)} i¢."
-        )
-        return
-    # Если этого же питомца уже продавали, счётчик платных смен способности
-    # возвращается вместе с ним — продажа не должна работать как дешёвый
-    # сброс подорожания (см. db.remember_pet_rerolls).
-    rerolls = await db.recall_pet_rerolls(chat_id, user_id, spec.key)
-    if not await db.add_pet(chat_id, user_id, spec.key, datetime.utcnow(), rerolls):
-        await db.add_coins(chat_id, user_id, spec.price)   # гонка — деньги назад
-        await message.reply("Не удалось завести питомца — попробуйте ещё раз.")
-        return
-    await db.add_log("pet_buy", chat_id=chat_id, actor_id=user_id,
-                     details=f"{spec.key}:{spec.price}")
-    await _check_collections(chat_id, user_id)
-    ability = pets_catalog.ability_text(spec.ability)
-    lines = [f"🐾 У вас появился {spec.title}!"]
-    if ability:
-        lines.append(f"✨ {ability} — пока он сыт и доволен.")
-    lines += [f"Назвать: <code>пет назвать {spec.key} {{имя}}</code>",
-              f"Кормить: <code>пет кормить {spec.key}</code> — тратит корм "
-              f"(<code>пет корм 10</code>)"]
-    if rerolls:
-        lines.append(f"✨ Смен способности за вами уже числится {rerolls} — "
-                     f"цена следующей это учитывает.")
-    await message.reply("\n".join(lines))
+    result = await game_actions.buy_pet(
+        message.chat.id, message.from_user.id, raw_key,
+        is_frozen=is_account_frozen, spend=spend_coins,
+        achievement_info=ACHIEVEMENTS.get, on_bought=_check_collections)
+    await message.reply(result.text)
 
 
 async def _pick_pet(message: Message, raw: Optional[str]):
-    """Питомец по ключу; без ключа — единственный, если он один."""
-    chat_id, user_id = message.chat.id, message.from_user.id
-    if raw:
-        spec = await _pet_spec(chat_id, raw)
-        if spec is None:
-            await message.reply("Такого питомца нет — посмотрите <code>пет каталог</code>.")
-            return None, None
-        row = await db.get_pet(chat_id, user_id, spec.key)
-        if row is None:
-            await message.reply(f"{spec.title} у вас нет.")
-            return None, None
-        return spec, row
-    rows = await db.list_pets(chat_id, user_id)
-    if not rows:
-        await message.reply("У вас нет питомцев — каталог: <code>пет каталог</code>.")
+    """Питомец по ключу; без ключа — единственный, если он один.
+
+    Само правило выбора живёт в game_actions.pick_pet: «кого именно имели в
+    виду» — вопрос игры, а не Telegram, и на сайте ответ обязан быть тот же.
+    Здесь остаётся только отправка ответа в чат.
+    """
+    spec, row, err = await game_actions.pick_pet(
+        message.chat.id, message.from_user.id, raw)
+    if spec is None:
+        await message.reply(err)
         return None, None
-    if len(rows) > 1:
-        await message.reply("У вас несколько питомцев — укажите, кого именно "
-                            "(<code>пет кормить кот</code>) или сразу всех "
-                            "(<code>пет кормить все</code>).")
-        return None, None
-    return (await _pet_specs(chat_id)).get(rows[0]["pet_key"]), rows[0]
-
-
-def _pet_cooldown_left(row: dict, field: str, minutes: int) -> Optional[timedelta]:
-    """Сколько ещё ждать до повтора действия. None — можно прямо сейчас.
-
-    Отдельная функция, потому что откат теперь проверяется в четырёх местах:
-    поштучно и массово, для кормёжки и для ласки. В массовой команде он не
-    ошибка, а строка в сводке, — и разъехавшиеся копии проверки означали бы
-    «поштучно рано, а пачкой уже можно».
-    """
-    last = row.get(field)
-    if not last:
-        return None
-    left = timedelta(minutes=minutes) - (datetime.utcnow() - last)
-    return left if left > timedelta(0) else None
-
-
-def _pet_feed_left(row: dict) -> Optional[timedelta]:
-    return _pet_cooldown_left(row, "last_fed_at", pets_catalog.FEED_COOLDOWN_MINUTES)
-
-
-def _pet_care_left(row: dict) -> Optional[timedelta]:
-    return _pet_cooldown_left(row, "last_care_at", pets_catalog.CARE_COOLDOWN_MINUTES)
-
-
-def _pet_no_food_text() -> str:
-    return (f"{pets_catalog.FOOD_ITEM_EMOJI} Корма нет — кормить нечем.\n"
-            f"Купить: <code>пет корм 10</code> "
-            f"(1 шт. — {pets_catalog.FOOD_ITEM_PRICE} i¢).")
-
-
-async def _feed_pet(chat_id: int, user_id: int, spec, row: dict,
-                    now: datetime, aura: "PetAura" = None) -> Optional[tuple[int, int, int]]:
-    """Одно кормление: тратит корм и банкует статы.
-
-    Возвращает (сытость, уровень до, уровень после) или None — корма не
-    хватило. Списание И ЕСТЬ проверка запаса: между «посмотрели, сколько
-    корма» и «покормили» его могли потратить соседним сообщением, а два
-    отдельных шага «проверить и списать» разошлись бы именно на этом.
-
-    Корм уходит ДО записи статов и возвращается, если запись не удалась, —
-    тем же порядком, каким при покупке питомца сначала списываются деньги,
-    а потом возвращаются при неудаче.
-    """
-    aura = aura or PetAura()
-    if not await db.remove_inventory_item(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY):
-        return None
-    # Поблажка «Компаньона» обязана участвовать здесь: настроение отсюда
-    # БАНКУЕТСЯ, и посчитанное без неё стёрло бы её накопленный эффект.
-    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-    hunger = pets_catalog.gain(hunger, pets_catalog.FEED_GAIN)
-    level_before = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.XP_BONUS_FEED))
-    try:
-        await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
-                               now, fed_at=now)
-    except Exception:
-        await db.add_inventory_item(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY)
-        raise
-    return hunger, level_before, pets_catalog.level_for_xp(xp)
-
-
-def _care_gain(verb: str) -> int:
-    if verb.startswith(("поцел", "целов")):
-        return pets_catalog.KISS_GAIN
-    if verb.startswith("обн"):
-        return pets_catalog.HUG_GAIN
-    return pets_catalog.PET_GAIN
-
-
-def _care_past(verb: str) -> str:
-    """Как назвать сделанное в ответе."""
-    if verb.startswith(("поцел", "целов")):
-        return "поцеловали"
-    if verb.startswith("обн"):
-        return "обняли"
-    return "погладили"
-
-
-async def _care_pet(chat_id: int, user_id: int, spec, row: dict, verb: str,
-                    now: datetime, aura: "PetAura" = None) -> tuple[int, int, int]:
-    """Одна ласка: (настроение, уровень до, уровень после). Ласка бесплатна —
-    платить нужно за еду, а не за внимание.
-
-    aura — способности, действующие на всех ваших питомцев (см. PetAura):
-    настроение отсюда БАНКУЕТСЯ, и посчитать его без поблажки значило бы
-    стирать её при каждой ласке."""
-    aura = aura or PetAura()
-    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-    mood = pets_catalog.gain(mood, _care_gain(verb))
-    level_before = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.XP_BONUS_CARE))
-    await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
-                           now, care_at=now)
-    return mood, level_before, pets_catalog.level_for_xp(xp)
-
-
-async def _pets_for_bulk(message: Message) -> list[tuple[dict, object]]:
-    """Питомцы хозяина парами (строка, вид) для массовых команд.
-
-    Пустой список — питомцев нет, и об этом уже сказано ответом.
-    """
-    chat_id, user_id = message.chat.id, message.from_user.id
-    rows = await db.list_pets(chat_id, user_id)
-    if not rows:
-        await message.reply("У вас нет питомцев — каталог: <code>пет каталог</code>.")
-        return []
-    specs = await _pet_specs(chat_id)
-    # Вид могли удалить из каталога чата: такого питомца не нарисовать и не
-    # описать, поэтому в пачку он не идёт (поштучно на него ругнётся _pick_pet).
-    pairs = [(row, specs[row["pet_key"]]) for row in rows if row["pet_key"] in specs]
-    if not pairs:
-        # Питомцы есть, но все — удалённых из каталога видов. Молчать нельзя:
-        # человек написал команду и должен понять, почему ничего не произошло.
-        await message.reply("Ваши питомцы больше не значатся в каталоге чата — "
-                            "спросите администрацию.")
-    return pairs
-
-
-def _pet_waiting_line(waiting: list[tuple[object, timedelta]]) -> str:
-    shown = ", ".join(f"{spec.name} ({format_duration_ru(left)})"
-                      for spec, left in waiting[:5])
-    tail = f" и ещё {len(waiting) - 5}" if len(waiting) > 5 else ""
-    return f"⏳ Ждут отката: {shown}{tail}"
+    return spec, row
 
 
 # ВНИМАНИЕ: массовые обработчики объявлены ВЫШЕ поштучных намеренно — aiogram
@@ -17151,52 +17140,8 @@ async def cmd_pet_feed_all(message: Message):
     """«пет покормить все» — накормить всех, на кого хватит корма."""
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    chat_id, user_id = message.chat.id, message.from_user.id
-    pairs = await _pets_for_bulk(message)
-    if not pairs:
-        return
-    now = datetime.utcnow()
-    aura = _pet_aura([row for row, _ in pairs],
-                     {spec.key: spec for _, spec in pairs},
-                     await _pinned_pet_key(chat_id, user_id))
-    waiting: list[tuple[object, timedelta]] = []
-    hungry: list[tuple[dict, object]] = []
-    for row, spec in pairs:
-        left = _pet_feed_left(row)
-        if left is not None:
-            waiting.append((spec, left))
-        else:
-            hungry.append((row, spec))
-    if not hungry:
-        await message.reply("🍽 Все ваши питомцы уже сыты.\n" + _pet_waiting_line(waiting))
-        return
-    fed: list[tuple[dict, object, tuple[int, int, int]]] = []
-    unfed = 0
-    for i, (row, spec) in enumerate(hungry):
-        result = await _feed_pet(chat_id, user_id, spec, row, now, aura)
-        if result is None:
-            # Корм кончился — остальных кормить нечем, дальше идти незачем.
-            unfed = len(hungry) - i
-            break
-        fed.append((row, spec, result))
-    if not fed:
-        await message.reply(_pet_no_food_text())
-        return
-    lines = [f"🍽 <b>Покормлено: {len(fed)} из {len(hungry)}</b>", DIVIDER]
-    for row, spec, (hunger, before, after) in fed:
-        line = f"{_pet_display(row, spec)} — {pets_catalog.bar(hunger)} {hunger}"
-        if after > before:
-            line += f"\n   ⭐ Новый уровень: {after}!"
-        lines.append(line)
-    if unfed:
-        lines.append(f"{pets_catalog.FOOD_ITEM_EMOJI} Корма не хватило ещё на "
-                     f"{unfed} — купить: <code>пет корм 10</code>")
-    if waiting:
-        lines.append(_pet_waiting_line(waiting))
-    left_food = await db.get_inventory_quantity(chat_id, user_id,
-                                                pets_catalog.FOOD_ITEM_KEY)
-    lines.append(f"{pets_catalog.FOOD_ITEM_EMOJI} Корма осталось: {left_food}")
-    await message.reply("\n".join(lines))
+    result = await game_actions.feed_all(message.chat.id, message.from_user.id)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17207,37 +17152,9 @@ async def cmd_pet_care_all(message: Message):
     """«пет обнять все» — приласкать всех разом."""
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    chat_id, user_id = message.chat.id, message.from_user.id
     verb = PET_CARE_ALL_RE.match(message.text.strip()).group(1).casefold()
-    pairs = await _pets_for_bulk(message)
-    if not pairs:
-        return
-    now = datetime.utcnow()
-    aura = _pet_aura([row for row, _ in pairs],
-                     {spec.key: spec for _, spec in pairs},
-                     await _pinned_pet_key(chat_id, user_id))
-    waiting: list[tuple[object, timedelta]] = []
-    done: list[tuple[dict, object, tuple[int, int, int]]] = []
-    for row, spec in pairs:
-        left = _pet_care_left(row)
-        if left is not None:
-            waiting.append((spec, left))
-            continue
-        done.append((row, spec,
-                     await _care_pet(chat_id, user_id, spec, row, verb, now,
-                                     aura)))
-    if not done:
-        await message.reply("😊 Все ваши питомцы уже довольны.\n" + _pet_waiting_line(waiting))
-        return
-    lines = [f"💞 Вы {_care_past(verb)} всех — {len(done)} из {len(pairs)}", DIVIDER]
-    for row, spec, (mood, before, after) in done:
-        line = f"{_pet_display(row, spec)} — {pets_catalog.bar(mood)} {mood} ({spec.sound})"
-        if after > before:
-            line += f"\n   ⭐ Новый уровень: {after}!"
-        lines.append(line)
-    if waiting:
-        lines.append(_pet_waiting_line(waiting))
-    await message.reply("\n".join(lines))
+    result = await game_actions.care_all(message.chat.id, message.from_user.id, verb)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17247,29 +17164,9 @@ async def cmd_pet_care_all(message: Message):
 async def cmd_pet_feed(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    spec, row = await _pick_pet(message, PET_FEED_RE.match(message.text.strip()).group(1))
-    if spec is None:
-        return
-    left = _pet_feed_left(row)
-    if left is not None:
-        await message.reply(f"🍽 {spec.name} пока сыт — покормить снова через "
-                            f"{format_duration_ru(left)}.")
-        return
-    aura = await _pet_aura_for(message.chat.id, message.from_user.id)
-    result = await _feed_pet(message.chat.id, message.from_user.id, spec, row,
-                            datetime.utcnow(), aura)
-    if result is None:
-        await message.reply(_pet_no_food_text())
-        return
-    hunger, level_before, level_after = result
-    text = (f"🍽 {_pet_display(row, spec)} накормлен(а). Сытость: "
-            f"{pets_catalog.bar(hunger)} {hunger}")
-    if level_after > level_before:
-        text += f"\n⭐ Новый уровень: {level_after}!"
-    left_food = await db.get_inventory_quantity(message.chat.id, message.from_user.id,
-                                                pets_catalog.FOOD_ITEM_KEY)
-    text += f"\n{pets_catalog.FOOD_ITEM_EMOJI} Корма осталось: {left_food}"
-    await message.reply(text)
+    raw = PET_FEED_RE.match(message.text.strip()).group(1)
+    result = await game_actions.feed_pet(message.chat.id, message.from_user.id, raw)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17283,23 +17180,9 @@ async def cmd_pet_care(message: Message):
         return
     match = PET_CARE_RE.match(message.text.strip())
     verb = match.group(1).casefold()
-    spec, row = await _pick_pet(message, match.group(2))
-    if spec is None:
-        return
-    left = _pet_care_left(row)
-    if left is not None:
-        await message.reply(f"😊 {spec.name} уже доволен(а) — ещё раз через "
-                            f"{format_duration_ru(left)}.")
-        return
-    aura = await _pet_aura_for(message.chat.id, message.from_user.id)
-    mood, level_before, level_after = await _care_pet(
-        message.chat.id, message.from_user.id, spec, row, verb,
-        datetime.utcnow(), aura)
-    text = (f"💞 Вы {_care_past(verb)} {_pet_display(row, spec)} — {spec.sound}. "
-            f"Настроение: {pets_catalog.bar(mood)} {mood}")
-    if level_after > level_before:
-        text += f"\n⭐ Новый уровень: {level_after}!"
-    await message.reply(text)
+    result = await game_actions.care_pet(message.chat.id, message.from_user.id,
+                                         verb, match.group(2))
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17309,62 +17192,22 @@ async def cmd_pet_care(message: Message):
 async def cmd_pet_food_buy(message: Message):
     """«пет корм 10» — тот же магазин, только не выходя из «пет».
 
-    Покупка идёт через общий _shop_buy: распродажа, скидка «Торгаша», остаток
-    на полке и отчисления в казну должны работать так же, как при «купить korm».
+    game_actions.buy_food всегда отвечает ActionResult (в т.ч. с числом —
+    честным отказом, см. его докстринг), но здесь она зовётся ради ветки
+    БЕЗ числа и ради побочного эффекта (досев товара в магазин чата, если
+    его там ещё не было). Покупку с числом делает не она, а общий _shop_buy
+    — тот же самый, каким корм покупают как «купить korm 10»: распродажа,
+    скидка «Торгаша» и остаток на полке должны совпадать, а не считаться
+    дважды по разным правилам.
     """
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    chat_id, user_id = message.chat.id, message.from_user.id
-    # Корм мог ещё не доехать в магазин этого чата: витрину с момента
-    # обновления бота могли ни разу не открыть, а покупать корм уже нужно.
-    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
     raw_qty = PET_FOOD_BUY_RE.match(message.text.strip()).group(1)
+    result = await game_actions.buy_food(message.chat.id, message.from_user.id, raw_qty)
     if raw_qty is None:
-        have = await db.get_inventory_quantity(chat_id, user_id, pets_catalog.FOOD_ITEM_KEY)
-        await message.reply(
-            f"{pets_catalog.FOOD_ITEM_EMOJI} <b>Корм</b> — "
-            f"{pets_catalog.FOOD_ITEM_PRICE} i¢ за штуку.\n"
-            f"У вас: {have} шт. Одно кормление — один корм.\n"
-            f"Купить: <code>пет корм 10</code>"
-        )
+        await message.reply(result.text)
         return
     await _shop_buy(message, pets_catalog.FOOD_ITEM_KEY, int(raw_qty))
-
-
-def _pet_walk_left(row: dict) -> Optional[timedelta]:
-    return _pet_cooldown_left(row, "last_walk_at",
-                              int(pets_catalog.WALK_COOLDOWN_HOURS * 60))
-
-
-async def _walk_pet(chat_id: int, user_id: int, spec, row: dict, now: datetime,
-                    aura: "PetAura") -> tuple[str, int]:
-    """Одна прогулка: (что рассказать, сколько монет). Монеты 0 — принесён предмет.
-
-    Питомец тратит немного сытости и получает настроение: гулять ему нравится,
-    но нагуливается и аппетит — иначе прогулка была бы бесплатным источником
-    монет, не связанным с кормом.
-    """
-    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-    hunger = max(0, hunger - pets_catalog.WALK_HUNGER_COST)
-    mood = pets_catalog.gain(mood, pets_catalog.WALK_MOOD_GAIN)
-    level = _pet_level(row)
-    xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.WALK_XP_BONUS))
-    await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp, now,
-                           walk_at=now)
-    finds = pets_catalog.walk_finds(spec.key)
-    if finds and random.randint(1, 100) <= pets_catalog.WALK_ITEM_CHANCE:
-        find = random.choice(finds)
-        # Товар мог быть не засеян в этом чате — тогда в инвентаре он выглядел
-        # бы голым ключом, поэтому засеваем каталог перед выдачей.
-        await db.seed_default_shop_items(chat_id)
-        await db.add_inventory_item(chat_id, user_id, find.item_key)
-        item = await db.get_shop_item(chat_id, find.item_key)
-        name = f"{item['emoji']} {html.escape(item['name'])}" if item else find.item_key
-        return f"{find.text} — {name}", 0
-    coins = aura.walk_coins(pets_catalog.walk_coins(
-        level, random.randint(pets_catalog.WALK_COINS_MIN, pets_catalog.WALK_COINS_MAX)))
-    await db.add_coins(chat_id, user_id, coins)
-    return f"нагулял(а) <b>{coins}</b> i¢", coins
 
 
 @router.message(
@@ -17375,42 +17218,8 @@ async def cmd_pet_walk_all(message: Message):
     """«пет гулять все» — выгулять всех, кто может идти."""
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    chat_id, user_id = message.chat.id, message.from_user.id
-    pairs = await _pets_for_bulk(message)
-    if not pairs:
-        return
-    now = datetime.utcnow()
-    pinned_key = await _pinned_pet_key(chat_id, user_id)
-    aura = _pet_aura([row for row, _ in pairs],
-                     {spec.key: spec for _, spec in pairs}, pinned_key)
-    waiting: list[tuple[object, timedelta]] = []
-    lines: list[str] = []
-    tired: list[str] = []
-    for row, spec in pairs:
-        left = _pet_walk_left(row)
-        if left is not None:
-            waiting.append((spec, left))
-            continue
-        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-        if not _pet_is_active(row, hunger, mood, pinned_key):
-            tired.append(spec.name)
-            continue
-        told, _coins = await _walk_pet(chat_id, user_id, spec, row, now, aura)
-        lines.append(f"{_pet_display(row, spec)} {told}")
-    if not lines:
-        parts = ["🚶 Гулять сейчас некому."]
-        if tired:
-            parts.append(f"😔 Не в настроении: {', '.join(tired)} — покормите и приласкайте.")
-        if waiting:
-            parts.append(_pet_waiting_line(waiting))
-        await message.reply("\n".join(parts))
-        return
-    out = [f"🚶 <b>Прогулка</b> — {len(lines)} из {len(pairs)}", DIVIDER] + lines
-    if tired:
-        out.append(f"😔 Не в настроении: {', '.join(tired)}")
-    if waiting:
-        out.append(_pet_waiting_line(waiting))
-    await message.reply("\n".join(out))
+    result = await game_actions.walk_all(message.chat.id, message.from_user.id)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17421,27 +17230,9 @@ async def cmd_pet_walk(message: Message):
     """«пет гулять {ключ}» — питомец уходит и приносит находку."""
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    chat_id, user_id = message.chat.id, message.from_user.id
-    spec, row = await _pick_pet(message, PET_WALK_RE.match(message.text.strip()).group(1))
-    if spec is None:
-        return
-    left = _pet_walk_left(row)
-    if left is not None:
-        await message.reply(f"🚶 {spec.name} уже нагулялся(-ась) — снова через "
-                            f"{format_duration_ru(left)}.")
-        return
-    aura = await _pet_aura_for(chat_id, user_id)
-    hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-    if not _pet_is_active(row, hunger, mood, await _pinned_pet_key(chat_id, user_id)):
-        await message.reply(f"😔 {spec.name} никуда не пойдёт — сначала покормите "
-                            f"и приласкайте.")
-        return
-    told, _coins = await _walk_pet(chat_id, user_id, spec, row,
-                                   datetime.utcnow(), aura)
-    await message.reply(
-        f"🚶 {_pet_display(row, spec)} сходил(а) погулять и {told}.\n"
-        f"Следующая прогулка — через {pets_catalog.WALK_COOLDOWN_HOURS} ч."
-    )
+    raw = PET_WALK_RE.match(message.text.strip()).group(1)
+    result = await game_actions.walk_pet(message.chat.id, message.from_user.id, raw)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17518,11 +17309,11 @@ def _pet_second_ability(row: dict, spec, others: list[dict], specs: dict) -> str
     место. Если свободных не осталось — пустая строка, эволюция всё равно
     состоится ради остальных трёх выгод.
     """
-    taken = set(_effective_abilities(row, spec))
+    taken = set(game_actions._effective_abilities(row, spec))
     for other in others:
         if other["pet_key"] == row["pet_key"]:
             continue
-        taken.update(_effective_abilities(other, specs.get(other["pet_key"])))
+        taken.update(game_actions._effective_abilities(other, specs.get(other["pet_key"])))
     free = [a.key for a in pets_catalog.ABILITIES if a.key not in taken]
     return random.choice(free) if free else ""
 
@@ -17552,10 +17343,10 @@ async def cmd_pet_evolve(message: Message):
         )
         return
     if row.get("evolved"):
-        await message.reply(f"{_pet_display(row, spec)} уже эволюционировал(а) — "
+        await message.reply(f"{game_actions.pet_display(row, spec)} уже эволюционировал(а) — "
                             f"второй раз тот же питомец не растёт.")
         return
-    level = _pet_level(row)
+    level = game_actions._pet_level(row)
     price = pets_catalog.evolve_price(spec.price)
     elixir = shop_effects.CRAFT_BY_KEY["elixir"]
     have_elixir = await db.get_inventory_quantity(chat_id, user_id, "elixir")
@@ -17587,7 +17378,7 @@ async def cmd_pet_evolve(message: Message):
     if await is_account_frozen(chat_id, user_id):
         await message.reply("🧊 Ваш счёт заморожен администрацией.")
         return
-    specs = await _pet_specs(chat_id)
+    specs = await game_actions._pet_specs(chat_id)
     others = await db.list_pets(chat_id, user_id)
     second = _pet_second_ability(row, spec, others, specs)
     # Эликсир списываем первым: он и есть главная плата, а вернуть его при
@@ -17609,8 +17400,8 @@ async def cmd_pet_evolve(message: Message):
         return
     await db.add_log("pet_evolve", chat_id=chat_id, actor_id=user_id,
                      details=f"{spec.key}:{second}")
-    first = _effective_ability(row, spec)
-    lines = [f"🌟 <b>{_pet_display(row, spec)} эволюционировал(а)!</b>",
+    first = game_actions._effective_ability(row, spec)
+    lines = [f"🌟 <b>{game_actions.pet_display(row, spec)} эволюционировал(а)!</b>",
              f"Теперь это {grown.emoji} <b>{grown.name}</b>."]
     if first:
         lines.append(f"✨ {pets_catalog.ability_text_evolved(first, 1)}")
@@ -17639,53 +17430,10 @@ async def cmd_pet_sell(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_buy"):
         return
     match = PET_SELL_RE.match(message.text.strip())
-    chat_id, user_id = message.chat.id, message.from_user.id
-    spec, row = await _pick_pet(message, match.group(1))
-    if spec is None:
-        return
-    if spec.by_achievement:
-        await message.reply(f"{spec.title} не продаётся — это знак отличия, "
-                            f"а не имущество.")
-        return
-    price = pets_catalog.sell_price(spec.price)
-    level = _pet_level(row)
-    rerolls = int(row.get("ability_rerolls") or 0)
-    if match.group(2) is None:
-        lines = [f"🐾 {_pet_display(row, spec)} — продажа за <b>{price}</b> i¢ "
-                 f"(половина цены каталога, {spec.price} i¢).",
-                 f"Сгорят уровень ⭐{level} и весь опыт — обратно их не выкупить."]
-        # Купленная способность — обычно самое дорогое, что теряется, а из
-        # слов «уровень и опыт» этого не видно. Счётчик смен при этом
-        # останется, то есть вернуть её будет стоить как следующую смену.
-        if row.get("ability"):
-            bought = pets_catalog.ability_text_at_level(row["ability"], level)
-            lines.append(f"✨ Купленная способность ({bought}) тоже сгорит, "
-                         f"а счётчик смен ({rerolls}) останется — вернуть её "
-                         f"будет стоить "
-                         f"{pets_catalog.ability_reroll_price(spec.price, rerolls)} i¢.")
-        lines.append(f"Подтвердить: <code>пет продать {spec.key} да</code>")
-        await message.reply("\n".join(lines))
-        return
-    if await is_account_frozen(chat_id, user_id):
-        await message.reply("🧊 Ваш счёт заморожен администрацией.")
-        return
-    # Счётчик платных смен способности переживает продажу: иначе продать и
-    # купить заново было бы дешёвым способом сбросить подорожавшие смены
-    # (см. pets.ability_reroll_price).
-    if rerolls:
-        await db.remember_pet_rerolls(chat_id, user_id, spec.key, rerolls)
-    if not await db.delete_pet(chat_id, user_id, spec.key):
-        # Гонка: два «пет продать ... да» подряд. Деньги начислять нельзя.
-        await message.reply(f"{spec.title} у вас уже нет.")
-        return
-    await db.add_coins(chat_id, user_id, price)
-    card = await db.get_profile_card(chat_id, user_id)
-    if card and card.get("pinned_pet") == spec.key:
-        await db.set_pinned_pet(chat_id, user_id, None)
-    await db.add_log("pet_sell", chat_id=chat_id, actor_id=user_id,
-                     details=f"{spec.key}:{price}")
-    await message.reply(f"🐾 {_pet_display(row, spec)} продан(а) за <b>{price}</b> i¢.\n"
-                        f"Завести снова: <code>пет купить {spec.key}</code>")
+    result = await game_actions.sell_pet(
+        message.chat.id, message.from_user.id, match.group(1),
+        confirm=match.group(2) is not None, is_frozen=is_account_frozen)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17696,16 +17444,9 @@ async def cmd_pet_rename(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
     match = PET_NAME_RE.match(message.text.strip())
-    spec = await _pet_spec(message.chat.id, match.group(1))
-    if spec is None:
-        await message.reply("Такого питомца нет — посмотрите <code>пет каталог</code>.")
-        return
-    if not await db.get_pet(message.chat.id, message.from_user.id, spec.key):
-        await message.reply(f"{spec.title} у вас нет.")
-        return
-    name = match.group(2).strip()[:64]
-    await db.rename_pet(message.chat.id, message.from_user.id, spec.key, name)
-    await message.reply(f"🐾 Теперь это {spec.title} «{html.escape(name)}».")
+    result = await game_actions.rename_pet(
+        message.chat.id, message.from_user.id, match.group(1), match.group(2))
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17715,15 +17456,9 @@ async def cmd_pet_rename(message: Message):
 async def cmd_pet_pin(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    spec = await _pet_spec(message.chat.id, PET_PIN_RE.match(message.text.strip()).group(1))
-    if spec is None:
-        await message.reply("Такого питомца нет — посмотрите <code>пет каталог</code>.")
-        return
-    if not await db.get_pet(message.chat.id, message.from_user.id, spec.key):
-        await message.reply(f"{spec.title} вам не принадлежит.")
-        return
-    await db.set_pinned_pet(message.chat.id, message.from_user.id, spec.key)
-    await message.reply(f"📌 {spec.title} закреплён(а) в профиле.")
+    raw_key = PET_PIN_RE.match(message.text.strip()).group(1)
+    result = await game_actions.pin_pet(message.chat.id, message.from_user.id, raw_key)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17733,8 +17468,8 @@ async def cmd_pet_pin(message: Message):
 async def cmd_pet_unpin(message: Message):
     if not _check_misc_access(message.from_user.id, "pet_care"):
         return
-    await db.set_pinned_pet(message.chat.id, message.from_user.id, None)
-    await message.reply("📌 Питомец больше не показывается в профиле.")
+    result = await game_actions.unpin_pet(message.chat.id, message.from_user.id)
+    await message.reply(result.text)
 
 
 @router.message(
@@ -17781,9 +17516,9 @@ async def cmd_pet_ability_reroll(message: Message):
         return
     rerolls = int(row.get("ability_rerolls") or 0)
     price = pets_catalog.ability_reroll_price(spec.price, rerolls)
-    level = _pet_level(row)
+    level = game_actions._pet_level(row)
     evolved = bool(row.get("evolved"))
-    current = _effective_ability(row, spec)
+    current = game_actions._effective_ability(row, spec)
     current_text = ((pets_catalog.ability_text_evolved(current, level) if evolved
                      else pets_catalog.ability_text_at_level(current, level))
                     or "без способности")
@@ -17794,7 +17529,7 @@ async def cmd_pet_ability_reroll(message: Message):
     # трогаем: цену нужно узнать ДО того, как она спишется, а не после.
     if match.group(2) is None:
         await message.reply(
-            f"{_pet_display(row, spec)}: сейчас — {current_text}.\n"
+            f"{game_actions.pet_display(row, spec)}: сейчас — {current_text}.\n"
             f"Смена стоит <b>{price}</b> i¢ (дальше дороже).\n"
             f"Список способностей и номеров: <code>пет способности</code>\n"
             f"Сменить: <code>пет способность {spec.key} {{номер}}</code>"
@@ -17807,9 +17542,9 @@ async def cmd_pet_ability_reroll(message: Message):
         return
     new_ability = (pets_catalog.ABILITY_NONE if choice == 0
                    else pets_catalog.ABILITIES[choice - 1].key)
-    current = _effective_ability(row, spec)
+    current = game_actions._effective_ability(row, spec)
     if new_ability == current:
-        await message.reply(f"У {_pet_display(row, spec)} уже эта способность.")
+        await message.reply(f"У {game_actions.pet_display(row, spec)} уже эта способность.")
         return
     # Бонусы одного вида не должны складываться дважды у одного игрока —
     # иначе выгоднее было бы не разнообразить питомцев, а перевести всех на
@@ -17821,15 +17556,15 @@ async def cmd_pet_ability_reroll(message: Message):
         if new_ability == (row.get("ability2") or ""):
             ability_name = pets_catalog.ABILITY_BY_KEY[new_ability].name
             await message.reply(
-                f"Способность «{ability_name}» у {_pet_display(row, spec)} уже "
+                f"Способность «{ability_name}» у {game_actions.pet_display(row, spec)} уже "
                 f"есть второй — одинаковые способности не складываются."
             )
             return
-        specs = await _pet_specs(chat_id)
+        specs = await game_actions._pet_specs(chat_id)
         for other in await db.list_pets(chat_id, user_id):
             if other["pet_key"] == spec.key:
                 continue
-            if new_ability in _effective_abilities(other, specs.get(other["pet_key"])):
+            if new_ability in game_actions._effective_abilities(other, specs.get(other["pet_key"])):
                 ability_name = pets_catalog.ABILITY_BY_KEY[new_ability].name
                 await message.reply(
                     f"Способность «{ability_name}» уже есть у другого вашего "
@@ -17854,7 +17589,7 @@ async def cmd_pet_ability_reroll(message: Message):
                      details=f"{spec.key}:{new_ability}:{price}")
     new_text = ("без способности" if new_ability == pets_catalog.ABILITY_NONE
                 else pets_catalog.ability_text_at_level(new_ability, level))
-    await message.reply(f"✨ {_pet_display(row, spec)} теперь: {new_text}\n"
+    await message.reply(f"✨ {game_actions.pet_display(row, spec)} теперь: {new_text}\n"
                         f"Списано {price} i¢.")
 
 
@@ -17867,8 +17602,9 @@ async def show_profile_pets(callback: CallbackQuery):
     except (IndexError, ValueError):
         await callback.answer("Кнопка устарела.", show_alert=True)
         return
-    text = await _pets_text(callback.message.chat.id, target_id,
-                            own=target_id == callback.from_user.id)
+    result = await game_actions.my_pets_text(
+        callback.message.chat.id, target_id, own=target_id == callback.from_user.id)
+    text = result.text
     await callback.answer()
     await edit_profile_message(callback, text, profile_back_kb(target_id, requester_id))
 
@@ -17968,7 +17704,7 @@ async def cfg_pet_toggle(message: Message, state: FSMContext):
         return
     new_state = not bool(row.get("is_active", True))
     await db.update_pet_spec(_pets_admin_chat_id(), key, is_active=new_state)
-    _pet_settings.pop(key, None)
+    game_actions._pet_settings.pop(key, None)
     await message.answer("✅ Включён." if new_state else "🚫 Выключен — купить нельзя.")
     await _show_pet_item_menu(message, state, key)
 
@@ -17979,7 +17715,7 @@ async def cfg_pet_delete(message: Message, state: FSMContext):
     data = await state.get_data()
     key = data.get("pet_edit_key")
     await db.delete_pet_spec(_pets_admin_chat_id(), key)
-    _pet_settings.pop(key, None)
+    game_actions._pet_settings.pop(key, None)
     # Уже заведённых у людей не трогаем: удаление убирает вид из продажи,
     # а не отбирает питомца у хозяина.
     await message.answer(f"🗑 Вид «{html.escape(key)}» убран из каталога. "
@@ -18063,7 +17799,7 @@ async def cfg_pet_edit_value(message: Message, state: FSMContext):
             return
 
     await db.update_pet_spec(_pets_admin_chat_id(), key, **{field: value})
-    _pet_settings.pop(key, None)
+    game_actions._pet_settings.pop(key, None)
     await db.add_log("pet_edited", chat_id=_pets_admin_chat_id(),
                      actor_id=message.from_user.id, details=f"{key}:{field}")
     note = ("\n\nТем, кто уже сменил способность за i¢ (<code>пет способность</code>), "
@@ -18348,7 +18084,7 @@ async def _collection_progress(chat_id: int, user_id: int) -> dict:
                 if int(row["level"]) >= business_catalog.MAX_LEVEL)
     out["empire"] = (maxed, total_biz)
 
-    specs = await _pet_specs(chat_id)
+    specs = await game_actions._pet_specs(chat_id)
     owned_pets = {row["pet_key"] for row in await db.list_pets(chat_id, user_id)}
     # Считаем по КАТАЛОГУ ЧАТА, а не по встроенному списку: админ мог завести
     # своих питомцев, и без них коллекция была бы уже неполной.
@@ -18656,7 +18392,7 @@ async def _passive_bonus(chat_id: int, user_id: int, activity: str) -> int:
     percent = shop_effects.passive_percent(keys, activity)
     # Питомец с подходящей способностью прибавляет к тому же занятию —
     # ферма, рыбалка, клад, подработка, бонус, смена (см. pets.ABILITIES).
-    percent += await _pet_bonus(chat_id, user_id, activity)
+    percent += await game_actions._pet_bonus(chat_id, user_id, activity)
     # Закрепы профиля: тема «Труд» у ачивки прибавляет к любому занятию,
     # «Экономика» — к ежедневному бонусу, рыба-трофей — к улову.
     percent += await _pin_bonus(chat_id, user_id, activity)
@@ -18728,6 +18464,43 @@ async def _apply_lucky(chat_id: int, user_id: int, amount: int) -> tuple[int, bo
     return amount * shop_effects.LUCKY_MULTIPLIER, True
 
 
+# Медвежатник — единственная кража, которую не отбить ничем, кроме пустого
+# инвентаря: страховка от неё не спасает, предупреждения жертве нет. Пока он
+# ограничивался только ценой предмета, богатый чистил чужие сумки подряд.
+# Кулдаун делает его событием, а не занятием.
+STEAL_COOLDOWN = timedelta(hours=10)
+
+
+def _steal_key(chat_id: int, user_id: int) -> str:
+    return f"steal:{chat_id}:{user_id}"
+
+
+async def _steal_cooldown_left(chat_id: int, user_id: int) -> Optional[timedelta]:
+    """Сколько ещё ждать, или None — можно идти на дело."""
+    row = await db.get_data(_steal_key(chat_id, user_id))
+    if not row or not row.get("data_value"):
+        return None
+    try:
+        last = datetime.fromisoformat(row["data_value"])
+    except ValueError:
+        return None
+    passed = datetime.utcnow() - last
+    return None if passed >= STEAL_COOLDOWN else STEAL_COOLDOWN - passed
+
+
+async def _steal_mark_used(chat_id: int, user_id: int, cut: float = 0.0) -> None:
+    """Отмечает, что медвежатник сработал.
+
+    cut — доля кулдауна, которую снимает слепок ключа. Механика та же, что у
+    «тачки для отхода» у ограбления (см. set_robbery_last_at): отметка
+    пишется задним числом, а не заводится отдельный заряд. Двух механизмов
+    на одну идею быть не должно.
+    """
+    stamp = datetime.utcnow() - STEAL_COOLDOWN * cut
+    await db.set_data(_steal_key(chat_id, user_id),
+                      stamp.isoformat(), updated_by=user_id)
+
+
 MEDVEZHATNIK_RE = ru_text.rx(r"(?i)^!?медвежатник\b\s*(.*)$")
 
 
@@ -18757,6 +18530,14 @@ async def cmd_steal_item(message: Message):
         return
     if await event_flag(chat_id, chat_events.F_NO_ROBBERY):
         await message.reply("🚓 Комендантский час — на улицах патрули. Не сегодня.")
+        return
+    left = await _steal_cooldown_left(chat_id, user_id)
+    if left is not None:
+        await message.reply(
+            f"🗝 Замки ещё не остыли — на дело можно раз в "
+            f"{format_duration_ru(STEAL_COOLDOWN)}. Следующий раз через "
+            f"{format_duration_ru(left)}."
+        )
         return
 
     target, rest = await resolve_command_target(message, trigger_words=1)
@@ -18794,15 +18575,50 @@ async def cmd_steal_item(message: Message):
         await message.reply(f"У {target_name} нет предмета «{html.escape(wanted)}».")
         return
 
+    # Сигнализация — единственная защита от медвежатника. По образцу броника
+    # у ограбления: срабатывает сама и тратится у жертвы. Проверяется ПОСЛЕ
+    # проверки наличия вещи, чтобы опечатка в ключе не сжигала ничего.
+    #
+    # Медвежатник при этом сгорает тоже — иначе им бесплатно проверяли бы,
+    # есть ли у цели сигнализация, и защита выдавала бы сама себя.
+    if victim_items.get(black_market.SIGNAL_KEY, 0) > 0:
+        await db.remove_inventory_item(chat_id, user_id, spec.key, 1)
+        await db.remove_inventory_item(chat_id, target.id, black_market.SIGNAL_KEY, 1)
+        await _steal_mark_used(chat_id, user_id)
+        await db.add_log("item_steal_blocked", chat_id=chat_id, actor_id=user_id,
+                         target_id=target.id, details=wanted)
+        actor_name = await display_name(chat_id, message.from_user)
+        target_name = await display_name(chat_id, target)
+        await message.answer(
+            f"🚨 {actor_name} вскрыл(а) закрома {target_name}, но взвыла "
+            f"сигнализация — уходить пришлось с пустыми руками."
+        )
+        await _dm_or_none(
+            target.id,
+            f"🚨 Вашу сигнализацию сорвали — кражу предотвратили, предмет "
+            f"«{html.escape(wanted)}» остался у вас. Сигнализация израсходована."
+        )
+        return
+
     # Медвежатник тратится в любом случае — иначе его можно было бы жать по
     # чужому инвентарю без риска, пока не найдётся что-то ценное.
     await db.remove_inventory_item(chat_id, user_id, spec.key, 1)
+    await _steal_mark_used(chat_id, user_id)
     if not await db.remove_inventory_item(chat_id, target.id, wanted, 1):
         await message.reply("Предмет успели потратить — вскрывать оказалось нечего.")
         return
     await db.add_inventory_item(chat_id, user_id, wanted, 1)
     await db.add_log("item_stolen", chat_id=chat_id, actor_id=user_id,
                      target_id=target.id, details=wanted)
+
+    # Слепок ключа сокращает откат на четверть — но только теперь, когда
+    # кража точно удалась. Отметка выше ставится до того, как исход известен,
+    # и на ветке «предмет успели потратить» слепок сгорел бы зря.
+    thief_items = {i["item_key"]: i["quantity"]
+                   for i in await db.list_inventory(chat_id, user_id)}
+    if thief_items.get(black_market.SLEPOK_KEY, 0) > 0:
+        await db.remove_inventory_item(chat_id, user_id, black_market.SLEPOK_KEY, 1)
+        await _steal_mark_used(chat_id, user_id, cut=black_market.STEAL_COOLDOWN_CUT)
 
     stolen = await db.get_shop_item(chat_id, wanted)
     stolen_name = stolen["name"] if stolen else wanted
@@ -19020,7 +18836,7 @@ async def _craft_req_state(chat_id: int, user_id: int,
         return bool(await db.list_user_titles(chat_id, user_id)), crafting.req_text(req)
     if kind == crafting.REQ_PET_LEVEL:
         rows = await db.list_pets(chat_id, user_id)
-        return (any(_pet_level(r) >= req.amount for r in rows),
+        return (any(game_actions._pet_level(r) >= req.amount for r in rows),
                 crafting.req_text(req))
     if kind == crafting.REQ_PET_EVOLVED:
         rows = await db.list_pets(chat_id, user_id)
@@ -20177,10 +19993,19 @@ async def cmd_dossier(message: Message):
     await db.add_log("dossier", chat_id=chat_id, actor_id=user_id, target_id=target.id)
 
     broken = sum(1 for b in businesses if b.get("broken_kind"))
+    coins = int(wallet.get("coins") or 0)
     lines = [
         f"🕵️ <b>Досье: {target_name}</b>",
         DIVIDER,
-        f"💰 В кошельке: <b>{int(wallet.get('coins') or 0)}</b> i¢",
+        f"💰 В кошельке: <b>{coins}</b> i¢",
+    ]
+    # Досье — единственное место, где про ЧУЖОЙ минус можно узнать вообще:
+    # в чужой кошелёк за объяснением не заглянешь, а голая цифра со знаком
+    # читается как поломка бота.
+    долг = debt_note(coins)
+    if долг:
+        lines.append(долг)
+    lines += [
         f"⭐ Звёздность: {wallet_stars(wallet)}",
         f"🏢 Бизнесов: {len(businesses)}" + (f" (сломано: {broken})" if broken else ""),
         f"📊 Акций на руках: {float(holding['shares']):.2f}",
@@ -20896,8 +20721,8 @@ async def cmd_robbery(message: Message):
         await db.remove_inventory_item(chat_id, user_id, "rabbit_paw", 1)
     # Питомцы: «Подельник» помогает грабителю, «Телохранитель» — жертве.
     chance = robbery.success_chance(has_rabbit_paw)
-    chance += await _pet_bonus(chat_id, user_id, "attack_robbery")
-    chance -= await _pet_bonus(chat_id, victim_id, "guard_robbery")
+    chance += await game_actions._pet_bonus(chat_id, user_id, "attack_robbery")
+    chance -= await game_actions._pet_bonus(chat_id, victim_id, "guard_robbery")
     # Постоянные привилегии предметов за ачивки: «Мастер-отмычка» помогает
     # грабителю, «Портфель карьериста» защищает жертву. Ничего не тратится.
     chance += await _item_perk(chat_id, user_id, shop_effects.PERK_ROBBERY_ATTACK)
@@ -20937,7 +20762,7 @@ async def cmd_robbery(message: Message):
             max(1, round(amount * await event_multiplier(chat_id, chat_events.T_ROBBERY))),
             int(victim_balance),
         )
-        baryga = await _pet_bonus(chat_id, user_id, "robbery_loot")
+        baryga = await game_actions._pet_bonus(chat_id, user_id, "robbery_loot")
         if baryga:
             amount = min(int(victim_balance), amount + amount * baryga // 100)
         if has_gold_pig:
@@ -21125,12 +20950,12 @@ async def cmd_business_raid(message: Message):
     if guarded:
         chance = max(1, chance - business_catalog.GUARD_RAID_PENALTY)
     # Питомцы: «Наводчик» помогает налётчику, «Сторож» — хозяину.
-    chance += await _pet_bonus(chat_id, user_id, "attack_raid")
-    chance -= await _pet_bonus(chat_id, victim_id, "guard_raid")
+    chance += await game_actions._pet_bonus(chat_id, user_id, "attack_raid")
+    chance -= await game_actions._pet_bonus(chat_id, victim_id, "guard_raid")
     chance = max(1, min(chance, 95))
     if random.randint(1, 100) <= chance:
         amount = robbery.compute_raid_amount(pot, has_gold_pig)
-        skupshchik = await _pet_bonus(chat_id, user_id, "raid_loot")
+        skupshchik = await game_actions._pet_bonus(chat_id, user_id, "raid_loot")
         if skupshchik:
             amount = min(pot, amount + amount * skupshchik // 100)
         if has_gold_pig:
@@ -22178,6 +22003,8 @@ BANK_RATE_SET_RE = ru_text.rx(r"(?i)^банк\s+ставка\s+(1|3|7)д?\s+(\d+
 BANK_CREDIT_FEE_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+комиссия\s+(\d+(?:\.\d+)?)$")
 BANK_CREDIT_PENALTY_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+пеня\s+(\d+(?:\.\d+)?)$")
 BANK_CREDIT_TERM_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+срок\s+(\d+)$")
+BANK_CREDIT_COLLECTOR_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+коллектор\s+(\d+)$")
+BANK_CREDIT_SEIZE_RE = ru_text.rx(r"(?i)^банк\s+кредит\s+взыскание\s+(\d+)$")
 BANK_MIN_DEPOSIT_RE = ru_text.rx(r"(?i)^банк\s+мин\s+вклад\s+(\S+)$")
 
 BANK_RATE_COLUMN = {"1": "rate_1d", "3": "rate_3d", "7": "rate_7d"}
@@ -22334,6 +22161,15 @@ async def cmd_bank_credit(message: Message):
             f"У вас уже есть непогашенный кредит: {account['credit_debt']} i¢. "
             "Сначала погасите его («!банк погасить {сумма}»)."
         )
+        return
+
+    # Взыскание (_seize_debt) уже увело баланс в минус — новый кредит поверх
+    # него утроил бы яму (старый минус + новый долг) без единого шанса выбраться.
+    wallet = await db.get_wallet(chat_id, user_id)
+    if int(wallet.get("coins") or 0) < 0:
+        await message.reply(
+            "🚨 За вами уже взыскан долг — баланс отрицательный. "
+            "Новый кредит дадут, когда выйдете в ноль.")
         return
 
     if await db.is_bank_blacklisted(chat_id, user_id):
@@ -22576,6 +22412,40 @@ async def cmd_bank_credit_term_set(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BANK_CREDIT_COLLECTOR_RE.match(t.strip()))),
+)
+async def cmd_bank_credit_collector_set(message: Message):
+    if not has_level(message.from_user.id, required_level("bank_manage")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Настраивать банк может «{level_name(required_level('bank_manage'))}» и выше.")
+        return
+    days = int(BANK_CREDIT_COLLECTOR_RE.match(message.text.strip()).group(1))
+    await db.set_bank_credit_settings(message.chat.id, collector_after_days=days)
+    if days:
+        await message.reply(f"✅ Коллектор приходит через {days} дн. просрочки.")
+    else:
+        await message.reply("✅ Коллектор выключен: приходить не будет.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BANK_CREDIT_SEIZE_RE.match(t.strip()))),
+)
+async def cmd_bank_credit_seize_set(message: Message):
+    if not has_level(message.from_user.id, required_level("bank_manage")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Настраивать банк может «{level_name(required_level('bank_manage'))}» и выше.")
+        return
+    days = int(BANK_CREDIT_SEIZE_RE.match(message.text.strip()).group(1))
+    await db.set_bank_credit_settings(message.chat.id, seize_after_days=days)
+    if days:
+        await message.reply(f"✅ Взыскание — через {days} дн. просрочки (или втрое от суммы кредита, что раньше).")
+    else:
+        await message.reply("✅ Взыскание по сроку выключено: долг всё равно взыщут, если вырастет втрое.")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and bool(BANK_MIN_DEPOSIT_RE.match(t.strip()))),
 )
 async def cmd_bank_min_deposit_set(message: Message):
@@ -22709,6 +22579,43 @@ async def cmd_bank_blacklist_list(message: Message):
 
 # ---------- Фоновая пеня за просроченные кредиты ----------
 BANK_PENALTY_CHECK_INTERVAL = 3600  # проверяем раз в час, начисляем не чаще раза в сутки на кредит
+# Пауза между сообщениями должникам. Просрочек в чате бывает два десятка, а
+# Telegram считает сообщения в секунду: без паузы хвост списка уходит в 429 и
+# оседает в log_suppressed — то есть часть людей о своём долге просто не
+# узнает. Та же величина, что в остальных массовых рассылках бота.
+BANK_PENALTY_SEND_PAUSE = 0.3
+
+
+def _days_since(moment) -> int:
+    """Сколько полных суток прошло. None — считаем, что нисколько."""
+    if not moment:
+        return 0
+    return max(0, (datetime.utcnow() - moment).days)
+
+
+async def _seize_debt(chat_id: int, user_id: int, debt: int) -> None:
+    """Взыскание: долг уходит из банка в кошелёк, возможно в минус.
+
+    Кредит закрывается здесь же, и это не деталь: пока он открыт, пеня
+    продолжает капать, а минус растёт быстрее любого заработка — выбраться
+    станет невозможно.
+    """
+    await db.reduce_bank_credit_debt(chat_id, user_id, debt)
+    await db.add_coins(chat_id, user_id, -debt)
+    warn_count = await db.add_warn(
+        chat_id, user_id, 0, "Просрочка кредита — взыскание",
+        datetime.utcnow() + WARN_DEFAULT_DURATION)
+    try:
+        await bot.send_message(
+            chat_id,
+            f"🚨 {mention_id(user_id)}, долг {debt} i¢ взыскан принудительно — "
+            f"баланс мог уйти в минус. Пока он отрицательный, покупать нельзя, "
+            f"а любой заработок идёт в счёт долга. Предупреждение "
+            f"({warn_count}/{WARN_LIMIT}).")
+    except Exception as exc:
+        log_suppressed("_seize_debt", exc)
+    await db.add_log("bank_credit_force_collected", chat_id=chat_id,
+                     target_id=user_id, details=str(debt))
 
 
 async def bank_penalty_loop() -> None:
@@ -22718,49 +22625,70 @@ async def bank_penalty_loop() -> None:
             rows = await db.list_overdue_bank_credits()
             for row in rows:
                 chat_id, user_id = row["chat_id"], row["user_id"]
+                # Замороженный счёт пропускаем целиком: ни визита, ни пени,
+                # ни взыскания. Заморозка закрывает человеку весь заработок
+                # разом (is_account_frozen стоит на ферме, работе, рыбалке —
+                # везде), поэтому загнанный ею в минус выбраться уже ничем
+                # не может: долг растёт, а зарабатывать нечем. Владельцу с
+                # «+бесконечностью» долг не касается по определению — он не
+                # тратит монеты и не может быть должен.
+                if has_infinite_money(user_id) or await is_account_frozen(chat_id, user_id):
+                    continue
                 # Кредитные каникулы (событие чата) — пеню в этот проход
                 # просто пропускаем, долг остаётся как есть.
                 if await event_flag(chat_id, chat_events.F_NO_BANK_PENALTY):
                     continue
                 penalty_percent = float(row["credit_penalty_percent"])
                 new_debt = int(round(int(row["credit_debt"]) * (1 + penalty_percent / 100)))
+
+                overdue_days = _days_since(row.get("credit_due_at"))
+                debt = int(row["credit_debt"])
                 principal = row.get("credit_amount")
 
-                # Пеня «съела» больше 200% от исходной суммы кредита (долг
-                # вырос минимум втрое от принципала) — дальше не ждём:
-                # варн и принудительное списание всего долга, даже в минус.
-                if principal and new_debt >= principal * 3:
-                    await db.reduce_bank_credit_debt(chat_id, user_id, new_debt)
-                    await db.add_coins(chat_id, user_id, -new_debt)
-                    warn_count = await db.add_warn(
-                        chat_id, user_id, 0,
-                        "Просрочка кредита — пеня превысила 200%",
-                        datetime.utcnow() + WARN_DEFAULT_DURATION,
-                    )
-                    try:
-                        await bot.send_message(
-                            chat_id,
-                            f"🚨 {mention_id(user_id)}, пеня по кредиту превысила 200% — "
-                            f"долг ({new_debt} i¢) списан принудительно (баланс мог уйти в минус), "
-                            f"выдано предупреждение ({warn_count}/{WARN_LIMIT}).",
-                        )
-                    except Exception as exc:
-                        log_suppressed("bank_penalty_loop", exc)
-                    await db.add_log(
-                        "bank_credit_force_collected", chat_id=chat_id, target_id=user_id, details=str(new_debt)
-                    )
+                if collectors.should_seize(
+                        overdue_days, int(row.get("seize_after_days") or 0),
+                        debt, principal):
+                    await _seize_debt(chat_id, user_id, debt)
+                    await asyncio.sleep(BANK_PENALTY_SEND_PAUSE)
                     continue
 
+                # Пеня начисляется до отправки и независимо от коллектора:
+                # визит — предупреждение, а не отсрочка. Порядок важен ради
+                # числа в сообщении. Раньше визит и объявление о пене уходили
+                # друг за другом двумя сообщениями про один и тот же кредит, и
+                # называли РАЗНЫЕ суммы — визит долг до пени, объявление после.
                 await db.apply_bank_credit_penalty(chat_id, user_id, new_debt)
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        f"⚠️ {mention_id(user_id)}, кредит просрочен — начислена пеня "
-                        f"{penalty_percent:g}%. Новый долг: {new_debt} i¢. "
-                        "Погасить: «!банк погасить {сумма}».",
+
+                # collectors.should_visit ждёт None как «ни разу не приходили» —
+                # это отдельный смысл от 0 («приходили сегодня», второй визит
+                # запрещён). _days_since(None) сам возвращает 0, так что для
+                # ещё не посещённого кредита (credit_last_visit_at IS NULL)
+                # None нужно передать явно, иначе самый первый визит коллектора
+                # не наступит никогда.
+                last_visit = row.get("credit_last_visit_at")
+                repay_hint = "Погасить: «!банк погасить {сумма}»."
+                if collectors.should_visit(
+                        overdue_days, int(row.get("collector_after_days") or 0),
+                        _days_since(last_visit) if last_visit else None):
+                    visits = await db.mark_credit_visit(chat_id, user_id)
+                    stage = collectors.stage_for(visits - 1)
+                    # Коллектор говорит ВМЕСТО объявления о пене, а не вместе
+                    # с ним: два сообщения в сутки про один долг читаются как
+                    # спам, и человек перестаёт читать оба.
+                    text = (
+                        f"{collectors.visit_text(stage, mention_id(user_id), new_debt)}\n"
+                        f"⚠️ Пеня {penalty_percent:g}% начислена. {repay_hint}"
                     )
+                else:
+                    text = (
+                        f"⚠️ {mention_id(user_id)}, кредит просрочен — начислена пеня "
+                        f"{penalty_percent:g}%. Новый долг: {new_debt} i¢. {repay_hint}"
+                    )
+                try:
+                    await bot.send_message(chat_id, text)
                 except Exception as exc:
                     log_suppressed("bank_penalty_loop", exc)
+                await asyncio.sleep(BANK_PENALTY_SEND_PAUSE)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -23021,6 +22949,34 @@ SHOP_BUY_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+купить|купить)
 # иначе разом выносит весь кошелёк.
 SHOP_BUY_MAX_QTY = 100
 SHOP_GIFT_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+подарить|подарить)\s+(\S+)\s*(.*)$")
+# Потолок тот же, что у покупки: дарить пачками разрешено, выносить склад
+# одной командой — нет.
+SHOP_GIFT_MAX_QTY = SHOP_BUY_MAX_QTY
+
+
+def _gift_quantity(remaining: str) -> tuple[int, str]:
+    """(сколько дарим, текст ошибки). Пусто — значит одну штуку.
+
+    Считаем количеством ТОЛЬКО голое число: всё остальное в хвосте — это
+    @username цели, и принимать его за число значило бы дарить втихую не
+    то количество, которое человек назвал.
+
+    isascii() рядом с isdigit() не придирка: isdigit() истинен и для «²», и
+    для арабо-индийской «٣», а int("²") на этом бросает ValueError — ловить
+    его тут некому, и весь обработчик подарка падал от одного символа в
+    сообщении. Считаем количеством только привычные цифры 0-9.
+    """
+    числа = [w for w in (remaining or "").split() if w.isascii() and w.isdigit()]
+    if not числа:
+        return 1, ""
+    if len(числа) > 1:
+        return 0, "Сколько дарить — укажите одним числом."
+    qty = int(числа[0])
+    if qty < 1:
+        return 0, "Подарить меньше одной штуки не получится."
+    if qty > SHOP_GIFT_MAX_QTY:
+        return 0, f"За раз можно подарить не больше {SHOP_GIFT_MAX_QTY} шт."
+    return qty, ""
 
 def shop_item_line(item: dict) -> str:
     desc = f" — {html.escape(item['description'])}" if item.get("description") else ""
@@ -23894,7 +23850,15 @@ async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineK
     await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
     await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
     await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
-    items = await db.list_shop_items(chat_id)
+    # Урожай заводим НЕАКТИВНЫМ: строка нужна ради названия в инвентаре и
+    # цены для «магазин продать», но купить его нельзя — иначе подсолнух
+    # брался бы за деньги, и выращивать стало бы незачем.
+    await db.seed_extra_shop_items(chat_id, farming.SHOP_ITEMS, is_active=False)
+    # Товары лавки прячем из витрины магазина — продаются они только там.
+    # db.list_shop_items при этом не трогаем: веб-панель должна видеть
+    # каталог чата целиком.
+    items = [i for i in await db.list_shop_items(chat_id)
+             if i["item_key"] not in black_market.POOL_KEYS]
     items.sort(key=lambda i: (i.get("stock") == 0, i["price"]))
     if not items:
         return (
@@ -24327,7 +24291,50 @@ async def cmd_shop_buy(message: Message):
                     int(match.group(2)) if match.group(2) else 1)
 
 
-async def _shop_buy(message: Message, item_key: str, qty: int) -> bool:
+BLACK_MARKET_TRIGGERS = ("лавка", "!лавка", "чёрный рынок", "черный рынок")
+BLACK_MARKET_BUY_RE = ru_text.rx(r"(?i)^!?лавка\s+купить\s+(\S+)(?:\s+(\d+))?$")
+
+
+# Покупка объявлена ДО списка: «лавка купить …» точным совпадением по
+# BLACK_MARKET_TRIGGERS не поймается, но обратный порядок читался бы как
+# ловушка для следующей правки.
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(BLACK_MARKET_BUY_RE.match(t.strip()))),
+)
+async def cmd_black_market_buy(message: Message):
+    if not _check_misc_access(message.from_user.id, "black_market_buy"):
+        return
+    await ensure_black_market_rotation(message.chat.id)
+    match = BLACK_MARKET_BUY_RE.match(message.text.strip())
+    await _shop_buy(message, match.group(1).casefold(),
+                    int(match.group(2)) if match.group(2) else 1,
+                    from_black_market=True)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in BLACK_MARKET_TRIGGERS),
+)
+async def cmd_black_market(message: Message):
+    if not _check_misc_access(message.from_user.id, "black_market"):
+        return
+    await ensure_black_market_rotation(message.chat.id)
+    items = await db.list_rotation_items(
+        message.chat.id, sorted(black_market.POOL_KEYS), local_today()
+    )
+    lines = ["🏴 <b>Чёрный рынок</b>", DIVIDER]
+    if not items:
+        lines.append("Сегодня пусто — заходите завтра.")
+    else:
+        lines.extend(shop_item_line(i) for i in items)
+        lines.append("\nКупить: <code>лавка купить {ключ}</code>")
+        lines.append("Ассортимент и запас меняются раз в сутки.")
+    await message.reply("\n".join(lines))
+
+
+async def _shop_buy(message: Message, item_key: str, qty: int,
+                    from_black_market: bool = False) -> bool:
     """Покупка товара магазина. Вынесена из обработчика, потому что тем же
     путём покупается корм для питомцев («пет корм 10»): иначе распродажа,
     скидка «Торгаша», остаток на полке и отчисления в казну разъехались бы
@@ -24345,6 +24352,28 @@ async def _shop_buy(message: Message, item_key: str, qty: int) -> bool:
     if item is None or not item["is_active"]:
         await message.reply(f"Товар с ключом «{html.escape(item_key)}» не найден в магазине. Список — «магазин».")
         return False
+    # Гейт лавки. Стоит ЗДЕСЬ, а не в отрисовке витрины, потому что
+    # SHOP_BUY_RE ловит и голое «купить {ключ}»: спрячь товар только из
+    # списка — и любой, кто знает ключ, купит его в обход ротации.
+    in_pool = item_key in black_market.POOL_KEYS
+    if in_pool and not from_black_market:
+        await message.reply(
+            f"{item['emoji']} «{html.escape(item['name'])}» в обычном магазине "
+            f"не продаётся — загляните в «лавка»."
+        )
+        return False
+    if from_black_market and not in_pool:
+        await message.reply(
+            f"{item['emoji']} «{html.escape(item['name'])}» в лавке нет — "
+            f"это товар обычного «магазин»."
+        )
+        return False
+    if in_pool and item.get("rotation_day") != local_today():
+        await message.reply(
+            f"{item['emoji']} «{html.escape(item['name'])}» сегодня не завозили. "
+            f"Что есть — покажет «лавка»."
+        )
+        return False
     if shop_effects.is_reward(item_key):
         await message.reply(
             f"{item['emoji']} «{html.escape(item['name'])}» не продаётся — "
@@ -24354,7 +24383,10 @@ async def _shop_buy(message: Message, item_key: str, qty: int) -> bool:
     if item.get("stock") is not None and item["stock"] <= 0:
         await message.reply(f"⚠️ Товар «{html.escape(item['name'])}» раскуплен — остатка больше нет.")
         return False
-    if item_key in robbery.ROBBERY_ITEMS:
+    # Потолок держим на всём пуле лавки, а не только на предметах ограбления:
+    # иначе медвежатник и новинки копились бы за много дней, и дефицит
+    # кончился бы на второй неделе.
+    if item_key in robbery.ROBBERY_ITEMS or item_key in black_market.POOL_KEYS:
         current_qty = next(
             (i["quantity"] for i in await db.list_inventory(message.chat.id, message.from_user.id)
              if i["item_key"] == item_key),
@@ -24376,7 +24408,7 @@ async def _shop_buy(message: Message, item_key: str, qty: int) -> bool:
     # ценники в самом магазине не переписываем.
     price = max(1, round(int(item["price"]) * await event_multiplier(message.chat.id, chat_events.T_SHOP)))
     # «Торгаш» (питомец) сбивает цену.
-    torgash = await _pet_bonus(message.chat.id, message.from_user.id, "discount_shop")
+    torgash = await game_actions._pet_bonus(message.chat.id, message.from_user.id, "discount_shop")
     if torgash:
         price = max(1, price - price * torgash // 100)
     total = price * qty
@@ -24462,7 +24494,12 @@ async def cmd_gift_item(message: Message):
     # Текст резолверу не подменяем: entity.offset считается по message.text,
     # и срез @username по укороченной строке уехал бы.
     trigger_words = 3 if _SHOP_NS_RE.match(raw) else 2
-    target, _remaining = await resolve_command_target(message, trigger_words=trigger_words)
+    # Когда команда — ответ на сообщение, цель уже известна, и голое число
+    # после ключа может означать только количество. Не выключи мы разбор
+    # голого ID, «подарить korm 4» ответом ушло бы пользователю с id=4.
+    target, remaining = await resolve_command_target(
+        message, trigger_words=trigger_words,
+        allow_bare_id=message.reply_to_message is None)
     if target is None and message.reply_to_message:
         target = message.reply_to_message.from_user
     if target is None:
@@ -24487,11 +24524,28 @@ async def cmd_gift_item(message: Message):
         )
         return
 
-    removed = await db.remove_inventory_item(message.chat.id, message.from_user.id, item_key)
-    if not removed:
-        await message.reply(f"У вас нет предмета «{html.escape(item_key)}» — проверьте «инвентарь».")
+    qty, qty_error = _gift_quantity(remaining)
+    if qty_error:
+        await message.reply(qty_error)
         return
-    await db.add_inventory_item(message.chat.id, target.id, item_key)
+
+    # Эта проверка нужна только ради понятного отказа («у вас 3 шт.»):
+    # решение, отдавать или нет, принимает сам UPDATE внутри
+    # remove_inventory_item — одним запросом, без окна для второй команды.
+    have = await db.get_inventory_quantity(message.chat.id, message.from_user.id, item_key)
+    if have < qty:
+        await message.reply(
+            f"У вас {have} шт. «{html.escape(item_key)}» — подарить {qty} не выйдет. "
+            "Что есть, видно в «инвентарь»."
+        )
+        return
+    if not await db.remove_inventory_item(message.chat.id, message.from_user.id, item_key, qty):
+        await message.reply(
+            f"«{html.escape(item_key)}» разошлись, пока шла команда, — подарить "
+            f"{qty} не вышло. Загляните в «инвентарь» и попробуйте ещё раз."
+        )
+        return
+    await db.add_inventory_item(message.chat.id, target.id, item_key, qty)
 
     # Если подаренный предмет был закреплён и у дарителя его больше не осталось — снимаем закреп
     card = await db.get_profile_card(message.chat.id, message.from_user.id)
@@ -24505,10 +24559,12 @@ async def cmd_gift_item(message: Message):
     emoji = item["emoji"] if item else "🎁"
     giver = await display_name(message.chat.id, message.from_user)
     receiver = await display_name(message.chat.id, target)
-    await message.reply(f"{emoji} {giver} дарит {receiver}: <b>{html.escape(item_name)}</b>!")
+    сколько = f" ×{qty}" if qty > 1 else ""
+    await message.reply(
+        f"{emoji} {giver} дарит {receiver}: <b>{html.escape(item_name)}</b>{сколько}!")
     await db.add_log(
         "gift_item", chat_id=message.chat.id, actor_id=message.from_user.id,
-        target_id=target.id, details=item_key,
+        target_id=target.id, details=f"{item_key}:{qty}" if qty > 1 else item_key,
     )
     gift_count = await _increment_gift_count(message.chat.id, message.from_user.id)
     if gift_count >= 20:
@@ -24528,7 +24584,7 @@ async def cmd_shop_usage(message: Message):
         "<code>магазин</code> — список товаров",
         "<code>магазин купить {ключ} [количество]</code>",
         "<code>магазин продать {ключ} [количество]</code>",
-        "<code>магазин подарить {ключ}</code> (ответом или @username/ID)",
+        "<code>магазин подарить {ключ} [количество]</code> (ответом или @username/ID)",
     ]
     if has_level(message.from_user.id, required_level("shop_manage")):
         lines.append("<code>магазин добавить {ключ} {цена} {название}</code>")
@@ -24768,7 +24824,7 @@ async def cmd_lootbox(message: Message):
         # «содержимое»: лутбокс выдаёт предмет или титул, а не монеты, и
         # умножать там попросту нечего.
         rare_chance = info["rare_chance"]
-        nyuhach = await _pet_bonus(chat_id, user_id, "lootbox")
+        nyuhach = await game_actions._pet_bonus(chat_id, user_id, "lootbox")
         nyuhach += await _pin_bonus(chat_id, user_id, "lootbox")   # тема «Коллекции»
         if nyuhach:
             rare_chance = min(100, rare_chance + rare_chance * nyuhach // 100)
@@ -27869,15 +27925,15 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
         lines.append(f"🏅 Ачивка: {ach['emoji']} <b>{ach['title']}</b>")
     if card and card.get("pinned_pet"):
         pet_row = await db.get_pet(chat_id, target.id, card["pinned_pet"])
-        pet_spec = (await _pet_specs(chat_id)).get(card["pinned_pet"])
+        pet_spec = (await game_actions._pet_specs(chat_id)).get(card["pinned_pet"])
         # Питомца могли отпустить уже после закрепления — тогда строки просто
         # нет, а не «закреплён неизвестно кто».
         if pet_row and pet_spec:
-            _aura = await _pet_aura_for(chat_id, target.id)
-            hunger, mood = _pet_now(pet_row, _aura.mood, _aura.hunger)
+            _aura = await game_actions.pet_aura_for(chat_id, target.id)
+            hunger, mood = game_actions._pet_now(pet_row, _aura.mood, _aura.hunger)
             given = pet_row.get("pet_name")
             shown = f"{pet_spec.title} «{html.escape(given)}»" if given else pet_spec.title
-            level = _pet_level(pet_row)
+            level = game_actions._pet_level(pet_row)
             lines.append(f"🐾 Питомец: {shown} — ⭐{level} — {pets_catalog.state_text(hunger, mood)}")
     if card and card.get("pinned_doll"):
         doll = await db.get_voodoo_doll(chat_id, target.id, int(card["pinned_doll"]))
@@ -27921,6 +27977,9 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     stars = wallet_stars(wallet)
     if coins or stars:
         lines.append(f"В кошельке: ☢️ {coins:,} i¢ · ✨ {stars}".replace(",", " "))
+    долг = debt_note(coins)
+    if долг:
+        lines.append(долг)
     reputation = await db.get_reputation(chat_id, target.id)
     lines.append(f"Репутация: {reputation}")
     prof_stats = await db.get_profession_stats(chat_id, target.id)
@@ -31127,6 +31186,46 @@ async def cmd_chat_event_force(message: Message):
         )
 
 
+# Ротация лавки. Ленивая: ассортимент обновляется при первом обращении в
+# новые сутки, а не по будильнику. Так лавка переживает простой бота —
+# суточный цикл ниже срабатывает только если бот был жив в нужный час, и
+# завязать на него единственный источник ассортимента значило бы, что после
+# ночного рестарта лавка пуста весь день.
+#
+# Цикл при этом ротацию тоже дёргает — ради объявления в чат. Функция
+# идемпотентна в пределах суток, так что два вызова безопасны.
+_black_market_locks: dict[int, asyncio.Lock] = {}
+
+
+def _black_market_lock(chat_id: int) -> asyncio.Lock:
+    """Свой замок на чат: две одновременные «лавки» не должны разыграть
+    ассортимент дважды. Хватает внутрипроцессного замка — ротацию делает
+    только бот, а он один процесс."""
+    lock = _black_market_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _black_market_locks[chat_id] = lock
+    return lock
+
+
+async def ensure_black_market_rotation(chat_id: int) -> bool:
+    """Выставляет ассортимент лавки на сегодня. True — если обновили сейчас."""
+    keys = sorted(black_market.POOL_KEYS)
+    today = local_today()
+    async with _black_market_lock(chat_id):
+        if await db.get_rotation_day(chat_id, keys) == today:
+            return False
+        # Строки должны существовать до выбора: в чате, где магазин ни разу
+        # не открывали, выбирать было бы нечего.
+        await db.seed_extra_shop_items(chat_id, black_market.NEW_ITEMS)
+        await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+        await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+        await db.clear_rotation_stock(chat_id, keys)
+        for item_key, stock in black_market.pick_rotation().items():
+            await db.set_shop_item_rotation(chat_id, item_key, stock, today)
+        return True
+
+
 # Час завоза — по настроенной зоне: с message_daily завоз никак не связан,
 # а «магазин обновляется в 15:00» человек читает как своё местное время.
 SHOP_RESTOCK_HOUR_LOCAL = 15
@@ -31149,7 +31248,9 @@ async def shop_restock_loop() -> None:
                 if last_row and last_row.get("data_value") == today_str:
                     continue
 
-                rows = await db.list_shop_items_for_restock(chat_id)
+                rows = await db.list_shop_items_for_restock(
+                    chat_id, exclude_keys=sorted(black_market.POOL_KEYS)
+                )
                 lines = ["🔄 <b>Магазин обновился!</b>", DIVIDER]
                 restocked_any = False
                 for row in rows:
@@ -31164,6 +31265,13 @@ async def shop_restock_loop() -> None:
                     if item:
                         lines.append(f"{item['emoji']} {html.escape(item['name'])} +{added}")
                         restocked_any = True
+
+                # Заодно крутим лавку — ради объявления. Сама по себе она
+                # обновится и без цикла, при первом обращении (см.
+                # ensure_black_market_rotation).
+                if await ensure_black_market_rotation(chat_id):
+                    lines.append("🏴 Чёрный рынок обновил ассортимент — «лавка»")
+                    restocked_any = True
 
                 await db.set_data(last_key, today_str)
                 notify_chat = settings.get("complaint_chat_id")
@@ -37264,6 +37372,7 @@ async def main():
     await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_pets_table()              # личные питомцы
     await db.ensure_voodoo_table()            # именные сувениры-куклы
+    await db.ensure_farm_plots_table()        # огород: грядки и помощь соседям
     await db.ensure_seasons_table()           # месячный зачёт
     await db.ensure_timezone_column()
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)

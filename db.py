@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import aiomysql
 
@@ -442,6 +443,21 @@ async def get_data(key: str) -> Optional[dict]:
         "SELECT data_key, data_value, updated_by, updated_at FROM bot_data WHERE data_key = %s",
         (key,),
     )
+
+
+# Флаг «панель что-то поправила, перечитай кэши». Живёт здесь, а не в панели,
+# потому что читателей двое и они в разных процессах: пишет webpanel, читает
+# panel_action_reload_loop в bot.py. Один ключ на обе стороны — иначе однажды
+# одна строка поедет, а вторая нет, и правки с сайта молча перестанут доезжать.
+PANEL_RELOAD_KEY = "panel_action_reload"
+
+
+async def signal_panel_reload() -> None:
+    """Поднять флаг перечитки: бот держит настройки и наборы фраз в памяти и о
+    правке из другого процесса сам не узнает. Значение — монотонно растущая
+    метка времени, чтобы бот увидел ЛЮБОЕ изменение, а не только отличное от
+    предыдущего по смыслу."""
+    await set_data(PANEL_RELOAD_KEY, f"{time.time():.6f}")
 
 
 async def delete_data(key: str) -> bool:
@@ -7128,13 +7144,30 @@ async def try_spend_coins(chat_id: int, user_id: int, amount: int) -> bool:
     return bool(changed)
 
 
+# «Списать, не уводя в минус — но и не вытаскивая из уже имеющегося минуса».
+#
+# Привычное GREATEST(coins - X, 0) держит ноль дном для ЛЮБОГО баланса, и
+# писалось оно тогда, когда минуса в экономике не существовало. С появлением
+# принудительного взыскания (см. _seize_debt в bot.py) минус стал штатным, и
+# та же строка начала не отнимать, а дарить: GREATEST(-50000 - 0, 0) обнуляло
+# долг любого размера — то есть провалить ограбление стало выгоднее, чем
+# гасить кредит.
+#
+# LEAST(coins, 0) делает дном ноль только тем, кто в плюсе; должнику дном
+# остаётся его собственный баланс — списание с пустого кошелька не углубляет
+# яму и не засыпает её. Для неотрицательного баланса выражение совпадает со
+# старым до монеты: LEAST(coins, 0) там и есть ноль.
+_TAKE_COINS_SQL = "GREATEST(coins - %s, LEAST(coins, 0))"
+
+
 async def take_coins_up_to(chat_id: int, user_id: int, amount: int) -> int:
     """Забирает не больше amount и не больше того, что есть. Возвращает,
     сколько реально забрали.
 
     Для конфискации и краж: там сумма считается от баланса, прочитанного
     мгновением раньше, и при одновременной трате баланс мог бы уйти в минус.
-    GREATEST(..., 0) в самом UPDATE исключает это независимо от гонок.
+    Нижняя граница в самом UPDATE (_TAKE_COINS_SQL) исключает это независимо
+    от гонок.
     """
     if amount <= 0:
         return 0
@@ -7145,7 +7178,7 @@ async def take_coins_up_to(chat_id: int, user_id: int, amount: int) -> int:
     )
     before = int(row["coins"]) if row else 0
     await _execute(
-        "UPDATE economy_wallets SET coins = GREATEST(coins - %s, 0) "
+        f"UPDATE economy_wallets SET coins = {_TAKE_COINS_SQL} "
         "WHERE chat_id = %s AND user_id = %s",
         (amount, chat_id, user_id),
     )
@@ -7278,9 +7311,21 @@ async def ensure_bank_tables() -> None:
         "credit_fee_percent DECIMAL(6,2) NOT NULL DEFAULT 20.00, "
         "credit_term_days INT NOT NULL DEFAULT 7, "
         "credit_penalty_percent DECIMAL(6,2) NOT NULL DEFAULT 10.00, "
-        "min_deposit BIGINT NOT NULL DEFAULT 1000"
+        "min_deposit BIGINT NOT NULL DEFAULT 1000, "
+        "collector_after_days INT NOT NULL DEFAULT 1, "
+        "seize_after_days INT NOT NULL DEFAULT 5"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    # Досоздаём для чатов, где таблица уже есть: без этого настройка
+    # появилась бы только у новых чатов, а старые молча остались бы без неё.
+    await _add_column_if_missing("bank_settings", "collector_after_days",
+                                 "INT NOT NULL DEFAULT 1")
+    await _add_column_if_missing("bank_settings", "seize_after_days",
+                                 "INT NOT NULL DEFAULT 5")
+    await _add_column_if_missing("bank_accounts", "credit_last_visit_at",
+                                 "DATETIME NULL")
+    await _add_column_if_missing("bank_accounts", "credit_visits",
+                                 "INT NOT NULL DEFAULT 0")
 
 async def ensure_bank_blacklist_table() -> None:
     """Чёрный список банка: пользователям из него недоступны кредиты."""
@@ -7347,6 +7392,7 @@ async def set_bank_rate(chat_id: int, term_key: str, percent: float) -> None:
 async def set_bank_credit_settings(
     chat_id: int, fee_percent: Optional[float] = None,
     term_days: Optional[int] = None, penalty_percent: Optional[float] = None,
+    collector_after_days: Optional[int] = None, seize_after_days: Optional[int] = None,
 ) -> None:
     await get_bank_settings(chat_id)
     sets, params = [], []
@@ -7356,6 +7402,10 @@ async def set_bank_credit_settings(
         sets.append("credit_term_days = %s"); params.append(term_days)
     if penalty_percent is not None:
         sets.append("credit_penalty_percent = %s"); params.append(penalty_percent)
+    if collector_after_days is not None:
+        sets.append("collector_after_days = %s"); params.append(collector_after_days)
+    if seize_after_days is not None:
+        sets.append("seize_after_days = %s"); params.append(seize_after_days)
     if not sets:
         return
     params.append(chat_id)
@@ -7400,10 +7450,15 @@ async def close_bank_deposit(chat_id: int, user_id: int) -> None:
 
 
 async def open_bank_credit(chat_id: int, user_id: int, principal: int, debt: int, term_days: int) -> None:
+    # credit_visits/credit_last_visit_at сбрасываются здесь же: счётчик визитов
+    # живёт на кредите, а не на человеке, — новый кредит это новый разговор, а
+    # не продолжение старого. Без сброса коллектор пришёл бы к свежему долгу
+    # сразу с последней (самой наглой) ступени, унаследованной от прошлого.
     await get_bank_account(chat_id, user_id)
     await _execute(
         "UPDATE bank_accounts SET credit_amount = %s, credit_debt = %s, credit_taken_at = UTC_TIMESTAMP(), "
-        "credit_due_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s DAY), credit_last_penalty_at = UTC_TIMESTAMP() "
+        "credit_due_at = DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s DAY), credit_last_penalty_at = UTC_TIMESTAMP(), "
+        "credit_visits = 0, credit_last_visit_at = NULL "
         "WHERE chat_id = %s AND user_id = %s",
         (principal, debt, term_days, chat_id, user_id),
     )
@@ -7415,9 +7470,15 @@ async def reduce_bank_credit_debt(chat_id: int, user_id: int, amount: int) -> in
     account = await get_bank_account(chat_id, user_id)
     new_debt = max(0, int(account["credit_debt"]) - amount)
     if new_debt == 0:
+        # Тот же сброс, что и при открытии — на случай, если следующий кредит
+        # когда-нибудь начнёт открываться в обход open_bank_credit: счётчик не
+        # должен пережить закрытый кредит ни при каком пути закрытия (обычное
+        # погашение через cmd_bank_repay и принудительное через _seize_debt —
+        # оба ведут сюда же).
         await _execute(
             "UPDATE bank_accounts SET credit_amount = 0, credit_debt = 0, credit_taken_at = NULL, "
-            "credit_due_at = NULL, credit_last_penalty_at = NULL WHERE chat_id = %s AND user_id = %s",
+            "credit_due_at = NULL, credit_last_penalty_at = NULL, "
+            "credit_visits = 0, credit_last_visit_at = NULL WHERE chat_id = %s AND user_id = %s",
             (chat_id, user_id),
         )
     else:
@@ -7432,7 +7493,8 @@ async def list_overdue_bank_credits() -> list[dict]:
     """Кредиты с истёкшим сроком, которым пора начислить дневную пеню (не
     чаще раза в 24 часа — см. credit_last_penalty_at)."""
     return await _fetchall(
-        "SELECT ba.*, bs.credit_penalty_percent FROM bank_accounts ba "
+        "SELECT ba.*, bs.credit_penalty_percent, bs.collector_after_days, bs.seize_after_days "
+        "FROM bank_accounts ba "
         "JOIN bank_settings bs ON bs.chat_id = ba.chat_id "
         "WHERE ba.credit_debt > 0 AND ba.credit_due_at IS NOT NULL AND ba.credit_due_at <= UTC_TIMESTAMP() "
         "AND (ba.credit_last_penalty_at IS NULL OR ba.credit_last_penalty_at <= (UTC_TIMESTAMP() - INTERVAL 1 DAY))"
@@ -7445,6 +7507,25 @@ async def apply_bank_credit_penalty(chat_id: int, user_id: int, new_debt: int) -
         "WHERE chat_id = %s AND user_id = %s",
         (new_debt, chat_id, user_id),
     )
+
+
+async def mark_credit_visit(chat_id: int, user_id: int) -> int:
+    """Отметить визит коллектора. Возвращает, каким по счёту он вышел.
+
+    Счётчик живёт на самом кредите, поэтому обнуляется вместе с ним: новый
+    кредит — новый разговор, а не продолжение старого.
+    """
+    await _execute(
+        "UPDATE bank_accounts SET credit_visits = credit_visits + 1, "
+        "credit_last_visit_at = UTC_TIMESTAMP() WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    row = await _fetchone(
+        "SELECT credit_visits FROM bank_accounts WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    return int(row["credit_visits"]) if row else 0
+
 
 async def get_stock_price(chat_id: int) -> float:
     row = await _fetchone("SELECT price FROM stock_market WHERE chat_id = %s", (chat_id,))
@@ -7845,14 +7926,21 @@ async def list_coins_top(
     обычно больше, чем ненулевых. Раньше это было не видно — топ отдавал
     только первую десятку, — но при листании нули растянулись бы на страницы
     одинаковых «0 i¢» после реального топа.
+
+    Отсекается именно НОЛЬ, а не «всё, что не больше нуля». Условие coins > 0
+    писалось, когда минус был невозможен, и с приходом принудительного
+    взыскания начало прятать людей: должник пропадал из топа целиком, счётчик
+    участников его не считал, а в чате, где у всех отняли последнее, бот
+    сообщал «Пока ни у кого нет i¢» — то есть врал. Спека требует обратного:
+    в топе должники показываются как есть, внизу списка.
     """
     count_row = await _fetchone(
-        "SELECT COUNT(*) AS total FROM economy_wallets WHERE chat_id = %s AND coins > 0",
+        "SELECT COUNT(*) AS total FROM economy_wallets WHERE chat_id = %s AND coins <> 0",
         (chat_id,),
     )
     rows = await _fetchall(
         "SELECT user_id, coins, star_level, total_farms FROM economy_wallets "
-        "WHERE chat_id = %s AND coins > 0 "
+        "WHERE chat_id = %s AND coins <> 0 "
         "ORDER BY coins DESC LIMIT %s OFFSET %s",
         (chat_id, limit, offset),
     )
@@ -8041,6 +8129,210 @@ async def count_voodoo_dolls_of(chat_id: int, target_id: int) -> int:
         (chat_id, target_id),
     )
     return int(row["cnt"]) if row else 0
+
+
+# ----------------------------------------------------------------------------
+# ОГОРОД: грядки (правила и числа — farming.py)
+# ----------------------------------------------------------------------------
+async def ensure_farm_plots_table() -> None:
+    """Занятые грядки. Пустая грядка — ОТСУТСТВИЕ строки, а не строка с NULL:
+    иначе при каждой правке числа грядок (оно растёт со звёздностью) пришлось
+    бы досоздавать и подчищать пустышки, и «сколько у меня грядок» имело бы два
+    источника правды — таблицу и звёздность.
+
+    ready_at считаем при посадке и храним готовым: он зависит от погоды дня
+    посадки и от питомцев, и пересчёт задним числом менял бы срок уже
+    посаженного при каждой правке баланса.
+
+    pest_at — когда сядет саранча (NULL — не сядет). Решается при посадке, см.
+    farming.pest_moment: возникни она в момент сбора, прогнать её было бы
+    некогда, и «ферма помочь» осталась бы декорацией.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS farm_plots ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "slot INT NOT NULL, "
+        "crop_key VARCHAR(32) NOT NULL, "
+        "planted_at DATETIME NOT NULL, "
+        "ready_at DATETIME NOT NULL, "
+        "pest_at DATETIME NULL, "
+        "PRIMARY KEY (chat_id, user_id, slot), "
+        "INDEX idx_farm_plots_pest (chat_id, user_id, pest_at)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS farm_help ("
+        "chat_id BIGINT NOT NULL, "
+        "helper_id BIGINT NOT NULL, "
+        "helped_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, helper_id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def list_farm_plots(chat_id: int, user_id: int) -> list[dict]:
+    return await _fetchall(
+        "SELECT slot, crop_key, planted_at, ready_at, pest_at FROM farm_plots "
+        "WHERE chat_id = %s AND user_id = %s ORDER BY slot",
+        (chat_id, user_id),
+    )
+
+
+async def plant_farm_crop(chat_id: int, user_id: int, slot: int, crop_key: str,
+                          planted_at, ready_at, pest_at) -> bool:
+    """False — грядка уже занята. INSERT без REPLACE намеренно: перезапись
+    затёрла бы чужой (свой же, но растущий) посев без единого слова."""
+    affected = await _execute(
+        "INSERT IGNORE INTO farm_plots "
+        "(chat_id, user_id, slot, crop_key, planted_at, ready_at, pest_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (chat_id, user_id, slot, crop_key, planted_at, ready_at, pest_at),
+    )
+    return bool(affected)
+
+
+async def clear_farm_plot(chat_id: int, user_id: int, slot: int) -> bool:
+    affected = await _execute(
+        "DELETE FROM farm_plots WHERE chat_id = %s AND user_id = %s AND slot = %s",
+        (chat_id, user_id, slot),
+    )
+    return bool(affected)
+
+
+async def clear_farm_pests(chat_id: int, user_id: int, now) -> int:
+    """Прогнать саранчу со всех грядок хозяина. Возвращает, со скольких.
+
+    Считаем только УЖЕ СЕВШУЮ (pest_at <= now): будущую саранчу сосед прогнать
+    не может — её ещё нет, и «спасибо, я снял то, чего не было» выглядело бы
+    издевательством.
+    """
+    rows = await _fetchall(
+        "SELECT slot FROM farm_plots WHERE chat_id = %s AND user_id = %s "
+        "AND pest_at IS NOT NULL AND pest_at <= %s",
+        (chat_id, user_id, now),
+    )
+    if not rows:
+        return 0
+    await _execute(
+        "UPDATE farm_plots SET pest_at = NULL WHERE chat_id = %s AND user_id = %s "
+        "AND pest_at IS NOT NULL AND pest_at <= %s",
+        (chat_id, user_id, now),
+    )
+    return len(rows)
+
+
+async def get_farm_help_at(chat_id: int, helper_id: int):
+    row = await _fetchone(
+        "SELECT helped_at FROM farm_help WHERE chat_id = %s AND helper_id = %s",
+        (chat_id, helper_id),
+    )
+    return row["helped_at"] if row else None
+
+
+async def record_farm_help(chat_id: int, helper_id: int, helped_at) -> None:
+    await _execute(
+        "INSERT INTO farm_help (chat_id, helper_id, helped_at) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE helped_at = VALUES(helped_at)",
+        (chat_id, helper_id, helped_at),
+    )
+
+
+# ----------------------------------------------------------------------------
+# НАСТРОЙКИ ЧАТА ДЛЯ ПАНЕЛИ (описание — chat_settings.py)
+#
+# Общий слой возможен только потому, что все початовые таблицы настроек
+# устроены одинаково: «строка чата или значения по умолчанию». Читаем по одному
+# запросу на таблицу, а не на поле: у банка семь настроек, и семь походов в
+# базу ради одной формы — это заметно.
+# ----------------------------------------------------------------------------
+async def get_chat_setting_values(chat_id: int, settings: list) -> dict:
+    """Текущие значения перечисленных настроек. Нет строки чата — умолчание."""
+    import chat_settings as cs
+
+    out: dict = {}
+    by_table: dict[str, list] = {}
+    for setting in settings:
+        if setting.storage == cs.STORAGE_COLUMN:
+            by_table.setdefault(setting.target, []).append(setting)
+        elif setting.storage == cs.STORAGE_DATA:
+            row = await get_data(setting.target.format(chat_id=chat_id))
+            out[setting.key] = _chat_setting_from_data(setting, row)
+        else:
+            row = await _fetchone(
+                f"SELECT {setting.target} FROM settings WHERE id = 1"
+            )
+            value = row[setting.target] if row else None
+            out[setting.key] = value if value is not None else setting.default
+
+    for table, group in by_table.items():
+        columns = ", ".join(sorted({s.column for s in group}))
+        row = await _fetchone(
+            f"SELECT {columns} FROM {table} WHERE chat_id = %s", (chat_id,)
+        )
+        for setting in group:
+            value = row[setting.column] if row else None
+            if value is None:
+                out[setting.key] = setting.default
+            elif setting.kind == cs.KIND_BOOL:
+                out[setting.key] = bool(value)
+            elif setting.kind == cs.KIND_CHOICE:
+                out[setting.key] = str(value)
+            else:
+                out[setting.key] = int(value) if setting.integer else float(value)
+    return out
+
+
+def _chat_setting_from_data(setting, row) -> object:
+    """Значение настройки, живущей в общем key-value.
+
+    Перевёрнутые (inverted) читаются наоборот: у боссов НАЛИЧИЕ ключа
+    boss_off означает «выключено», и притворяться, что это обычный флаг,
+    нельзя — иначе включение писало бы ноль вместо удаления ключа.
+    """
+    import chat_settings as cs
+
+    if setting.kind == cs.KIND_BOOL:
+        present = row is not None and (setting.inverted or row.get("data_value") == "1")
+        return (not present) if setting.inverted else present
+    if row is None:
+        return setting.default
+    raw = row.get("data_value")
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return setting.default
+    return int(number) if setting.integer else number
+
+
+async def set_chat_setting_value(chat_id: int, setting, value) -> None:
+    """Запись значения. Значение уже проверено chat_settings.validate."""
+    import chat_settings as cs
+
+    if setting.storage == cs.STORAGE_COLUMN:
+        await _execute(
+            f"INSERT INTO {setting.target} (chat_id, {setting.column}) VALUES (%s, %s) "
+            f"ON DUPLICATE KEY UPDATE {setting.column} = VALUES({setting.column})",
+            (chat_id, value),
+        )
+        return
+
+    if setting.storage == cs.STORAGE_SETTINGS:
+        await _execute(
+            f"UPDATE settings SET {setting.target} = %s WHERE id = 1", (value,)
+        )
+        return
+
+    key = setting.target.format(chat_id=chat_id)
+    if setting.kind == cs.KIND_BOOL:
+        # Для перевёрнутых «включить» — это стереть ключ, а не записать ноль.
+        write = (not value) if setting.inverted else bool(value)
+        if write:
+            await set_data(key, "1")
+        else:
+            await delete_data(key)
+        return
+    await set_data(key, str(value))
 
 
 async def ensure_seasons_table() -> None:
@@ -9335,7 +9627,20 @@ async def tax_all_wallets(chat_id: int, percent: float) -> int:
 
 
 async def add_coins_to_users(chat_id: int, user_ids: list[int], amount: int) -> int:
-    """Начисляет amount каждому из user_ids. Возвращает число получивших."""
+    """Начисляет amount каждому из user_ids. Возвращает число получивших.
+
+    Начисление именно складывается, без нижней границы в ноль. Она тут стояла
+    (GREATEST(coins + %s, 0)) с тех пор, когда минуса в экономике не бывало, и
+    после появления взыскания превратилась в способ списать долг бесплатно:
+    выплата должнику не уменьшала минус, а обнуляла его. Причём попасть под
+    выплату должник мог не случайно — «Благотворительность» выбирает
+    получателей через list_poor_wallets по возрастанию монет, то есть он в
+    очереди первый по построению.
+
+    Оба вызывающих (события чата «Раздача» и «Благотворительность») передают
+    только положительные суммы, так что защищать этой границей было нечего и
+    раньше: на плюсовом балансе она не срабатывала никогда.
+    """
     if not user_ids or amount == 0:
         return 0
     placeholders = ", ".join(["%s"] * len(user_ids))
@@ -9343,7 +9648,7 @@ async def add_coins_to_users(chat_id: int, user_ids: list[int], amount: int) -> 
     for uid in user_ids:
         await get_wallet(chat_id, uid)
     await _execute(
-        f"UPDATE economy_wallets SET coins = GREATEST(coins + %s, 0) "
+        f"UPDATE economy_wallets SET coins = coins + %s "
         f"WHERE chat_id = %s AND user_id IN ({placeholders})",
         (amount, chat_id, *user_ids),
     )
@@ -9439,6 +9744,11 @@ async def ensure_shop_tables() -> None:
     )
     await _add_column_if_missing("shop_items", "stock", "INT NULL")
     await _add_column_if_missing("shop_items", "restock_max", "INT NULL DEFAULT 10")
+    # День, на который выставлен ассортимент лавки (см. black_market.py).
+    # Отличает «сегодня не завозили» от «раскупили»: позиция в ассортименте,
+    # если rotation_day — сегодняшняя дата по зоне чата. Вчерашние строки
+    # перестают совпадать сами, чистить их не нужно.
+    await _add_column_if_missing("shop_items", "rotation_day", "DATE NULL")
     # Отложенные эффекты предметов: талисман и страховка не срабатывают сразу,
     # а ждут своего случая (следующего заработка, следующей поломки). Живут
     # зарядами, а не временем: купил — лежит, пока не пригодится.
@@ -10225,13 +10535,26 @@ async def add_shop_item(
     chat_id: int, item_key: str, name: str, price: int,
     description: Optional[str] = None, emoji: str = "🎁",
     stock: Optional[int] = None, restock_max: Optional[int] = 10,
+    is_active: bool = True,
 ) -> bool:
+    """is_active=False — товар есть в каталоге, но НЕ продаётся.
+
+    Так заводится урожай с грядки: строка в shop_items нужна, чтобы предмет
+    показывался в инвентаре с названием и эмодзи, а не голым ключом, и чтобы у
+    него была цена для «магазин продать». Но купить его нельзя — иначе
+    подсолнух, который «нигде, кроме грядки, не берётся», брался бы за деньги,
+    и весь смысл выращивать пропал бы.
+
+    Ставится ТОЛЬКО при создании (существующий ключ функция не трогает):
+    админ, включивший товар руками, останется с включённым.
+    """
     if await get_shop_item(chat_id, item_key) is not None:
         return False
     await _execute(
-        "INSERT INTO shop_items (chat_id, item_key, name, description, emoji, price, stock, restock_max) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (chat_id, item_key, name, description, emoji, price, stock, restock_max),
+        "INSERT INTO shop_items "
+        "(chat_id, item_key, name, description, emoji, price, stock, restock_max, is_active) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (chat_id, item_key, name, description, emoji, price, stock, restock_max, is_active),
     )
     return True
 
@@ -10344,6 +10667,84 @@ async def set_shop_item_stock(chat_id: int, item_key: str, stock: Optional[int])
     ))
 
 
+# --- ротация лавки (чёрный рынок) -------------------------------------------
+#
+# Запас у лавки живёт в той же колонке stock, что у магазина, — отдельной
+# таблицы у неё нет намеренно (см. black_market.py). Отличает её только
+# rotation_day: позиция продаётся, если день сегодняшний.
+#
+# Плейсхолдеры под IN собираются f-строкой. Соблазн написать
+# «... IN (%s)» % ", ".join(["%%s"] * n) заканчивается запросом с «IN (%%s,
+# %%s)»: оператор % не обрабатывает подставленное значение повторно.
+def _key_placeholders(keys: list[str]) -> str:
+    return ", ".join(["%s"] * len(keys))
+
+
+async def set_shop_item_rotation(
+    chat_id: int, item_key: str, stock: int, rotation_day
+) -> bool:
+    """Ставит позицию лавки в ассортимент дня с указанным запасом.
+
+    Запас и день пишутся одним запросом: порознь позиция побывала бы в
+    состоянии «сегодняшняя, но с вчерашним запасом», и в этот зазор
+    пролезала бы покупка.
+    """
+    return bool(await _execute(
+        "UPDATE shop_items SET stock = %s, rotation_day = %s "
+        "WHERE chat_id = %s AND item_key = %s",
+        (stock, rotation_day, chat_id, item_key),
+    ))
+
+
+async def clear_rotation_stock(chat_id: int, keys: Sequence[str]) -> None:
+    """Обнуляет запас у всех позиций лавки перед выбором нового ассортимента.
+
+    rotation_day при этом НЕ трогаем: он остаётся вчерашним, и позиция сама
+    перестаёт считаться сегодняшней.
+    """
+    keys = list(keys)
+    if not keys:
+        return
+    await _execute(
+        f"UPDATE shop_items SET stock = 0 "
+        f"WHERE chat_id = %s AND item_key IN ({_key_placeholders(keys)})",
+        (chat_id, *keys),
+    )
+
+
+async def get_rotation_day(chat_id: int, keys: Sequence[str]):
+    """На какой день выставлен ассортимент лавки. None — ни разу не выставлен."""
+    keys = list(keys)
+    if not keys:
+        return None
+    row = await _fetchone(
+        f"SELECT MAX(rotation_day) AS day FROM shop_items "
+        f"WHERE chat_id = %s AND item_key IN ({_key_placeholders(keys)})",
+        (chat_id, *keys),
+    )
+    return row["day"] if row else None
+
+
+async def list_rotation_items(chat_id: int, keys: Sequence[str], day) -> list[dict]:
+    """Позиции лавки, попавшие в ассортимент указанного дня.
+
+    Выключенные админом (is_active = FALSE) не показываем: покупка всё равно
+    отказала бы по этому же признаку, и лавка обещала бы товар, который на
+    «лавка купить» отвечает «не найден в магазине», хотя он прямо в списке.
+    Ротация про выключенные не знает и выбрать такую позицию может — тогда
+    в ассортименте будет на строку меньше, и это честнее строки-обманки.
+    """
+    keys = list(keys)
+    if not keys:
+        return []
+    return await _fetchall(
+        f"SELECT * FROM shop_items WHERE chat_id = %s AND rotation_day = %s "
+        f"AND is_active = TRUE AND item_key IN ({_key_placeholders(keys)}) "
+        f"ORDER BY price DESC",
+        (chat_id, day, *keys),
+    )
+
+
 async def try_decrement_shop_item_stock(chat_id: int, item_key: str) -> bool:
     """Атомарно списывает 1 шт. остатка. True — списано либо остаток
     безлимитный (stock IS NULL). False — остаток уже 0."""
@@ -10392,12 +10793,32 @@ async def return_shop_stock(chat_id: int, item_key: str, amount: int) -> None:
     )
 
 
-async def list_shop_items_for_restock(chat_id: int) -> list[dict]:
-    return await _fetchall(
+async def list_shop_items_for_restock(
+    chat_id: int, exclude_keys: Sequence[str] = ()
+) -> list[dict]:
+    """Позиции, которым положен суточный завоз.
+
+    exclude_keys — товары лавки: у них запас УСТАНАВЛИВАЕТ ротация, и завоз
+    обязан пройти мимо. Иначе он прибавил бы (restock_shop_item складывает
+    без потолка) запас к позициям, которые ротация только что обнулила, —
+    «сегодня не завозили» молча стало бы покупаемым, а исход зависел бы от
+    того, кто из двоих записал последним.
+
+    Исключение делается ЗДЕСЬ, на чтении, а не проставлением restock_max =
+    NULL в базе: значение в базе админ может вернуть из панели
+    (set_shop_item_restock_max), и дефицит тихо умер бы.
+    """
+    query = (
         "SELECT item_key, restock_max FROM shop_items "
-        "WHERE chat_id = %s AND restock_max IS NOT NULL AND restock_max > 0",
-        (chat_id,),
+        "WHERE chat_id = %s AND restock_max IS NOT NULL AND restock_max > 0"
     )
+    params: list = [chat_id]
+    if exclude_keys:
+        keys = list(exclude_keys)
+        placeholders = ", ".join(["%s"] * len(keys))
+        query += f" AND item_key NOT IN ({placeholders})"
+        params.extend(keys)
+    return await _fetchall(query, tuple(params))
 
 
 async def restock_shop_item(chat_id: int, item_key: str, amount: int) -> None:
@@ -10468,24 +10889,36 @@ async def get_inventory_quantity(chat_id: int, user_id: int, item_key: str) -> i
 
 async def remove_inventory_item(chat_id: int, user_id: int, item_key: str, amount: int = 1) -> bool:
     """Списывает amount штук, не давая уйти в минус. False — если недостаточно
-    (или предмета нет вовсе)."""
-    row = await _fetchone(
-        "SELECT quantity FROM user_inventory WHERE chat_id = %s AND user_id = %s AND item_key = %s",
+    (или предмета нет вовсе).
+
+    Проверка и списание обязаны быть одним запросом — ровно по той же
+    причине, что у try_spend_coins выше. Раньше здесь читали количество,
+    сравнивали и записывали новое: между чтением и записью пролезала вторая
+    команда того же человека, обе видели «хватает» и обе списывали одну и ту
+    же вещь. Получатели при этом получали по предмету каждый, то есть штука
+    бралась из воздуха. Пока дарили строго по одной, гонка удваивала одну
+    вещь; с появлением подарка пачкой («подарить korm 100») цена ошибки
+    выросла ровно во столько же раз.
+
+    Условие quantity >= %s стоит в самом UPDATE, поэтому решение принимает
+    СУБД под блокировкой строки, и второму запросу просто нечего обновлять.
+    """
+    changed = await _execute(
+        "UPDATE user_inventory SET quantity = quantity - %s "
+        "WHERE chat_id = %s AND user_id = %s AND item_key = %s AND quantity >= %s",
+        (amount, chat_id, user_id, item_key, amount),
+    )
+    if not changed:
+        return False
+    # Опустевшую строку убираем следом: иначе предмет остался бы в инвентаре
+    # нулём, а список инвентаря показывал бы «0 шт.». Условие quantity <= 0
+    # в самом DELETE нужно на случай, если параллельная выдача успела
+    # пополнить ту же строку между этими двумя запросами.
+    await _execute(
+        "DELETE FROM user_inventory "
+        "WHERE chat_id = %s AND user_id = %s AND item_key = %s AND quantity <= 0",
         (chat_id, user_id, item_key),
     )
-    if row is None or row["quantity"] < amount:
-        return False
-    new_qty = row["quantity"] - amount
-    if new_qty <= 0:
-        await _execute(
-            "DELETE FROM user_inventory WHERE chat_id = %s AND user_id = %s AND item_key = %s",
-            (chat_id, user_id, item_key),
-        )
-    else:
-        await _execute(
-            "UPDATE user_inventory SET quantity = %s WHERE chat_id = %s AND user_id = %s AND item_key = %s",
-            (new_qty, chat_id, user_id, item_key),
-        )
     return True
 
 
@@ -10980,7 +11413,7 @@ async def apply_robbery_success(chat_id: int, robber_id: int, victim_id: int, am
             await conn.begin()
             try:
                 await cur.execute(
-                    "UPDATE economy_wallets SET coins = GREATEST(coins - %s, 0) "
+                    f"UPDATE economy_wallets SET coins = {_TAKE_COINS_SQL} "
                     "WHERE chat_id = %s AND user_id = %s",
                     (amount, chat_id, victim_id),
                 )
@@ -11010,7 +11443,8 @@ async def apply_robbery_fail(chat_id: int, robber_id: int, loss_amount: int) -> 
     await get_wallet(chat_id, robber_id)
     await get_robbery_stats(chat_id, robber_id)
     await _execute(
-        "UPDATE economy_wallets SET coins = GREATEST(coins - %s, 0) WHERE chat_id = %s AND user_id = %s",
+        f"UPDATE economy_wallets SET coins = {_TAKE_COINS_SQL} "
+        "WHERE chat_id = %s AND user_id = %s",
         (loss_amount, chat_id, robber_id),
     )
     await _execute(
@@ -11039,9 +11473,13 @@ async def pick_random_robbery_victim(chat_id: int, exclude_user_id: int, min_bal
     )
 
 
-async def seed_extra_shop_items(chat_id: int, items: list[tuple[str, str, int, str, str]]) -> int:
+async def seed_extra_shop_items(chat_id: int, items: list[tuple[str, str, int, str, str]],
+                                is_active: bool = True) -> int:
     """Дозасев: в отличие от seed_default_shop_items не требует пустого
     магазина, поэтому новые товары появляются и в уже работающих чатах.
+
+    is_active=False — завести в каталоге, но не пускать в продажу (см.
+    add_shop_item): так заводится урожай с грядки.
 
     Ровно это и нужно при добавлении товаров в существующего бота:
     seed_default_shop_items() у непустого магазина возвращает 0 и новинки
@@ -11050,7 +11488,8 @@ async def seed_extra_shop_items(chat_id: int, items: list[tuple[str, str, int, s
     """
     count = 0
     for item_key, name, price, description, emoji in items:
-        if await add_shop_item(chat_id, item_key, name, price, description, emoji):
+        if await add_shop_item(chat_id, item_key, name, price, description, emoji,
+                               is_active=is_active):
             count += 1
     return count
 

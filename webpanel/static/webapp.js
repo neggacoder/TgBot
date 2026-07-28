@@ -289,6 +289,94 @@ async function tabClan() {
   });
 }
 
+// --- вкладка «Питомцы» -------------------------------------------------
+
+// Три действия из тех, что умеет game_actions: кабинет — не замена команд
+// боту, а быстрый доступ к паре самых частых («что не входит» в спеке
+// подпроекта — инвентарь, торговля и т.п. остаются в чате).
+//
+// Кнопка рисуется на КАЖДОГО питомца и уносит его ключ. Без ключа действие
+// уходит «кому-нибудь», и всякий, у кого питомцев больше одного, получал в
+// ответ совет набрать команду в чате — то есть кнопки были мертвы у всех,
+// кто собирает «Зоопарк».
+const PET_ACTIONS = [
+  { action: "feed", label: "Покормить" },
+  { action: "pet", label: "Погладить" },
+  { action: "walk", label: "Гулять" },
+];
+
+// Те же действия сразу на всех: при пяти питомцах жать по три кнопки на
+// каждого — работа, а не игра. У ласки «всем» слово обязательно (сервер без
+// него отвечает отказом): одним действием гладят, обнимают и целуют.
+const PET_ALL_ACTIONS = [
+  { action: "feed_all", label: "Покормить всех" },
+  { action: "care_all", label: "Погладить всех", verb: "pet" },
+  { action: "walk_all", label: "Выгулять всех" },
+];
+
+// key === null — кнопка «всем»: у массовых действий питомца не выбирают.
+function petButtons(actions, key) {
+  return actions.map((a) =>
+    `<button data-pet-action="${a.action}"`
+    + (key === null ? "" : ` data-pet-key="${escapeHtml(key)}"`)
+    + (a.verb ? ` data-pet-verb="${a.verb}"` : "")
+    + `>${a.label}</button>`).join("");
+}
+
+async function loadGamePets() {
+  const list = $("#gamepets-list");
+  const msg = $("#gamepets-msg");
+  msg.innerHTML = "";
+  list.innerHTML = '<div class="skeleton"></div>';
+  try {
+    // data.text уже содержит телеграмную HTML-разметку от сервера — вставляем
+    // как есть (как и announcements выше), а не через escapeHtml. А вот
+    // data.pets приходит обычными данными, и их экранируем сами.
+    const data = await api(`/api/member/game/pets?chat_id=${currentChat}`);
+    const pets = data.pets || [];
+    let html = card("Питомцы", data.text);
+    for (const pet of pets) {
+      html += `<div class="pet-head">${escapeHtml(pet.emoji)} ${escapeHtml(pet.name)}</div>`
+            + `<div class="grid">${petButtons(PET_ACTIONS, pet.key)}</div>`;
+    }
+    // С одним питомцем «всем» — те же три кнопки второй раз, только с другой
+    // подписью: показываем, только когда их правда несколько.
+    if (pets.length > 1) {
+      html += `<div class="pet-head">Всем сразу</div>`
+            + `<div class="grid">${petButtons(PET_ALL_ACTIONS, null)}</div>`;
+    }
+    list.innerHTML = html;
+    list.querySelectorAll("[data-pet-action]").forEach((btn) => {
+      btn.onclick = () => runGamePetAction(btn);
+    });
+  } catch (e) {
+    list.innerHTML = empty(e.message);
+  }
+}
+
+async function runGamePetAction(btn) {
+  btn.disabled = true;
+  const body = { chat_id: currentChat };
+  // Ключ и слово ласки кладём только когда они есть: у массовых действий
+  // питомца не выбирают, а лишний verb сервер у них не читает.
+  if (btn.dataset.petKey) body.key = btn.dataset.petKey;
+  if (btn.dataset.petVerb) body.verb = btn.dataset.petVerb;
+  try {
+    const d = await api(`/api/member/game/pets/${btn.dataset.petAction}`, {
+      method: "POST", body,
+    });
+    // Отказ по правилам игры (ok:false — «не хватило корма» и т.п.) это не
+    // сбой, а законный исход: текст показываем тем же местом, что и успех,
+    // без отдельной ветки на ok. Список при этом НЕ перезапрашиваем: десять
+    // нажатий «покормить» подряд — и десять миганий экрана раздражают
+    // сильнее, чем на миг устаревшая цифра голода.
+    $("#gamepets-msg").innerHTML = card("", d.text);
+  } catch (e) {
+    toast(e.message, "err");
+  }
+  btn.disabled = false;
+}
+
 // Подтверждение: у Telegram оно нативное, в браузере — обычный confirm.
 function confirmAnd(question, action) {
   const run = async () => {
@@ -300,12 +388,17 @@ function confirmAnd(question, action) {
 
 // --- запуск ----------------------------------------------------------------
 
-const TABS = { me: tabMe, love: tabLove, family: tabFamily, clan: tabClan };
+const TABS = { me: tabMe, love: tabLove, family: tabFamily, clan: tabClan, gamepets: loadGamePets };
 
 async function showTab(name) {
   currentTab = name;
+  // «Питомцы» помечен data-mtab, а не data-tab (см. webapp.html) — у него
+  // свой экран #mtab-gamepets, а не общий #view, поэтому оба атрибута нужно
+  // проверять при подсветке активной кнопки.
   document.querySelectorAll(".tab").forEach((b) =>
-    b.classList.toggle("active", b.dataset.tab === name));
+    b.classList.toggle("active", (b.dataset.tab || b.dataset.mtab) === name));
+  $("#view").hidden = name === "gamepets";
+  $("#mtab-gamepets").hidden = name !== "gamepets";
   try {
     await TABS[name]();
   } catch (e) {
@@ -386,7 +479,7 @@ async function start() {
 
   $("#tabs").hidden = false;
   document.querySelectorAll(".tab").forEach((b) => {
-    b.onclick = () => showTab(b.dataset.tab);
+    b.onclick = () => showTab(b.dataset.tab || b.dataset.mtab);
   });
 
   showTab("me");

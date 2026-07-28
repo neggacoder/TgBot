@@ -153,6 +153,7 @@
     <button class="nav-btn" data-view="logs"><svg class="ic"><use href="#ic-file"/></svg>Журнал</button>
     <button class="nav-btn" data-view="actions"><svg class="ic"><use href="#ic-wand"/></svg>Действия</button>
     <button class="nav-btn" data-view="cmdtree"><svg class="ic"><use href="#ic-sliders"/></svg>Дерево команд</button>
+    <button class="nav-btn" data-view="chatsettings"><svg class="ic"><use href="#ic-sliders"/></svg>Настройки чата</button>
     <button class="nav-btn" data-view="settings"><svg class="ic"><use href="#ic-settings"/></svg>Настройки</button>
     <button class="nav-btn owner-only hidden" data-view="users"><svg class="ic"><use href="#ic-id"/></svg>Аккаунты</button>
 
@@ -630,6 +631,16 @@
         <p class="sub">Правки применяются в чатах через несколько секунд.</p>
         <div id="reward-levels-body"></div>
       </details>
+    </section>
+
+    <section class="view hidden" id="view-chatsettings">
+      <div class="card">
+        <label>Чат
+          <select id="chatsettings-chat"></select>
+        </label>
+      </div>
+      <div id="chatsettings-out"></div>
+      <div id="chatsettings-msg"></div>
     </section>
 
     <section class="view hidden" id="view-actions">

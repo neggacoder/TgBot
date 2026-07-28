@@ -178,6 +178,11 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+# Настройки чатов живут отдельным модулем: app.py и без них 4000+ строк.
+from .chat_settings_api import router as chat_settings_router  # noqa: E402
+app.include_router(chat_settings_router)
+
+
 # ---------------------------------------------------------------------------
 # Действия в отношениях,фразы
 # ---------------------------------------------------------------------------
@@ -1301,7 +1306,7 @@ CMD_CLEANUP_MAX_MINUTES = 48 * 60
 
 ACTION_PHRASE_MAX = 512  # длина колонки phrase
 ACTION_KEY_MAX = 64      # длина колонки action_key
-PANEL_ACTION_RELOAD_KEY = "panel_action_reload"
+PANEL_ACTION_RELOAD_KEY = db.PANEL_RELOAD_KEY
 
 # Вид набора → функции db. Синонимы есть только у РП.
 ACTION_SETS = {
@@ -1342,9 +1347,11 @@ def _db_call(spec: dict, op: str):
 
 
 async def _signal_action_reload() -> None:
-    """Поднять флаг, по которому бот перечитает РП/себяшки. Значение —
-    монотонно растущая метка времени, чтобы бот увидел любое изменение."""
-    await db.set_data(PANEL_ACTION_RELOAD_KEY, f"{time.time():.6f}")
+    """Поднять флаг, по которому бот перечитает РП/себяшки и настройки.
+
+    Сам хелпер живёт в db: его нужен и chat_settings_api, а тот импортировать
+    app.py не может — app.py импортирует его самого, вышел бы цикл."""
+    await db.signal_panel_reload()
 
 
 # --- Дерево команд (зеркало COMMAND_REGISTRY бота в БД) ---------------------
@@ -4373,5 +4380,16 @@ async def webapp_page():
 async def setup_page():
     return _index_html()
 
+
+# Питомцы кабинета — отдельным модулем, а не рядом с настройками чата у
+# верхних импортов (строка ~182): тому роутеру зависимости не нужны, а этот
+# берёт get_bot и _require_member_in_chat как значения — их нужно проставить
+# ПОСЛЕ того, как оба определены выше в этом файле, иначе получилось бы
+# NameError при импорте.
+from . import member_game_api  # noqa: E402
+from .member_game_api import router as member_game_router  # noqa: E402
+member_game_api.get_bot = get_bot
+member_game_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_game_router)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

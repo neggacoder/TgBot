@@ -134,6 +134,24 @@ button.act.ghost { background: transparent; color: var(--link); }
 .grid button[disabled] { opacity: .4; }
 .grid button small { display: block; color: var(--muted); font-size: 12px; }
 
+/* --- питомцы --- */
+/* Ответы бота свёрстаны переводами строк: список питомцев, разделитель,
+   полоски сытости и опыта, подсказки. В HTML перевод строки — обычный
+   пробел, поэтому весь экран выводился одним слипшимся абзацем. pre-wrap
+   возвращает строки на место и при этом ничего не ломает в разметке:
+   <b> и <code> из телеграмного текста по-прежнему отрисовываются тегами,
+   а не показываются словами. */
+#gamepets-list .card,
+#gamepets-msg .card { white-space: pre-wrap; }
+
+/* Подпись над своим рядом кнопок: у каждого питомца ряд свой, и без имени
+   рядом непонятно, кого именно кормит эта «Покормить». */
+.pet-head {
+  margin: 12px 2px 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 .empty {
   padding: 26px 14px;
   text-align: center;

@@ -31,10 +31,13 @@ def test_нормализация_убирает_ё():
     assert ru_text.yo(None) == ""
 
 
-@pytest.mark.parametrize("text", ["черное", "чёрное", "ЧЁРНОЕ", " Черное "])
-def test_слово_команды_узнаётся_в_любом_написании(text):
-    """is_command_like смотрит по первому слову — на нём и проверяем."""
-    assert bot_module.is_command_like(text + " что-то")
+@pytest.mark.parametrize("text", ["налет", "налёт", "НАЛЁТ", " Налет "])
+def test_команда_узнаётся_в_любом_написании(text):
+    """Берём настоящую команду с «ё» («налёт»), а не слово из описания:
+    аргументы вроде цвета рулетки «чёрное» командой не являются и узнаваться
+    не обязаны — раньше они попадали в триггеры по ошибке разбора."""
+    assert bot_module.is_command_like(text + " @кто-то")
+    assert bot_module.resolve_command_key(text) == "business_raid"
 
 
 def test_наборы_триггеров_не_держат_недостижимых_записей():
@@ -53,6 +56,24 @@ def test_наборы_триггеров_не_держат_недостижим�
                 if "ё" in entry and entry.replace("ё", "е") not in value:
                     плохие.append(f"{module.__name__}.{name}: {entry!r}")
     assert not плохие, "недостижимые триггеры:\n" + "\n".join(плохие)
+
+
+def test_индексы_форм_команд_нормализованы():
+    """Тест выше умеет заглядывать только в множества строк, а формы команд
+    лежат в словаре списков кортежей — мимо него. Вход в resolve_command_key и
+    is_command_like нормализован, поэтому «ё» в самом индексе делает форму
+    недостижимой в обоих написаниях сразу."""
+    плохие = []
+    for имя, индекс in (
+        ("_COMMAND_PREFIX_INDEX", bot_module._COMMAND_PREFIX_INDEX),
+        ("_CLEANUP_PREFIX_INDEX", bot_module._CLEANUP_PREFIX_INDEX),
+    ):
+        for ключ, записи in индекс.items():
+            формы = [з[2] for з in записи] if имя == "_COMMAND_PREFIX_INDEX" else [з[0] for з in записи]
+            for слово in (ключ, *(w for форма in формы for w in форма)):
+                if "ё" in слово:
+                    плохие.append(f"{имя}: {слово!r}")
+    assert not плохие, "формы команд не в е-написании:\n" + "\n".join(sorted(set(плохие)))
 
 
 @pytest.mark.parametrize("text", [

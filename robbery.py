@@ -30,7 +30,15 @@ GOLD_PIG_LOOT_BONUS_PERCENT = 40               # 🐷 бонус к сумме �
 ROBBERY_ITEM_MAX_QUANTITY = 3                  # больше стольки штук не докупить одновременно
 SURVEILLANCE_STRIKES_LIMIT = 3
 SURVEILLANCE_PARDON_PRICE = 100_000
-SURVEILLANCE_PASS_ITEM_KEY = "surveillance_pass"
+# Ключ намеренно с опечаткой («survilence», без первой «e»): именно под ним
+# предмет заведён в ROBBERY_ITEMS ниже, продан людям и лежит у них в
+# user_inventory. Раньше константа писалась правильно — и не совпадала с
+# каталогом, из-за чего «отмазка» за 20 000 i¢ не срабатывала никогда: код
+# искал ключ, которого нет ни у кого. Чинится именно константа, а не каталог:
+# переименование ключа осиротило бы все купленные копии, и в инвентаре они
+# стали бы голым ключом без названия (list_inventory берёт название через
+# LEFT JOIN по этому ключу).
+SURVEILLANCE_PASS_ITEM_KEY = "survilence_pass"
 
 
 # ----------------------------------------------------------------------------
@@ -111,6 +119,16 @@ def success_chance(has_rabbit_paw: bool) -> int:
 
 
 def compute_steal_amount(victim_balance: int, has_gold_pig: bool) -> int:
+    """Сколько унесут из кошелька. С пустого и с должника — ничего.
+
+    Проверка та же, что у compute_raid_amount ниже, и по той же причине:
+    без неё max(1, ...) вытаскивал бы монету из отрицательного баланса —
+    формула отдавала свой минимум там, где брать нечего вовсе. Через зеркало
+    жертвы («!ограбить» разворачивается на грабителя) сюда приходит баланс
+    самого грабителя, а он после взыскания бывает отрицательным.
+    """
+    if victim_balance <= 0:
+        return 0
     percent = random.randint(ROBBERY_MIN_PERCENT, ROBBERY_MAX_PERCENT)
     amount = victim_balance * percent / 100
     if has_gold_pig:
@@ -119,10 +137,20 @@ def compute_steal_amount(victim_balance: int, has_gold_pig: bool) -> int:
 
 
 def compute_fail_loss(robber_balance: int, has_lucky_coin: bool, has_gold_pig: bool) -> int:
+    """Сколько теряет грабитель при провале. Никогда не меньше нуля.
+
+    Нижняя граница — не перестраховка. С появлением принудительного взыскания
+    (см. collectors.py) отрицательный баланс стал штатным состоянием, а
+    процент от него — отрицательным числом. Дальше это ломало обе команды,
+    которые сюда ходят: налёт делает add_coins(-loss) и ПЛАТИЛ должнику за
+    провал, а ограбление списывало «минус потерю», то есть долг рос вверх
+    к нулю. Провал не может быть источником дохода — брать с пустого
+    кошелька просто нечего.
+    """
     if has_lucky_coin:
         return 0
     percent = GOLD_PIG_FAIL_LOSS_PERCENT if has_gold_pig else DEFAULT_FAIL_LOSS_PERCENT
-    return int(round(robber_balance * percent / 100))
+    return max(0, int(round(robber_balance * percent / 100)))
 
 
 # ----------------------------------------------------------------------------

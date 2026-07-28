@@ -74,12 +74,20 @@ def test_рецепт_с_целью_ровно_один():
     assert [r.key for r in C.RECIPES if r.target] == ["кукла"]
 
 
-def test_рецепты_требуют_только_существующий_хлам():
+def test_рецепты_требуют_только_существующие_предметы():
+    """Рецепт с опечаткой в ключе собрать нельзя НИКОГДА, и понять это по
+    сообщению бота невозможно: он честно скажет «не хватает материалов».
+
+    Источников два: хлам из магазина и урожай с грядки (farming). Оба —
+    настоящие каталоги; всё, чего нет ни там, ни там, — опечатка.
+    """
     import db
+    import farming
+    known = set(db.JUNK_ITEM_KEYS) | {c.item_key for c in farming.CROPS}
     for recipe in C.RECIPES:
         for req in recipe.reqs:
             if req.kind == C.REQ_ITEM:
-                assert req.key in db.JUNK_ITEM_KEYS, f"{recipe.key}: {req.key}"
+                assert req.key in known, f"{recipe.key}: {req.key}"
 
 
 def test_ключи_рецептов_не_повторяются():

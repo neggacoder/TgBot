@@ -30,9 +30,18 @@
     <button class="tab" data-tab="love">Пара</button>
     <button class="tab" data-tab="family">Семья</button>
     <button class="tab" data-tab="clan">Клан</button>
+    <button class="tab" data-mtab="gamepets">Питомцы</button>
   </nav>
 
   <main id="view"><div class="skeleton"></div></main>
+
+  <!-- Свой экран, а не содержимое #view: тот целиком перезаписывается каждой
+       вкладкой (см. render()), а тут список питомцев и ответ действия должны
+       жить порознь — ответ обновляется на месте, без перерисовки списка. -->
+  <div id="mtab-gamepets" hidden>
+    <div id="gamepets-list"><div class="skeleton"></div></div>
+    <div id="gamepets-msg"></div>
+  </div>
 
   <div id="toast" class="toast" hidden></div>
 </div>
