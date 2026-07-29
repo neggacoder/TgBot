@@ -19031,30 +19031,39 @@ async def cmd_steal_item(message: Message):
         await message.reply(f"У {target_name} нет предмета «{html.escape(wanted)}».")
         return
 
-    # Сигнализация — единственная защита от медвежатника. По образцу броника
-    # у ограбления: срабатывает сама и тратится у жертвы. Проверяется ПОСЛЕ
-    # проверки наличия вещи, чтобы опечатка в ключе не сжигала ничего.
+    # Сигнализация — единственная защита от медвежатника, и она ВЕРОЯТНОСТНАЯ:
+    # снижает шанс кражи, а не отменяет её (см. SIGNAL_BLOCK_CHANCE). Гарантия
+    # означала бы, что предмет за 75 000 упирается в предмет за 20 000 и не
+    # может его обойти никогда.
     #
-    # Медвежатник при этом сгорает тоже — иначе им бесплатно проверяли бы,
-    # есть ли у цели сигнализация, и защита выдавала бы сама себя.
+    # Проверяется ПОСЛЕ проверки наличия вещи, чтобы опечатка в ключе не
+    # сжигала ничего. Когда срабатывает — медвежатник сгорает тоже: иначе им
+    # бесплатно проверяли бы, есть ли у цели сигнализация, и защита выдавала
+    # бы сама себя.
+    # Промах сигнализации — не «её нет»: она осталась у жертвы и сработает в
+    # следующий раз. Списывать её за несделанную работу значило бы продавать
+    # за 20 000 один бросок кубика.
+    signal_missed = False
     if victim_items.get(black_market.SIGNAL_KEY, 0) > 0:
-        await db.remove_inventory_item(chat_id, user_id, spec.key, 1)
-        await db.remove_inventory_item(chat_id, target.id, black_market.SIGNAL_KEY, 1)
-        await _steal_mark_used(chat_id, user_id)
-        await db.add_log("item_steal_blocked", chat_id=chat_id, actor_id=user_id,
-                         target_id=target.id, details=wanted)
-        actor_name = await display_name(chat_id, message.from_user)
-        target_name = await display_name(chat_id, target)
-        await message.answer(
-            f"🚨 {actor_name} вскрыл(а) закрома {target_name}, но взвыла "
-            f"сигнализация — уходить пришлось с пустыми руками."
-        )
-        await _dm_or_none(
-            target.id,
-            f"🚨 Вашу сигнализацию сорвали — кражу предотвратили, предмет "
-            f"«{html.escape(wanted)}» остался у вас. Сигнализация израсходована."
-        )
-        return
+        if random.randint(1, 100) <= black_market.SIGNAL_BLOCK_CHANCE:
+            await db.remove_inventory_item(chat_id, user_id, spec.key, 1)
+            await db.remove_inventory_item(chat_id, target.id, black_market.SIGNAL_KEY, 1)
+            await _steal_mark_used(chat_id, user_id)
+            await db.add_log("item_steal_blocked", chat_id=chat_id, actor_id=user_id,
+                             target_id=target.id, details=wanted)
+            actor_name = await display_name(chat_id, message.from_user)
+            target_name = await display_name(chat_id, target)
+            await message.answer(
+                f"🚨 {actor_name} вскрыл(а) закрома {target_name}, но взвыла "
+                f"сигнализация — уходить пришлось с пустыми руками."
+            )
+            await _dm_or_none(
+                target.id,
+                f"🚨 Вашу сигнализацию сорвали — кражу предотвратили, предмет "
+                f"«{html.escape(wanted)}» остался у вас. Сигнализация израсходована."
+            )
+            return
+        signal_missed = True
 
     # Медвежатник тратится в любом случае — иначе его можно было бы жать по
     # чужому инвентарю без риска, пока не найдётся что-то ценное.
@@ -19084,10 +19093,20 @@ async def cmd_steal_item(message: Message):
         f"🗝 {actor_name} вскрыл(а) закрома и унёс(ла) у {target_name} "
         f"предмет «{html.escape(stolen_name)}»."
     )
+    # Про защиту говорим обязательно, и по-разному. Молчание после промаха
+    # выглядит как сломанный предмет: человек купил сигнализацию за 20 000,
+    # его всё равно обнесли, и он не знает, сработало ли что-нибудь вообще.
+    if signal_missed:
+        защита = (f"\n🚨 Сигнализация не сработала — она глушит кражу с шансом "
+                  f"{black_market.SIGNAL_BLOCK_CHANCE}%. Потрачена не была, "
+                  f"остаётся у вас на следующий раз.")
+    else:
+        защита = (f"\n🚨 От медвежатника есть защита — «Сигнализация» на чёрном "
+                  f"рынке: глушит кражу с шансом {black_market.SIGNAL_BLOCK_CHANCE}%.")
     await _dm_or_none(
         target.id,
         f"🗝 У вас украли предмет «{html.escape(stolen_name)}». "
-        f"Работал медвежатник — от него не спасает ничего, кроме пустого инвентаря."
+        f"Работал медвежатник.{защита}"
     )
 
 
@@ -38057,6 +38076,14 @@ async def main():
     await db.ensure_command_cleanup_column()
     await db.ensure_command_cleanup_table()   # свой срок очистки у отдельных команд
     await db.ensure_cleanup_extra_table()     # ручной список чистки («чк»)
+    # Сигнализация перестала глушить кражу гарантированно — карточка товара в
+    # уже работающих чатах об этом не знает (add_shop_item существующий ключ
+    # не трогает).
+    await db.ensure_shop_item_description(
+        black_market.SIGNAL_KEY,
+        black_market.SIGNAL_DESCRIPTION,
+        black_market.SIGNAL_STALE_DESCRIPTION,
+    )
     await db.ensure_earning_activity_table()  # бонус / подработка / шапка
     await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_pets_table()              # личные питомцы

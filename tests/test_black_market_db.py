@@ -151,3 +151,34 @@ def test_no_query_uses_doubled_placeholders(monkeypatch):
     assert seen, "ни один запрос не выполнился — тест ничего не проверил"
     for query in seen:
         assert "%%s" not in query
+
+
+# --- обновление карточки товара после смены механики ------------------------
+
+def test_описание_обновляется_только_у_протухшего(monkeypatch):
+    """add_shop_item существующий ключ не трогает, поэтому смена механики
+    предмета не доезжала до уже работающих чатов: код перестал гасить кражу
+    гарантированно, а карточка продолжала это обещать."""
+    spy = _Spy()
+    monkeypatch.setattr(db_module, "_execute", spy)
+
+    asyncio.run(db_module.ensure_shop_item_description("signalizaciya", "новое", "старое"))
+
+    assert "UPDATE shop_items SET description" in spy.query
+    # Дословная сверка — не перестраховка: описание правится в админке, и
+    # переписывать чужую правку миграция не имеет права.
+    assert "AND description = %s" in spy.query
+    assert spy.params == ("новое", "signalizaciya", "старое")
+
+
+def test_старое_описание_сигнализации_не_разъехалось_с_новым():
+    """Миграция сверяется с текстом дословно. Опечатка в SIGNAL_STALE_DESCRIPTION
+    означала бы, что карточка не обновится нигде и никто этого не заметит."""
+    import black_market as BM
+
+    assert BM.SIGNAL_STALE_DESCRIPTION != BM.SIGNAL_DESCRIPTION
+    assert str(BM.SIGNAL_BLOCK_CHANCE) in BM.SIGNAL_DESCRIPTION
+    # Каталог обязан отдавать именно новое описание — иначе свежие чаты
+    # получат одно, а миграция запишет другое.
+    описание = [i for i in BM.NEW_ITEMS if i[0] == BM.SIGNAL_KEY][0][3]
+    assert описание == BM.SIGNAL_DESCRIPTION

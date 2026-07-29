@@ -11598,6 +11598,29 @@ async def pick_random_robbery_victim(chat_id: int, exclude_user_id: int, min_bal
     )
 
 
+async def ensure_shop_item_description(item_key: str, description: str,
+                                       stale: str) -> None:
+    """Переписывает описание товара во ВСЕХ чатах — но только там, где оно
+    дословно совпало со stale.
+
+    Зачем вообще нужна. Строки товаров заводит add_shop_item, а он существующий
+    ключ не трогает (и правильно: админ, включивший товар руками, должен
+    остаться с включённым). Значит смена механики предмета не доезжает до уже
+    работающих чатов, и карточка в «магазин»/«инвентарь» продолжает обещать
+    старое поведение. Именно так случилось с сигнализацией: код перестал гасить
+    кражу гарантированно, а описание об этом не знало.
+
+    Сверка по дословному совпадению — не перестраховка: описание правится в
+    админке (см. «Добавить товар» в bot.py), и переписывать чужую правку
+    миграция не имеет права.
+    """
+    await _execute(
+        "UPDATE shop_items SET description = %s "
+        "WHERE item_key = %s AND description = %s",
+        (description, item_key, stale),
+    )
+
+
 async def seed_extra_shop_items(chat_id: int, items: list[tuple[str, str, int, str, str]],
                                 is_active: bool = True) -> int:
     """Дозасев: в отличие от seed_default_shop_items не требует пустого

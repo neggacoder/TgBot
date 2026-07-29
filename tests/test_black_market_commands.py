@@ -336,13 +336,20 @@ class _Кража:
         monkeypatch.setattr(bot_module, "_check_misc_access", lambda uid, key: True)
 
 
+def _бросок(monkeypatch, значение: int):
+    """Фиксирует кубик сигнализации: значение не больше SIGNAL_BLOCK_CHANCE —
+    сработала, больше — промах."""
+    monkeypatch.setattr(bot_module.random, "randint", lambda a, b: значение)
+
+
 def test_signalizaciya_blocks_the_theft_but_burns_the_burglar_tool(monkeypatch):
-    """Сигнализация гасит кражу, но медвежатник вор всё равно теряет.
+    """Сигнализация сработала: гасит кражу, но медвежатник вор всё равно теряет.
 
     Иначе жать медвежатником по чужим закромам стало бы бесплатной проверкой
     «а есть ли у него сигнализация», и защита выдавала бы сама себя.
     """
     мир = _Кража(monkeypatch, у_жертвы=("diamond", BM.SIGNAL_KEY))
+    _бросок(monkeypatch, BM.SIGNAL_BLOCK_CHANCE)      # ровно на границе — ещё срабатывает
     message = _Reply("медвежатник diamond")
 
     asyncio.run(bot_module.cmd_steal_item(message))
@@ -385,12 +392,72 @@ def test_slepok_survives_a_blocked_theft(monkeypatch):
     """
     мир = _Кража(monkeypatch, у_жертвы=("diamond", BM.SIGNAL_KEY),
                  у_вора=("medvezhatnik", BM.SLEPOK_KEY))
+    _бросок(monkeypatch, 1)
     message = _Reply("медвежатник diamond")
 
     asyncio.run(bot_module.cmd_steal_item(message))
 
     assert (777, BM.SLEPOK_KEY) not in мир.снято
     assert мир.отметки == [0.0]
+
+
+# --- сигнализация промахнулась ---------------------------------------------
+
+def test_signalizaciya_only_lowers_the_odds(monkeypatch):
+    """Главное в этой механике: гарантии больше нет.
+
+    Гарантия означала, что предмет за 75 000 упирается в предмет за 20 000 и
+    не может обойти его никогда. Теперь бросок выше порога — и кража идёт
+    обычным путём.
+    """
+    мир = _Кража(monkeypatch, у_жертвы=("diamond", BM.SIGNAL_KEY))
+    _бросок(monkeypatch, BM.SIGNAL_BLOCK_CHANCE + 1)
+    message = _Reply("медвежатник diamond")
+
+    asyncio.run(bot_module.cmd_steal_item(message))
+
+    assert (VICTIM_ID, "diamond") in мир.снято, "кража должна была пройти"
+    assert (777, "diamond") in мир.выдано
+
+
+def test_missed_signalizaciya_stays_with_the_victim(monkeypatch):
+    """Списывать её за несделанную работу значило бы продавать за 20 000 один
+    бросок кубика. Не сработала — осталась и сработает в следующий раз."""
+    мир = _Кража(monkeypatch, у_жертвы=("diamond", BM.SIGNAL_KEY))
+    _бросок(monkeypatch, 100)
+    message = _Reply("медвежатник diamond")
+
+    asyncio.run(bot_module.cmd_steal_item(message))
+
+    assert (VICTIM_ID, BM.SIGNAL_KEY) not in мир.снято
+
+
+def test_victim_is_told_the_alarm_did_not_fire(monkeypatch):
+    """Молчание после промаха выглядит как сломанный предмет: человек купил
+    сигнализацию за 20 000, его всё равно обнесли, и он не знает, сработало ли
+    вообще хоть что-нибудь."""
+    мир = _Кража(monkeypatch, у_жертвы=("diamond", BM.SIGNAL_KEY))
+    _бросок(monkeypatch, 100)
+    message = _Reply("медвежатник diamond")
+
+    asyncio.run(bot_module.cmd_steal_item(message))
+
+    личка = "\n".join(мир.в_личку)
+    assert "не сработала" in личка
+    assert str(BM.SIGNAL_BLOCK_CHANCE) in личка, "шанс должен быть назван числом"
+
+
+def test_victim_without_alarm_learns_the_defence_exists(monkeypatch):
+    """Раньше здесь стояло «от него не спасает ничего» — с появлением
+    сигнализации это стало неправдой."""
+    мир = _Кража(monkeypatch, у_жертвы=("diamond",))
+    message = _Reply("медвежатник diamond")
+
+    asyncio.run(bot_module.cmd_steal_item(message))
+
+    личка = "\n".join(мир.в_личку)
+    assert "Сигнализация" in личка
+    assert "не спасает ничего" not in личка
 
 
 def test_steal_mark_shifts_the_stamp_back_by_a_quarter(monkeypatch):
