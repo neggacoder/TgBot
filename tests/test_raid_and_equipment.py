@@ -183,6 +183,11 @@ def world(monkeypatch):
                      ("add_log", _noop), ("touch_earning_activity", _noop),
                      ("get_earning_activity", _returns(None)),
                      ("is_under_surveillance", _returns(False)),
+                     # Сообщение «вы под надзором» показывает, сколько ждать до
+                     # бесплатного снятия, и лезет за датой в базу отдельным
+                     # запросом — без заглушки тест падал бы на пустом пуле.
+                     ("surveillance_pardon_at",
+                      _returns(datetime.utcnow() + robbery.SURVEILLANCE_AUTO_PARDON)),
                      ("remove_inventory_item", _returns(True)),
                      ("add_robbery_strike", _returns((1, False)))]:
         monkeypatch.setattr(bot_module.db, name, fn, raising=False)

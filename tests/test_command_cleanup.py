@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -373,3 +374,384 @@ def test_новые_синонимы_не_едят_живую_речь(text):
     """Синонимы — обычные слова. Защищает то же правило, что и раньше: форма
     без аргументов совпадает только целиком."""
     assert not bot_module.is_command_like(text), text
+
+
+# ---------------------------------------------------------------------------
+# «дом» и остальные команды relationships_v2
+#
+# Симптом был такой: «дом» в чате жалоб не убирался никогда. Причин у него
+# оказалось ДВЕ, независимые друг от друга, и каждая в одиночку ломала чистку
+# целиком. Поэтому и тестов два.
+# ---------------------------------------------------------------------------
+
+def test_очистка_живёт_на_диспетчере_а_не_на_роутере():
+    """Причина №1 — порядок роутеров.
+
+    relationships_v2.router подключён к диспетчеру РАНЬШЕ основного, а в
+    очередь на удаление сообщение ставила middleware, висевшая на основном
+    роутере. Всё, что разбирал rel2 («дом», «отн», «рб»), до неё не доходило
+    и в очередь не попадало никогда.
+
+    Проверяем именно место регистрации: вернись эта логика на роутер — и
+    команды rel2 молча выпадут из чистки снова, а поймать это по поведению
+    без живого Telegram нечем.
+    """
+    на_диспетчере = [type(m).__name__ for m in bot_module.dp.message.outer_middleware]
+    assert "CommandCleanupMiddleware" in на_диспетчере, (
+        "middleware очистки обязана стоять на диспетчере — иначе команды "
+        "relationships_v2 в очередь не попадают"
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "дом",
+    "дом купить cottage",
+    "дом комнаты",
+    "дом комнаты декор",
+    "дом комната kitchen",
+    "дом улучшения",
+    "дом улучшить kitchen",
+    "дом действие kitchen",
+    "дом продать",
+    "дом топ",
+])
+def test_все_формы_дома_опознаются(text):
+    """Причина №2 — фраза реестра без плейсхолдеров.
+
+    «дом купить» было записано как форма БЕЗ аргумента, то есть требовало
+    совпадения целиком, и «дом купить cottage» не опознавалось вовсе. Одной
+    починки роутера было бы мало: чистилось бы голое «дом», а всё остальное
+    продолжало бы висеть.
+    """
+    assert bot_module.is_command_like(text), text
+    assert bot_module.resolve_command_key(text) == "rel2_house", text
+
+
+@pytest.mark.parametrize("text", [
+    "отн пт",
+    "отн пт яйцо kot",
+    "отн пт карта 5",
+    "отн пт имя 5 Барсик",
+    "отн пт действие 5 play",
+    "отн пт домик 5 box",
+    "отн пт комната 5 kitchen",
+    "отн пт отпустить 5",
+])
+def test_все_формы_питомцев_пары_опознаются(text):
+    assert bot_module.is_command_like(text), text
+    assert bot_module.resolve_command_key(text) == "rel2_pets", text
+
+
+def test_дом_в_живой_речи_остаётся_речью():
+    """Голое «дом» намеренно оставлено полной формой: обработчик rel2 отвечает
+    на любое сообщение, начинающееся этим словом, но удалять из-за этого чужую
+    фразу бот не должен. Кому нужно иначе — есть ручной список «+чк дом»."""
+    assert not bot_module.is_command_like("дом у меня далеко")
+
+
+# ---------------------------------------------------------------------------
+# Ручной список чистки — команды «чк», «+чк», «-чк»
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def пустой_список():
+    """Список глобальный, поэтому соседние тесты обязаны видеть его чистым."""
+    было = list(bot_module.cleanup_extra_phrases)
+    bot_module.cleanup_extra_phrases.clear()
+    bot_module.rebuild_cleanup_extra_forms()
+    yield
+    bot_module.cleanup_extra_phrases[:] = было
+    bot_module.rebuild_cleanup_extra_forms()
+
+
+def test_ручной_список_добирает_то_чего_не_узнал_реестр(пустой_список):
+    """Ровно тот сценарий, ради которого «чк» и заводили."""
+    assert not bot_module.is_command_like("дом у меня далеко")
+
+    bot_module.cleanup_extra_phrases.append("дом")
+    bot_module.rebuild_cleanup_extra_forms()
+
+    assert bot_module.is_command_like("дом у меня далеко")
+
+    bot_module.cleanup_extra_phrases.clear()
+    bot_module.rebuild_cleanup_extra_forms()
+
+    assert not bot_module.is_command_like("дом у меня далеко"), (
+        "«-чк» обязан возвращать всё как было"
+    )
+
+
+def test_ручная_запись_ловит_по_началу_сообщения(пустой_список):
+    """Смысл слов «чистить эту команду» для многоформенной команды — покрыть
+    все её формы разом, а не только голое название."""
+    bot_module.cleanup_extra_phrases.append("дом")
+    bot_module.rebuild_cleanup_extra_forms()
+
+    assert bot_module.is_command_like("дом топ")
+    assert bot_module.is_command_like("дом купить cottage")
+    # Но по началу СЛОВА, а не строки: «домик» — другое слово.
+    assert not bot_module.is_command_like("домик у озера")
+    # И только с начала сообщения, а не откуда попало.
+    assert not bot_module.is_command_like("мой дом топ")
+
+
+def test_ручная_запись_нормализуется_как_входящее_сообщение(пустой_список):
+    """По обе стороны сравнения — один и тот же разбор: ё→е и синоним первого
+    слова. Разбери мы фразу иначе — «+чк налёт» записал бы форму, до которой
+    входящее «налет» уже не доходит."""
+    bot_module.cleanup_extra_phrases.append("Налёт Соседа")
+    bot_module.rebuild_cleanup_extra_forms()
+
+    assert bot_module.is_command_like("налет соседа сегодня")
+
+
+def test_пустая_фраза_в_список_не_годится():
+    """Запись, распадающаяся в ноль слов, лежала бы в списке и молча ничего не
+    ловила — худший вид настройки."""
+    assert bot_module.normalize_cleanup_phrase("   ") == ()
+    assert bot_module.normalize_cleanup_phrase("дом") == ("дом",)
+
+
+def test_неприкосновенные_команды_перечислены_верно():
+    """CLEANUP_KEEP_NAMES показывают админу в выводе «чк», а решает всё
+    регулярка рядом. Разъедься они — «чк» начнёт врать про то, что чистится, а
+    что нет."""
+    невыполненные = [n for n in bot_module.CLEANUP_KEEP_NAMES
+                     if not bot_module.is_cleanup_exempt(n)]
+    assert not невыполненные, ("названы в «чк» как неприкосновенные, но чистятся: "
+                               + ", ".join(невыполненные))
+
+
+def test_вывод_чк_помещается_в_свёрнутую_цитату(пустой_список):
+    """Секций четыре, а список персональных сроков растёт без предела —
+    развёрнутым это заняло бы весь экран у всех в чате."""
+    текст = bot_module._cleanup_status_text()
+    assert "<blockquote expandable>" in текст and "</blockquote>" in текст
+    # Про приоритет неприкосновенных сказано прямо: иначе «+чк перевод»
+    # выглядит как молча не сработавшая настройка.
+    assert "НЕ ЧИСТИТСЯ НИКОГДА" in текст
+    # «&варн» экранирован — голый амперсанд Telegram примет за HTML-сущность.
+    assert "&варн" not in текст and "&amp;варн" in текст
+
+
+def test_аргумент_читается_и_с_тире_и_без():
+    """«+чк — дом» пишут ровно так же часто, как «+чк дом», а фраза,
+    записанная вместе с тире, не совпала бы уже ни с чем."""
+    assert bot_module._cleanup_arg("+чк дом") == "дом"
+    assert bot_module._cleanup_arg("+чк — дом") == "дом"
+    assert bot_module._cleanup_arg("+чк - дом") == "дом"
+    assert bot_module._cleanup_arg("-чк  —  дом купить") == "дом купить"
+    assert bot_module._cleanup_arg("чк") == ""
+
+
+@pytest.mark.parametrize("text,ожидание", [
+    ("+чк -чат", "-чат"),
+    ("+чк -правила", "-правила"),
+    ("+чк -босс", "-босс"),
+    ("-чк -мут", "-мут"),
+])
+def test_команда_с_дефисом_не_теряет_дефис(text, ожидание):
+    """Худшая из возможных ошибок разбора аргумента.
+
+    С дефиса начинается целое семейство настоящих команд. Срежь его заодно с
+    тире-разделителем — и «+чк -чат» запишет в список голое слово «чат», а
+    список сопоставляется по НАЧАЛУ сообщения: бот начнёт удалять любую живую
+    фразу, начинающуюся словом «чат». Админ получил бы не «не сработало», а
+    «сработало не то и хуже». Разделяет их пробел после дефиса.
+    """
+    assert bot_module._cleanup_arg(text) == ожидание
+
+
+def test_свои_сроки_показаны_формой_а_не_первым_словом(пустой_список, monkeypatch):
+    """«титул» вместо «титул купить» склеило бы четыре разные команды в одну
+    строку — а весь смысл раздела в том, чтобы показать, что настроено."""
+    monkeypatch.setitem(bot_module.command_cleanup_overrides, "title_buy", 1)
+    текст = bot_module._cleanup_status_text()
+    assert "титул купить" in текст
+
+
+@pytest.mark.parametrize("text", ["чк", "+чк дом", "-чк дом"])
+def test_сами_команды_чк_тоже_чистятся(text):
+    """Команда о чистке, уезжающая мимо чистки, — отдельный сорт стыда."""
+    assert bot_module.is_command_like(text), text
+
+
+# ---------------------------------------------------------------------------
+# Обработчики «+чк» / «-чк» целиком: важно не «что ответил бот», а обновился ли
+# кэш. База и разбор могут быть правы по отдельности, а команда — молча не
+# работать до перезапуска, потому что список в памяти остался старым.
+# ---------------------------------------------------------------------------
+
+class _ЗаписьВЧат:
+    """Минимальное Message: текст, автор и собранные ответы."""
+
+    def __init__(self, text):
+        self.text = text
+        self.chat = type("C", (), {"id": -1001234567890, "type": "supergroup"})()
+        self.from_user = type("U", (), {"id": 1, "is_bot": False})()
+        self.ответы = []
+
+    async def reply(self, text, **kwargs):
+        self.ответы.append(text)
+
+
+@pytest.fixture
+def _чк(monkeypatch, пустой_список):
+    """Подменяет таблицу списком в памяти — так же, как её видит бот."""
+    хранилище: list[str] = []
+
+    async def add(phrase, added_by=None):
+        if phrase in хранилище:
+            return False
+        хранилище.append(phrase)
+        return True
+
+    async def remove(phrase):
+        if phrase not in хранилище:
+            return False
+        хранилище.remove(phrase)
+        return True
+
+    async def listing():
+        return sorted(хранилище)
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot_module.db, "add_cleanup_extra_command", add, raising=False)
+    monkeypatch.setattr(bot_module.db, "remove_cleanup_extra_command", remove, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_cleanup_extra_commands", listing, raising=False)
+    monkeypatch.setattr(bot_module.db, "add_log", noop, raising=False)
+    monkeypatch.setattr(bot_module, "has_level", lambda *a, **k: True)
+    return хранилище
+
+
+def test_плюс_чк_начинает_чистить_сразу(_чк):
+    """Без перезапуска бота: кэш обновляется в том же обработчике."""
+    assert not bot_module.is_command_like("дом у меня далеко")
+
+    msg = _ЗаписьВЧат("+чк дом")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == ["дом"]
+    assert bot_module.is_command_like("дом у меня далеко"), (
+        "фраза записана в базу, но кэш в памяти не пересобран"
+    )
+    assert "✅" in msg.ответы[0]
+
+
+def test_минус_чк_перестаёт_чистить_сразу(_чк):
+    asyncio.run(bot_module.cmd_cleanup_add(_ЗаписьВЧат("+чк дом")))
+
+    msg = _ЗаписьВЧат("-чк дом")
+    asyncio.run(bot_module.cmd_cleanup_del(msg))
+
+    assert _чк == []
+    assert not bot_module.is_command_like("дом у меня далеко")
+    assert "✅" in msg.ответы[0]
+
+
+def test_повторное_добавление_честно_говорит_что_уже_есть(_чк):
+    asyncio.run(bot_module.cmd_cleanup_add(_ЗаписьВЧат("+чк дом")))
+
+    msg = _ЗаписьВЧат("+чк дом")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == ["дом"], "дубля в списке быть не должно"
+    assert "уже в списке" in msg.ответы[0]
+
+
+def test_удаление_несуществующего_не_врёт_про_успех(_чк):
+    msg = _ЗаписьВЧат("-чк несуществующая")
+    asyncio.run(bot_module.cmd_cleanup_del(msg))
+
+    assert "не было" in msg.ответы[0]
+
+
+def test_плюс_чк_без_аргумента_объясняет_как_пользоваться(_чк):
+    msg = _ЗаписьВЧат("+чк")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == []
+    assert "+чк" in msg.ответы[0]
+
+
+def test_неприкосновенную_команду_в_чистку_не_пускают(_чк):
+    """Проверка на неприкосновенность стоит в middleware РАНЬШЕ расчёта срока,
+    поэтому «+чк перевод» не заработал бы никогда. Отказать вслух честнее, чем
+    записать строку, которая ничего не делает."""
+    msg = _ЗаписьВЧат("+чк перевод")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == []
+    assert "не чистятся никогда" in msg.ответы[0]
+
+
+# ---------------------------------------------------------------------------
+# Сквозной прогон: сообщение проходит через middleware и оказывается в очереди
+# ---------------------------------------------------------------------------
+
+def _сообщение(text: str, chat_id: int):
+    from datetime import datetime as _dt
+
+    from aiogram.types import Chat, Message, User
+    return Message(
+        message_id=42,
+        date=_dt.now(),
+        chat=Chat(id=chat_id, type="supergroup"),
+        from_user=User(id=555, is_bot=False, first_name="Тестер"),
+        text=text,
+    )
+
+
+def _прогнать_через_очистку(monkeypatch, text: str) -> list[tuple]:
+    """Гоняет сообщение через CommandCleanupMiddleware и возвращает то, что
+    уехало в очередь на удаление."""
+    очередь: list[tuple] = []
+    ЧАТ_ЖАЛОБ = -1009999999999
+
+    async def add_cleanup_entry(chat_id, message_id, delete_at):
+        очередь.append((chat_id, message_id))
+
+    async def handler(event, data):
+        return None
+
+    monkeypatch.setattr(bot_module.db, "add_cleanup_entry", add_cleanup_entry, raising=False)
+    monkeypatch.setitem(bot_module.settings, "complaint_chat_id", ЧАТ_ЖАЛОБ)
+    monkeypatch.setitem(bot_module.settings, "command_cleanup_minutes", "15")
+
+    mw = bot_module.CommandCleanupMiddleware()
+    asyncio.run(mw(handler, _сообщение(text, ЧАТ_ЖАЛОБ), {}))
+    return очередь
+
+
+@pytest.mark.parametrize("text", ["дом", "дом купить cottage", "дом топ", "отн пт карта 5"])
+def test_команды_rel2_доезжают_до_очереди_на_удаление(monkeypatch, text):
+    """Та самая жалоба, с которой всё началось: «дом» висел в чате вечно.
+
+    Проверка сквозная, а не по кусочкам: между «бот узнаёт команду» и «строка
+    появилась в очереди» стоит middleware, и ровно там всё и ломалось.
+    """
+    assert _прогнать_через_очистку(monkeypatch, text), f"{text!r} не попало в очередь"
+
+
+def test_живая_речь_в_очередь_не_едет(monkeypatch):
+    assert not _прогнать_через_очистку(monkeypatch, "дом у меня далеко")
+
+
+def test_перевод_в_очередь_не_едет(monkeypatch):
+    """Расписка о переводе обязана остаться в чате: спор о деньгах через час
+    восстанавливать будет нечем."""
+    assert not _прогнать_через_очистку(monkeypatch, "перевод 500 @kto")
+
+
+def test_добавленное_через_чк_доезжает_до_очереди(monkeypatch, пустой_список):
+    """Полный путь ручного списка: «+чк дом» → фраза в кэше → сообщение в
+    очереди. Каждое звено по отдельности уже проверено, здесь — что они
+    соединены."""
+    assert not _прогнать_через_очистку(monkeypatch, "дом у меня далеко")
+
+    bot_module.cleanup_extra_phrases.append("дом")
+    bot_module.rebuild_cleanup_extra_forms()
+
+    assert _прогнать_через_очистку(monkeypatch, "дом у меня далеко")

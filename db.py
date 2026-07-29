@@ -15,6 +15,7 @@ from typing import Any, Optional, Sequence
 import aiomysql
 
 import professions
+import robbery
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +378,62 @@ async def set_command_cleanup(command_key: str, minutes: int, updated_by: Option
 
 async def reset_command_cleanup(command_key: str) -> None:
     await _execute("DELETE FROM command_cleanup WHERE command_key = %s", (command_key,))
+
+
+# ----------------------------------------------------------------------------
+# Ручной список чистки команд («чк» в чате). Автоочистка узнаёт команду по
+# фразам из COMMAND_REGISTRY, и разбор фраз неизбежно что-то не угадывает —
+# до сих пор единственным лекарством была правка кода. Здесь лежат фразы,
+# которые чистка обязана считать командами независимо от реестра.
+#
+# Таблица глобальная, без chat_id — как command_cleanup рядом: автоочистка и
+# так работает ровно в одном чате (settings.complaint_chat_id), и второе
+# измерение было бы фикцией.
+# ----------------------------------------------------------------------------
+async def ensure_cleanup_extra_table() -> None:
+    # 190 символов, а не 255: под utf8mb4 индекс на VARCHAR(255) не влезает в
+    # 767 байт старого формата строк InnoDB. Команд длиннее 190 символов не
+    # бывает.
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS cleanup_extra_commands ("
+        "phrase VARCHAR(190) NOT NULL PRIMARY KEY, "
+        "added_by BIGINT NULL, "
+        "added_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def list_cleanup_extra_commands() -> list[str]:
+    rows = await _fetchall(
+        "SELECT phrase FROM cleanup_extra_commands ORDER BY phrase"
+    )
+    return [r["phrase"] for r in rows]
+
+
+async def add_cleanup_extra_command(phrase: str, added_by: Optional[int] = None) -> bool:
+    """Добавляет фразу. False — она уже была в списке (повтор не ошибка, но и
+    не событие: вызывающий код отвечает «уже в списке», а не «готово»)."""
+    existing = await _fetchone(
+        "SELECT phrase FROM cleanup_extra_commands WHERE phrase = %s", (phrase,)
+    )
+    if existing:
+        return False
+    await _execute(
+        "INSERT IGNORE INTO cleanup_extra_commands (phrase, added_by) VALUES (%s, %s)",
+        (phrase, added_by),
+    )
+    return True
+
+
+async def remove_cleanup_extra_command(phrase: str) -> bool:
+    """Убирает фразу. False — её в списке не было."""
+    existing = await _fetchone(
+        "SELECT phrase FROM cleanup_extra_commands WHERE phrase = %s", (phrase,)
+    )
+    if not existing:
+        return False
+    await _execute("DELETE FROM cleanup_extra_commands WHERE phrase = %s", (phrase,))
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -9664,7 +9721,11 @@ async def clear_all_surveillance(chat_id: int) -> int:
     freed = int(row["n"] or 0) if row else 0
     if freed:
         await _execute(
-            "UPDATE robbery_stats SET under_surveillance = 0, surveillance_strikes = 0 "
+            # Дату начала гасим вместе с флагом: оставшись в строке, она стала
+            # бы стартом СЛЕДУЮЩЕГО надзора — и человек, помилованный сегодня,
+            # вышел бы из завтрашнего надзора задним числом.
+            "UPDATE robbery_stats SET under_surveillance = 0, surveillance_strikes = 0, "
+            "surveillance_since = NULL "
             "WHERE chat_id = %s AND under_surveillance = 1",
             (chat_id,),
         )
@@ -11326,6 +11387,20 @@ async def ensure_robbery_tables() -> None:
     )
     await _add_column_if_missing("robbery_stats", "surveillance_strikes", "INT NOT NULL DEFAULT 0")
     await _add_column_if_missing("robbery_stats", "under_surveillance", "TINYINT(1) NOT NULL DEFAULT 0")
+    # Когда человек сел под надзор — от этой даты отсчитывается бесплатное
+    # снятие по сроку (robbery.SURVEILLANCE_AUTO_PARDON, см.
+    # is_under_surveillance ниже).
+    await _add_column_if_missing("robbery_stats", "surveillance_since", "DATETIME NULL")
+    # Бэкфилл тем, кто уже сидит под надзором на момент появления колонки.
+    # Оба «естественных» прочтения NULL ломают механику: считать его «давно» —
+    # значит амнистировать весь чат в первую же секунду после выката, считать
+    # «никогда» — оставить вечный надзор ровно тем людям, ради которых срок и
+    # вводится. Поэтому две недели отсчитываем от момента миграции: наказание
+    # не обнуляется, но и не длится вечно.
+    await _execute(
+        "UPDATE robbery_stats SET surveillance_since = UTC_TIMESTAMP() "
+        "WHERE under_surveillance = 1 AND surveillance_since IS NULL"
+    )
 
 async def get_robbery_stats(chat_id: int, user_id: int) -> dict:
     row = await _fetchone(
@@ -11361,25 +11436,75 @@ async def add_robbery_strike(chat_id: int, user_id: int, limit: int) -> tuple[in
     already = bool(row["under_surveillance"]) if row else False
     newly_caught = False
     if strikes >= limit and not already:
+        # Дата ставится тем же запросом, что и флаг: надзор без даты начала —
+        # это надзор, из которого нет выхода по сроку.
         await _execute(
-            "UPDATE robbery_stats SET under_surveillance = 1 WHERE chat_id = %s AND user_id = %s",
-            (chat_id, user_id),
+            "UPDATE robbery_stats SET under_surveillance = 1, surveillance_since = %s "
+            "WHERE chat_id = %s AND user_id = %s",
+            (datetime.utcnow(), chat_id, user_id),
         )
         newly_caught = True
     return strikes, newly_caught
 
 
-async def is_under_surveillance(chat_id: int, user_id: int) -> bool:
+async def surveillance_pardon_at(chat_id: int, user_id: int) -> Optional[datetime]:
+    """Когда надзор снимется сам. None — если человек не под надзором.
+
+    Нужна сообщениям: без показанного срока бесплатный выход невидим, и
+    механика читается как «ничего не изменилось, плати сто тысяч»."""
     row = await _fetchone(
-        "SELECT under_surveillance FROM robbery_stats WHERE chat_id = %s AND user_id = %s",
+        "SELECT under_surveillance, surveillance_since FROM robbery_stats "
+        "WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )
-    return bool(row and row["under_surveillance"])
+    if not row or not row["under_surveillance"]:
+        return None
+    since = row["surveillance_since"] or datetime.utcnow()
+    return since + robbery.SURVEILLANCE_AUTO_PARDON
+
+
+async def is_under_surveillance(chat_id: int, user_id: int) -> bool:
+    """Под надзором ли человек ПРЯМО СЕЙЧАС — с учётом срока давности.
+
+    Снятие по сроку сделано здесь, лениво, а не фоновым циклом: эта функция —
+    единственная точка чтения флага, поэтому одна проверка закрывает сразу все
+    места, где надзор что-то запрещает, и переживает любой простой бота
+    (после недельного молчания сроки не «доигрываются», они просто уже вышли).
+    """
+    row = await _fetchone(
+        "SELECT under_surveillance, surveillance_since FROM robbery_stats "
+        "WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    if not row or not row["under_surveillance"]:
+        return False
+    # NULL после бэкфилла означает строку, созданную в промежутке между
+    # миграцией и этим чтением, — считаем, что срок только пошёл.
+    since = row["surveillance_since"]
+    if since is None:
+        await _execute(
+            "UPDATE robbery_stats SET surveillance_since = %s "
+            "WHERE chat_id = %s AND user_id = %s",
+            (datetime.utcnow(), chat_id, user_id),
+        )
+        return True
+    if datetime.utcnow() - since < robbery.SURVEILLANCE_AUTO_PARDON:
+        return True
+    await clear_robbery_surveillance(chat_id, user_id)
+    return False
 
 
 async def clear_robbery_surveillance(chat_id: int, user_id: int) -> None:
+    """Снимает надзор — и обнуляет страйки вместе с ним.
+
+    Страйки здесь не для порядка: add_robbery_strike сажает под надзор по
+    условию «страйков не меньше лимита, и человек ещё не под надзором».
+    Оставь счётчик на трёх — и следующая же поимка вернёт надзор мгновенно,
+    сколько бы недель человек ни ждал и сколько бы тысяч ни заплатил.
+    """
     await _execute(
-        "UPDATE robbery_stats SET under_surveillance = 0, surveillance_strikes = 0 "
+        "UPDATE robbery_stats SET under_surveillance = 0, surveillance_strikes = 0, "
+        "surveillance_since = NULL "
         "WHERE chat_id = %s AND user_id = %s",
         (chat_id, user_id),
     )

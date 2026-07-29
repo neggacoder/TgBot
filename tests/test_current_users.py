@@ -132,7 +132,7 @@ def test_сообщение_заносит_в_current_users(monkeypatch):
     async def next_handler(event, data):
         return "ok"
 
-    mw = bot_module.MessageCounterMiddleware()
+    mw = bot_module.MessageStatsMiddleware()
     result = asyncio.run(mw(next_handler, message, {}))
 
     assert result == "ok"

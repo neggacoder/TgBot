@@ -221,17 +221,29 @@ dp.include_router(router)
 WORD_FILTER: set[str] = set()
 
 
-async def _enforce_word_filter(event: "Message") -> bool:
-    """Удаляет сообщение, если в нём есть слово из фильтра. True — удалено (и
-    дальше его обрабатывать не нужно).
+def word_filter_hit(event: "Message") -> Optional[str]:
+    """Запрещённое слово в сообщении — или None. БЕЗ удаления, логов и любых
+    других следов.
+
+    Отдельно от _enforce_word_filter, потому что ответ на вопрос «это спам?»
+    нужен и тому, кто ничего с сообщением не делает: счётчики сообщений не
+    должны засчитывать то, что сейчас удалит фильтр. Раньше их связывал
+    порядок вызовов в одной middleware, теперь они живут в разных местах — и
+    связывать их обязана общая проверка, а не два одинаковых условия.
 
     Админы (модератор и выше) освобождены: им нужно обсуждать модерацию и сам
     фильтр, и они не спамят. Проверяем и text, и caption — запрещённое слово
     прячут и в подписи к картинке.
     """
     if not WORD_FILTER or is_admin(event.from_user.id):
-        return False
-    hit = word_filter.find_banned(event.text or event.caption, WORD_FILTER)
+        return None
+    return word_filter.find_banned(event.text or event.caption, WORD_FILTER)
+
+
+async def _enforce_word_filter(event: "Message") -> bool:
+    """Удаляет сообщение, если в нём есть слово из фильтра. True — удалено (и
+    дальше его обрабатывать не нужно)."""
+    hit = word_filter_hit(event)
     if hit is None:
         return False
     try:
@@ -272,20 +284,40 @@ async def _enforce_auto_delete(event: "Message") -> bool:
     return True
 
 
-class MessageCounterMiddleware(BaseMiddleware):
+class MessageStatsMiddleware(BaseMiddleware):
+    """Счётчики сообщений: /профиль, /топ, known_users, очки сезона, ачивки.
+
+    Живёт на ДИСПЕТЧЕРЕ. Раньше эти строки были частью middleware основного
+    роутера — а relationships_v2.router подключён раньше него, и всё, что
+    разбирал он («дом», «отн», «рб»), в статистику не попадало вообще. Человек,
+    игравший в дом и питомцев весь день, оставался в чате с нулём сообщений.
+
+    Регистрируется ПЕРВОЙ, до CommandCleanupMiddleware, и это не косметика:
+    внутри есть asyncio.create_task на случайный стикер, а задача уносит с
+    собой копию контекста. Создайся она внутри контекста очистки — стикер
+    уехал бы в очередь на удаление вместе с командой, которая его вызвала.
+    Порядок регистрации оставляет её снаружи, как было до разделения.
+
+    Фильтр мата и медленный режим сюда НЕ переехали: они остались на основном
+    роутере ровно там, где были. Единственное, что их здесь связывает, —
+    word_filter_hit: спам, который сейчас удалят, не должен попадать ни в
+    статистику, ни в ленту. Проверка чистая, без побочных действий; сам
+    фильтр по-прежнему один и работает там же, где работал.
+    """
+
     async def __call__(self, handler, event, data):
         if (
             isinstance(event, Message)
             and event.chat.type in ("group", "supergroup")
             and event.from_user is not None
         ):
-            # Фильтр слов — до счётчиков: удалённый спам не должен попадать ни
-            # в статистику, ни в ленту, ни к обработчикам команд.
             try:
-                if not event.from_user.is_bot and await _enforce_word_filter(event):
-                    return
+                spam = not event.from_user.is_bot and word_filter_hit(event) is not None
             except Exception:
-                logger.exception("Ошибка фильтра слов")
+                logger.exception("Ошибка проверки фильтра слов")
+                spam = False
+            if spam:
+                return await handler(event, data)
             try:
                 # Статистика/счётчики (/профиль, /топ, known_users) — только
                 # по людям: иначе спам от ботов в чате искажал бы рейтинги.
@@ -326,6 +358,26 @@ class MessageCounterMiddleware(BaseMiddleware):
                 await _remember_recent_message(event)
             except Exception:
                 logger.exception("Не удалось обновить счётчик сообщений")
+        return await handler(event, data)
+
+
+class MessageGuardMiddleware(BaseMiddleware):
+    """Фильтр мата и медленный режим — то, что решает, дойдёт ли сообщение до
+    обработчиков вообще.
+
+    Осталась на основном роутере, где и была (раньше называлась
+    MessageCounterMiddleware и делала заодно счётчики — те уехали в
+    MessageStatsMiddleware выше). На команды relationships_v2 она, как и
+    прежде, не распространяется: перенос модерации на все сообщения — это
+    смена правил чата, а не починка статистики.
+    """
+
+    async def __call__(self, handler, event, data):
+        if (
+            isinstance(event, Message)
+            and event.chat.type in ("group", "supergroup")
+            and event.from_user is not None
+        ):
             try:
                 if not event.from_user.is_bot and await _enforce_word_filter(event):
                     return
@@ -336,6 +388,35 @@ class MessageCounterMiddleware(BaseMiddleware):
                     return
             except Exception:
                 logger.exception("Ошибка медленного режима")
+        return await handler(event, data)
+
+
+class CommandCleanupMiddleware(BaseMiddleware):
+    """Ставит команду (и всё, что бот ответит на неё) в очередь на удаление.
+
+    Живёт на ДИСПЕТЧЕРЕ, а не на роутере, и это принципиально. Раньше этот
+    блок был частью MessageCounterMiddleware, висящей на основном router, —
+    а relationships_v2.router подключён раньше него (см. dp.include_router
+    выше). Всё, что разбирал rel2 — «дом», «отн», «рб» и их формы, — до
+    основного роутера не доходило, и в очередь не попадало НИКОГДА. Со
+    стороны это выглядело как «дом почему-то не чистится».
+
+    Просто повесить ту же middleware ещё и на rel2 нельзя: внешняя middleware
+    срабатывает на входе события в роутер, до фильтров, — то есть отработала
+    бы на каждом сообщении в rel2 и ещё раз на основном роутере для всего,
+    что rel2 не взял. Постановка в очередь такое переживает (INSERT IGNORE по
+    уникальному ключу), а счётчик сообщений и фильтр мата — нет: они бы
+    задвоились почти на всём потоке. Поэтому переехала одна только очистка, и
+    сразу на уровень диспетчера, где она выполняется ровно один раз до любого
+    роутера.
+
+    Порядок относительно фильтра мата при этом поменялся: теперь сообщение
+    попадает в очередь ДО того, как фильтр решит его удалить. Отдельной
+    защиты не добавляем — цикл очистки уже молча глотает TelegramBadRequest
+    для сообщений, удалённых раньше срока, и убирает строку из очереди.
+    """
+
+    async def __call__(self, handler, event, data):
         cleanup_token = None
         complaint_chat_id = settings.get("complaint_chat_id")
         if (
@@ -361,7 +442,11 @@ class MessageCounterMiddleware(BaseMiddleware):
                 _cleanup_context.reset(cleanup_token)
 
 
-router.message.outer_middleware(MessageCounterMiddleware())
+# Порядок важен: статистика — снаружи очистки (см. её docstring про стикер и
+# копию контекста), очистка — снаружи роутеров, чтобы видеть и команды rel2.
+dp.message.outer_middleware(MessageStatsMiddleware())
+dp.message.outer_middleware(CommandCleanupMiddleware())
+router.message.outer_middleware(MessageGuardMiddleware())
 
 
 class CommandPermissionMiddleware(BaseMiddleware):
@@ -390,7 +475,7 @@ class CommandPermissionMiddleware(BaseMiddleware):
     и он закрыл бы команды, которых никто не настраивал, по причине, которую
     никто не выбирал.
 
-    Регистрируется ПОСЛЕ MessageCounterMiddleware, чтобы фильтр слов и
+    Регистрируется ПОСЛЕ MessageGuardMiddleware, чтобы фильтр слов и
     счётчики сообщений отработали до заслона: команда не по уровню — всё
     равно сообщение, и оно должно попасть в статистику, а мат в нём —
     удалиться.
@@ -630,6 +715,12 @@ command_level_overrides: dict[str, int] = {}  # command_key -> уровень, �
 # command_key -> свой срок автоочистки в минутах (таблица command_cleanup).
 # Пусто в норме: команда без строки живёт по общему сроку из настроек.
 command_cleanup_overrides: dict[str, int] = {}
+# Ручной список чистки («чк» в чате, таблица cleanup_extra_commands): фразы,
+# которые автоочистка обязана считать командами, даже если разбор реестра их не
+# узнал. Рядом — те же фразы, разобранные в слова: сопоставление идёт по словам,
+# и раскладывать строку на каждое сообщение незачем.
+cleanup_extra_phrases: list[str] = []
+_cleanup_extra_forms: list[tuple[str, ...]] = []
 reward_degree_level_overrides: dict[int, int] = {}  # степень награды -> уровень, из reward_degree_levels
 pending_complaints_count: int = 0  # кэш числа новых (нерассмотренных) жалоб, для бейджа в меню
 
@@ -643,7 +734,7 @@ recent_chat_messages: dict[int, deque] = {}
 
 async def _remember_recent_message(message: Message) -> None:
     """Кладёт сообщение в кольцевой буфер чата — вызывается из
-    MessageCounterMiddleware для каждого сообщения в группе.
+    MessageStatsMiddleware для каждого сообщения в группе.
 
     Буфер в памяти нужен «.стикер N» (склейка соседних сообщений), а копия в
     таблице recent_messages — плашке в веб-панели: панель работает отдельным
@@ -854,6 +945,8 @@ async def load_caches() -> None:
     command_level_overrides = await db.list_command_levels()
     command_cleanup_overrides.clear()
     command_cleanup_overrides.update(await db.list_command_cleanup())
+    cleanup_extra_phrases[:] = await db.list_cleanup_extra_commands()
+    rebuild_cleanup_extra_forms()
     reward_degree_level_overrides = await db.list_reward_degree_levels()
     pending_complaints_count = await db.count_pending_complaints()
     user_registry = {
@@ -1272,8 +1365,14 @@ COMMAND_REGISTRY: dict[str, dict] = {
     # Новые команды добавлены СТРОГО в конец реестра, чтобы не сдвинуть
     # числовые ID уже существующих команд (см. комментарий у COMMAND_IDS выше).
     "rel2_bonus":       {"phrase": "отн бонус", "category": "РП", "level": 0},
-    "rel2_house":        {"phrase": "дом / дом купить / дом комнаты / дом комната / дом улучшения / дом улучшить / дом действие / дом продать / дом топ", "category": "РП", "level": 0},
-    "rel2_pets":         {"phrase": "отн пт / отн пт яйцо / отн пт карта / отн пт актив / отн пт имя / отн пт действие / отн пт домик / отн пт комната / отн пт отпустить", "category": "РП", "level": 0},
+    # Плейсхолдеры у форм с аргументами обязательны. Без них форма считается
+    # ПОЛНОЙ, и совпадение требуется целиком: «дом купить cottage» переставал
+    # быть командой вовсе — ни очистки, ни раздачи прав. Голое «дом» намеренно
+    # остаётся полной формой: обработчик rel2 отвечает на любое сообщение,
+    # начинающееся словом «дом», и открой мы эту форму — под очистку уехало бы
+    # и «дом у меня далеко». Кому нужно иначе — есть ручной список «+чк дом».
+    "rel2_house":        {"phrase": "дом / дом купить {ключ} / дом комнаты [категория] / дом комната {ключ} / дом улучшения / дом улучшить {ключ} / дом действие {ключ} / дом продать / дом топ", "category": "РП", "level": 0},
+    "rel2_pets":         {"phrase": "отн пт / отн пт яйцо {ключ} / отн пт карта {id} / отн пт актив {id} / отн пт имя {id} {имя} / отн пт действие {id} {действие} / отн пт домик {id} {ключ} / отн пт комната {id} {ключ} / отн пт отпустить {id}", "category": "РП", "level": 0},
     "rel2_pet_duel":     {"phrase": "отн пт дуэль {ответом}", "category": "РП", "level": 0},
     "rel2_children":     {"phrase": "отн родить {ответом} / рб список / рб профиль / рб имя / рб действие / рб секция / рб школа / рб лечить / рб долгожители / рб событие / рб отчет / рб отказаться", "category": "РП", "level": 0},
     # Новые команды — строго в конец реестра (см. COMMAND_IDS выше).
@@ -1297,7 +1396,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "robbery_run":     {"phrase": "!ограбить / !ограбить бинокль @username", "category": "Экономика", "level": 0},
     "robbery_stats":   {"phrase": "стата ограблений / моя стата ограблений", "category": "Экономика", "level": 0},
     "robbery_top":     {"phrase": "топ грабителей", "category": "Экономика", "level": 0},
-    "robbery_pardon":  {"phrase": "откуп — снять надзор за 100 000 i¢", "category": "Экономика", "level": 0},
+    "robbery_pardon":  {"phrase": "откуп — снять надзор за 100 000 i¢ (или подождать 14 дней — снимется сам)", "category": "Экономика", "level": 0},
     "race_play":       {"phrase": "!гонки {ставка} — гонки лошадей (казино), лошадь выбирается кнопкой", "category": "Экономика", "level": 0},
     "achievement_pin": {"phrase": "закрепить ачивку {код} / открепить ачивку", "category": "Разное", "level": 0},
     "stock_settings":  {"phrase": "биржа настройки / биржа настройки рост|падение|дивиденды {число} / биржа настройки спокойная|обычная|азартная", "category": "Экономика", "level": LEVEL_ADMIN},
@@ -1351,6 +1450,12 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "farm_plant":      {"phrase": "ферма посадить {культура} [сколько]", "category": "Экономика", "level": 0},
     "farm_harvest":    {"phrase": "ферма собрать / собрать урожай — забрать всё поспевшее", "category": "Экономика", "level": 0},
     "farm_help":       {"phrase": "ферма помочь @кому — прогнать саранчу с чужих грядок", "category": "Экономика", "level": 0},
+    # Ручной список чистки. Плейсхолдер {команда} у +чк/-чк обязателен: без
+    # него форма считается полной, и сама же чистка перестанет узнавать
+    # «+чк дом» — команда о чистке уехала бы мимо чистки.
+    "cleanup_list":    {"phrase": "чк — что убирает автоочистка команд", "category": "Настройка", "level": LEVEL_ADMIN},
+    "cleanup_add":     {"phrase": "+чк {команда} — добавить команду в чистку", "category": "Настройка", "level": LEVEL_ADMIN},
+    "cleanup_del":     {"phrase": "-чк {команда} — убрать команду из чистки", "category": "Настройка", "level": LEVEL_ADMIN},
 }
 
 
@@ -1390,6 +1495,19 @@ _CLEANUP_KEEP_RE = ru_text.rx(
 )
 
 
+# То же самое человеческими словами — для вывода «чк». Регулярку выше показать
+# админу нельзя, а знать, что список неприкосновенных существует, ему нужно:
+# иначе «+чк перевод» выглядит как молча не сработавшая настройка. Два списка
+# держатся вместе тестом (tests/test_command_cleanup.py): каждое слово отсюда
+# обязано быть освобождено регуляркой, и наоборот.
+CLEANUP_KEEP_NAMES = (
+    "перевод", "перевести",
+    "варн", "-варн", "&варн", "&-варн",
+    "мут", "-мут", "размут",
+    "бан", "-бан", "разбан",
+)
+
+
 def is_cleanup_exempt(text: Optional[str]) -> bool:
     """Нужно ли оставить это сообщение (и ответ бота на него) в чате навсегда."""
     return bool(text) and bool(_CLEANUP_KEEP_RE.match(text))
@@ -1412,7 +1530,7 @@ def cmd_cleanup_minutes() -> int:
 # ----------------------------------------------------------------------------
 # СВОЙ СРОК ОЧИСТКИ У ОТДЕЛЬНОЙ КОМАНДЫ (панель → «Дерево команд»)
 #
-# Решение принимает MessageCounterMiddleware — ДО того, как aiogram выберет
+# Решение принимает CommandCleanupMiddleware — ДО того, как aiogram выберет
 # обработчик, то есть в момент, когда «какая это команда» ещё никто не знает.
 # Единственное, что о команде известно наверняка, — её текст, поэтому ключ
 # команды восстанавливаем из него же, по фразам-триггерам из COMMAND_REGISTRY.
@@ -1619,10 +1737,63 @@ def is_command_like(text: Optional[str]) -> bool:
     # и одинокий «+» — это тире в диалоге и «плюсую», а не команды.
     if _SIGIL_RE.match(words[0]):
         return True
-    return any(
+    if any(
         _form_matches(words, prefix, open_form)
         for prefix, open_form in _CLEANUP_PREFIX_INDEX.get(words[0], ())
+    ):
+        return True
+    # Ручной список — последним: он добирает то, чего не узнал разбор реестра,
+    # и на всё остальное не влияет.
+    return _matches_cleanup_extra_words(words)
+
+
+# ----------------------------------------------------------------------------
+# РУЧНОЙ СПИСОК ЧИСТКИ («чк»)
+#
+# Записи из него сопоставляются как ОТКРЫТЫЕ формы — то есть по началу
+# сообщения, а не целиком: «+чк дом» обязан покрыть и «дом», и «дом топ», и
+# «дом купить cottage». Для многоформенной команды другого смысла у слов
+# «чистить эту команду» нет.
+#
+# Плата за это — риск принять за команду живую речь («дом у меня далеко»). Он
+# ограничен: автоочистка работает ровно в одном служебном чате жалоб, и список
+# наполняет админ вручную, глядя на конкретную команду. Про поведение по
+# началу фразы сказано прямо в выводе «чк», чтобы это не было сюрпризом.
+# ----------------------------------------------------------------------------
+def normalize_cleanup_phrase(text: str) -> tuple[str, ...]:
+    """Фраза ручного списка в слова — ровно так же, как разбирается входящее
+    сообщение. Пусто — фраза не годится в список.
+
+    Один и тот же _command_words по обе стороны сравнения нужен буквально:
+    он приводит ё→е и подменяет первое слово синонимом («петы» → «пет»).
+    Разбери мы фразу иначе — «+чк петы» записал бы форму, до которой входящее
+    сообщение уже не доходит.
+    """
+    return tuple(_command_words(text))
+
+
+def rebuild_cleanup_extra_forms() -> None:
+    """Пересобирает разобранные формы из cleanup_extra_phrases."""
+    _cleanup_extra_forms.clear()
+    for phrase in cleanup_extra_phrases:
+        form = normalize_cleanup_phrase(phrase)
+        if form:
+            _cleanup_extra_forms.append(form)
+
+
+def _matches_cleanup_extra_words(words: list[str]) -> bool:
+    return any(
+        len(form) <= len(words) and tuple(words[: len(form)]) == form
+        for form in _cleanup_extra_forms
     )
+
+
+def matches_cleanup_extra(text: Optional[str]) -> bool:
+    """Совпадает ли сообщение с чем-нибудь из ручного списка."""
+    if not _cleanup_extra_forms or not text:
+        return False
+    words = _command_words(text)
+    return bool(words) and _matches_cleanup_extra_words(words)
 
 
 def is_cleanup_targetable(command_key: str) -> bool:
@@ -1791,7 +1962,7 @@ def _queue_cleanup(chat_id: int, message_id: int, delete_at: datetime) -> None:
 @bot.session.middleware()
 async def cleanup_tracking_middleware(make_request, bot_obj, method):
     """Ловит все исходящие вызовы Bot API. Пока для текущего апдейта установлен
-    _cleanup_context (см. MessageCounterMiddleware), любое сообщение, которое
+    _cleanup_context (см. CommandCleanupMiddleware), любое сообщение, которое
     бот отправляет в ТОТ ЖЕ чат, тоже ставится в очередь на удаление вместе
     с исходной командой.
 
@@ -4563,6 +4734,11 @@ async def panel_action_reload_loop() -> None:
                 # Свои сроки автоочистки команд — оттуда же, из «дерева команд».
                 command_cleanup_overrides.clear()
                 command_cleanup_overrides.update(await db.list_command_cleanup())
+                # Ручной список чистки («чк»). Его правят из чата, но
+                # перечитываем и здесь: у бота может быть несколько процессов,
+                # и добавивший фразу не должен ждать перезапуска соседнего.
+                cleanup_extra_phrases[:] = await db.list_cleanup_extra_commands()
+                rebuild_cleanup_extra_forms()
                 reward_degree_level_overrides.clear()
                 reward_degree_level_overrides.update(await db.list_reward_degree_levels())
                 await refresh_propose_caches()
@@ -6132,6 +6308,184 @@ async def cmd_set_cleanup_minutes(message: Message):
             f"🧹 Автоочистка включена: команды (и ответы бота на них) в этом чате "
             f"будут удаляться через {minutes} мин. после отправки. Обычные сообщения не трогаются."
         )
+
+
+# ----------------------------------------------------------------------------
+# РУЧНОЙ СПИСОК ЧИСТКИ КОМАНД: «чк», «+чк {команда}», «-чк {команда}»
+#
+# Зачем он нужен помимо настройки «чистка команд {минуты}». Срок — про «через
+# сколько», список — про «что вообще считается командой». Автоочистка узнаёт
+# команду по фразам из COMMAND_REGISTRY, разбор фраз неизбежно что-то не
+# угадывает, и до появления этих трёх команд единственным лекарством была
+# правка кода с выкатом. Теперь промах чинится из чата.
+# ----------------------------------------------------------------------------
+# Ведущее тире-разделитель в «+чк — дом». Длинное и среднее тире срезаем
+# всегда, обычный дефис — ТОЛЬКО с пробелом после.
+#
+# Разница принципиальная. С дефиса начинается целое семейство настоящих
+# команд: «-чат», «-правила», «-босс», «-мут». Срежь его без оглядки — и
+# «+чк -чат» записал бы в список голое слово «чат», а список сопоставляется
+# по началу сообщения: бот начал бы удалять любую живую фразу со слова «чат».
+# То есть админ получил бы не «не сработало», а «сработало не то и хуже».
+_CLEANUP_ARG_DASH_RE = re.compile(r"^(?:[—–]+\s*|-\s+)+")
+
+
+def _cleanup_arg(text: str, trigger_words: int = 1) -> str:
+    """Аргумент команды: всё после её слова, без тире-разделителя.
+
+    Тире здесь не каприз — «+чк — дом» пишут ровно так же часто, как «+чк дом»,
+    а фраза, записанная в список вместе с тире, не совпала бы уже ни с чем.
+    """
+    rest = text.strip().split(maxsplit=trigger_words)
+    arg = rest[trigger_words] if len(rest) > trigger_words else ""
+    return _CLEANUP_ARG_DASH_RE.sub("", arg.strip()).strip()
+
+
+def _cleanup_status_text() -> str:
+    """Полная картина чистки команд — одним сообщением, в свёрнутой цитате.
+
+    Свёрнутой, потому что секций четыре, а список персональных сроков растёт
+    без предела: развёрнутым оно заняло бы весь экран у всех в чате.
+    """
+    complaint_chat_id = settings.get("complaint_chat_id")
+    minutes = cmd_cleanup_minutes()
+    head = ["🧹 <b>Чистка команд</b>", DIVIDER]
+    if not complaint_chat_id:
+        head.append("⚠️ Чат для чистки не назначен — она сейчас нигде не работает.")
+        head.append("Назначить: команда <code>жалобы сюда</code> в нужном чате.")
+    elif minutes == 0:
+        head.append("⚠️ Срок — 0: чистка выключена. Включить: <code>чистка команд 15</code>.")
+    else:
+        head.append(f"Срок: <b>{minutes}</b> мин. · работает в чате <code>{complaint_chat_id}</code>")
+
+    body: list[str] = []
+
+    body.append(f"➕ ДОБАВЛЕНО ВРУЧНУЮ ({len(cleanup_extra_phrases)}):")
+    if cleanup_extra_phrases:
+        body += [f"  · {html.escape(p)}" for p in cleanup_extra_phrases]
+        body.append("  Совпадение — по началу сообщения: «дом» ловит и «дом топ».")
+    else:
+        body.append("  пусто — чистятся только команды из реестра бота")
+    body.append("  Добавить: +чк команда · убрать: -чк команда")
+
+    if command_cleanup_overrides:
+        body.append("")
+        body.append(f"⏱ СВОЙ СРОК ({len(command_cleanup_overrides)}):")
+        for key in sorted(command_cleanup_overrides):
+            entry = COMMAND_REGISTRY.get(key)
+            # Форма целиком, а не её первое слово: «титул» вместо «титул купить»
+            # склеило бы в одну строку четыре разные команды, и раздел, весь
+            # смысл которого — показать, что настроено, перестал бы это делать.
+            prefixes = _phrase_prefixes(entry["phrase"]) if entry else []
+            name = " ".join(prefixes[0]) if prefixes else key
+            value = command_cleanup_overrides[key]
+            body.append(f"  · {html.escape(name)} — "
+                        + ("не чистить" if value == 0 else f"{value} мин."))
+
+    body.append("")
+    body.append("🔒 НЕ ЧИСТИТСЯ НИКОГДА:")
+    # html.escape обязателен: среди неприкосновенных есть «&варн», и голый
+    # амперсанд Telegram разбирает как начало HTML-сущности.
+    body.append("  " + " · ".join(html.escape(n) for n in CLEANUP_KEEP_NAMES))
+    # Про приоритет сказано прямо: проверка на неприкосновенность стоит в
+    # middleware РАНЬШЕ расчёта срока, поэтому «+чк перевод» ничего не изменит,
+    # и без этой строки настройка выглядела бы сломанной.
+    body.append("  Эти остаются как след наказания и расписка о переводе.")
+    body.append("  Список сильнее «+чк»: добавить их в чистку нельзя.")
+
+    return "\n".join(head) + "\n<blockquote expandable>" + "\n".join(body) + "</blockquote>"
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) == "чк"),
+)
+async def cmd_cleanup_list(message: Message):
+    if not has_level(message.from_user.id, required_level("cleanup_list")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем "
+                                f"«{level_name(required_level('cleanup_list'))}» и выше.")
+        return
+    await message.reply(_cleanup_status_text())
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo((t.strip().casefold().split() or [""])[0]) == "+чк"),
+)
+async def cmd_cleanup_add(message: Message):
+    if not has_level(message.from_user.id, required_level("cleanup_add")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем "
+                                f"«{level_name(required_level('cleanup_add'))}» и выше.")
+        return
+    phrase = _cleanup_arg(message.text)
+    if not phrase:
+        await message.reply(
+            "Использование: <code>+чк {команда}</code> — команда будет убираться "
+            "автоочисткой.\nНапример: <code>+чк дом</code>\n"
+            "Ловится по началу сообщения: «дом» покроет и «дом топ», и «дом купить cottage».\n"
+            "Посмотреть список — <code>чк</code>."
+        )
+        return
+    # Проверяем ту же нормализацию, по которой потом пойдёт сравнение: фраза,
+    # распадающаяся в ноль слов, записалась бы в список и молча ничего не
+    # ловила — худший вид настройки.
+    if not normalize_cleanup_phrase(phrase):
+        await message.reply("Так нельзя: из этой фразы не выходит ни одного слова команды.")
+        return
+    if is_cleanup_exempt(phrase):
+        await message.reply(
+            f"«{html.escape(phrase)}» — из тех команд, что не чистятся никогда "
+            "(наказания и переводы остаются в чате как след). Добавить их в чистку нельзя."
+        )
+        return
+    if not await db.add_cleanup_extra_command(phrase, message.from_user.id):
+        await message.reply(f"«{html.escape(phrase)}» уже в списке.")
+        return
+    cleanup_extra_phrases[:] = await db.list_cleanup_extra_commands()
+    rebuild_cleanup_extra_forms()
+    await db.add_log("cleanup_extra_add", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=phrase)
+    minutes = cmd_cleanup_minutes()
+    tail = (f" Убирается через {minutes} мин."
+            if minutes and settings.get("complaint_chat_id")
+            else " ⚠️ Но сама чистка сейчас выключена — см. <code>чк</code>.")
+    await message.reply(f"✅ «{html.escape(phrase)}» добавлена в чистку команд.{tail}")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo((t.strip().casefold().split() or [""])[0]) == "-чк"),
+)
+async def cmd_cleanup_del(message: Message):
+    if not has_level(message.from_user.id, required_level("cleanup_del")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем "
+                                f"«{level_name(required_level('cleanup_del'))}» и выше.")
+        return
+    phrase = _cleanup_arg(message.text)
+    if not phrase:
+        await message.reply(
+            "Использование: <code>-чк {команда}</code> — убрать команду из ручного списка.\n"
+            "Например: <code>-чк дом</code>\nПосмотреть список — <code>чк</code>."
+        )
+        return
+    if not await db.remove_cleanup_extra_command(phrase):
+        await message.reply(
+            f"«{html.escape(phrase)}» в ручном списке не было — убирать нечего. "
+            "Посмотреть список: <code>чк</code>."
+        )
+        return
+    cleanup_extra_phrases[:] = await db.list_cleanup_extra_commands()
+    rebuild_cleanup_extra_forms()
+    await db.add_log("cleanup_extra_del", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=phrase)
+    # Про реестр говорим честно: минус в ручном списке не отменяет того, что
+    # команду и так узнаёт разбор фраз, — иначе админ решит, что чистка
+    # сломалась, увидев её работающей после «-чк».
+    still = " Она всё равно чистится — бот узнаёт её сам, по реестру." if is_command_like(phrase) else ""
+    await message.reply(f"✅ «{html.escape(phrase)}» убрана из ручного списка.{still}")
 
 
 def _is_timezone_command(t: Optional[str]) -> bool:
@@ -15582,7 +15936,7 @@ async def _my_businesses_text(chat_id: int, user_id: int) -> str:
 # ВСЕ команды раздела начинаются со слова «бизнес» — включая эти две, у
 # которых естественнее звучали бы «мой бизнес» и «каталог бизнесов».
 # Единый префикс нужен не для красоты: по ведущим словам фразы бот отличает
-# команду в MessageCounterMiddleware (см. resolve_command_key) ещё ДО выбора
+# команду в CommandCleanupMiddleware (см. resolve_command_key) ещё ДО выбора
 # обработчика — так работают и свой срок автоочистки, и выдача прав по дереву
 # команд. Форма, выпадающая из префикса, в этой связке опознаётся хуже и
 # может утащить настройку не туда.
@@ -20624,6 +20978,33 @@ async def cmd_farm_set_yield(message: Message):
 
 
 
+# ----------------------------------------------------------------------------
+# Как выйти из-под надзора. Выходов два — заплатить или подождать, — и оба
+# обязаны быть видны в КАЖДОМ сообщении про надзор. Ждать невидимый срок
+# нельзя: если бот молчит про две недели, человек видит только ценник в сто
+# тысяч и делает единственный доступный вывод — что механика для него
+# закрыта навсегда.
+# ----------------------------------------------------------------------------
+def _surveillance_exit_hint(left: Optional[timedelta] = None) -> str:
+    """Строка «как снять надзор». left — сколько ждать; None = полный срок
+    (только что посадили, отсчёт пошёл с этой секунды)."""
+    wait = format_duration_ru(left if left is not None else robbery.SURVEILLANCE_AUTO_PARDON)
+    return (f"Снять: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢) "
+            f"или подождать {wait} — снимется само.")
+
+
+async def _surveillance_left(chat_id: int, user_id: int) -> Optional[timedelta]:
+    """Сколько осталось до бесплатного снятия. None — человек не под надзором.
+
+    Ноль не возвращаем: is_under_surveillance к этому моменту уже сняла бы
+    истёкший надзор, а гонку в пару секунд честнее показать как «вот-вот»,
+    чем как «0 секунд»."""
+    pardon_at = await db.surveillance_pardon_at(chat_id, user_id)
+    if pardon_at is None:
+        return None
+    return max(pardon_at - datetime.utcnow(), timedelta(seconds=1))
+
+
 def _is_robbery_command(text: Optional[str]) -> bool:
     if not text or not text.strip():
         return False
@@ -20646,7 +21027,7 @@ async def cmd_robbery(message: Message):
     if await db.is_under_surveillance(chat_id, user_id):
         await message.reply(
             "🚨 Вы под надзором — грабежи для вас недоступны.\n"
-            f"Снять надзор: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
+            + _surveillance_exit_hint(await _surveillance_left(chat_id, user_id))
         )
         return
     now = datetime.utcnow()
@@ -20801,7 +21182,7 @@ async def cmd_robbery(message: Message):
             if newly_caught:
                 surveillance_line = (
                     f"\n🚨 Вас поймали {strikes}-й раз — теперь вы <b>под надзором</b> и не можете "
-                    f"грабить.\nСнять: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
+                    f"грабить.\n{_surveillance_exit_hint()}"
                 )
             elif strikes < robbery.SURVEILLANCE_STRIKES_LIMIT:
                 left = robbery.SURVEILLANCE_STRIKES_LIMIT - strikes
@@ -20870,7 +21251,7 @@ async def cmd_business_raid(message: Message):
     if await db.is_under_surveillance(chat_id, user_id):
         await message.reply(
             "🚨 Вы под надзором — налёты для вас недоступны.\n"
-            f"Снять надзор: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
+            + _surveillance_exit_hint(await _surveillance_left(chat_id, user_id))
         )
         return
     now = datetime.utcnow()
@@ -21012,7 +21393,7 @@ async def cmd_business_raid(message: Message):
         if newly_caught:
             surveillance_line = (
                 f"\n🚨 Вас поймали {strikes}-й раз — теперь вы <b>под надзором</b>.\n"
-                f"Снять: <code>откуп</code> ({robbery.SURVEILLANCE_PARDON_PRICE} i¢)."
+                f"{_surveillance_exit_hint()}"
             )
         elif strikes < robbery.SURVEILLANCE_STRIKES_LIMIT:
             left = robbery.SURVEILLANCE_STRIKES_LIMIT - strikes
@@ -21081,7 +21462,14 @@ async def cmd_robbery_pardon(message: Message):
     price = robbery.SURVEILLANCE_PARDON_PRICE
     if not await spend_coins(chat_id, user_id, price):
         wallet = await db.get_wallet(chat_id, user_id)
-        await message.reply(f"Недостаточно монет: у вас {wallet.get('coins', 0)} i¢, нужно {price}.")
+        # Именно здесь про бесплатный выход сказать важнее всего: человек
+        # только что упёрся в ценник, которого у него нет.
+        left = await _surveillance_left(chat_id, user_id)
+        await message.reply(
+            f"Недостаточно монет: у вас {wallet.get('coins', 0)} i¢, нужно {price}.\n"
+            f"⏳ Можно не платить: надзор снимется сам через "
+            f"{format_duration_ru(left or robbery.SURVEILLANCE_AUTO_PARDON)}."
+        )
         return
     await db.clear_robbery_surveillance(chat_id, user_id)
     await message.reply(f"✅ Откуп оплачен ({price} i¢) — надзор снят, можно грабить снова.")
@@ -28039,8 +28427,11 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     if warn_count:
         extra.append(f"⚠️ Предупреждений: <b>{warn_count}</b>")
     if await db.is_under_surveillance(chat_id, target.id):
+        left = await _surveillance_left(chat_id, target.id)
+        wait = f", само снимется через {format_duration_ru(left)}" if left else ""
         extra.append(
-            f"🚨 <b>Под надзором</b> — грабежи запрещены (откуп: {robbery.SURVEILLANCE_PARDON_PRICE} i¢)"
+            f"🚨 <b>Под надзором</b> — грабежи запрещены "
+            f"(откуп: {robbery.SURVEILLANCE_PARDON_PRICE} i¢{wait})"
         )
     if await db.is_bank_blacklisted(chat_id, target.id):
         extra.append("🚫 В чёрном списке банка (кредиты недоступны)")
@@ -34304,7 +34695,7 @@ async def cmd_bigmi_large(message: Message):
 )
 async def cmd_unreg(message: Message):
     """Выйти из созывов текущего чата до своего следующего сообщения в чат
-    (см. MessageCounterMiddleware, который автоматически снимает анрег)."""
+    (см. MessageStatsMiddleware, который автоматически снимает анрег)."""
     parts = message.text.strip().split(maxsplit=1)
     note = parts[1].strip()[:256] if len(parts) > 1 and parts[1].strip() else None
     await db.set_unreg(message.chat.id, message.from_user.id, note)
@@ -37368,6 +37759,7 @@ async def main():
     await db.ensure_cmd_cleanup_table()
     await db.ensure_command_cleanup_column()
     await db.ensure_command_cleanup_table()   # свой срок очистки у отдельных команд
+    await db.ensure_cleanup_extra_table()     # ручной список чистки («чк»)
     await db.ensure_earning_activity_table()  # бонус / подработка / шапка
     await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_pets_table()              # личные питомцы
