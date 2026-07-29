@@ -23003,9 +23003,7 @@ async def cmd_casino_roulette(message: Message):
     if bet_amount is None or bet_amount <= 0:
         await message.reply("Ставка должна быть больше нуля.")
         return
-    if bet_amount > CASINO_ROULETTE_MAX_BET:
-        await message.reply(f"Слишком большая ставка (максимум {CASINO_ROULETTE_MAX_BET} i¢).")
-        return
+
 
     chat_id, user_id = message.chat.id, message.from_user.id
     # Играем с БАЛАНСА КАЗИНО — того же, что у костей, орла/решки и покера
@@ -23397,9 +23395,7 @@ async def cmd_race_start(message: Message):
     if amount is None or amount <= 0:
         await message.reply("Не понял ставку. Например: <code>!гонки 300</code>")
         return
-    if amount > CASINO_MAX_BET:
-        await message.reply(f"Слишком большая ставка (максимум {CASINO_MAX_BET} i¢).")
-        return
+
 
     chat_id, user_id = message.chat.id, message.from_user.id
     wallet = await db.get_casino_wallet(chat_id, user_id)
