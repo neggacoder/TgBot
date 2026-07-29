@@ -74,6 +74,7 @@ import farming
 import fishing
 import market
 import collectors
+import activities
 from activity_chart import (
     ACTIVITY_CHART_DAYS,
     ACTIVITY_CHART_MIN_DAYS,
@@ -1456,6 +1457,10 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "cleanup_list":    {"phrase": "чк — что убирает автоочистка команд", "category": "Настройка", "level": LEVEL_ADMIN},
     "cleanup_add":     {"phrase": "+чк {команда} — добавить команду в чистку", "category": "Настройка", "level": LEVEL_ADMIN},
     "cleanup_del":     {"phrase": "-чк {команда} — убрать команду из чистки", "category": "Настройка", "level": LEVEL_ADMIN},
+    # Все три формы — полные, без плейсхолдеров: панель не принимает
+    # аргументов, а открытая форма сделала бы командой любую фразу,
+    # начинающуюся словами «что делать».
+    "activity_board":  {"phrase": "чем заняться / что делать / !дела — что готово прямо сейчас, а что ещё ждёт", "category": "Экономика", "level": 0},
 }
 
 
@@ -1794,6 +1799,50 @@ def matches_cleanup_extra(text: Optional[str]) -> bool:
         return False
     words = _command_words(text)
     return bool(words) and _matches_cleanup_extra_words(words)
+
+
+def guess_command_form(text: Optional[str]) -> Optional[str]:
+    """Где в живом сообщении кончается команда и начинаются аргументы.
+
+    Нужна для «+чк ответом»: человек показывает боту реальное сообщение
+    («.рулетка 400 красное»), а в список должна лечь именно команда —
+    «.рулетка». Ставку и цвет записывать нельзя: список сравнивается с
+    началом сообщения, и запись со ставкой не совпала бы уже никогда, кроме
+    случая, когда кто-то поставит ровно столько же.
+
+    Границу знает сам бот — по формам команд, которые он и так различает.
+    Выигрывает САМАЯ ДЛИННАЯ подходящая форма, поэтому «топ стриков»
+    остаётся «топ стриков», а не сокращается до «топ»: это две разные
+    команды, и чистить одну вместо другой — не то, о чём просили.
+
+    Открытая форма или полная — здесь неважно. Вопрос стоит иначе, чем при
+    опознании команды: не «является ли сообщение командой целиком», а «какая
+    его часть — команда». Поэтому сверяем по началу и в том, и в другом
+    случае.
+
+    Ничего не подошло — смотрим на служебный знак: «.рулетка», «!орёл» и
+    «+чат» бот считает командами по одному только знаку в начале, и
+    перечислять их в реестре никто не обязан. Такие команды всегда в одно
+    слово, поэтому его и берём.
+
+    None — на команду не похоже вовсе. Гадать дальше нельзя: ошибка здесь
+    кладёт в список кусок живой речи, а список ловит по началу сообщения.
+    """
+    if not text:
+        return None
+    words = _command_words(text)
+    if not words:
+        return None
+    best: Optional[tuple[str, ...]] = None
+    for prefix, _open_form in _CLEANUP_PREFIX_INDEX.get(words[0], ()):
+        if len(prefix) <= len(words) and tuple(words[: len(prefix)]) == prefix:
+            if best is None or len(prefix) > len(best):
+                best = prefix
+    if best is not None:
+        return " ".join(best)
+    if _SIGIL_RE.match(words[0]):
+        return words[0]
+    return None
 
 
 def is_cleanup_targetable(command_key: str) -> bool:
@@ -6341,6 +6390,51 @@ def _cleanup_arg(text: str, trigger_words: int = 1) -> str:
     return _CLEANUP_ARG_DASH_RE.sub("", arg.strip()).strip()
 
 
+def _cleanup_target_phrase(message: Message) -> tuple[str, str]:
+    """Какую команду правит «+чк»/«-чк» и откуда она взялась.
+
+    Два способа, и написанное руками всегда сильнее угаданного: человек,
+    указавший команду явно, знает, чего хочет, лучше любого разбора.
+
+    Второй способ — ответом на живое сообщение с командой. Он и удобнее, и
+    надёжнее: не надо вспоминать, как именно пишется форма, и не получится
+    записать в список фразу, которой бот не знает. Вернувшийся ярлык нужен
+    только подсказкам, чтобы объяснять ровно то, что пошло не так.
+    """
+    written = _cleanup_arg(message.text or "")
+    if written:
+        return written, "текст"
+    reply = message.reply_to_message
+    if reply is None:
+        return "", "пусто"
+    guessed = guess_command_form(reply.text or reply.caption)
+    return (guessed or ""), ("реплай" if guessed else "реплай-мимо")
+
+
+def _cleanup_usage_text(команда: str, откуда: str) -> str:
+    """Подсказка на неудачный вызов. Разная в зависимости от того, что именно
+    не получилось: «не понял ответ» и «не хватает аргумента» — разные беды, и
+    один текст на оба случая не объясняет ни одну."""
+    if откуда == "реплай-мимо":
+        return (
+            "Не нашёл команду в том сообщении — похоже, это обычный текст.\n"
+            f"Напишите её словом: <code>{команда} {{команда}}</code>, "
+            f"например <code>{команда} дом</code>."
+        )
+    хвост = ("Ловится по началу сообщения: «дом» покроет и «дом топ», "
+             "и «дом купить cottage».\n" if команда == "+чк"
+             else "Убирает запись из ручного списка.\n")
+    return (
+        f"Использование: <code>{команда} {{команда}}</code>, "
+        f"например <code>{команда} дом</code>.\n"
+        f"Или <b>ответом</b> на сообщение с командой — просто <code>{команда}</code>: "
+        "бот сам отделит команду от аргументов "
+        "(«.рулетка 400 красное» → «.рулетка», «топ стриков» → «топ стриков»).\n"
+        + хвост +
+        "Посмотреть список — <code>чк</code>."
+    )
+
+
 def _cleanup_status_text() -> str:
     """Полная картина чистки команд — одним сообщением, в свёрнутой цитате.
 
@@ -6367,6 +6461,8 @@ def _cleanup_status_text() -> str:
     else:
         body.append("  пусто — чистятся только команды из реестра бота")
     body.append("  Добавить: +чк команда · убрать: -чк команда")
+    body.append("  Или ответом на сообщение с командой — просто +чк / -чк:")
+    body.append("  бот сам отбросит аргументы («.рулетка 400 красное» → «.рулетка»).")
 
     if command_cleanup_overrides:
         body.append("")
@@ -6419,14 +6515,9 @@ async def cmd_cleanup_add(message: Message):
             await message.reply(f"⛔ Команда доступна только с уровнем "
                                 f"«{level_name(required_level('cleanup_add'))}» и выше.")
         return
-    phrase = _cleanup_arg(message.text)
+    phrase, откуда = _cleanup_target_phrase(message)
     if not phrase:
-        await message.reply(
-            "Использование: <code>+чк {команда}</code> — команда будет убираться "
-            "автоочисткой.\nНапример: <code>+чк дом</code>\n"
-            "Ловится по началу сообщения: «дом» покроет и «дом топ», и «дом купить cottage».\n"
-            "Посмотреть список — <code>чк</code>."
-        )
+        await message.reply(_cleanup_usage_text("+чк", откуда))
         return
     # Проверяем ту же нормализацию, по которой потом пойдёт сравнение: фраза,
     # распадающаяся в ноль слов, записалась бы в список и молча ничего не
@@ -6451,7 +6542,14 @@ async def cmd_cleanup_add(message: Message):
     tail = (f" Убирается через {minutes} мин."
             if minutes and settings.get("complaint_chat_id")
             else " ⚠️ Но сама чистка сейчас выключена — см. <code>чк</code>.")
-    await message.reply(f"✅ «{html.escape(phrase)}» добавлена в чистку команд.{tail}")
+    # При добавлении ответом показываем, что именно бот принял за команду:
+    # он отбросил аргументы сам, и человек должен увидеть результат, а не
+    # узнать о нём через неделю по неубранным сообщениям.
+    взято = " (аргументы отброшены)" if откуда == "реплай" else ""
+    await message.reply(
+        f"✅ «{html.escape(phrase)}»{взято} добавлена в чистку команд.{tail}\n"
+        "Убирается и она, и всё, что с неё начинается."
+    )
 
 
 @router.message(
@@ -6464,12 +6562,9 @@ async def cmd_cleanup_del(message: Message):
             await message.reply(f"⛔ Команда доступна только с уровнем "
                                 f"«{level_name(required_level('cleanup_del'))}» и выше.")
         return
-    phrase = _cleanup_arg(message.text)
+    phrase, откуда = _cleanup_target_phrase(message)
     if not phrase:
-        await message.reply(
-            "Использование: <code>-чк {команда}</code> — убрать команду из ручного списка.\n"
-            "Например: <code>-чк дом</code>\nПосмотреть список — <code>чк</code>."
-        )
+        await message.reply(_cleanup_usage_text("-чк", откуда))
         return
     if not await db.remove_cleanup_extra_command(phrase):
         await message.reply(
@@ -14195,6 +14290,7 @@ async def _farm_execute(chat_id: int, user_id: int) -> str:
             return (
                 f"❌ НЕЗАЧЁТ! Фармить можно раз в {format_duration_ru(cooldown)}. "
                 f"Следующая добыча через {format_duration_ru(remaining)}"
+                + await activity_hint(chat_id, user_id, "farm")
             )
 
     yield_percent = await db.get_farm_yield(chat_id)
@@ -14806,6 +14902,7 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
             return (
                 f"🎣 Клёва не будет — рыба ещё не вернулась. "
                 f"Следующий заброс через {format_duration_ru(FISHING_COOLDOWN - elapsed)}"
+                + await activity_hint(chat_id, user_id, "fishing")
             )
 
     no_junk = bool(await _item_perk(chat_id, user_id, shop_effects.PERK_NO_EMPTY_FISHING))
@@ -15259,6 +15356,7 @@ async def _treasure_execute(chat_id: int, user_id: int) -> str:
             return (
                 "⛏ Лопата затупилась, руки в мозолях. "
                 f"Копать снова можно через {format_duration_ru(TREASURE_COOLDOWN - elapsed)}"
+                + await activity_hint(chat_id, user_id, "treasure")
             )
 
     seed = random.randint(TREASURE_SEED_MIN, TREASURE_SEED_MAX)
@@ -15409,6 +15507,7 @@ async def _daily_bonus_execute(chat_id: int, user_id: int) -> str:
         return (
             "🎁 Сегодняшний бонус вы уже забрали.\n"
             f"Следующий — через {format_duration_ru(tomorrow - now)}."
+            + await activity_hint(chat_id, user_id, "daily_bonus")
         )
 
     saved_by_fire = False
@@ -15496,6 +15595,7 @@ async def _side_job_execute(chat_id: int, user_id: int) -> str:
         return (
             "😮‍💨 Вы ещё не отдышались после прошлой подработки.\n"
             f"Следующая — через {format_duration_ru(SIDE_JOB_COOLDOWN - (now - last))}."
+            + await activity_hint(chat_id, user_id, "side_job")
         )
 
     emoji, what, low, high = random.choice(SIDE_JOBS)
@@ -15598,6 +15698,7 @@ async def cmd_hat(message: Message):
         await message.reply(
             "🎩 Вы недавно уже пускали шапку — дайте чату отдохнуть.\n"
             f"Следующий раз — через {format_duration_ru(HAT_COOLDOWN - (now - last))}."
+            + await activity_hint(chat_id, user_id, "hat")
         )
         return
 
@@ -15999,6 +16100,7 @@ async def cmd_business_buy(message: Message):
         await message.reply(
             f"Недостаточно монет: {item.name} стоит <b>{item.price}</b> i¢, "
             f"а у вас {wallet.get('coins', 0)} i¢."
+            + await activity_hint(chat_id, user_id)
         )
         return
 
@@ -21034,7 +21136,8 @@ async def cmd_robbery(message: Message):
     last = stats.get("last_robbery_at")
     if last and (now - last) < robbery.ROBBERY_COOLDOWN:
         remaining = robbery.ROBBERY_COOLDOWN - (now - last)
-        await message.reply(f"⏳ Слишком рано — следующая попытка через {format_duration_ru(remaining)}.")
+        await message.reply(f"⏳ Слишком рано — следующая попытка через {format_duration_ru(remaining)}."
+                            + await activity_hint(chat_id, user_id, "robbery"))
         return
 
     text = message.text.strip()
@@ -21259,7 +21362,8 @@ async def cmd_business_raid(message: Message):
     last = (row or {}).get("last_at")
     if last and (now - last) < robbery.RAID_COOLDOWN:
         left = robbery.RAID_COOLDOWN - (now - last)
-        await message.reply(f"⏳ Слишком рано — следующий налёт через {format_duration_ru(left)}.")
+        await message.reply(f"⏳ Слишком рано — следующий налёт через {format_duration_ru(left)}."
+                            + await activity_hint(chat_id, user_id, "raid"))
         return
 
     # Цель: указанная (@username / ответом) либо самая жирная копилка в чате.
@@ -21474,6 +21578,188 @@ async def cmd_robbery_pardon(message: Message):
     await db.clear_robbery_surveillance(chat_id, user_id)
     await message.reply(f"✅ Откуп оплачен ({price} i¢) — надзор снят, можно грабить снова.")
     await db.add_log("robbery_pardon", chat_id=chat_id, actor_id=user_id)
+
+
+# ============================================================================
+# ПАНЕЛЬ «ЧЕМ ЗАНЯТЬСЯ» — что готово прямо сейчас, а что ещё ждёт.
+#
+# Кулдаунов в боте два десятка, лежат они в шести модулях и ничем не связаны.
+# Чтобы понять, что можно сделать, человек вслепую перебирал команды и раз за
+# разом получал отказ: «слишком рано», «не отдышались», «клёва не будет».
+# Спрашивать наугад и получать «нет» — худший вид разговора с ботом.
+#
+# Каталог и отрисовка — в activities.py; здесь только сбор готовности, потому
+# что здесь живут кулдауны и запросы. Ни одной новой таблицы: все источники
+# уже написаны, панель их только собирает в одном месте.
+# ============================================================================
+def _left_or_none(last: Optional[datetime], cooldown: timedelta,
+                  now: datetime) -> Optional[timedelta]:
+    """Сколько ждать. None — уже можно (в том числе если ни разу не делали)."""
+    if not last:
+        return None
+    passed = now - last
+    return cooldown - passed if passed < cooldown else None
+
+
+async def collect_activity_states(chat_id: int, user_id: int) -> tuple[list, Optional[str]]:
+    """Состояние всех занятий человека и общая причина, если она одна на всех.
+
+    Каждое занятие спрашивается своим источником — тем же, по которому потом
+    откажет или пустит сама команда. Второй трактовки готовности не заводим:
+    панель, обещающая «готово» там, где команда скажет «рано», хуже её
+    отсутствия.
+    """
+    now = datetime.utcnow()
+    states: list[activities.ActivityState] = []
+
+    def add(key: str, *, left=None, blocked=None, wait_note=None) -> None:
+        states.append(activities.ActivityState(
+            activities.BY_KEY[key], left=left, blocked=blocked, wait_note=wait_note
+        ))
+
+    # Заморозка гасит весь денежный цикл разом. Показываем её одной строкой в
+    # шапке, а не повторяем одну и ту же причину десять раз подряд.
+    frozen = await is_account_frozen(chat_id, user_id)
+    frozen_note = ("🧊 Счёт заморожен администрацией — заработок недоступен целиком."
+                   if frozen else None)
+
+    # 🎁 Бонус — по СУТКАМ, а не по часам: механика устроена по дате
+    # (last_day == сегодня), и отсчёт 24 часов от момента получения показывал
+    # бы срок, которого на самом деле нет.
+    bonus = await db.get_earning_activity(chat_id, user_id, EARN_DAILY_BONUS)
+    if bonus and bonus.get("last_day") == utc_today():
+        midnight = datetime.combine(utc_today() + timedelta(days=1), datetime.min.time())
+        add("daily_bonus", left=max(midnight - now, timedelta(seconds=1)))
+    else:
+        add("daily_bonus")
+
+    side = await db.get_earning_activity(chat_id, user_id, EARN_SIDE_JOB)
+    add("side_job", left=_left_or_none((side or {}).get("last_at"), SIDE_JOB_COOLDOWN, now))
+
+    hat = await db.get_earning_activity(chat_id, user_id, EARN_HAT)
+    add("hat", left=_left_or_none((hat or {}).get("last_at"), HAT_COOLDOWN, now))
+
+    # 👷 Работа: без профессии команда существует, но человеку недоступна —
+    # это «нельзя», а не «готово», и в причине сразу написано, чем чинить.
+    prof = await db.get_profession_stats(chat_id, user_id)
+    if not prof.get("profession_key") or prof["profession_key"] not in PROFESSIONS:
+        add("profession", blocked="нет профессии, устроиться: "
+                                  "<code>!работа устроиться {профессия}</code>")
+    else:
+        add("profession", left=_left_or_none(prof.get("last_work_at"),
+                                             PROFESSION_WORK_COOLDOWN, now))
+
+    fishing = await db.get_fishing_stats(chat_id, user_id)
+    add("fishing", left=_left_or_none(fishing.get("last_fish_at"), FISHING_COOLDOWN, now))
+
+    digger = await db.get_digger(chat_id, user_id)
+    add("treasure", left=_left_or_none(digger.get("last_dig_at"), TREASURE_COOLDOWN, now))
+
+    # 🌾 Ферма: «Трактор» укорачивает кулдаун, и считать его надо тем же
+    # способом, что и сама команда, — иначе панель обещает одно, а бот пускает
+    # по другому.
+    wallet = await db.get_wallet(chat_id, user_id)
+    farm_cooldown = FARM_COOLDOWN
+    cut = await _item_perk(chat_id, user_id, shop_effects.PERK_FARM_COOLDOWN)
+    if cut:
+        farm_cooldown = timedelta(seconds=FARM_COOLDOWN.total_seconds() * (100 - cut) / 100)
+    add("farm", left=_left_or_none(wallet.get("last_farm_at"), farm_cooldown, now))
+
+    # 🏢 Бизнес — единственное занятие, где ждут не время, а сумму. Поддельный
+    # срок здесь был бы враньём: доход капает непрерывно.
+    businesses_rows = await _load_businesses(chat_id, user_id)
+    if not businesses_rows:
+        add("business", blocked="нет бизнеса, каталог: <code>бизнесы</code>")
+    elif any(_business_pending(row) > 0 for row in businesses_rows):
+        add("business")
+    else:
+        add("business", wait_note="копится")
+
+    # 🥷 Ограбление и 💥 налёт: надзор закрывает оба, и в причине — оба выхода,
+    # платный и бесплатный (см. систему откупа).
+    if await db.is_under_surveillance(chat_id, user_id):
+        left = await _surveillance_left(chat_id, user_id)
+        причина = (f"под надзором, снять: <code>откуп</code> "
+                   f"({robbery.SURVEILLANCE_PARDON_PRICE} i¢)")
+        if left:
+            причина += f" или подождать {format_duration_ru(left)}"
+        add("robbery", blocked=причина)
+        add("raid", blocked=причина)
+    else:
+        stats = await db.get_robbery_stats(chat_id, user_id)
+        add("robbery", left=_left_or_none(stats.get("last_robbery_at"),
+                                          robbery.ROBBERY_COOLDOWN, now))
+        raid = await db.get_earning_activity(chat_id, user_id, EARN_BUSINESS_RAID)
+        add("raid", left=_left_or_none((raid or {}).get("last_at"),
+                                       robbery.RAID_COOLDOWN, now))
+
+    return states, frozen_note
+
+
+# ----------------------------------------------------------------------------
+# ПОДСКАЗКА ПОД ОТКАЗОМ: «нельзя — зато вот что можно».
+#
+# Отказ без следующего шага — тупик: «слишком рано», и человек снова гадает,
+# что попробовать. Панель выше отвечает на этот вопрос целиком, подсказка —
+# одной строкой прямо там, где он и возник.
+#
+# Показывается НЕ ЧАЩЕ раза в ACTIVITY_HINT_COOLDOWN на человека, и это не
+# экономия на запросах (хотя сборка состояний стоит десяти обращений к базе).
+# Совет, повторённый под каждым вторым сообщением, перестаёт читаться и
+# превращается в обои — а с ним перестаёт читаться и сам отказ, к которому он
+# приписан.
+#
+# Словарь растёт по одной дате на активного человека и не чистится: даже
+# многотысячный чат — это десятки килобайт, а всякая чистка тут стоила бы
+# дороже, чем экономила.
+# ----------------------------------------------------------------------------
+ACTIVITY_HINT_COOLDOWN = timedelta(minutes=10)
+_activity_hint_shown: dict[tuple[int, int], datetime] = {}
+
+
+async def activity_hint(chat_id: int, user_id: int,
+                        exclude: Optional[str] = None) -> str:
+    """Приписка к отказу — с ведущим переводом строки, чтобы вызывающему коду
+    оставалось только приклеить её к своему тексту. Пусто — значит промолчали.
+    """
+    now = datetime.utcnow()
+    last = _activity_hint_shown.get((chat_id, user_id))
+    if last and now - last < ACTIVITY_HINT_COOLDOWN:
+        return ""
+    try:
+        states, frozen = await collect_activity_states(chat_id, user_id)
+    except Exception:
+        # Подсказка — украшение к отказу. Уронить из-за неё сам отказ значило
+        # бы променять понятное «слишком рано» на молчание бота.
+        logger.exception("Не удалось собрать подсказку о занятиях")
+        return ""
+    if frozen:
+        # Счёт заморожен: предлагать нечего, и человеку об этом уже сказали.
+        return ""
+    hint = activities.render_hint(states, exclude=exclude,
+                                  format_left=format_duration_ru)
+    if not hint:
+        return ""
+    _activity_hint_shown[(chat_id, user_id)] = now
+    return "\n" + hint
+
+
+_ACTIVITY_BOARD_FORMS = ("чем заняться", "что делать", "!дела")
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t)
+                and ru_text.yo(" ".join(t.strip().casefold().split())) in _ACTIVITY_BOARD_FORMS),
+)
+async def cmd_activity_board(message: Message):
+    if not _check_misc_access(message.from_user.id, "activity_board"):
+        return
+    states, frozen_note = await collect_activity_states(message.chat.id, message.from_user.id)
+    await message.reply(activities.render_panel(
+        states, divider=DIVIDER, format_left=format_duration_ru, frozen_note=frozen_note,
+    ))
+
 
 # ============================================================================
 # Казино: Рулетка (красное/чёрное/зелёное) — ставка i¢ из личного кошелька.
@@ -23473,7 +23759,8 @@ def profession_level_from_xp(xp: int) -> int:
     return level
 
 
-async def _profession_execute_work(chat_id: int, user_id: int) -> str:
+async def _profession_execute_work(chat_id: int, user_id: int, *,
+                                   with_hint: bool = True) -> str:
     stats = await db.get_profession_stats(chat_id, user_id)
     prof_key = stats.get("profession_key")
     if not prof_key or prof_key not in PROFESSIONS:
@@ -23488,7 +23775,13 @@ async def _profession_execute_work(chat_id: int, user_id: int) -> str:
         if not await db.has_profession_upgrade(chat_id, user_id, "офис") \
                 or not await db.use_profession_office(chat_id, user_id, utc_today()):
             remaining = PROFESSION_WORK_COOLDOWN - (now - last)
-            return f"❌ НЕЗАЧЁТ! Следующая смена через {format_duration_ru(remaining)}."
+            отказ = f"❌ НЕЗАЧЁТ! Следующая смена через {format_duration_ru(remaining)}."
+            # with_hint=False приходит от «работа вместе»: там этот текст
+            # показывают НЕ его владельцу, а тому, кто позвал напарника.
+            # Подсказка выдала бы ему чужие кулдауны — то самое, ради чего
+            # панель сделана личной (чужую смотрят платным «досье»).
+            return отказ + (await activity_hint(chat_id, user_id, "profession")
+                            if with_hint else "")
         office_note = "🏢 Смена вне очереди — сработал собственный офис."
 
     prof = PROFESSIONS[prof_key]
@@ -23917,7 +24210,8 @@ async def cmd_prof_together(message: Message):
     if "НЕЗАЧЁТ" in first or "❌" in first:
         await message.reply(f"Смена не вышла у вас:\n{first}")
         return
-    second = await _profession_execute_work(chat_id, target.id)
+    # Без подсказки: отказ напарника читает не он, а спрашивающий.
+    second = await _profession_execute_work(chat_id, target.id, with_hint=False)
     if "НЕЗАЧЁТ" in second or "❌" in second:
         await message.reply(
             f"Напарник сейчас работать не может:\n{second}\n"
@@ -24809,6 +25103,9 @@ async def _shop_buy(message: Message, item_key: str, qty: int,
             f"Недостаточно монет: нужно {total} i¢"
             + (f" ({qty} × {price})" if qty > 1 else "")
             + f", а у вас {wallet.get('coins', 0)} i¢."
+            # Тут подсказка уместнее всего: человек упёрся не в срок, а в
+            # деньги, и «чем заняться» — прямой ответ, где их взять.
+            + await activity_hint(message.chat.id, message.from_user.id)
         )
         return False
     await db.add_inventory_item(message.chat.id, message.from_user.id, item_key, qty)
