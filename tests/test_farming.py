@@ -252,6 +252,16 @@ class _World:
         self.total_farms = stars_farms
         self.messages: list[str] = []
         self.animals: list[dict] = []
+        # Настоящий key-value, а не одно число на все ключи: по этим ключам
+        # живут и купленные грядки, и счётчики посадок/сборов под ачивки, и
+        # общая заглушка превращала посадку в покупку грядки.
+        self.data: dict[str, str] = {}
+
+    async def get_data(self, key):
+        return {"data_value": self.data[key]} if key in self.data else None
+
+    async def set_data(self, key, value, updated_by=None):
+        self.data[key] = str(value)
 
     # хлев: «ферма собрать» забирает и грядки, и продукт скота (см. livestock).
     # Здесь он пуст — сам хлев проверяется своими тестами.
@@ -403,8 +413,8 @@ async def test_больше_грядок_чем_есть_не_посадить(�
     деньги за несуществующие."""
     было = мир.coins
     await bot_module.cmd_farm_plant(_Message("ферма посадить картошка 20", мир))
-    assert len(мир.plots) == farming.PLOTS_MAX
-    assert было - мир.coins == farming.BY_KEY["kartoshka"].seed_price * farming.PLOTS_MAX
+    assert len(мир.plots) == farming.PLOTS_FROM_STARS_MAX
+    assert было - мир.coins == farming.BY_KEY["kartoshka"].seed_price * farming.PLOTS_FROM_STARS_MAX
 
 
 @_sync
@@ -412,7 +422,7 @@ async def test_на_занятые_грядки_не_сажают(мир):
     await bot_module.cmd_farm_plant(_Message("ферма посадить картошка 7", мир))
     было = мир.coins
     await bot_module.cmd_farm_plant(_Message("ферма посадить клубника", мир))
-    assert len(мир.plots) == farming.PLOTS_MAX
+    assert len(мир.plots) == farming.PLOTS_FROM_STARS_MAX
     assert мир.coins == было, "за неудачную посадку деньги брать нельзя"
     assert "заняты" in мир.messages[-1]
 
@@ -570,3 +580,76 @@ async def test_старая_ферма_не_тронута():
     """Огород добавили рядом, а не вместо: команда «ферма» осталась прежней."""
     assert "ферма" in bot_module.FARM_TRIGGERS
     assert bot_module.resolve_command_key("ферма") == "farm_run"
+
+
+# ---------------------------------------------------------------------------
+# Расширение огорода до 40 грядок
+#
+# Источников четыре, и складываются они все. Ломается это двумя способами:
+# потолок перестаёт держать (грядок больше сорока) или один из источников
+# тихо теряется в сумме.
+# ---------------------------------------------------------------------------
+
+def test_звёздность_отдаёт_своё_и_останавливается():
+    """Раньше её потолок был потолком всего огорода. Теперь она даёт семь и
+    дальше не растит — иначе покупать грядки было бы незачем."""
+    assert farming.plots_from_stars(0) == farming.PLOTS_BASE
+    assert farming.plots_from_stars(1000) == farming.PLOTS_FROM_STARS_MAX
+
+
+def test_источники_складываются():
+    всего = farming.plots_for(stars=1000, bought=20, extra=9)
+    assert всего == farming.PLOTS_FROM_STARS_MAX + 20 + 9 == 36
+
+
+def test_общий_потолок_держит():
+    """Три отдельных потолка на один огород означали бы, что человек упирается
+    в невидимую стену и не понимает, какой источник кончился."""
+    assert farming.plots_for(stars=1000, bought=100, extra=100) == farming.PLOTS_MAX
+    assert farming.PLOTS_MAX == 40
+
+
+def test_отрицательные_источники_не_отнимают_грядки():
+    assert farming.plots_for(stars=-5, bought=-3, extra=-2) == farming.PLOTS_BASE
+
+
+def test_цена_грядки_растёт_с_каждой_купленной():
+    цены = [farming.plot_price(n) for n in range(farming.PLOTS_BUY_MAX)]
+    assert цены == sorted(цены), "цена обязана расти, иначе покупка не выбор"
+    assert цены[0] == farming.PLOTS_BUY_BASE_PRICE
+    assert цены[-1] > цены[0] * 10, "к концу покупка должна быть заметной"
+
+
+def test_подсказка_про_звёзды_кончается_вместе_со_звёздным_потолком():
+    """После седьмой грядки звёздность не даёт ничего, и обещать «ещё через
+    2 ⭐» было бы враньём."""
+    assert farming.plots_next_star(0) is not None
+    assert farming.plots_next_star(1000) is None
+
+
+def test_ачивки_и_теплица_дают_грядки():
+    """Три предмета с PERK_FARM_PLOTS складываются — это и позволяет добраться
+    до потолка тому, кто не хочет покупать все двадцать."""
+    import shop_effects as SE
+    дающие = [i for i in SE.ACHIEVEMENT_ITEMS + SE.CRAFT_ITEMS
+              if i.perk == SE.PERK_FARM_PLOTS]
+    assert len(дающие) >= 3, "источник «предметы» должен быть не из одной вещи"
+    assert sum(i.perk_percent for i in дающие) >= 10
+
+
+def test_до_потолка_можно_дойти_без_покупок():
+    """Иначе сорок грядок означали бы «заплати», а не «играй»."""
+    import shop_effects as SE
+    от_предметов = sum(i.perk_percent for i in SE.ACHIEVEMENT_ITEMS + SE.CRAFT_ITEMS
+                       if i.perk == SE.PERK_FARM_PLOTS)
+    assert farming.plots_for(1000, bought=0, extra=от_предметов) > farming.PLOTS_FROM_STARS_MAX
+
+
+def test_покупки_и_предметов_хватает_на_весь_потолок():
+    import shop_effects as SE
+    от_предметов = sum(i.perk_percent for i in SE.ACHIEVEMENT_ITEMS + SE.CRAFT_ITEMS
+                       if i.perk == SE.PERK_FARM_PLOTS)
+    достижимо = farming.plots_for(1000, farming.PLOTS_BUY_MAX, от_предметов)
+    assert достижимо == farming.PLOTS_MAX, (
+        f"до сорока не дотянуться: максимум {достижимо}"
+    )

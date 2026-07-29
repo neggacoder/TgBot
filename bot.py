@@ -1472,6 +1472,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "activity_board":  {"phrase": "чем заняться / что делать / !дела — что готово прямо сейчас, а что ещё ждёт", "category": "Экономика", "level": 0},
     "economy_report":  {"phrase": "экономика — сколько монет в чате, у кого и откуда пришли", "category": "Статистика", "level": LEVEL_MODERATOR},
     "income_set":      {"phrase": "доход / доход {источник} {процент} / доход лимит {число} — множители заработка и суточный лимит подработок", "category": "Настройка", "level": LEVEL_ADMIN},
+    "farm_expand":     {"phrase": "ферма расширить / купить грядку / расширить огород — ещё одна грядка за монеты, цена растёт с каждой", "category": "Экономика", "level": 0},
     "raid_mode":       {"phrase": "рейд начался / рейд окончен — антирейд: закрыть чат, сменить ссылку и забанить свежих новичков без роли (кнопки в личке бота)", "category": "Модерация", "level": LEVEL_ADMIN},
 }
 
@@ -14611,10 +14612,59 @@ def farm_weather(chat_id: int) -> farming.Weather:
     return farming.weather_for(chat_id, utc_today())
 
 
+async def _farm_bought_plots(chat_id: int, user_id: int) -> int:
+    """Сколько грядок человек докупил за монеты. Живёт в общем key-value:
+    одно число на человека — не повод заводить таблицу."""
+    row = await db.get_data(_farm_plots_key(chat_id, user_id))
+    try:
+        return max(0, int((row or {}).get("data_value") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _farm_plots_key(chat_id: int, user_id: int) -> str:
+    return f"farm_plots:{chat_id}:{user_id}"
+
+
+def _farm_counter_key(chat_id: int, user_id: int, what: str) -> str:
+    return f"farm_count_{what}:{chat_id}:{user_id}"
+
+
+async def _farm_bump_counter(chat_id: int, user_id: int, what: str, by: int = 1) -> int:
+    """Счётчик посадок/сборов под ачивки. Считаем ГРЯДКИ, а не команды: «посадил
+    сто раз по одной» и «десять раз по десять» — одинаковый труд, и различать
+    их значило бы награждать за дробление команд."""
+    key = _farm_counter_key(chat_id, user_id, what)
+    row = await db.get_data(key)
+    try:
+        было = int((row or {}).get("data_value") or 0)
+    except (TypeError, ValueError):
+        было = 0
+    стало = было + max(0, by)
+    await db.set_data(key, str(стало), updated_by=user_id)
+    return стало
+
+
+async def _farm_plot_sources(chat_id: int, user_id: int) -> dict:
+    """Откуда взялась каждая грядка. Разбивка нужна не для красоты: упершись в
+    потолок, человек обязан видеть, какой именно источник ещё не выбран, —
+    иначе «40 максимум» выглядит как стена без двери."""
+    stars = wallet_stars(await db.get_wallet(chat_id, user_id))
+    bought = await _farm_bought_plots(chat_id, user_id)
+    # Предметы (ачивки и теплица) — тем же способом, что и остальные привилегии.
+    items = await _item_perk(chat_id, user_id, shop_effects.PERK_FARM_PLOTS)
+    return {
+        "stars": stars,
+        "from_stars": farming.plots_from_stars(stars),
+        "bought": bought,
+        "items": items,
+        "total": farming.plots_for(stars, bought, items),
+    }
+
+
 async def _farm_plot_count(chat_id: int, user_id: int) -> int:
-    """Сколько у человека грядок. Считается от звёздности — той самой, которая
-    упиралась в потолок и после этого не значила ничего."""
-    return farming.plots_for(wallet_stars(await db.get_wallet(chat_id, user_id)))
+    """Сколько у человека грядок всего: звёздность + купленное + предметы."""
+    return (await _farm_plot_sources(chat_id, user_id))["total"]
 
 
 def _farm_plot_line(row: dict, now: datetime) -> str:
@@ -14645,21 +14695,34 @@ async def _farm_garden_text(chat_id: int, user_id: int) -> str:
     weather = farm_weather(chat_id)
     aura = await _farm_aura(chat_id, user_id)
     rows = await db.list_farm_plots(chat_id, user_id)
-    # Кошелёк читаем ОДИН раз: и число грядок, и «сколько до следующей» растут
-    # из одной и той же звёздности, и два запроса за ней разошлись бы.
-    stars = wallet_stars(await db.get_wallet(chat_id, user_id))
-    total = farming.plots_for(stars)
+    # Источники читаем ОДНИМ проходом: звёздность, покупки и предметы нужны и
+    # для числа грядок, и для подсказки «чем расширить», и два независимых
+    # запроса за одним и тем же разошлись бы.
+    src = await _farm_plot_sources(chat_id, user_id)
+    stars, total = src["stars"], src["total"]
     now = datetime.utcnow()
 
     lines = [
         "🌱 <b>Ваш огород</b>",
         DIVIDER,
         f"{weather.emoji} <b>{weather.name}.</b> {weather.text}",
-        f"🪴 Грядок: {len(rows)}/{total}",
+        f"🪴 Грядок: {len(rows)}/{total} из {farming.PLOTS_MAX}",
     ]
+    # Разбивка — только когда грядки пришли не из одного места: иначе строка
+    # «звёздность 4, куплено 0, предметы 0» была бы шумом.
+    if src["bought"] or src["items"]:
+        lines.append(f"   ⭐ {src['from_stars']} · 🛒 {src['bought']} · 🎒 {src['items']}")
     need = farming.plots_next_star(stars)
     if need:
         lines.append(f"   ещё одна грядка — через {need} ⭐ звёздности")
+    elif total < farming.PLOTS_MAX:
+        # Звёздность своё отдала — говорим, чем расширяться дальше, иначе
+        # потолок в семь грядок выглядит как конец огорода.
+        цена = farming.plot_price(src["bought"])
+        if src["bought"] < farming.PLOTS_BUY_MAX:
+            lines.append(f"   расширить: <code>ферма расширить</code> — {цена} i¢")
+        else:
+            lines.append("   грядки за монеты кончились — дальше ачивки и теплица")
     lines.append(DIVIDER)
     if rows:
         lines += [_farm_plot_line(row, now) for row in rows]
@@ -14743,6 +14806,62 @@ async def cmd_farm_crops(message: Message):
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and bool(FARM_PLANT_RE.match(t.strip()))),
 )
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t)
+                and ru_text.yo(" ".join(t.strip().casefold().split()))
+                # «ферма грядка» намеренно НЕ входит: она отличается от
+                # «ферма грядки» (просмотр огорода) одной буквой, и промах
+                # пальцем списывал бы деньги вместо показа списка.
+                in ("ферма расширить", "купить грядку", "расширить огород")),
+)
+async def cmd_farm_expand(message: Message):
+    """«ферма расширить» — купить ещё одну грядку.
+
+    По одной за команду, а не пачкой: цена растёт с каждой купленной, и
+    «ферма расширить 10» пришлось бы считать суммой геометрической прогрессии,
+    которую человек не может проверить в уме. Одна покупка — одна понятная
+    цифра.
+    """
+    if not _check_misc_access(message.from_user.id, "farm_expand"):
+        return
+    chat_id, user_id = message.chat.id, message.from_user.id
+    if await is_account_frozen(chat_id, user_id):
+        await message.reply("🧊 Ваш счёт заморожен администрацией.")
+        return
+    src = await _farm_plot_sources(chat_id, user_id)
+    if src["total"] >= farming.PLOTS_MAX:
+        await message.reply(f"🪴 У вас уже {farming.PLOTS_MAX} грядок — это потолок.")
+        return
+    if src["bought"] >= farming.PLOTS_BUY_MAX:
+        await message.reply(
+            f"🛒 За монеты можно купить не больше {farming.PLOTS_BUY_MAX} грядок, "
+            "и они у вас уже есть.\nДальше огород расширяют ачивки и 🏡 теплица "
+            "(<code>крафты</code>)."
+        )
+        return
+    цена = farming.plot_price(src["bought"])
+    if not await spend_coins(chat_id, user_id, цена):
+        wallet = await db.get_wallet(chat_id, user_id)
+        await message.reply(
+            f"Не хватает монет: грядка стоит {цена} i¢, у вас "
+            f"{int(wallet.get('coins') or 0)} i¢."
+            + await activity_hint(chat_id, user_id)
+        )
+        return
+    стало = src["bought"] + 1
+    await db.set_data(_farm_plots_key(chat_id, user_id), str(стало), updated_by=user_id)
+    await db.add_log("farm_expand", chat_id=chat_id, actor_id=user_id, details=str(стало))
+    всего = farming.plots_for(src["stars"], стало, src["items"])
+    хвост = (f"Следующая — {farming.plot_price(стало)} i¢."
+             if стало < farming.PLOTS_BUY_MAX and всего < farming.PLOTS_MAX
+             else "Грядки за монеты кончились — дальше ачивки и 🏡 теплица.")
+    await message.reply(
+        f"🪴 Куплена грядка за {цена} i¢. Теперь их <b>{всего}</b> "
+        f"из {farming.PLOTS_MAX}.\n{хвост}"
+    )
+
+
 async def cmd_farm_plant(message: Message):
     """«ферма посадить клубника [сколько]» — занять свободные грядки."""
     if not _check_misc_access(message.from_user.id, "farm_plant"):
@@ -14810,6 +14929,8 @@ async def cmd_farm_plant(message: Message):
         return
     if planted < want:
         await db.add_coins(chat_id, user_id, crop.seed_price * (want - planted))
+    if await _farm_bump_counter(chat_id, user_id, "plant", planted) >= 100:
+        await grant_achievement(chat_id, user_id, "farm_plant_100")
 
     lines = [
         f"{crop.emoji} Посажено: <b>{crop.name}</b> ×{planted} "
@@ -15078,6 +15199,8 @@ async def cmd_farm_harvest(message: Message):
         lines.append(f"\n{weather.emoji} Погода дня сбора: {znak}{weather.yield_percent}% к урожаю")
     if aura.harvest:
         lines.append(f"🐝 Пчела прибавила {aura.harvest}%")
+    if await _farm_bump_counter(chat_id, user_id, "harvest", len(ripe)) >= 100:
+        await grant_achievement(chat_id, user_id, "farm_harvest_100")
     if barn_lines:
         lines.append("")
         lines += barn_lines
@@ -19103,9 +19226,7 @@ async def cmd_transfer(message: Message):
             "Попробуйте ответом на его сообщение, если оно есть."
         )
         return
-    if target.id == message.from_user.id:
-        await message.reply("Самому себе переводить не имеет смысла 🙂")
-        return
+
     if getattr(target, "is_bot", False):
         await message.reply("Боты монеты не тратят 🤖")
         return
@@ -22190,18 +22311,27 @@ async def cmd_economy_report(message: Message):
 # числа можно поджать в конкретном чате, а не новое «правильное» значение,
 # выбранное вслепую: какое правильное — покажет «экономика» через неделю.
 # ============================================================================
+def _percent_text(value: float) -> str:
+    """Процент человеку: «100», «50,5» — но не «100,00».
+
+    Два знака после запятой у настройки, которую ставят целыми числами, —
+    это шум, из-за которого таблица читается медленнее, чем должна.
+    """
+    return _ru_decimal(value, 0 if float(value).is_integer() else 1)
+
+
 async def _income_board_text(chat_id: int) -> str:
     lines = ["💹 <b>Доход чата</b>", DIVIDER,
              "Множители заработка (100% — как задумано):"]
     for key, word, title in chat_settings.INCOME_SOURCES:
         percent = await db.get_income_percent(chat_id, key)
         пометка = " — <i>выключено</i>" if percent <= 0 else ""
-        lines.append(f"{title} — <b>{_ru_decimal(percent)}%</b>{пометка}")
+        lines.append(f"{title} — <b>{_percent_text(percent)}%</b>{пометка}")
     # Ферма упомянута, хоть её тут и нет: у неё своя, более старая ручка, и
     # промолчать о ней значило бы оставить человека в уверенности, что
     # урожайность не настраивается.
     yield_percent = await db.get_farm_yield(chat_id)
-    lines.append(f"🌾 Ферма — <b>{_ru_decimal(yield_percent)}%</b> "
+    lines.append(f"🌾 Ферма — <b>{_percent_text(yield_percent)}%</b> "
                  f"(своя команда: <code>ферма урожайность</code>)")
     limit = await db.get_side_job_daily_limit(chat_id)
     lines.append("")
@@ -22279,7 +22409,7 @@ async def cmd_income_set(message: Message):
                      details=f"{source}:{percent}")
     хвост = " — источник выключен." if percent <= 0 else "."
     await message.reply(
-        f"✅ {chat_settings.INCOME_TITLES[source]}: <b>{_ru_decimal(percent)}%</b>{хвост}"
+        f"✅ {chat_settings.INCOME_TITLES[source]}: <b>{_percent_text(percent)}%</b>{хвост}"
     )
 
 
@@ -22607,9 +22737,9 @@ _CASINO_ROULETTE_USAGE = (
     "Играют с баланса казино: <code>казино баланс</code>, "
     "<code>казино пополнить {сумма}</code>."
 )
-CASINO_ROULETTE_MAX_BET = 100_000  # предохранитель от переполнения/абсурдных ставок
-CASINO_DAILY_BONUS = 100
-CASINO_MAX_BET = 100_000
+CASINO_ROULETTE_MAX_BET = 100_000_000  # предохранитель от переполнения/абсурдных ставок
+CASINO_DAILY_BONUS = 1_000
+CASINO_MAX_BET = 100_000_000
 CASINO_DICE_RE = ru_text.rx(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
 CASINO_COIN_RE = ru_text.rx(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
 CASINO_POKER_RE = ru_text.rx(r"(?i)^!?покер\s+(\S+)$")
@@ -33162,6 +33292,10 @@ ACHIEVEMENTS: dict = {
     "season_3":        {"emoji": "🥉", "title": "Бронза сезона", "desc": "занять 3 место в месячном зачёте"},
     "work_20":         {"emoji": "🤖", "title": "Работяга", "desc": "отработать 20 смен"},
     "farm_100":        {"emoji": "🚜", "title": "Фермер", "desc": "собрать ферму 100 раз"},
+    # Огородные — отдельно от «Фермера»: тот про старую команду «ферма», а эти
+    # про грядки, и путать их нельзя. Обе выдают предмет, расширяющий огород.
+    "farm_harvest_100": {"emoji": "🧺", "title": "Сто сборов", "desc": "собрать урожай с грядок 100 раз"},
+    "farm_plant_100":  {"emoji": "🌱", "title": "Сто посадок", "desc": "посадить 100 грядок"},
     "fish_100":        {"emoji": "🎣", "title": "Рыбак", "desc": "поймать 100 уловов"},
     "treasure_10":     {"emoji": "🗺", "title": "Кладоискатель", "desc": "найти 10 кладов"},
     "sidejob_50":      {"emoji": "🧰", "title": "Мастер на все руки", "desc": "взять 50 подработок"},

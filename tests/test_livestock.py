@@ -240,3 +240,71 @@ def test_у_каждой_степени_награды_свой_трофей():
     assert планки == sorted(планки), "порядок задаёт выдачу — он обязан быть по возрастанию"
     assert len(планки) == len(set(планки)), "две награды на одну степень"
     assert планки == list(range(1, 9)), "степени 1–8 покрыты не полностью"
+
+
+# ---------------------------------------------------------------------------
+# Регрессия: покупка животного отвечала «уже куплено» с первого раза
+# ---------------------------------------------------------------------------
+
+def test_покупка_отвечает_по_вставке_а_не_по_сравнению_дат(monkeypatch):
+    """Тот самый баг: «у меня нет коровы, но пишет, что уже была».
+
+    Ответ брался из сравнения записанной bought_at с переданной датой. Но
+    bought_at — это DATETIME, MySQL режет микросекунды, а datetime.utcnow()
+    их приносит: равенство не выполнялось НИКОГДА. Первая же покупка отвечала
+    «животное уже куплено» и возвращала деньги за корову, которая при этом
+    преспокойно стояла в хлеву.
+
+    Проверяем именно источник ответа: он обязан приходить из rowcount самой
+    вставки, а не из чтения обратно.
+    """
+    import db as db_module
+
+    запросы = []
+
+    async def execute(query, params=()):
+        запросы.append(" ".join(query.split()))
+        return 1        # INSERT IGNORE вставил строку
+
+    async def fetchone(query, params=()):
+        raise AssertionError("ответ не должен зависеть от чтения обратно")
+
+    monkeypatch.setattr(db_module, "_execute", execute)
+    monkeypatch.setattr(db_module, "_fetchone", fetchone)
+
+    ок = asyncio.run(db_module.add_farm_animal(
+        CHAT_ID, USER_ID, "korova", datetime.utcnow()))
+
+    assert ок is True
+    assert any("INSERT IGNORE INTO farm_animals" in q for q in запросы)
+
+
+def test_повторная_покупка_отвечает_отказом(monkeypatch):
+    """INSERT IGNORE по существующему ключу даёт rowcount 0 — это и есть
+    «уже есть», без всяких сравнений."""
+    import db as db_module
+
+    async def execute(query, params=()):
+        return 0
+
+    monkeypatch.setattr(db_module, "_execute", execute)
+
+    ок = asyncio.run(db_module.add_farm_animal(
+        CHAT_ID, USER_ID, "korova", datetime.utcnow()))
+
+    assert ок is False
+
+
+def test_микросекунды_даты_на_ответ_не_влияют(monkeypatch):
+    """Смысл правки одной строкой: какой бы ни была дата, ответ решает вставка."""
+    import db as db_module
+
+    async def execute(query, params=()):
+        return 1
+
+    monkeypatch.setattr(db_module, "_execute", execute)
+
+    с_микро = datetime(2026, 7, 29, 12, 0, 0, 123456)
+    без_микро = datetime(2026, 7, 29, 12, 0, 0)
+    assert asyncio.run(db_module.add_farm_animal(CHAT_ID, USER_ID, "korova", с_микро))
+    assert asyncio.run(db_module.add_farm_animal(CHAT_ID, USER_ID, "korova", без_микро))

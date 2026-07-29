@@ -275,6 +275,7 @@ PERK_NO_EMPTY_TREASURE = "no_empty_treasure"  # яма не бывает пус�
 PERK_BREAK_RESIST = "break_resist"         # −N% к шансу поломки бизнеса
 PERK_STREAK_SHIELD = "streak_shield"       # серия не сгорает за один пропуск
 PERK_FARM_NO_PESTS = "farm_no_pests"       # на грядки не садятся вредители
+PERK_FARM_PLOTS = "farm_plots"             # +N грядок, пока предмет в инвентаре
 
 # Привилегии-переключатели: у них нет процента, важен сам факт наличия.
 FLAG_PERKS = frozenset({
@@ -305,6 +306,24 @@ class AchievementItem:
 
 
 ACHIEVEMENT_ITEMS: tuple[AchievementItem, ...] = (
+    AchievementItem(
+        "lopata_master", "Мастерская лопата", "🪛", "farm_harvest_100",
+        EFFECT_PASSIVE_BOOST,
+        "Пока в инвентаре — +4 грядки на огороде и +10% к ферме. "
+        "Ачивка «Сто сборов»",
+        activity=ACTIVITY_FARM, percent=10,
+        perk=PERK_FARM_PLOTS, perk_percent=4,
+        perk_text="+4 грядки на огороде",
+    ),
+    AchievementItem(
+        "agronom_diplom", "Диплом агронома", "📜", "farm_plant_100",
+        EFFECT_PASSIVE_BOOST,
+        "Пока в инвентаре — +3 грядки на огороде и +10% к ферме. "
+        "Ачивка «Сто посадок»",
+        activity=ACTIVITY_FARM, percent=10,
+        perk=PERK_FARM_PLOTS, perk_percent=3,
+        perk_text="+3 грядки на огороде",
+    ),
     AchievementItem(
         "robot_worker", "Робот работяги", "🤖", "work_20",
         EFFECT_PASSIVE_BOOST,
@@ -507,6 +526,13 @@ CRAFT_ITEMS = CRAFT_ITEMS + (
         activity=ACTIVITY_FISHING, percent=15,
     ),
     AchievementItem(
+        "teplica", "Теплица", "🏡", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт. Пока в инвентаре — +6 грядок на огороде",
+        perk=PERK_FARM_PLOTS, perk_percent=6,
+        perk_text="+6 грядок на огороде",
+    ),
+    AchievementItem(
         "tulup", "Тулуп", "🧥", "",
         EFFECT_PASSIVE_BOOST,
         "Крафт из шерсти и пера. Пока в инвентаре — ферма приносит на 20% "
@@ -562,8 +588,10 @@ def perk_percent(item_keys, perk: str) -> int:
     """Суммарная сила привилегии от предметов, лежащих в инвентаре.
 
     Складывается по той же причине, что и passive_percent: разные предметы —
-    разные заслуги. Сейчас на каждую привилегию приходится ровно один
-    предмет, так что сумма из одного слагаемого.
+    разные заслуги. У большинства привилегий предмет ровно один, и сумма
+    выходит из одного слагаемого; у PERK_FARM_PLOTS их три (две ачивки и
+    теплица), и складываются они осознанно — на этом и держится путь к сорока
+    грядкам без покупок.
     """
     total = 0
     for key in item_keys:

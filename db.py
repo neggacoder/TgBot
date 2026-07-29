@@ -8293,19 +8293,21 @@ async def list_farm_animals(chat_id: int, user_id: int) -> list[dict]:
 async def add_farm_animal(chat_id: int, user_id: int, animal_key: str,
                           now: datetime) -> bool:
     """False — такое животное уже есть. Проверка и вставка одним запросом:
-    двумя командами подряд можно было бы купить корову дважды."""
-    await _execute(
+    двумя командами подряд можно было бы купить корову дважды.
+
+    Ответ берём из rowcount самой вставки (INSERT IGNORE: 1 — вставили, 0 —
+    уже было), а НЕ из сравнения записанной даты с переданной. Сравнение и
+    было багом: bought_at — это DATETIME, MySQL режет микросекунды, а
+    datetime.utcnow() их приносит. Равенство не выполнялось никогда, поэтому
+    ПЕРВАЯ же покупка отвечала «животное уже куплено» — и возвращала деньги
+    за корову, которая при этом преспокойно стояла в хлеву.
+    """
+    return await _execute(
         "INSERT IGNORE INTO farm_animals "
         "(chat_id, user_id, animal_key, bought_at, last_collect_at) "
         "VALUES (%s, %s, %s, %s, %s)",
         (chat_id, user_id, animal_key, now, now),
-    )
-    row = await _fetchone(
-        "SELECT bought_at FROM farm_animals "
-        "WHERE chat_id = %s AND user_id = %s AND animal_key = %s",
-        (chat_id, user_id, animal_key),
-    )
-    return bool(row and row["bought_at"] == now)
+    ) > 0
 
 
 async def remove_farm_animal(chat_id: int, user_id: int, animal_key: str) -> bool:
