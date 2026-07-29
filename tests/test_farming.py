@@ -653,3 +653,43 @@ def test_покупки_и_предметов_хватает_на_весь_по�
     assert достижимо == farming.PLOTS_MAX, (
         f"до сорока не дотянуться: максимум {достижимо}"
     )
+
+
+# --- покупка грядок пачкой --------------------------------------------------
+
+def test_цена_пачки_складывается_поштучно():
+    """Не по формуле суммы прогрессии: цена каждой округляется отдельно, и
+    «честная» формула разошлась бы с тем, что человек заплатит, покупая их по
+    одной."""
+    вручную = sum(farming.plot_price(n) for n in range(5))
+    assert farming.plots_total_price(0, 5) == вручную
+
+
+def test_пачка_из_нуля_ничего_не_стоит():
+    assert farming.plots_total_price(0, 0) == 0
+    assert farming.plots_total_price(0, -3) == 0
+
+
+def test_цена_пачки_учитывает_уже_купленное():
+    """Шестая грядка дороже первой — значит и пачка «с шестой» дороже пачки
+    «с первой»."""
+    assert farming.plots_total_price(5, 3) > farming.plots_total_price(0, 3)
+
+
+def test_сколько_влезет_упирается_в_деньги():
+    сколько = farming.plots_affordable(0, 20_000, farming.PLOTS_BUY_MAX)
+    assert farming.plots_total_price(0, сколько) <= 20_000
+    assert farming.plots_total_price(0, сколько + 1) > 20_000, (
+        "можно было купить ещё одну — значит посчитали меньше, чем есть"
+    )
+
+
+def test_сколько_влезет_упирается_в_место():
+    assert farming.plots_affordable(0, 10 ** 9, 3) == 3
+    assert farming.plots_affordable(0, 10 ** 9, 0) == 0
+
+
+def test_на_пустой_кошелёк_не_влезает_ничего():
+    assert farming.plots_affordable(0, 0, farming.PLOTS_BUY_MAX) == 0
+    assert farming.plots_affordable(0, farming.PLOTS_BUY_BASE_PRICE - 1,
+                                    farming.PLOTS_BUY_MAX) == 0

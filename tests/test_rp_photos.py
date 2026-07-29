@@ -61,11 +61,33 @@ def test_пустая_папка_даёт_пустой_список(media):
     assert rp_photos.list_photos("несуществующий", "mf") == []
 
 
-def test_откат_на_другую_пару(media):
-    """Для «оба парня» картинок нет, но есть у mf — берём оттуда, иначе жест
-    остался бы без картинки навсегда."""
-    url = rp_photos.pick_photo_url("hugs", "mm")
-    assert url and url.endswith("/rp/hugs/mf/one.jpg"), url
+def test_чужая_гендерная_папка_не_берётся(media):
+    """Раньше при пустой папке брали любую соседнюю. С появлением направления
+    соседняя папка — это и есть неверное направление: картинка показывала бы
+    не то, что написано в тексте жеста."""
+    assert rp_photos.pick_photo_url("hugs", "mm") is None
+    assert rp_photos.pick_photo_url("hugs", "fm") is None
+
+
+def test_общая_корзина_под_запрет_не_попадает(media, tmp_path):
+    """Она по своей природе не гендерная — одна картинка на всех, и
+    направления в ней нет."""
+    (tmp_path / "hugs" / "common.jpg").write_bytes(b"\xff\xd8\xff")
+    url = rp_photos.pick_photo_url("hugs", "fm")
+    assert url and url.endswith("/rp/hugs/all/common.jpg"), url
+
+
+def test_направление_без_папки_идёт_в_корзину(media, tmp_path):
+    (tmp_path / "hugs" / "common.jpg").write_bytes(b"\xff\xd8\xff")
+    url = rp_photos.pick_photo_url("hugs", None)
+    assert url and url.endswith("/rp/hugs/all/common.jpg"), url
+
+
+def test_каждая_папка_проходит_проверку_путей():
+    """pairing_dir — белый список; новая папка, не попавшая в него, отдавала
+    бы None молча, и картинок в ней никто бы не увидел."""
+    for pairing in rp_photos.STORAGE_PAIRINGS:
+        assert rp_photos.pairing_dir("hugs", pairing) is not None, pairing
 
 
 def test_нет_картинок_вообще_даёт_none(media):
@@ -125,3 +147,88 @@ def test_остальная_панель_по_прежнему_под_входо
     """Публичной должна была стать ровно одна ручка, а не раздел целиком."""
     for endpoint in ("/api/rel-gestures", "/api/settings", "/api/chats"):
         assert client.get(endpoint).status_code == 401, endpoint
+
+
+# ---------------------------------------------------------------------------
+# Правило подбора — одно на бота и панель
+# ---------------------------------------------------------------------------
+
+def test_бот_и_панель_выбирают_одинаково():
+    """Копий правила было две: своя в relationships_v2 и своя в webpanel. Обе
+    теряли направление, и разойтись им было нечем — панель показывала админу
+    превью, а бот присылал в чат другое.
+
+    Проверяем не «совпали значения», а что обе стороны зовут ОДНУ функцию:
+    совпадение двух копий держится ровно до первой правки.
+    """
+    import relationships_v2 as rel
+
+    пары = [("м", "ж"), ("ж", "м"), ("м", "м"), ("ж", "ж"), (None, "ж"), ("др", "др")]
+    for actor, target in пары:
+        assert rel._rp_pairing(actor, target) == rp_photos.pairing_for(actor, target)
+
+
+def test_в_панели_не_осталось_своей_копии_правила():
+    """Сторож против возврата: строка вида «{g1, g2} == {"м"}» и была тем
+    местом, где терялось направление."""
+    import io, os
+    корень = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    исходник = io.open(os.path.join(корень, "webpanel", "app.py"), encoding="utf-8").read()
+    assert '{g1, g2}' not in исходник, "в панели снова своя копия правила пар"
+
+
+def test_направления_попарно_различимы():
+    """mf и fm обязаны быть разными строками: совпади они — вся задача
+    свелась бы к переименованию папки."""
+    направления = {rp_photos.pairing_for(a, b)
+                   for a, b in (("м", "ж"), ("ж", "м"), ("м", "м"), ("ж", "ж"))}
+    assert направления == {"mf", "fm", "mm", "ff"}
+    assert set(rp_photos.PAIRINGS) == направления
+
+
+# ---------------------------------------------------------------------------
+# Регресс: у большинства фотки при «отн» исчезли
+#
+# Направление считается только по заполненной анкете, а заполняют её единицы.
+# Отправив всех остальных в пустую корзину, мы лишили картинок почти весь чат:
+# в mf лежит 60+ фото, в all — ноль. Честность, которой никто не видит, потому
+# что смотреть не на что, честностью не является.
+# ---------------------------------------------------------------------------
+
+def test_без_анкеты_человек_считается_женщиной(media):
+    """Решение пользователя: пол, не указанный в анкете, считается женским.
+
+    Благодаря этому направление известно ВСЕГДА — «неизвестного» просто не
+    бывает, и запасные папки поверх правила не нужны.
+    """
+    assert rp_photos.DEFAULT_GENDER == "ж"
+    assert rp_photos.pairing_for("м", None) == "mf"
+    assert rp_photos.pairing_for(None, "м") == "fm"
+    assert rp_photos.pairing_for(None, None) == "ff"
+
+
+def test_мужчина_и_человек_без_анкеты_идут_в_mf(media):
+    """Тот самый пример: я мужчина, второй неизвестен — значит он ж."""
+    url = rp_photos.pick_photo_url("hugs", rp_photos.pairing_for("м", None))
+    assert url and url.endswith("/rp/hugs/mf/one.jpg"), url
+
+
+def test_другой_пол_считается_женским():
+    assert rp_photos.pairing_for("др", "м") == "fm"
+    assert rp_photos.pairing_for("м", "др") == "mf"
+
+
+def test_пустая_папка_уходит_в_корзину(media, tmp_path):
+    """У жеста со своей общей картинкой она показывается, когда точной папки
+    направления нет."""
+    (tmp_path / "hugs" / "common.jpg").write_bytes(b"\xff\xd8\xff")
+    url = rp_photos.pick_photo_url("hugs", "fm")
+    assert url and url.endswith("/rp/hugs/all/common.jpg"), url
+
+
+def test_известное_направление_нейтральную_папку_НЕ_берёт(media):
+    """Главное свойство задачи и оно не должно было пострадать: если мы знаем,
+    что било наоборот, картинка «М бьёт Ж» не показывается, даже когда она
+    единственная в наличии."""
+    assert rp_photos.pick_photo_url("hugs", "fm") is None
+    assert rp_photos.pick_photo_url("hugs", "mm") is None

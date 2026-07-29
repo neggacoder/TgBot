@@ -22,15 +22,30 @@ if not hasattr(aiogram, "Dispatcher"):
 import relationships_v2 as rel  # noqa: E402
 
 
-def test_папка_пары_по_полу():
+def test_папка_учитывает_направление_жеста():
+    """Главное свойство: у жеста есть тот, кто его делает, и тот, кому.
+
+    Пока папка означала «парень и девушка как угодно», девушка, ударившая
+    парня, получала картинку, где парень бьёт девушку, — прямо наперекор
+    тексту жеста.
+    """
+    assert rel._rp_pairing("м", "ж") == "mf"
+    assert rel._rp_pairing("ж", "м") == "fm"
+    assert rel._rp_pairing("м", "ж") != rel._rp_pairing("ж", "м")
+
+
+def test_одинаковый_пол_направления_не_имеет():
     assert rel._rp_pairing("м", "м") == "mm"
     assert rel._rp_pairing("ж", "ж") == "ff"
-    assert rel._rp_pairing("м", "ж") == "mf"
-    assert rel._rp_pairing("ж", "м") == "mf"
-    # неизвестный пол или «другой» → нейтральная mf
-    assert rel._rp_pairing(None, "м") == "mf"
-    assert rel._rp_pairing("др", "ж") == "mf"
-    assert rel._rp_pairing(None, None) == "mf"
+
+
+def test_без_анкеты_человек_считается_женщиной():
+    """Пол, не указанный в анкете, считается женским — тогда направление
+    известно всегда, и папка находится тоже всегда."""
+    assert rel._rp_pairing("м", None) == "mf"
+    assert rel._rp_pairing(None, "м") == "fm"
+    assert rel._rp_pairing("др", "ж") == "ff"
+    assert rel._rp_pairing(None, None) == "ff"
 
 
 # Источник картинок ровно один — наше хранилище (rp_photos), то есть файлы,
@@ -65,10 +80,27 @@ def test_берёт_файл_из_точной_пары(store):
     assert rel._pick_rp_photo_url("hugs", "м", "м") == "https://example.org/rp/hugs/mm/mm.jpg"
 
 
-def test_откат_на_другую_пару(store):
-    """Для точной пары файлов нет, но есть у соседней — берём оттуда."""
+def test_чужая_гендерная_папка_не_берётся(store):
+    """Тот самый баг, только с другой стороны: раньше при пустой папке брали
+    любую соседнюю — «лучше показать чужую, чем ничего». С появлением
+    направления это правило переворачивается: чужая папка И ЕСТЬ неверное
+    направление."""
     store("kisses", "mf", "a.png")
-    assert rel._pick_rp_photo_url("kisses", "м", "м") == "https://example.org/rp/kisses/mf/a.png"
+    assert rel._pick_rp_photo_url("kisses", "ж", "м") is None
+    assert rel._pick_rp_photo_url("kisses", "м", "м") is None
+
+
+def test_своя_папка_направления_берётся(store):
+    store("kisses", "fm", "she.png")
+    store("kisses", "mf", "he.png")
+    assert rel._pick_rp_photo_url("kisses", "ж", "м") == "https://example.org/rp/kisses/fm/she.png"
+    assert rel._pick_rp_photo_url("kisses", "м", "ж") == "https://example.org/rp/kisses/mf/he.png"
+
+
+def test_мужчина_и_безанкетный_идут_в_mf(store):
+    """Тот самый пример: я мужчина, второй неизвестен — значит он ж."""
+    store("hugs", "mf", "a.png")
+    assert rel._pick_rp_photo_url("hugs", "м", None) == "https://example.org/rp/hugs/mf/a.png"
 
 
 def test_откат_на_общую_корзину(store):

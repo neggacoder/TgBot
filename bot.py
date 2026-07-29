@@ -764,7 +764,7 @@ async def _remember_recent_message(message: Message) -> None:
         elif message.video is not None:
             kind = "📹 Видео"
         elif message.sticker is not None:
-            kind = "Стикер"
+            kind = "🧩 Стикер"
         elif message.document is not None:
             kind = "📎 Файл"
 
@@ -775,6 +775,10 @@ async def _remember_recent_message(message: Message) -> None:
         "username": message.from_user.username if message.from_user else None,
         "text": text,
         "kind": kind,
+        # Ради «.стикер N»: без file_id склейка показывала стикеры и фото
+        # СЛОВАМИ («Стикер», «🖼 Фото»), потому что в буфере лежал только
+        # текст. Позже file_id не достать — берём его сейчас.
+        "media_file_id": media_file_id(message),
     }
     # Снимок реплая — снимаем ЗДЕСЬ и только здесь. Telegram присылает
     # содержимое процитированного сообщения в reply_to_message живого
@@ -1472,7 +1476,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "activity_board":  {"phrase": "чем заняться / что делать / !дела — что готово прямо сейчас, а что ещё ждёт", "category": "Экономика", "level": 0},
     "economy_report":  {"phrase": "экономика — сколько монет в чате, у кого и откуда пришли", "category": "Статистика", "level": LEVEL_MODERATOR},
     "income_set":      {"phrase": "доход / доход {источник} {процент} / доход лимит {число} — множители заработка и суточный лимит подработок", "category": "Настройка", "level": LEVEL_ADMIN},
-    "farm_expand":     {"phrase": "ферма расширить / купить грядку / расширить огород — ещё одна грядка за монеты, цена растёт с каждой", "category": "Экономика", "level": 0},
+    "farm_expand":     {"phrase": "ферма расширить [сколько] / купить грядку / расширить огород — грядки за монеты, цена растёт с каждой; «все» — сколько влезет", "category": "Экономика", "level": 0},
     "raid_mode":       {"phrase": "рейд начался / рейд окончен — антирейд: закрыть чат, сменить ссылку и забанить свежих новичков без роли (кнопки в личке бота)", "category": "Модерация", "level": LEVEL_ADMIN},
 }
 
@@ -2816,6 +2820,58 @@ def _raid_mode_key(chat_id: int) -> str:
 async def raid_mode_on(chat_id: int) -> bool:
     row = await db.get_data(_raid_mode_key(chat_id))
     return bool(row and row.get("data_value") == "1")
+
+
+# Все тексты кнопок меню лички — какие бы права ни были у человека.
+#
+# Нужны заявочному обработчику (handle_user_message): он ловит ЛЮБОЕ сообщение
+# в личке без состояния и стоит в файле раньше половины команд, поэтому
+# забирал их себе. Так и было сломано: нажатие «Логи» и «РЕЙД НАЧАЛСЯ» уезжало
+# админам как заявка на вступление, а сама команда не выполнялась никогда.
+#
+# Список явный, а не собранный из клавиатуры: собрать его можно только вызвав
+# private_menu_kb за конкретного человека, а полный набор кнопок не выдаётся
+# никому — у админа своя половина, у обычного своя. От расхождения защищает
+# тест (tests/test_bot_routing.py): он поднимает клавиатуру с включёнными
+# правами и сверяет, что каждая её кнопка перечислена здесь.
+PRIVATE_MENU_BUTTONS: frozenset[str] = frozenset({
+    "Помощь", "Логи", "Аноним", "Сайт", "Админка", "Моя роль",
+    "Жалоба", "Мой рынок",
+    "🌴 Рест", "🎭 Роли",
+    BTN_ROLE_RESERVE, BTN_ROLE_TAKE, BTN_ROLE_HELP,
+    BTN_RAID_ON, BTN_RAID_OFF,
+})
+
+# Команды лички, которые НАБИРАЮТ руками. Кнопкой они не выдаются, но беда у
+# них та же: объявлены ниже заявочного обработчика и без этого списка уезжали
+# бы админам как заявка на вступление.
+PRIVATE_PASSTHROUGH_COMMANDS: frozenset[str] = frozenset({
+    "фарт", "подкрутить",
+})
+
+
+# Те же кнопки и команды в е-написании и нижнем регистре — в таком виде их
+# сравнивают сами обработчики (см. private_menu_kb: «текст кнопок — это ровно
+# те же слова-триггеры, что и для ручного ввода»).
+_PRIVATE_PASSTHROUGH_NORM: frozenset[str] = frozenset(
+    ru_text.yo(t.casefold())
+    for t in (PRIVATE_MENU_BUTTONS | PRIVATE_PASSTHROUGH_COMMANDS)
+)
+
+
+def is_private_passthrough(text: Optional[str]) -> bool:
+    """Не заявка ли это, а кнопка или команда лички.
+
+    Регистр не важен, и это не мелочь: кнопка подписана «Логи», а руками то же
+    самое пишут «логи». Сравнивай мы буквально — нажатие работало бы, а
+    набранное слово уезжало админам заявкой. Ровно так и было сломано «мой
+    рынок»: кнопка «Мой рынок» открывала рынок, а те же два слова с маленькой
+    буквы — нет.
+    """
+    если_есть = (text or "").strip()
+    if not если_есть:
+        return False
+    return ru_text.yo(если_есть.casefold()) in _PRIVATE_PASSTHROUGH_NORM
 
 
 def private_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
@@ -8174,6 +8230,18 @@ async def cmd_roles_delete_menu(message: Message):
 # ----------------------------------------------------------------------------
 @router.message(F.chat.type == "private", StateFilter(None), ~F.text.startswith("/"))
 async def handle_user_message(message: Message):
+    # Кнопки меню лички пропускаем дальше по цепочке. Этот обработчик ловит
+    # ЛЮБОЕ сообщение в личке без состояния и стоит в файле раньше половины
+    # команд — забирая себе всё, что объявлено ниже. Именно так молча не
+    # работали «Логи» и «РЕЙД НАЧАЛСЯ»: нажатие уезжало админам как заявка на
+    # вступление, а сама команда не выполнялась никогда.
+    #
+    # SkipHandler, а не return: обычный выход из обработчика в aiogram
+    # ОСТАНАВЛИВАЕТ разбор, и кнопка провалилась бы в тишину вместо своей
+    # команды.
+    if is_private_passthrough(message.text):
+        raise SkipHandler()
+
     user_id = message.from_user.id
     in_test_mode = user_id in test_mode_admins
 
@@ -10515,6 +10583,84 @@ def parse_amount(text: str) -> Optional[int]:
     number = float(match.group(1).replace(",", "."))
     multiplier = _AMOUNT_SUFFIXES.get((match.group(2) or "").casefold(), 1)
     return int(round(number * multiplier))
+
+
+# ----------------------------------------------------------------------------
+# «ВСЕ» ВМЕСТО ЧИСЛА: потратить всё, что есть.
+#
+# Живёт ОТДЕЛЬНО от parse_amount, и это не педантизм. parse_amount зовут из
+# 28 мест, и половина из них числа не тратит, а НАЗНАЧАЕТ: цена товара,
+# потолок рынка, минимальный вклад, проценты по вкладу. Пропусти «все» туда —
+# и «магазин цена fishka все» поставила бы ценник в размер кошелька владельца.
+#
+# Сумму разворачиваем на месте вызова, а не внутри разбора: кошельков два —
+# основной и отдельный кошелёк казино, — и знает, каким платят, только сам
+# обработчик.
+# ----------------------------------------------------------------------------
+SPEND_ALL_WORDS = frozenset({"все", "all", "max", "макс"})
+
+
+def is_spend_all(raw: Optional[str]) -> bool:
+    """Написано ли вместо числа «всё, что есть». «Всё» и «ВСЕ» — тоже да."""
+    if not raw:
+        return False
+    return ru_text.yo(raw.strip().casefold()) in SPEND_ALL_WORDS
+
+
+def parse_spend_amount(raw: Optional[str], available: int) -> Optional[int]:
+    """Сумма к трате: число, сокращение или «все».
+
+    available — сколько на том кошельке, которым платят. Ноль и минус отдаём
+    как есть: решать, отказать или промолчать, — дело вызывающего, у него
+    свой текст отказа.
+    """
+    if is_spend_all(raw):
+        return max(0, int(available))
+    return parse_amount(raw or "")
+
+
+def parse_spend_quantity(raw: Optional[str], *, price: int, coins: int,
+                         limit: int, stock: Optional[int] = None) -> Optional[int]:
+    """Сколько штук покупаем. «все» — сколько влезет.
+
+    Ограничителей у «все» три, и берётся МЕНЬШИЙ: деньги, потолок команды
+    (он заведён против опечаток вроде «купить fishka 100000») и остаток на
+    складе. Вернуть больше любого из них значило бы пообещать покупку,
+    которая тут же и провалится.
+
+    Ноль — это «не хватает даже на одну», а не «купить нисколько»: отличить
+    их вызывающий обязан, поэтому ноль возвращается честно, а не подменяется
+    единицей.
+    """
+    if not is_spend_all(raw):
+        if raw is None:
+            return 1
+        return int(raw) if raw.isdigit() else None
+    сколько = limit
+    if price > 0:
+        сколько = min(сколько, max(0, int(coins)) // price)
+    if stock is not None:
+        сколько = min(сколько, max(0, int(stock)))
+    return max(0, сколько)
+
+
+async def resolve_wallet_amount(message: Message, raw: Optional[str]) -> Optional[int]:
+    """Сумма из ОСНОВНОГО кошелька: число, сокращение или «все»."""
+    if is_spend_all(raw):
+        wallet = await db.get_wallet(message.chat.id, message.from_user.id)
+        return max(0, int(wallet.get("coins") or 0))
+    return parse_amount(raw or "")
+
+
+async def resolve_casino_amount(message: Message, raw: Optional[str]) -> Optional[int]:
+    """Сумма из КОШЕЛЬКА КАЗИНО. Отдельная функция, а не флаг у прошлой:
+    кошелька два, и «все» на ставке обязано считать тот, которым платят.
+    Ошибись здесь — и «рулетка все» поставила бы на кон весь основной
+    кошелёк, которого казино вообще не касается."""
+    if is_spend_all(raw):
+        wallet = await db.get_casino_wallet(message.chat.id, message.from_user.id)
+        return max(0, int(wallet.get("balance") or 0))
+    return parse_amount(raw or "")
 
 
 def find_amount(text: str) -> Optional[int]:
@@ -13440,22 +13586,35 @@ def _fallback_text_for(msg: Message) -> Optional[str]:
     if msg.video is not None:
         return "📹 Видео"
     if msg.sticker is not None:
-        return "Стикер"
+        # Досюда доходят только те стикеры, которые не показать картинкой —
+        # анимированные и видео. Эмодзи для единообразия с соседями: голое
+        # слово среди «🎤 Голосовое» и «🖼 Фото» читалось как опечатка.
+        return "🧩 Стикер"
     return None
 
 
-async def _fetch_message_media(msg: Message) -> Optional[bytes]:
-    """Картинка из сообщения, чтобы вставить её прямо в бабл цитаты.
+def media_file_id(msg: Message) -> Optional[str]:
+    """file_id картинки, которую Pillow сумеет открыть, — или None.
 
-    None для всего, что Pillow не откроет — видео, гифок, анимированных и
-    видео-стикеров; для них останется текстовая пометка из _fallback_text_for.
+    Отдельно от скачивания, потому что нужен ещё и кольцевому буферу: чтобы
+    склейка «.стикер N» могла показать стикер картинкой, file_id обязан быть
+    сохранён В МОМЕНТ ПРИЁМА сообщения. Позже взять его неоткуда — в буфере
+    лежит только то, что мы туда положили.
+
+    Видео, гифки, анимированные и видео-стикеры сюда не попадают: Pillow их
+    не откроет, и для них остаётся текстовая пометка из _fallback_text_for.
     """
-    file_id = None
     if msg.photo:
-        file_id = msg.photo[-1].file_id
-    elif msg.sticker is not None and not msg.sticker.is_animated and not msg.sticker.is_video:
-        file_id = msg.sticker.file_id
-    if file_id is None:
+        return msg.photo[-1].file_id
+    if msg.sticker is not None and not msg.sticker.is_animated and not msg.sticker.is_video:
+        return msg.sticker.file_id
+    return None
+
+
+async def download_media_bytes(file_id: Optional[str]) -> Optional[bytes]:
+    """Байты картинки по file_id. None — не скачалось (файл протух, нет прав,
+    сеть): бабл в этом случае просто останется текстовым, а не пропадёт."""
+    if not file_id:
         return None
     try:
         buf = BytesIO()
@@ -13465,6 +13624,11 @@ async def _fetch_message_media(msg: Message) -> Optional[bytes]:
     except Exception:
         logger.warning("Не удалось скачать медиа для цитаты", exc_info=True)
         return None
+
+
+async def _fetch_message_media(msg: Message) -> Optional[bytes]:
+    """Картинка из сообщения, чтобы вставить её прямо в бабл цитаты."""
+    return await download_media_bytes(media_file_id(msg))
 
 
 def _reply_snapshot_from_buffer(chat_id: int, message_id: int) -> Optional[dict]:
@@ -13612,14 +13776,23 @@ async def cmd_text_sticker(message: Message):
                 "username": src.from_user.username if src.from_user else None,
                 "text": _fallback_text_for(src),
                 "kind": None,
+                "media_file_id": media_file_id(src),
             }
             prior = [m for m in buf_list if m["message_id"] < src.message_id]
             window = prior[-(count - 1):] + [src_item] if count > 1 else [src_item]
 
         for item in window:
             uid = item.get("user_id")
-            text = item.get("text") or item.get("kind")
-            if uid is None or not text:
+            # Картинку показываем картинкой — ради этого file_id и лежит в
+            # буфере. Раньше здесь был только текст, и стикер в склейке
+            # превращался в слово «Стикер», а фото — в «🖼 Фото».
+            media_bytes = await download_media_bytes(item.get("media_file_id"))
+            # С картинкой в бабле подписью служит текст сообщения (у стикера
+            # его нет — бабл будет одной картинкой), без картинки — пометка
+            # вида «🎤 Голосовое». Тот же порядок, что и у одиночного стикера.
+            text = (item.get("text") or "") if media_bytes else (
+                item.get("text") or item.get("kind") or "")
+            if uid is None or (not text and media_bytes is None):
                 continue
             nickname = await db.get_nickname(message.chat.id, uid)
             name = nickname or item.get("full_name") or (
@@ -13630,6 +13803,7 @@ async def cmd_text_sticker(message: Message):
                 name=name,
                 text=text,
                 avatar_bytes=await _avatar_for(uid),
+                media_bytes=media_bytes,
             )
             # Плашку получает каждое сообщение склейки, у которого реплай
             # был: буфер теперь хранит снимок реплая для всех сообщений, а не
@@ -14802,26 +14976,25 @@ async def cmd_farm_crops(message: Message):
     await message.answer("\n".join(lines))
 
 
-@router.message(
-    F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and bool(FARM_PLANT_RE.match(t.strip()))),
+# «ферма грядка» намеренно НЕ входит: она отличается от «ферма грядки»
+# (просмотр огорода) одной буквой, и промах пальцем списывал бы деньги вместо
+# показа списка.
+FARM_EXPAND_RE = ru_text.rx(
+    r"(?i)^(?:!?ферма\s+расширить|купить\s+грядку|расширить\s+огород)(?:\s+(\S+))?$"
 )
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t)
-                and ru_text.yo(" ".join(t.strip().casefold().split()))
-                # «ферма грядка» намеренно НЕ входит: она отличается от
-                # «ферма грядки» (просмотр огорода) одной буквой, и промах
-                # пальцем списывал бы деньги вместо показа списка.
-                in ("ферма расширить", "купить грядку", "расширить огород")),
+    F.text.func(lambda t: bool(t) and bool(FARM_EXPAND_RE.match(t.strip()))),
 )
 async def cmd_farm_expand(message: Message):
-    """«ферма расширить» — купить ещё одну грядку.
+    """«ферма расширить [сколько]» — купить грядки.
 
-    По одной за команду, а не пачкой: цена растёт с каждой купленной, и
-    «ферма расширить 10» пришлось бы считать суммой геометрической прогрессии,
-    которую человек не может проверить в уме. Одна покупка — одна понятная
-    цифра.
+    Без числа — одну. С числом или словом «все» — пачкой, и тогда бот сам
+    считает сумму: цена растёт с каждой купленной, и складывать двадцать
+    разных чисел в уме человек не должен. Именно поэтому в ответе называется
+    и итог, и цена первой с последней — проверить счёт можно, не веря на слово.
     """
     if not _check_misc_access(message.from_user.id, "farm_expand"):
         return
@@ -14840,28 +15013,77 @@ async def cmd_farm_expand(message: Message):
             "(<code>крафты</code>)."
         )
         return
-    цена = farming.plot_price(src["bought"])
-    if not await spend_coins(chat_id, user_id, цена):
-        wallet = await db.get_wallet(chat_id, user_id)
+
+    # Сколько ВООБЩЕ влезет: упираемся и в покупной потолок, и в общий.
+    место = min(farming.PLOTS_BUY_MAX - src["bought"], farming.PLOTS_MAX - src["total"])
+    wallet = await db.get_wallet(chat_id, user_id)
+    монеты = int(wallet.get("coins") or 0)
+
+    raw = (FARM_EXPAND_RE.match(message.text.strip()).group(1) or "").strip()
+    if is_spend_all(raw):
+        сколько = farming.plots_affordable(src["bought"], монеты, место)
+        if сколько <= 0:
+            await message.reply(
+                f"На грядку не хватает: она стоит {farming.plot_price(src['bought'])} i¢, "
+                f"у вас {монеты} i¢." + await activity_hint(chat_id, user_id)
+            )
+            return
+    elif raw:
+        if not raw.isdigit() or int(raw) <= 0:
+            await message.reply(
+                "Сколько грядок купить — число или слово «все».\n"
+                "Например: <code>ферма расширить 5</code> или "
+                "<code>ферма расширить все</code>"
+            )
+            return
+        сколько = int(raw)
+        if сколько > место:
+            # Молча урезать нельзя: человек назвал число и должен понять,
+            # почему получил другое.
+            await message.reply(
+                f"Столько не влезет: свободно ещё {место} "
+                f"{'грядка' if место == 1 else 'грядок'} "
+                f"(потолок покупки {farming.PLOTS_BUY_MAX}, всего {farming.PLOTS_MAX}).\n"
+                f"Попробуйте <code>ферма расширить {место}</code> или "
+                "<code>ферма расширить все</code>."
+            )
+            return
+    else:
+        сколько = 1
+
+    итог = farming.plots_total_price(src["bought"], сколько)
+    if not await spend_coins(chat_id, user_id, итог):
         await message.reply(
-            f"Не хватает монет: грядка стоит {цена} i¢, у вас "
-            f"{int(wallet.get('coins') or 0)} i¢."
+            f"Не хватает монет: {сколько} "
+            f"{'грядка' if сколько == 1 else 'грядок'} стоит {итог} i¢, "
+            f"у вас {монеты} i¢."
+            + (f"\nНа что хватает — <code>ферма расширить все</code>."
+               if farming.plots_affordable(src["bought"], монеты, место) else "")
             + await activity_hint(chat_id, user_id)
         )
         return
-    стало = src["bought"] + 1
+
+    стало = src["bought"] + сколько
     await db.set_data(_farm_plots_key(chat_id, user_id), str(стало), updated_by=user_id)
-    await db.add_log("farm_expand", chat_id=chat_id, actor_id=user_id, details=str(стало))
+    await db.add_log("farm_expand", chat_id=chat_id, actor_id=user_id,
+                     details=f"+{сколько} -> {стало}")
     всего = farming.plots_for(src["stars"], стало, src["items"])
+    # Разбивку показываем только для пачки: у одной грядки итог и есть цена.
+    разбивка = (f" ({farming.plot_price(src['bought'])} → "
+                f"{farming.plot_price(стало - 1)} i¢ за штуку)" if сколько > 1 else "")
     хвост = (f"Следующая — {farming.plot_price(стало)} i¢."
              if стало < farming.PLOTS_BUY_MAX and всего < farming.PLOTS_MAX
              else "Грядки за монеты кончились — дальше ачивки и 🏡 теплица.")
     await message.reply(
-        f"🪴 Куплена грядка за {цена} i¢. Теперь их <b>{всего}</b> "
-        f"из {farming.PLOTS_MAX}.\n{хвост}"
+        f"🪴 Куплено грядок: <b>{сколько}</b> за {итог} i¢{разбивка}.\n"
+        f"Теперь их <b>{всего}</b> из {farming.PLOTS_MAX}.\n{хвост}"
     )
 
 
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(FARM_PLANT_RE.match(t.strip()))),
+)
 async def cmd_farm_plant(message: Message):
     """«ферма посадить клубника [сколько]» — занять свободные грядки."""
     if not _check_misc_access(message.from_user.id, "farm_plant"):
@@ -19226,15 +19448,23 @@ async def cmd_transfer(message: Message):
             "Попробуйте ответом на его сообщение, если оно есть."
         )
         return
-
+    if target.id == message.from_user.id:
+        await message.reply("Самому себе переводить не имеет смысла 🙂")
+        return
     if getattr(target, "is_bot", False):
         await message.reply("Боты монеты не тратят 🤖")
         return
 
-    amount = find_amount(remaining)
+    # «все» ищем отдельно от числа: find_amount вытаскивает ПЕРВОЕ число из
+    # свободного текста, а слова там нет вовсе — оно и не нашлось бы.
+    if any(is_spend_all(слово) for слово in remaining.split()):
+        amount = await resolve_wallet_amount(message, "все")
+    else:
+        amount = find_amount(remaining)
     if amount is None:
         await message.reply(
-            "Укажите сумму перевода, например:\n<code>Перевод @username 100</code> или <code>Перевод @username 10к</code>"
+            "Укажите сумму перевода, например:\n<code>Перевод @username 100</code>, "
+            "<code>Перевод @username 10к</code> или <code>Перевод @username все</code>"
         )
         return
     if amount <= 0:
@@ -22737,9 +22967,9 @@ _CASINO_ROULETTE_USAGE = (
     "Играют с баланса казино: <code>казино баланс</code>, "
     "<code>казино пополнить {сумма}</code>."
 )
-CASINO_ROULETTE_MAX_BET = 100_000_000  # предохранитель от переполнения/абсурдных ставок
-CASINO_DAILY_BONUS = 1_000
-CASINO_MAX_BET = 100_000_000
+CASINO_ROULETTE_MAX_BET = 100_000  # предохранитель от переполнения/абсурдных ставок
+CASINO_DAILY_BONUS = 100
+CASINO_MAX_BET = 100_000
 CASINO_DICE_RE = ru_text.rx(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
 CASINO_COIN_RE = ru_text.rx(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
 CASINO_POKER_RE = ru_text.rx(r"(?i)^!?покер\s+(\S+)$")
@@ -22764,7 +22994,7 @@ async def cmd_casino_roulette(message: Message):
         return
 
     m = CASINO_ROULETTE_RE.match(message.text.strip())
-    bet_amount = parse_amount(m.group(1))
+    bet_amount = await resolve_casino_amount(message, m.group(1))
     color = CASINO_COLOR_ALIASES.get(m.group(2).casefold())
 
     if color is None:
@@ -22920,7 +23150,8 @@ CASINO_WITHDRAW_RE = ru_text.rx(r"(?i)^!?казино\s+вывести\s+(\S+)$"
 async def cmd_casino_withdraw(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_withdraw"):
         return
-    amount = parse_amount(CASINO_WITHDRAW_RE.match(message.text.strip()).group(1))
+    amount = await resolve_casino_amount(
+        message, CASINO_WITHDRAW_RE.match(message.text.strip()).group(1))
     if amount is None or amount <= 0:
         await message.reply("Сумма вывода должна быть больше нуля.")
         return
@@ -22949,7 +23180,8 @@ async def cmd_casino_withdraw(message: Message):
 async def cmd_casino_topup(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_topup"):
         return
-    amount = parse_amount(CASINO_TOPUP_RE.match(message.text.strip()).group(1))
+    amount = await resolve_wallet_amount(
+        message, CASINO_TOPUP_RE.match(message.text.strip()).group(1))
     if amount is None or amount <= 0:
         await message.reply("Сумма пополнения должна быть больше нуля.")
         return
@@ -22975,7 +23207,7 @@ async def cmd_casino_dice(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_dice"):
         return
     m = CASINO_DICE_RE.match(message.text.strip())
-    bet, guess = parse_amount(m.group(1)), int(m.group(2))
+    bet, guess = await resolve_casino_amount(message, m.group(1)), int(m.group(2))
     if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
@@ -23032,7 +23264,7 @@ async def cmd_casino_coin(message: Message):
         return
     m = CASINO_COIN_RE.match(message.text.strip())
     guess = "орёл" if m.group(1).casefold() in ("орёл", "орел") else "решка"
-    bet = parse_amount(m.group(2))
+    bet = await resolve_casino_amount(message, m.group(2))
     if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
@@ -23086,7 +23318,8 @@ async def cmd_casino_coin(message: Message):
 async def cmd_casino_poker(message: Message):
     if not _check_misc_access(message.from_user.id, "casino_poker"):
         return
-    bet = parse_amount(CASINO_POKER_RE.match(message.text.strip()).group(1))
+    bet = await resolve_casino_amount(
+        message, CASINO_POKER_RE.match(message.text.strip()).group(1))
     if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
@@ -23159,7 +23392,8 @@ def _race_pick_kb(chat_id: int) -> InlineKeyboardMarkup:
     F.text.func(lambda t: bool(t) and bool(RACE_CMD_RE.match(t.strip()))),
 )
 async def cmd_race_start(message: Message):
-    amount = parse_amount(RACE_CMD_RE.match(message.text.strip()).group(1))
+    amount = await resolve_casino_amount(
+        message, RACE_CMD_RE.match(message.text.strip()).group(1))
     if amount is None or amount <= 0:
         await message.reply("Не понял ставку. Например: <code>!гонки 300</code>")
         return
@@ -23699,7 +23933,7 @@ async def cmd_bank_deposit(message: Message):
     if not _check_misc_access(message.from_user.id, "bank_deposit"):
         return
     m = BANK_DEPOSIT_RE.match(message.text.strip())
-    amount, days = parse_amount(m.group(1)), int(m.group(2))
+    amount, days = await resolve_wallet_amount(message, m.group(1)), int(m.group(2))
     if amount is None:
         await message.reply("Не понял сумму вклада.")
         return
@@ -23947,7 +24181,8 @@ async def decline_bank_credit(callback: CallbackQuery):
 async def cmd_bank_repay(message: Message):
     if not _check_misc_access(message.from_user.id, "bank_repay"):
         return
-    amount = parse_amount(BANK_REPAY_RE.match(message.text.strip()).group(1))
+    amount = await resolve_wallet_amount(
+        message, BANK_REPAY_RE.match(message.text.strip()).group(1))
     if amount is None or amount <= 0:
         await message.reply("Сумма погашения должна быть больше нуля.")
         return
@@ -24568,7 +24803,7 @@ SHOP_ADD_RE = ru_text.rx(r"(?is)^!?магазин\s+добавить\s+(\S+)\s+(
 SHOP_DELETE_RE = ru_text.rx(r"(?i)^!?магазин\s+удалить\s+(\S+)$")
 SHOP_TOGGLE_RE = ru_text.rx(r"(?i)^!?магазин\s+(вкл|выкл)\s+(\S+)$")
 # Количество необязательно: «купить fishka» — как раньше, одна штука.
-SHOP_BUY_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+купить|купить)\s+(\S+)(?:\s+(\d+))?$")
+SHOP_BUY_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+купить|купить)\s+(\S+)(?:\s+(\S+))?$")
 # Потолок на одну команду: опечатка в количестве («купить fishka 100000»)
 # иначе разом выносит весь кошелёк.
 SHOP_BUY_MAX_QTY = 100
@@ -25920,12 +26155,13 @@ async def cmd_shop_toggle(message: Message):
 )
 async def cmd_shop_buy(message: Message):
     match = SHOP_BUY_RE.match(message.text.strip())
-    await _shop_buy(message, match.group(1).casefold(),
-                    int(match.group(2)) if match.group(2) else 1)
+    # Отдаём сырой токен: «все» разворачивается в _shop_buy, где известны все
+    # четыре ограничителя — деньги, потолок, остаток и лимит на предметы.
+    await _shop_buy(message, match.group(1).casefold(), match.group(2) or 1)
 
 
 BLACK_MARKET_TRIGGERS = ("лавка", "!лавка", "чёрный рынок", "черный рынок")
-BLACK_MARKET_BUY_RE = ru_text.rx(r"(?i)^!?лавка\s+купить\s+(\S+)(?:\s+(\d+))?$")
+BLACK_MARKET_BUY_RE = ru_text.rx(r"(?i)^!?лавка\s+купить\s+(\S+)(?:\s+(\S+))?$")
 
 
 # Покупка объявлена ДО списка: «лавка купить …» точным совпадением по
@@ -25940,8 +26176,7 @@ async def cmd_black_market_buy(message: Message):
         return
     await ensure_black_market_rotation(message.chat.id)
     match = BLACK_MARKET_BUY_RE.match(message.text.strip())
-    await _shop_buy(message, match.group(1).casefold(),
-                    int(match.group(2)) if match.group(2) else 1,
+    await _shop_buy(message, match.group(1).casefold(), match.group(2) or 1,
                     from_black_market=True)
 
 
@@ -25966,21 +26201,37 @@ async def cmd_black_market(message: Message):
     await message.reply("\n".join(lines))
 
 
-async def _shop_buy(message: Message, item_key: str, qty: int,
+async def _shop_buy(message: Message, item_key: str, qty, 
                     from_black_market: bool = False) -> bool:
     """Покупка товара магазина. Вынесена из обработчика, потому что тем же
     путём покупается корм для питомцев («пет корм 10»): иначе распродажа,
     скидка «Торгаша», остаток на полке и отчисления в казну разъехались бы
     между двумя копиями кода.
 
+    qty — число или слово «все». Разворачивается оно ЗДЕСЬ, а не в
+    обработчике, и по одной причине: ограничителей у «все» четыре — деньги,
+    потолок команды, остаток на полке и лимит на предметы ограбления, — и все
+    четыре известны только тут. Считать их снаружи значило бы завести вторую
+    копию правил магазина.
+
     Возвращает, состоялась ли покупка (все отказы объясняются ответом здесь же).
     """
-    if qty <= 0:
-        await message.reply("Количество должно быть больше нуля.")
-        return False
-    if qty > SHOP_BUY_MAX_QTY:
-        await message.reply(f"За раз можно купить не больше {SHOP_BUY_MAX_QTY} шт.")
-        return False
+    сколько_влезет = is_spend_all(qty if isinstance(qty, str) else None)
+    # Сколько ещё таких предметов разрешено держать. None — ограничения нет
+    # (обычный товар), число — лимит предметов ограбления за вычетом своих.
+    место_под_такие: Optional[int] = None
+    if not сколько_влезет:
+        if not isinstance(qty, int):
+            qty = parse_spend_quantity(str(qty), price=0, coins=0, limit=SHOP_BUY_MAX_QTY)
+        if qty is None:
+            await message.reply("Количество — число или слово «все».")
+            return False
+        if qty <= 0:
+            await message.reply("Количество должно быть больше нуля.")
+            return False
+        if qty > SHOP_BUY_MAX_QTY:
+            await message.reply(f"За раз можно купить не больше {SHOP_BUY_MAX_QTY} шт.")
+            return False
     item = await db.get_shop_item(message.chat.id, item_key)
     if item is None or not item["is_active"]:
         await message.reply(f"Товар с ключом «{html.escape(item_key)}» не найден в магазине. Список — «магазин».")
@@ -26025,18 +26276,21 @@ async def _shop_buy(message: Message, item_key: str, qty: int,
              if i["item_key"] == item_key),
             0,
         )
-        if current_qty + qty > robbery.ROBBERY_ITEM_MAX_QUANTITY:
+        осталось_места = robbery.ROBBERY_ITEM_MAX_QUANTITY - current_qty
+        if сколько_влезет:
+            # Для «все» лимит — это ещё один потолок, а не отказ: человек
+            # просил «сколько можно», и ответить ему «нельзя столько» было бы
+            # ответом на незаданный вопрос.
+            место_под_такие = max(0, осталось_места)
+        elif current_qty + qty > robbery.ROBBERY_ITEM_MAX_QUANTITY:
             await message.reply(
                 f"⚠️ Предметов ограбления можно держать не больше "
                 f"{robbery.ROBBERY_ITEM_MAX_QUANTITY} шт. — у вас уже {current_qty}."
             )
             return False
-    if not await db.try_take_shop_stock(message.chat.id, item_key, qty):
-        await message.reply(
-            f"⚠️ Товара «{html.escape(item['name'])}» столько нет — "
-            f"проверьте остаток в «магазин»."
-        )
-        return False
+    # Цену считаем ДО снятия остатка: «все» упирается в неё, а снимать с полки
+    # можно только уже известное количество.
+    #
     # Распродажа (событие чата) снижает цену только в момент покупки —
     # ценники в самом магазине не переписываем.
     price = max(1, round(int(item["price"]) * await event_multiplier(message.chat.id, chat_events.T_SHOP)))
@@ -26044,6 +26298,32 @@ async def _shop_buy(message: Message, item_key: str, qty: int,
     torgash = await game_actions._pet_bonus(message.chat.id, message.from_user.id, "discount_shop")
     if torgash:
         price = max(1, price - price * torgash // 100)
+
+    if сколько_влезет:
+        wallet = await db.get_wallet(message.chat.id, message.from_user.id)
+        предел = SHOP_BUY_MAX_QTY if место_под_такие is None else min(SHOP_BUY_MAX_QTY, место_под_такие)
+        qty = parse_spend_quantity(
+            "все", price=price, coins=int(wallet.get("coins") or 0),
+            limit=предел, stock=item.get("stock"),
+        )
+        if qty <= 0:
+            # Ноль — это «не хватает даже на одну», и сказать это надо словами:
+            # «куплено 0 шт.» человек прочитал бы как поломку.
+            await message.reply(
+                f"На «{html.escape(item['name'])}» не хватает даже на одну: "
+                f"цена {price} i¢, у вас {int(wallet.get('coins') or 0)} i¢."
+                + (" И лимит на такие предметы уже выбран."
+                   if место_под_такие == 0 else "")
+                + await activity_hint(message.chat.id, message.from_user.id)
+            )
+            return False
+
+    if not await db.try_take_shop_stock(message.chat.id, item_key, qty):
+        await message.reply(
+            f"⚠️ Товара «{html.escape(item['name'])}» столько нет — "
+            f"проверьте остаток в «магазин»."
+        )
+        return False
     total = price * qty
     if not await spend_coins(message.chat.id, message.from_user.id, total):
         # Остаток уже снят с полки — возвращаем, иначе товар исчезал бы из

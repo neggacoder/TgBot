@@ -190,3 +190,93 @@ def test_плашка_меняет_картинку():
     )])
 
     assert with_reply.height > plain.height, "плашка должна добавлять высоту баблу"
+
+
+# ---------------------------------------------------------------------------
+# Стикеры и фото в склейке «.стикер N» — картинкой, а не словом
+#
+# Одиночный «.стикер» медиа скачивал и всегда показывал картинкой. Склейка же
+# строилась из кольцевого буфера, а буфер хранил только текст — поэтому стикер
+# в ней превращался в слово «Стикер», а фото в «🖼 Фото».
+# ---------------------------------------------------------------------------
+
+def _sticker_message(message_id: int, user_id: int, *, animated=False, video=False):
+    from aiogram.types import Chat, Message, Sticker, User
+    sticker = Sticker(
+        file_id="STICKER_FILE_ID", file_unique_id="u", type="regular",
+        width=512, height=512, is_animated=animated, is_video=video,
+    )
+    return Message(
+        message_id=message_id, date=datetime.now(),
+        chat=Chat(id=CHAT_ID, type="supergroup"),
+        from_user=User(id=user_id, is_bot=False, first_name=f"U{user_id}"),
+        sticker=sticker,
+    )
+
+
+def _photo_message(message_id: int, user_id: int):
+    from aiogram.types import Chat, Message, PhotoSize, User
+    return Message(
+        message_id=message_id, date=datetime.now(),
+        chat=Chat(id=CHAT_ID, type="supergroup"),
+        from_user=User(id=user_id, is_bot=False, first_name=f"U{user_id}"),
+        photo=[PhotoSize(file_id="SMALL", file_unique_id="a", width=90, height=90),
+               PhotoSize(file_id="BIG", file_unique_id="b", width=800, height=800)],
+    )
+
+
+def test_file_id_берётся_у_статичного_стикера():
+    assert bot_module.media_file_id(_sticker_message(1, AUTHOR_ID)) == "STICKER_FILE_ID"
+
+
+def test_у_фото_берётся_самый_большой_размер():
+    """Мелкое превью в бабле выглядело бы мылом."""
+    assert bot_module.media_file_id(_photo_message(1, AUTHOR_ID)) == "BIG"
+
+
+@pytest.mark.parametrize("kw", [{"animated": True}, {"video": True}])
+def test_анимированные_и_видео_стикеры_картинкой_не_идут(kw):
+    """Pillow их не откроет — им остаётся текстовая пометка, и она обязана
+    быть с эмодзи, как у соседей: голое слово «Стикер» среди «🎤 Голосовое» и
+    «🖼 Фото» читалось как опечатка."""
+    msg = _sticker_message(1, AUTHOR_ID, **kw)
+    assert bot_module.media_file_id(msg) is None
+    assert bot_module._fallback_text_for(msg) == "🧩 Стикер"
+
+
+def test_буфер_запоминает_file_id_в_момент_приёма():
+    """Позже его взять неоткуда: в буфере лежит только то, что мы туда
+    положили, а самого сообщения к моменту «.стикер N» уже нет."""
+    asyncio.run(bot_module._remember_recent_message(_sticker_message(10, AUTHOR_ID)))
+    запись = bot_module.recent_chat_messages[CHAT_ID][-1]
+
+    assert запись["media_file_id"] == "STICKER_FILE_ID"
+    assert запись["kind"] == "🧩 Стикер", "пометка на случай, если файл не скачается"
+
+
+def test_буфер_запоминает_file_id_фото():
+    asyncio.run(bot_module._remember_recent_message(_photo_message(11, AUTHOR_ID)))
+    assert bot_module.recent_chat_messages[CHAT_ID][-1]["media_file_id"] == "BIG"
+
+
+def test_у_текстового_сообщения_медиа_нет():
+    asyncio.run(bot_module._remember_recent_message(_message(12, AUTHOR_ID, "привет")))
+    assert bot_module.recent_chat_messages[CHAT_ID][-1]["media_file_id"] is None
+
+
+def test_несканчавшееся_медиа_не_роняет_бабл(monkeypatch):
+    """Файл мог протухнуть или сеть отвалиться. Бабл в этом случае остаётся
+    текстовым, а не пропадает вместе со всей склейкой."""
+    async def падает(*a, **k):
+        raise RuntimeError("сеть отвалилась")
+
+    monkeypatch.setattr(bot_module.bot, "download", падает, raising=False)
+    assert asyncio.run(bot_module.download_media_bytes("STICKER_FILE_ID")) is None
+
+
+def test_пустой_file_id_за_сетью_не_ходит(monkeypatch):
+    async def взрыв(*a, **k):
+        raise AssertionError("скачивать нечего — file_id пуст")
+
+    monkeypatch.setattr(bot_module.bot, "download", взрыв, raising=False)
+    assert asyncio.run(bot_module.download_media_bytes(None)) is None

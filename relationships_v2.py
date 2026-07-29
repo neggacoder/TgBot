@@ -4173,15 +4173,18 @@ async def load_gestures() -> None:
 # пока картинку не зальют через панель («Действия» → отн-жесты).
 
 
-def _rp_pairing(gender_a: Optional[str], gender_b: Optional[str]) -> str:
-    """Ключ пары по двум анкетным полам: mm / ff / mf. Неизвестный пол или
-    «другой» → mf (нейтральная папка по умолчанию)."""
-    genders = {gender_a, gender_b}
-    if genders == {"м"}:
-        return "mm"
-    if genders == {"ж"}:
-        return "ff"
-    return "mf"
+def _rp_pairing(gender_actor: Optional[str], gender_target: Optional[str]) -> Optional[str]:
+    """Папка по НАПРАВЛЕНИЮ жеста: кто делает и кому.
+
+    Правило живёт в rp_photos — там же, где хранилище, — и оттуда же его берёт
+    панель. Здесь остался только вызов: две копии одного правила разъехались
+    бы при первой правке, и превью в панели показывало бы не то, что уходит
+    в чат.
+
+    Раньше эта функция складывала оба пола в множество и на первой же строке
+    теряла, кто кого. Отсюда и брался «уебать» с картинкой наоборот.
+    """
+    return rp_photos.pairing_for(gender_actor, gender_target)
 
 
 def _pick_rp_photo_url(folder, gender_a, gender_b):

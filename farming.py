@@ -83,6 +83,33 @@ def plot_price(bought: int) -> int:
     return int(round(PLOTS_BUY_BASE_PRICE * (PLOTS_BUY_PRICE_STEP ** max(0, bought))))
 
 
+def plots_total_price(bought: int, count: int) -> int:
+    """Сколько стоят следующие count грядок, если куплено уже bought.
+
+    Складываем поштучно, а не по формуле суммы прогрессии: цена каждой
+    округляется отдельно (см. plot_price), и «честная» формула разошлась бы с
+    тем, что человек заплатит, покупая их по одной.
+    """
+    return sum(plot_price(bought + i) for i in range(max(0, count)))
+
+
+def plots_affordable(bought: int, coins: int, room: int) -> int:
+    """Сколько грядок можно купить прямо сейчас: пока хватает монет и места.
+
+    room — сколько ещё влезает (по обоим потолкам: покупному и общему).
+    Считаем по одной, потому что цена растёт: делить кошелёк на среднюю цену
+    значило бы обещать больше, чем получится.
+    """
+    сколько, потрачено = 0, 0
+    while сколько < max(0, room):
+        цена = plot_price(bought + сколько)
+        if потрачено + цена > max(0, coins):
+            break
+        потрачено += цена
+        сколько += 1
+    return сколько
+
+
 def plots_from_stars(stars: int) -> int:
     """Грядки, которые дала одна только звёздность."""
     return min(PLOTS_FROM_STARS_MAX,

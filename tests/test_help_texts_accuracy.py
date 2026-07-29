@@ -191,3 +191,73 @@ def test_справка_описывает_количество_у_подарк�
     bot = _source("bot.py")
     assert "магазин подарить {ключ} [количество]" in bot, (
         "подсказка «магазин» обещает подарок без количества")
+
+
+# ---------------------------------------------------------------------------
+# Числа справки против чисел кода
+#
+# Так и появилась жалоба «в хелпе написано до 7 грядок, мы разве не меняли до
+# 40?»: потолок огорода вырос, новый раздел написали, а в соседнем, старом,
+# осталось «максимум семь». Правка числа в коде и правка справки — два разных
+# действия, и второе забывается молча.
+# ---------------------------------------------------------------------------
+
+def _константы():
+    import os
+    os.environ.setdefault("BOT_TOKEN", "123456:TESTTOKENTESTTOKENTESTTOKENTESTTOKEN")
+    os.environ.setdefault("OWNER_IDS", "1")
+    import bot, farming, livestock, robbery, black_market
+    import shop_effects as SE
+    return bot, farming, livestock, robbery, black_market, SE
+
+
+def test_справка_знает_настоящий_потолок_грядок():
+    bot, farming, *_ = _константы()
+    текст = _help_text()
+
+    assert str(farming.PLOTS_MAX) in текст, "потолок огорода в справке не назван"
+    # Тот самый забытый кусок: старый потолок как ОБЩИЙ максимум.
+    assert "максимум семь" not in текст, (
+        "в справке остался старый потолок огорода — звёздность даёт семь, "
+        "но весь огород растёт до сорока"
+    )
+
+
+def test_справка_знает_все_источники_грядок():
+    bot, farming, livestock, robbery, black_market, SE = _константы()
+    текст = _help_text()
+
+    assert str(farming.PLOTS_FROM_STARS_MAX) in текст
+    assert str(farming.PLOTS_BUY_MAX) in текст
+    for item in SE.ACHIEVEMENT_ITEMS + SE.CRAFT_ITEMS:
+        if item.perk == SE.PERK_FARM_PLOTS:
+            assert item.name in текст, f"{item.name} даёт грядки, но в справке его нет"
+
+
+def test_справка_знает_шанс_сигнализации():
+    """Он менялся с «гарантированно» на 40%, и текст об этом узнал не сразу."""
+    *_, black_market, SE = _константы()
+    текст = _help_text()
+    assert str(black_market.SIGNAL_BLOCK_CHANCE) in текст
+
+
+def test_справка_знает_срок_откупа_и_окно_рейда():
+    bot, farming, livestock, robbery, *_ = _константы()
+    текст = _help_text()
+
+    assert str(robbery.SURVEILLANCE_AUTO_PARDON.days) in текст
+    assert str(int(bot.RAID_WINDOW.total_seconds() // 60)) in текст
+
+
+def test_справка_знает_цены_всего_скота():
+    """Цена, поменянная в каталоге и забытая в справке, — обещание, которое
+    бот не выполнит."""
+    bot, farming, livestock, *_ = _константы()
+    текст = _help_text()
+
+    потерянные = []
+    for a in livestock.ANIMALS:
+        с_пробелом = f"{a.price:,}".replace(",", " ")
+        if с_пробелом not in текст and str(a.price) not in текст:
+            потерянные.append(f"{a.name} ({a.price})")
+    assert not потерянные, "цены не совпали со справкой: " + ", ".join(потерянные)

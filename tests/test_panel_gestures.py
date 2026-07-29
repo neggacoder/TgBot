@@ -50,9 +50,17 @@ def test_список_жестов_с_фото(client, monkeypatch, tmp_path):
     assert res.status_code == 200, res.text
     data = res.json()
     assert data["gestures"][0]["gesture_key"] == "hug"
-    assert data["gestures"][0]["photos"] == {"mf": [], "mm": [], "ff": [], "all": []}
-    # «all» — общая корзина жеста (файлы прямо в его папке), см. rp_photos
-    assert data["pairings"] == ["mf", "mm", "ff", "all"]
+    # Набор папок берётся из rp_photos.STORAGE_PAIRINGS — перечислять их здесь
+    # копией значило бы завести второй список, который разъедется с первым.
+    assert data["gestures"][0]["photos"] == {
+        pairing: [] for pairing in rp_photos.STORAGE_PAIRINGS
+    }
+    # Панель обязана показывать РОВНО те папки, которые знает хранилище:
+    # список из своей копии разъехался бы, и «fm» не появилась бы в форме
+    # загрузки — то есть фото «Ж делает М» залить было бы некуда.
+    # «all» — общая корзина жеста (файлы прямо в его папке), см. rp_photos.
+    assert data["pairings"] == list(rp_photos.STORAGE_PAIRINGS)
+    assert "fm" in data["pairings"], "некуда заливать фото обратного направления"
 
 
 def test_добавление_жеста_плохой_ключ(client):

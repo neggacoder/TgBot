@@ -2639,20 +2639,15 @@ async def api_member_gestures(user: PanelUser = Depends(auth.require_member)):
 
 
 def _member_gesture_photo(media_folder: str, g1: Optional[str], g2: Optional[str]) -> Optional[str]:
-    pref = "mm" if {g1, g2} == {"м"} else "ff" if {g1, g2} == {"ж"} else "mf"
-    order = []
-    for pairing in (pref, "mf", "mm", "ff"):
-        if pairing not in order:
-            order.append(pairing)
-    for pairing in order:
-        directory = os.path.join(RP_MEDIA_ROOT, media_folder, pairing)
-        try:
-            files = [f for f in os.listdir(directory) if os.path.splitext(f)[1].lower() in _PHOTO_EXTS]
-        except OSError:
-            continue
-        if files:
-            return os.path.join(directory, secrets.choice(files))
-    return None
+    """Превью жеста для личного кабинета — по тем же правилам, что и в чате.
+
+    Правило подбора и порядок запасных вариантов берём из rp_photos: своя
+    копия здесь уже была, тоже теряла направление, и разойтись им было нечем
+    — превью показывало бы одно, а бот присылал другое.
+
+    g1 — кто делает жест, g2 — кому.
+    """
+    return rp_photos.pick_photo_url(media_folder, rp_photos.pairing_for(g1, g2))
 
 
 class MemberGestureBody(BaseModel):
