@@ -96,6 +96,21 @@ RECIPES: tuple[Recipe, ...] = (
     # радует. Живёт не в инвентаре, а в своей таблице (см. db.voodoo_dolls) —
     # потому и не теряется, не продаётся и не грабится: всё это ходит по
     # user_inventory, и того, чего там нет, оно не достанет.
+    # --- Ветка фермы ---------------------------------------------------------
+    # Материалы сюда приходят не из магазина, а из хлева (см. livestock.py):
+    # это первые рецепты, где ингредиент нельзя купить ни за какие деньги.
+    # Монеты в них небольшие — платят за них временем животных, а не кошельком.
+    Recipe("сыр", "syr",
+           (Req(REQ_ITEM, "moloko", 2), Req(REQ_COINS, amount=300))),
+    Recipe("пирог", "pirog",
+           (Req(REQ_ITEM, "yayca", 4), Req(REQ_ITEM, "moloko", 1),
+            Req(REQ_COINS, amount=1_200))),
+    Recipe("шарф", "sharf",
+           (Req(REQ_ITEM, "sherst", 3), Req(REQ_COINS, amount=1_500))),
+    Recipe("тулуп", "tulup",
+           (Req(REQ_ITEM, "sherst", 5), Req(REQ_ITEM, "pero", 8),
+            Req(REQ_COINS, amount=6_000))),
+
     Recipe("кукла", "",
            _junk("nitka", "skrepka", "nosok") + (Req(REQ_COINS, amount=2_000),),
            target=True),

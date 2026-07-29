@@ -115,7 +115,15 @@ def test_переключатели_русской_рулетки_не_заде�
 @pytest.fixture
 def casino(monkeypatch):
     """Казино-баланс и кошелёк i¢ по отдельности — чтобы видеть, что тронуто."""
-    state = {"casino": 1_000, "coins": 50_000, "log": []}
+    state = {"casino": 1_000, "coins": 50_000, "log": [], "lucky": False}
+
+    # Подкрученный фарт («фарт» у владельца бота). По умолчанию его нет —
+    # обычная рулетка обязана оставаться честной; сам фарт проверяется ниже.
+    async def take_lucky(user_id):
+        было, state["lucky"] = state["lucky"], False
+        return было
+
+    monkeypatch.setattr(bot_module, "_take_lucky_roulette", take_lucky, raising=False)
 
     async def get_casino_wallet(chat_id, user_id):
         return {"balance": state["casino"], "last_bonus_date": None}
@@ -238,3 +246,46 @@ def test_неверный_цвет_объясняет_без_точки(casino):
     assert "рулетка {ставка} {цвет}" in replies[0]
     assert ".рулетка {ставка}" not in replies[0], "подсказка не должна учить старой форме"
     assert casino["casino"] == 1_000, "при непонятном цвете деньги не трогаем"
+
+
+# --- подкрученный фарт ------------------------------------------------------
+#
+# Владелец бота выдаёт человеку один гарантированно выигрышный заход — просто
+# чтобы обрадовать. Ломается это двумя способами: фарт не срабатывает вовсе
+# или, наоборот, не сгорает и превращается в станок.
+
+def test_фарт_делает_следующий_заход_выигрышным(casino, monkeypatch):
+    casino["lucky"] = True
+    # Кубик оставляем честным: подкрутка обязана работать сама, а не совпадать.
+    monkeypatch.setattr(bot_module.random, "randint", lambda a, b: 0)
+
+    ответ = "\n".join(_play("рулетка 100 красное"))
+
+    assert "Выигрыш" in ответ, ответ
+    assert "Красное" in ответ
+
+
+def test_фарт_сгорает_после_одного_захода(casino, monkeypatch):
+    casino["lucky"] = True
+    monkeypatch.setattr(bot_module.random, "randint", lambda a, b: 0)  # честный ноль — зелёное
+
+    первый = "\n".join(_play("рулетка 100 красное"))
+    второй = "\n".join(_play("рулетка 100 красное"))
+
+    assert "Выигрыш" in первый
+    assert "Проигрыш" in второй, "заряд не сгорел — подарок стал станком"
+
+
+def test_фарт_уважает_выбранный_цвет(casino, monkeypatch):
+    """Гарантия — на ЦВЕТ ставки, а не на «красное всегда»."""
+    casino["lucky"] = True
+    monkeypatch.setattr(bot_module.random, "randint", lambda a, b: 1)  # честная единица — красное
+
+    ответ = "\n".join(_play("рулетка 100 черное"))
+
+    assert "Выигрыш" in ответ and "Чёрное" in ответ, ответ
+
+
+def test_без_фарта_рулетка_остаётся_честной(casino, monkeypatch):
+    monkeypatch.setattr(bot_module.random, "randint", lambda a, b: 0)   # зелёное
+    assert "Проигрыш" in "\n".join(_play("рулетка 100 красное"))

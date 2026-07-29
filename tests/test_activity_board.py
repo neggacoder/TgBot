@@ -163,6 +163,13 @@ def мир(monkeypatch):
     monkeypatch.setattr(bot_module, "is_account_frozen", _returns(False), raising=False)
     monkeypatch.setattr(bot_module, "_item_perk", _returns(0), raising=False)
     monkeypatch.setattr(bot_module, "_load_businesses", _returns([]), raising=False)
+    # Заработок домножается на настройку чата, а подработка ещё и считается
+    # за сутки — обе ручки проверяются своими тестами, здесь они «как было».
+    monkeypatch.setattr(bot_module.db, "get_income_percent", _returns(100.0), raising=False)
+    monkeypatch.setattr(bot_module.db, "get_side_job_daily_limit", _returns(0), raising=False)
+    monkeypatch.setattr(bot_module.db, "count_activity_today", _returns(0), raising=False)
+    monkeypatch.setattr(bot_module.db, "bump_activity_today", _returns(None), raising=False)
+    monkeypatch.setattr(bot_module.db, "touch_earning_activity", _returns(None), raising=False)
     return monkeypatch
 
 

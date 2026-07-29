@@ -251,6 +251,15 @@ class _World:
         self.help_at = None
         self.total_farms = stars_farms
         self.messages: list[str] = []
+        self.animals: list[dict] = []
+
+    # хлев: «ферма собрать» забирает и грядки, и продукт скота (см. livestock).
+    # Здесь он пуст — сам хлев проверяется своими тестами.
+    async def list_farm_animals(self, chat_id, user_id):
+        return self.animals
+
+    async def touch_farm_animals(self, chat_id, user_id, keys, now):
+        return None
 
     # кошелёк
     async def get_wallet(self, chat_id, user_id):

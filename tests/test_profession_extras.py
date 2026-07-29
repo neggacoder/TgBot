@@ -31,6 +31,34 @@ os.environ.setdefault("OWNER_IDS", "1")
 
 import bot as bot_module  # noqa: E402
 
+@pytest.fixture(autouse=True)
+def _обычный_множитель_дохода(monkeypatch):
+    """Заработок с некоторых пор домножается на настройку чата
+    («доход подработка 50»). Здесь она не проверяется — у неё свой тест, — но
+    без заглушки эти тесты полезли бы в базу за ней."""
+    async def сто(chat_id, source):
+        return 100.0
+
+    async def _учёт(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot_module.db, "get_income_percent", сто, raising=False)
+    # Ферма, рыбалка и клад теперь пишут строку учёта в earning_activity —
+    # ради отчёта «экономика». Кулдауны у них по-прежнему свои, поэтому здесь
+    # это просто лишний поход в базу.
+    monkeypatch.setattr(bot_module.db, "touch_earning_activity", _учёт, raising=False)
+    monkeypatch.setattr(bot_module.db, "bump_activity_today", _учёт, raising=False)
+
+    # Суточный лимит подработок: 0 — «без лимита», то есть поведение до его
+    # появления. Сам лимит проверяется своим тестом.
+    async def _без_лимита(chat_id):
+        return 0
+
+    monkeypatch.setattr(bot_module.db, "get_side_job_daily_limit",
+                        _без_лимита, raising=False)
+
+
+
 CHAT_ID = -1001234567890
 USER_ID = 555
 OTHER_ID = 777

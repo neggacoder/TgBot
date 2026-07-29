@@ -89,6 +89,26 @@ def _code(text: str) -> str:
 HINT_MAX_ITEMS = 4
 
 
+def wallets_holding_half(wallets: list[int]) -> int:
+    """Сколько верхних кошельков покрывают половину всех денег.
+
+    Грубая, зато читаемая замена коэффициенту Джини: «половина денег у 3 из
+    42» говорит о расслоении больше, чем 0.78, и не требует объяснять, что
+    такое Джини, каждому админу.
+
+    Список ждём отсортированным по убыванию — так его и отдаёт запрос.
+    """
+    total = sum(wallets)
+    if total <= 0:
+        return 0
+    накоплено = 0
+    for сколько, coins in enumerate(wallets, start=1):
+        накоплено += coins
+        if накоплено * 2 >= total:
+            return сколько
+    return len(wallets)
+
+
 def render_hint(
     states: list[ActivityState],
     *,

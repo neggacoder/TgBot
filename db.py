@@ -2050,6 +2050,34 @@ async def list_newcomers(chat_id: int, limit: int = 10) -> list[dict]:
     )
 
 
+async def list_new_members_without_role_since(
+    chat_id: int, since: datetime, limit: int = 500
+) -> list[dict]:
+    """Новички за период, У КОТОРЫХ НЕТ РОЛИ — под антирейд.
+
+    Роль (взятая или забронированная) — единственный признак «свой», который у
+    бота есть про человека, ещё ничего не написавшего: рейд-боты ролей не
+    держат, а живой новичок, за которым бронь, приходит по договорённости.
+    Проверка живёт в SQL, а не в коде вызывающего: список бывает на сотни
+    строк, и вытаскивать роли отдельным запросом на каждого — это сотни
+    запросов в тот момент, когда чат горит.
+    """
+    holders = (
+        "SELECT holder_user_id AS user_id FROM chat_roles "
+        "WHERE chat_id = %s AND status = 'taken' AND holder_user_id IS NOT NULL "
+        "UNION "
+        "SELECT reserved_user_id AS user_id FROM chat_roles "
+        "WHERE chat_id = %s AND status = 'reserved' AND reserved_user_id IS NOT NULL"
+    )
+    return await _fetchall(
+        f"SELECT user_id, full_name, username, first_seen_at FROM known_users "
+        f"WHERE chat_id = %s AND first_seen_at >= %s "
+        f"AND user_id NOT IN ({holders}) "
+        f"ORDER BY first_seen_at DESC LIMIT %s",
+        (chat_id, since, chat_id, chat_id, limit),
+    )
+
+
 async def list_new_members_since(chat_id: int, since: datetime, limit: int = 200) -> list[dict]:
     """Известные боту участники, впервые появившиеся в чате не раньше `since`
     (используется командой «нью {период}», например «нью 2д»)."""
@@ -7041,6 +7069,41 @@ async def ensure_earning_activity_table() -> None:
     # Сколько раз занятие вообще выполнялось — под ачивки вида «50 подработок».
     # total_earned для счёта не годится: он в монетах, а шкала менялась.
     await _add_column_if_missing("earning_activity", "times", "INT NOT NULL DEFAULT 0")
+    # Срабатываний за ТЕКУЩИЕ сутки — под лимит подработок. Отметка суток —
+    # уже существующая last_day: у подработки она свободна, её занимает
+    # только бонус, а это другая строка (другой activity_key).
+    await _add_column_if_missing("earning_activity", "day_times", "INT NOT NULL DEFAULT 0")
+
+
+async def count_activity_today(chat_id: int, user_id: int, activity_key: str, day) -> int:
+    """Сколько раз источник сработал сегодня. Вчерашний счётчик — это ноль."""
+    row = await _fetchone(
+        "SELECT last_day, day_times FROM earning_activity "
+        "WHERE chat_id = %s AND user_id = %s AND activity_key = %s",
+        (chat_id, user_id, activity_key),
+    )
+    if not row or row["last_day"] != day:
+        return 0
+    return int(row["day_times"] or 0)
+
+
+async def bump_activity_today(chat_id: int, user_id: int, activity_key: str, day) -> None:
+    """Увеличивает суточный счётчик, обнуляя его при смене суток.
+
+    Обнуление живёт в ТОМ ЖЕ запросе, что и увеличение, и это не экономия:
+    отдельная полуночная задача означала бы, что после простоя бота лимит у
+    всех остался вчерашним — а простой здесь штатное состояние (см. ленивую
+    копилку бизнесов и ротацию лавки рядом).
+    """
+    await _execute(
+        "INSERT INTO earning_activity "
+        "(chat_id, user_id, activity_key, last_day, day_times) "
+        "VALUES (%s, %s, %s, %s, 1) "
+        "ON DUPLICATE KEY UPDATE "
+        "day_times = IF(last_day <=> VALUES(last_day), day_times + 1, 1), "
+        "last_day = VALUES(last_day)",
+        (chat_id, user_id, activity_key, day),
+    )
 
 
 async def get_earning_activity(chat_id: int, user_id: int, activity_key: str) -> Optional[dict]:
@@ -7057,13 +7120,21 @@ async def touch_earning_activity(
 ) -> None:
     """Отмечает, что механика только что сработала. Пишется ДО начисления
     монет: упади запись — человек останется без денег, но не с возможностью
-    жать команду в цикле."""
+    жать команду в цикле.
+
+    day=None означает «этой механике сутки не важны», а НЕ «сбросить дату».
+    Разница появилась вместе с суточным лимитом подработок: last_day держит
+    отметку суток для day_times, и запись NULL поверх неё обнуляла бы лимит
+    при каждой подработке — то есть лимита не было бы вовсе. Раньше day
+    передавал только бонус, поэтому вопрос не стоял.
+    """
     await _execute(
         "INSERT INTO earning_activity "
         "(chat_id, user_id, activity_key, last_at, streak, last_day, total_earned, times) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, 1) "
         "ON DUPLICATE KEY UPDATE last_at = VALUES(last_at), streak = VALUES(streak), "
-        "last_day = VALUES(last_day), total_earned = total_earned + VALUES(total_earned), "
+        "last_day = IF(VALUES(last_day) IS NULL, last_day, VALUES(last_day)), "
+        "total_earned = total_earned + VALUES(total_earned), "
         "times = times + 1",
         (chat_id, user_id, activity_key, now, streak or 0, day, max(0, earned)),
     )
@@ -8191,6 +8262,82 @@ async def count_voodoo_dolls_of(chat_id: int, target_id: int) -> int:
 # ----------------------------------------------------------------------------
 # ОГОРОД: грядки (правила и числа — farming.py)
 # ----------------------------------------------------------------------------
+async def ensure_farm_animals_table() -> None:
+    """Хлев: одно животное каждого вида на человека.
+
+    last_collect_at — единственное, что нужно для подсчёта продукта: сколько
+    накопилось, выводится из прошедшего времени (см. livestock.produced).
+    Фоновой задачи нет и не нужно — тот же ленивый приём, что у копилки
+    бизнеса и ротации лавки, и он так же переживает простой бота.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS farm_animals ("
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "animal_key VARCHAR(32) NOT NULL, "
+        "bought_at DATETIME NOT NULL, "
+        "last_collect_at DATETIME NOT NULL, "
+        "PRIMARY KEY (chat_id, user_id, animal_key)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def list_farm_animals(chat_id: int, user_id: int) -> list[dict]:
+    return await _fetchall(
+        "SELECT animal_key, bought_at, last_collect_at FROM farm_animals "
+        "WHERE chat_id = %s AND user_id = %s ORDER BY bought_at",
+        (chat_id, user_id),
+    )
+
+
+async def add_farm_animal(chat_id: int, user_id: int, animal_key: str,
+                          now: datetime) -> bool:
+    """False — такое животное уже есть. Проверка и вставка одним запросом:
+    двумя командами подряд можно было бы купить корову дважды."""
+    await _execute(
+        "INSERT IGNORE INTO farm_animals "
+        "(chat_id, user_id, animal_key, bought_at, last_collect_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (chat_id, user_id, animal_key, now, now),
+    )
+    row = await _fetchone(
+        "SELECT bought_at FROM farm_animals "
+        "WHERE chat_id = %s AND user_id = %s AND animal_key = %s",
+        (chat_id, user_id, animal_key),
+    )
+    return bool(row and row["bought_at"] == now)
+
+
+async def remove_farm_animal(chat_id: int, user_id: int, animal_key: str) -> bool:
+    """False — животного и не было (значит и денег за него возвращать не за что)."""
+    row = await _fetchone(
+        "SELECT animal_key FROM farm_animals "
+        "WHERE chat_id = %s AND user_id = %s AND animal_key = %s",
+        (chat_id, user_id, animal_key),
+    )
+    if not row:
+        return False
+    await _execute(
+        "DELETE FROM farm_animals WHERE chat_id = %s AND user_id = %s AND animal_key = %s",
+        (chat_id, user_id, animal_key),
+    )
+    return True
+
+
+async def touch_farm_animals(chat_id: int, user_id: int, keys: list[str],
+                             now: datetime) -> None:
+    """Отмечает, что продукт забрали. Пишется ПОСЛЕ выдачи предметов: упади
+    запись — человек получит вещи ещё раз, и это лучше, чем потерять их."""
+    if not keys:
+        return
+    placeholders = ", ".join(["%s"] * len(keys))
+    await _execute(
+        f"UPDATE farm_animals SET last_collect_at = %s "
+        f"WHERE chat_id = %s AND user_id = %s AND animal_key IN ({placeholders})",
+        (now, chat_id, user_id, *keys),
+    )
+
+
 async def ensure_farm_plots_table() -> None:
     """Занятые грядки. Пустая грядка — ОТСУТСТВИЕ строки, а не строка с NULL:
     иначе при каждой правке числа грядок (оно растёт со звёздностью) пришлось
@@ -8390,6 +8537,101 @@ async def set_chat_setting_value(chat_id: int, setting, value) -> None:
             await delete_data(key)
         return
     await set_data(key, str(value))
+
+
+# ----------------------------------------------------------------------------
+# Настройки заработка: множители «кранов» и суточный лимит подработок.
+#
+# Читаем и пишем ЧЕРЕЗ РЕЕСТР chat_settings, а не своими запросами к key-value.
+# Ключ хранения, умолчание и границы описаны там один раз, и второй копии
+# этих трёх чисел в боте быть не должно: разъедься они — панель показывала бы
+# одно, а бот считал по другому, и понять это можно было бы только по деньгам.
+# ----------------------------------------------------------------------------
+async def get_income_percent(chat_id: int, source: str) -> float:
+    """Множитель источника в процентах. 100 — как задумано в коде."""
+    import chat_settings as cs
+
+    setting = cs.BY_KEY.get(cs.income_setting_key(source))
+    if setting is None:
+        return 100.0
+    values = await get_chat_setting_values(chat_id, [setting])
+    return float(values.get(setting.key, setting.default))
+
+
+async def set_income_percent(chat_id: int, source: str, percent: float) -> None:
+    import chat_settings as cs
+
+    setting = cs.BY_KEY[cs.income_setting_key(source)]
+    await set_chat_setting_value(chat_id, setting, percent)
+
+
+SIDE_JOB_LIMIT_KEY = "economy.side_job_daily_limit"
+
+
+async def get_side_job_daily_limit(chat_id: int) -> int:
+    """Сколько подработок в сутки. 0 — без лимита."""
+    import chat_settings as cs
+
+    setting = cs.BY_KEY[SIDE_JOB_LIMIT_KEY]
+    values = await get_chat_setting_values(chat_id, [setting])
+    return int(values.get(setting.key, setting.default))
+
+
+async def set_side_job_daily_limit(chat_id: int, value: int) -> None:
+    import chat_settings as cs
+
+    await set_chat_setting_value(chat_id, cs.BY_KEY[SIDE_JOB_LIMIT_KEY], value)
+
+
+# ----------------------------------------------------------------------------
+# Срез экономики чата — под команду «экономика».
+#
+# Всё уже копилось: earning_activity пишет total_earned с самого появления, и
+# до этой команды не читал его НИКТО. Новых таблиц не заводим, историю по дням
+# не выдумываем: показываем накопительный итог и подписываем его честно.
+# ----------------------------------------------------------------------------
+ECONOMY_TOP_SCAN = 500   # столько верхних кошельков хватает, чтобы найти половину денег
+
+
+async def economy_overview(chat_id: int) -> dict:
+    row = await _fetchone(
+        "SELECT COALESCE(SUM(coins), 0) AS net, "
+        "       COALESCE(SUM(GREATEST(coins, 0)), 0) AS positive, "
+        "       COALESCE(-SUM(LEAST(coins, 0)), 0) AS debt, "
+        "       SUM(coins > 0) AS holders "
+        "FROM economy_wallets WHERE chat_id = %s",
+        (chat_id,),
+    ) or {}
+    wallets = await _fetchall(
+        "SELECT coins FROM economy_wallets WHERE chat_id = %s AND coins > 0 "
+        "ORDER BY coins DESC LIMIT %s",
+        (chat_id, ECONOMY_TOP_SCAN),
+    )
+    sources = await _fetchall(
+        "SELECT activity_key, COALESCE(SUM(total_earned), 0) AS earned, "
+        "       COALESCE(SUM(times), 0) AS times "
+        "FROM earning_activity WHERE chat_id = %s GROUP BY activity_key",
+        (chat_id,),
+    )
+    # Работа живёт в своей таблице и в earning_activity не попадает — забыть
+    # её значило бы потерять один из самых крупных источников.
+    prof = await _fetchone(
+        "SELECT COALESCE(SUM(total_earned), 0) AS earned, "
+        "       COALESCE(SUM(total_shifts), 0) AS times "
+        "FROM profession_stats WHERE chat_id = %s",
+        (chat_id,),
+    ) or {}
+    return {
+        "net": int(row.get("net") or 0),
+        "positive": int(row.get("positive") or 0),
+        "debt": int(row.get("debt") or 0),
+        "holders": int(row.get("holders") or 0),
+        "wallets": [int(w["coins"]) for w in wallets],
+        "sources": {r["activity_key"]: (int(r["earned"] or 0), int(r["times"] or 0))
+                    for r in sources},
+        "profession": (int(prof.get("earned") or 0), int(prof.get("times") or 0)),
+        "treasury": await get_chat_coins(chat_id),
+    }
 
 
 async def ensure_seasons_table() -> None:
@@ -10513,6 +10755,25 @@ DEFAULT_SHOP_ITEMS: list[tuple[str, str, int, str, str]] = [
     ("rocket", "Ракета", 6500, "Настоящая космическая ракета", "🚀"),
     ("dragon", "Дракон", 9000, "Легендарный дракон", "🐉"),
     ("phoenix", "Феникс", 12000, "Мифическая птица", "🔥"),
+    # Верх лестницы: между фениксом (12 000) и ценами бизнесов зияла дыра, и
+    # копить было не на что — витрина кончалась раньше, чем кошелёк.
+    ("kometa", "Комета", 16000, "Поймана за хвост", "☄️"),
+    ("mayak", "Маяк", 20000, "Светит только вам", "🗼"),
+    ("yahta", "Яхта", 28000, "Своя, а не в аренду", "🛥️"),
+    ("ostrov", "Остров", 40000, "С пальмой и без соседей", "🏝️"),
+    ("zamok", "Замок", 60000, "С башнями и сквозняками", "🏰"),
+    ("planeta", "Планета", 90000, "Небольшая, зато собственная", "🪐"),
+    # Середина: между звездой (200) и короной (500) было пусто.
+    ("chay", "Чай", 60, "Крепкий, с лимоном", "🍵"),
+    ("blin", "Блин", 90, "Первый — комом, этот нет", "🥞"),
+    ("sushi", "Суши", 320, "Свежие, с имбирём", "🍣"),
+    ("gitara", "Гитара", 380, "Три аккорда и вечер занят", "🎸"),
+    ("bilet", "Билет в кино", 420, "Ряд десятый, место у прохода", "🎫"),
+    ("kaktus", "Кактус", 260, "Не требует внимания", "🌵"),
+    ("zont", "Зонт", 340, "На случай той самой погоды", "☂️"),
+    ("nautbuk", "Ноутбук", 5500, "Тянет всё, кроме сборки", "💻"),
+    ("teleskop", "Телескоп", 7000, "В него видно соседний чат", "🔭"),
+    ("mototsikl", "Мотоцикл", 8000, "Шумный и прекрасный", "🏍️"),
 
     # --- ХЛАМ (ключи собраны в JUNK_ITEM_KEYS ниже) --------------------------
     # Дешёвый и намеренно бесполезный: ничего не делает, никуда не влияет.
@@ -10529,6 +10790,11 @@ DEFAULT_SHOP_ITEMS: list[tuple[str, str, int, str, str]] = [
     ("kirpich", "Половина кирпича", 9, "Вторая половина где-то там", "🧱"),
     ("banan_kozhura", "Кожура банана", 7, "Классика жанра", "🍌"),
     ("pyl", "Комок пыли", 2, "Собран лично", "🌫"),
+    ("kryshka", "Крышка от ручки", 3, "Ручка потерялась раньше", "🖊"),
+    ("bilet_star", "Прошлогодний билет", 5, "Поездка была так себе", "🎟"),
+    ("provod", "Провод неизвестно от чего", 8, "Выбросить страшно", "🔌"),
+    ("monetka", "Иностранная монетка", 11, "Нигде не принимают", "🪙"),
+    ("perchatka", "Одна перчатка", 4, "Левая. Или правая", "🧤"),
     ("zhvachka", "Жёваная жвачка", 8, "Не спрашивайте, чья", "🫙"),
     ("vilka", "Вилка без зубца", 11, "Три зубца — тоже вилка", "🍴"),
     ("kartoshka", "Картофелина с лицом", 15, "Она на вас смотрит", "🥔"),
@@ -10559,6 +10825,7 @@ JUNK_ITEM_KEYS: tuple[str, ...] = (
     "nosok", "skrepka", "kamen", "probka", "fantik", "gvozd", "puzyr",
     "kirpich", "banan_kozhura", "pyl", "zhvachka", "vilka", "kartoshka",
     "nitka", "chek",
+    "kryshka", "bilet_star", "provod", "monetka", "perchatka",
 )
 
 
