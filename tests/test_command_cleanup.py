@@ -712,7 +712,7 @@ def _прогнать_через_очистку(monkeypatch, text: str) -> list[
     очередь: list[tuple] = []
     ЧАТ_ЖАЛОБ = -1009999999999
 
-    async def add_cleanup_entry(chat_id, message_id, delete_at):
+    async def add_cleanup_entry(chat_id, message_id, delete_at, root_message_id=None):
         очередь.append((chat_id, message_id))
 
     async def handler(event, data):

@@ -2781,17 +2781,49 @@ async def ensure_cmd_cleanup_table() -> None:
         "chat_id BIGINT NOT NULL, "
         "message_id BIGINT NOT NULL, "
         "delete_at DATETIME NOT NULL, "
+        "root_message_id BIGINT NULL, "
         "INDEX idx_cmd_cleanup_delete_at (delete_at), "
+        "INDEX idx_cmd_cleanup_root (chat_id, root_message_id), "
         "UNIQUE KEY uniq_cmd_cleanup_msg (chat_id, message_id)"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
+    # Кто с кем в одной группе: у команды здесь её собственный id, у каждого
+    # ответа бота — id команды. Нужно для «античк» (снять с удаления сообщение
+    # вместе с его парой). У строк, попавших в очередь до появления колонки,
+    # остаётся NULL — по ним «античк» снимет только само сообщение.
+    await _add_column_if_missing("cmd_cleanup_queue", "root_message_id", "BIGINT NULL")
 
 
-async def add_cleanup_entry(chat_id: int, message_id: int, delete_at) -> None:
+async def add_cleanup_entry(chat_id: int, message_id: int, delete_at, root_message_id: Optional[int] = None) -> None:
     await _execute(
-        "INSERT IGNORE INTO cmd_cleanup_queue (chat_id, message_id, delete_at) VALUES (%s, %s, %s)",
-        (chat_id, message_id, delete_at),
+        "INSERT IGNORE INTO cmd_cleanup_queue (chat_id, message_id, delete_at, root_message_id) "
+        "VALUES (%s, %s, %s, %s)",
+        (chat_id, message_id, delete_at, root_message_id),
     )
+
+
+async def cancel_cleanup_group(chat_id: int, message_id: int) -> int:
+    """Снимает с удаления сообщение вместе со всей его группой («античк»).
+
+    Группа — команда и все ответы бота на неё; корень известен обеим сторонам,
+    поэтому неважно, на что именно ответили: и с команды, и с ответа бота
+    выходим на один и тот же root_message_id. Возвращает число снятых строк;
+    0 — этого сообщения в очереди не было (не команда из «чк», или его уже
+    удалили по сроку), и тогда помечать нечего.
+    """
+    row = await _fetchone(
+        "SELECT message_id, root_message_id FROM cmd_cleanup_queue "
+        "WHERE chat_id = %s AND message_id = %s",
+        (chat_id, message_id),
+    )
+    if row is None:
+        return 0
+    root = row["root_message_id"] or row["message_id"]
+    return await _execute(
+        "DELETE FROM cmd_cleanup_queue WHERE chat_id = %s "
+        "AND (message_id = %s OR root_message_id = %s)",
+        (chat_id, root, root),
+    ) or 0
 
 
 async def list_due_cleanup_entries(now, limit: int = 200) -> list[dict]:

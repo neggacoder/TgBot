@@ -107,7 +107,11 @@ def test_все_новые_вещи_попадают_в_засев():
     keys = {row[0] for row in rows}
     # Медалей за «наградить» тут нет: их перестали выдавать, и заводить
     # витрину предметов, которые никому не достанутся, незачем.
-    assert keys == set(SE.BY_KEY) | set(SE.ACHIEVEMENT_BY_KEY)
+    #
+    # Материалы мастерской (MATERIAL_KEYS) уезжают этим же засевом и только им:
+    # db.DEFAULT_SHOP_ITEMS попадает лишь в пустой магазин, то есть в живой чат
+    # новая строка оттуда не доедет никогда.
+    assert keys == set(SE.BY_KEY) | set(SE.MATERIAL_KEYS) | set(SE.ACHIEVEMENT_BY_KEY)
     assert not (keys & set(SE.REWARD_BY_KEY))
     for _key, name, price, description, emoji in rows:
         assert name and description and emoji

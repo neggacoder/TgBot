@@ -137,6 +137,62 @@ RECIPES: tuple[Recipe, ...] = (
            (Req(REQ_PET_EVOLVED),
             Req(REQ_ACHIEVEMENT, "collection_tycoon"),
             Req(REQ_COINS, amount=250_000))),
+
+    # --- Ветка мастерской ----------------------------------------------------
+    # Материалы (shop_effects.MATERIAL_ITEMS) покупаются за копейки, поэтому
+    # цену держат монеты и доказательства: ачивка того занятия, которое предмет
+    # ускоряет, звёздность или уровень профессии. Иначе снаряжение,
+    # укорачивающее кулдауны всем занятиям, покупалось бы за один вечер.
+    #
+    # Ключи рецептов — по-русски, как у ветки фермы: «крафт ледобур» пишут
+    # чаще, чем «крафт ledobur».
+    Recipe("ледобур", "ledobur",
+           (Req(REQ_ITEM, "doska", 2), Req(REQ_ITEM, "provoloka", 3),
+            Req(REQ_ITEM, "shesterenka", 1),
+            Req(REQ_COINS, amount=18_000))),
+    Recipe("эхолот", "echolot",
+           (Req(REQ_ITEM, "steklo", 2), Req(REQ_ITEM, "lampochka", 2),
+            Req(REQ_ITEM, "shesterenka", 2),
+            Req(REQ_COINS, amount=35_000),
+            Req(REQ_ACHIEVEMENT, "fish_100"))),
+    Recipe("металлоискатель", "metalloiskatel",
+           (Req(REQ_ITEM, "magnit", 2), Req(REQ_ITEM, "provoloka", 4),
+            Req(REQ_ITEM, "lampochka", 1),
+            Req(REQ_COINS, amount=22_000))),
+    Recipe("кирка", "almaznaya_kirka",
+           (Req(REQ_ITEM, "podshipnik", 2), Req(REQ_ITEM, "doska", 3),
+            Req(REQ_COINS, amount=45_000),
+            Req(REQ_ACHIEVEMENT, "treasure_10"))),
+    Recipe("кофемашина", "kofemashina",
+           (Req(REQ_ITEM, "shesterenka", 3), Req(REQ_ITEM, "pruzhina", 2),
+            Req(REQ_ITEM, "steklo", 1),
+            Req(REQ_COINS, amount=28_000))),
+    # Комбинезон — единственное снаряжение, которое просит уровень профессии:
+    # спецовку выдают тому, кто уже работает, а не тому, кто купил досок.
+    Recipe("комбинезон", "kombinezon",
+           (Req(REQ_ITEM, "provoloka", 2), Req(REQ_ITEM, "sherst", 4),
+            Req(REQ_COINS, amount=30_000),
+            Req(REQ_PROF_LEVEL, amount=5))),
+    Recipe("карта", "klubnaya_karta",
+           (Req(REQ_ITEM, "steklo", 1), Req(REQ_ITEM, "magnit", 1),
+            Req(REQ_COINS, amount=40_000))),
+    # Торговый знак — вторая скидка, и она складывается с картой. Просит
+    # звёздность: скидку в магазине даёт не станок, а репутация в чате.
+    Recipe("знак", "torgovyy_znak",
+           (Req(REQ_ITEM, "podshipnik", 1), Req(REQ_ITEM, "pruzhina", 2),
+            Req(REQ_ITEM, "lampochka", 2),
+            Req(REQ_COINS, amount=90_000),
+            Req(REQ_STARS, amount=3))),
+    # Вершина ветки: материалов больше, чем в любом другом рецепте, и десятый
+    # уровень профессии — то есть собрать его раньше, чем доработаешь до верха,
+    # нельзя. Скрафченное снаряжение в требования не берём: предметы из
+    # REWARD_KEYS ни один рецепт не расходует, и заводить для вездехода
+    # отдельный путь «потратить награду» — новая механика, а не рецепт.
+    Recipe("вездеход", "vezdehod",
+           (Req(REQ_ITEM, "podshipnik", 4), Req(REQ_ITEM, "shesterenka", 6),
+            Req(REQ_ITEM, "doska", 5), Req(REQ_ITEM, "pruzhina", 3),
+            Req(REQ_COINS, amount=150_000),
+            Req(REQ_PROF_LEVEL, amount=10))),
 )
 
 BY_KEY: dict[str, Recipe] = {r.key: r for r in RECIPES}

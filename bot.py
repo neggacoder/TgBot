@@ -438,10 +438,14 @@ class CommandCleanupMiddleware(BaseMiddleware):
             if minutes > 0:
                 delete_at = datetime.utcnow() + timedelta(minutes=minutes)
                 try:
-                    await db.add_cleanup_entry(event.chat.id, event.message_id, delete_at)
+                    # Команда — корень своей группы: её id уезжает и в саму
+                    # строку, и в контекст, откуда его возьмут ответы бота.
+                    await db.add_cleanup_entry(
+                        event.chat.id, event.message_id, delete_at, event.message_id
+                    )
                 except Exception:
                     logger.exception("Не удалось запланировать очистку команды")
-                cleanup_token = _cleanup_context.set((event.chat.id, delete_at))
+                cleanup_token = _cleanup_context.set((event.chat.id, delete_at, event.message_id))
 
         try:
             return await handler(event, data)
@@ -515,6 +519,340 @@ router.message.outer_middleware(CommandPermissionMiddleware())
 # «Отношения 2.0» живут в своём роутере, включённом раньше основного, — без
 # отдельной регистрации их команды заслон бы не увидел.
 relationships_v2.router.message.outer_middleware(CommandPermissionMiddleware())
+
+
+# ----------------------------------------------------------------------------
+# РУБИЛЬНИК ЗАРАБОТКА (админ-панель → «Заработок»)
+#
+# Пять источников дохода, каждый выключается отдельно. Выключенный не отвечает
+# СОВСЕМ: ни ответа, ни реакции — команда выглядит так, будто её у бота нет.
+# Отсюда и middleware: любой отказ, который успел бы отправить обработчик, —
+# уже нарушение требования.
+#
+# Почему формы команд перечислены здесь явно, а не взяты из COMMAND_REGISTRY:
+# реестр знает не все написания («!бизнес» — синоним фермы, которого нет в
+# его фразе), а дыра в рубильнике означает «админ выключил, а команда живёт».
+# Поэтому источником правды остаются те же константы, по которым срабатывают
+# сами обработчики (FARM_TRIGGERS, CASINO_DICE_RE и прочие) — они определены
+# ниже по файлу, и это нормально: matcher вызывается уже во время работы.
+#
+# Управление источником при этом НЕ выключается: «биржа цена», «биржа
+# настройки» и «биржа вкл» — админские команды, и потерять их вместе с
+# заработком значило бы запереть админа снаружи.
+# ----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class EarningSource:
+    key: str                      # ключ в bot_data и в кэше earnings_off
+    label: str                    # как называется в панели
+    hint: str                     # что именно перестанет работать — для админа
+    command_keys: frozenset[str]  # ключи COMMAND_REGISTRY, которые гасим
+    # Формы, которых реестр не знает (синоним «!бизнес», «покер» без «!» и
+    # т.п.), — их приходится ловить теми же выражениями, что и обработчики.
+    extra: Optional[Callable[[str], bool]] = None
+    # Зонтик: выключение этого источника гасит и перечисленные. Нужен там, где
+    # у людей есть общее название для нескольких команд: «выключил казино» —
+    # значит замолчать должны и кости, и покер, и кошелёк казино, а не только
+    # то, что админ успел нажать по одной кнопке.
+    covers: frozenset[str] = frozenset()
+
+
+def _is_farm_command(text: str) -> bool:
+    # «!бизнес» — синоним фермы, которого нет во фразе реестра.
+    return ru_text.yo(text.strip().casefold()) in FARM_TRIGGERS
+
+
+def _is_stock_command(text: str) -> bool:
+    # Своё выражение, а не ключ реестра: у «биржи» один ключ и на сделки, и на
+    # просмотр, а гасить надо только их, оставив «биржа цена/настройки/вкл».
+    return bool(STOCK_EARNING_RE.match(ru_text.yo(text.strip().casefold())))
+
+
+def _is_robbery_cmd(text: str) -> bool:
+    # Обёртка, а не прямая ссылка: сам предикат обработчика объявлен ниже по
+    # файлу, а каталог источников собирается прямо здесь — имя должно
+    # разрешаться в момент вызова, а не в момент сборки кортежа.
+    return _is_robbery_command(text)
+
+
+def _is_business_collect(text: str) -> bool:
+    # «бизнес забрать» — синоним «собрать», которого нет во фразе реестра, а
+    # именно он и забирает доход из копилки.
+    return bool(BUSINESS_COLLECT_RE.match(text.strip()))
+
+
+def _norm(text: str) -> str:
+    return ru_text.yo(" ".join(text.strip().casefold().split()))
+
+
+def _is_roulette_command(text: str) -> bool:
+    # Обработчик казино принимает «!рулетка»/«.рулетка», а во фразе реестра
+    # служебного знака нет — именно этой щелью рулетка и переживала выключение.
+    t = text.strip()
+    return bool(CASINO_ROULETTE_RE.match(t) or CASINO_ROULETTE_BARE_RE.match(t))
+
+
+def _is_russian_roulette(text: str) -> bool:
+    return _parse_roulette_count(text) is not None
+
+
+def _is_lootbox_command(text: str) -> bool:
+    return (_norm(text).split() or [""])[0] in ("!лутбокс", "лутбокс")
+
+
+_MARKET_USER_RE = ru_text.rx(
+    r"(?i)^!?рынок(?:\s+(?:купить|заявка|снять|цена|описание|мои)\b.*)?$"
+)
+
+
+def _is_market_command(text: str) -> bool:
+    # Модерация рынка («рынок заявки/принять/отклонить/режим/комиссия/потолок/
+    # лимит») сюда не попадает намеренно: выключенным рынком админ должен
+    # продолжать управлять.
+    t = _norm(text)
+    return bool(_MARKET_USER_RE.match(t)) or t in MARKET_OWN_TRIGGERS
+
+
+def _is_raid_command(text: str) -> bool:
+    t = _norm(text)
+    return t in RAID_TRIGGERS or bool(RAID_RE.match(t))
+
+
+def _is_side_job_command(text: str) -> bool:
+    return _norm(text) in SIDE_JOB_TRIGGERS
+
+
+def _is_hat_command(text: str) -> bool:
+    return _norm(text) in HAT_TRIGGERS
+
+
+def _is_fishing_command(text: str) -> bool:
+    t = _norm(text)
+    return t in FISHING_TRIGGERS or t in ("сетка", "!сетка", "садок")
+
+
+def _is_boss_command(text: str) -> bool:
+    return _norm(text) in BOSS_STATUS_TRIGGERS
+
+
+def _is_poker_command(text: str) -> bool:
+    return bool(CASINO_POKER_RE.match(text.strip()))
+
+
+def _is_race_command(text: str) -> bool:
+    return bool(RACE_CMD_RE.match(text.strip()))
+
+
+def _keys(*names: str) -> frozenset[str]:
+    return frozenset(names)
+
+
+# Все источники дохода бота. Гасим то, что приносит монеты, и то, без чего оно
+# бессмысленно (сетка — это продажа улова, каталог бизнесов — витрина
+# выключенного). Справочное (топы, стата) и админское (настройки биржи, рынка,
+# боссов) остаётся: выключенным источником админ должен продолжать управлять.
+EARNING_SOURCES: tuple[EarningSource, ...] = (
+    EarningSource("farm", "🌾 Ферма", "«ферма», «фарма», «фармить», «!бизнес»",
+                  _keys("farm_run"), _is_farm_command),
+    EarningSource("garden", "🌱 Огород",
+                  "«огород», «грядки», «ферма посадить/собрать/расширить/помочь»",
+                  _keys("farm_garden", "farm_crops", "farm_plant", "farm_harvest",
+                        "farm_help", "farm_expand")),
+    EarningSource("barn", "🐄 Хлев", "«хлев», «скот», «ферма купить/продать {животное}»",
+                  _keys("farm_barn")),
+    EarningSource("work", "👷 Работа", "«!работа», «!работать», «!работа вместе/заказ»",
+                  _keys("prof_run", "prof_together", "prof_order")),
+    EarningSource("side_job", "🧰 Подработка", "«подработка», «халтура», «шабашка»",
+                  _keys("side_job"), _is_side_job_command),
+    EarningSource("hat", "🎩 Шапка", "«шапка», «шапка по кругу», «скинемся»",
+                  _keys("hat_round"), _is_hat_command),
+    EarningSource("business", "🏢 Бизнес",
+                  "«бизнес», «бизнесы», «бизнес купить/собрать/улучшить/продать»",
+                  _keys("business_catalog", "business_mine", "business_buy",
+                        "business_collect", "business_upgrade", "business_sell",
+                        "business_transfer", "business_repair", "business_pin",
+                        "business_equip"),
+                  _is_business_collect),
+    EarningSource("raid", "💥 Налёт", "«налёт», «бизнес налёт»",
+                  _keys("business_raid"), _is_raid_command),
+    EarningSource("fishing", "🎣 Рыбалка", "«рыбалка», «рыбачить», «удочка», «сетка», «садок»",
+                  _keys("fishing_run", "fishing_net"), _is_fishing_command),
+    # «клад инфа» остаётся: это справка о накопленном, как «топ уловов» у
+    # рыбалки, — гасим копание, а не рассказ о нём.
+    EarningSource("treasure", "⛏ Клад", "«клад», «копать», «искать клад»",
+                  _keys("treasure_dig")),
+    # Цель у ограбления бывает без бинокля («!ограбить @кому»), а во фразе
+    # реестра такой формы нет — берём предикат самого обработчика.
+    EarningSource("robbery", "🥷 Ограбления", "«!ограбить», «!ограбить бинокль @кому»",
+                  _keys("robbery_run"), _is_robbery_cmd),
+    EarningSource("stock", "📈 Биржа",
+                  "«биржа», «биржа купить/продать/дивиденды» "
+                  "(настройки биржи остаются)",
+                  _keys("stock_market"), _is_stock_command),
+    EarningSource("market", "🛒 Рынок участников",
+                  "«рынок», «рынок купить/заявка/снять/мои» (модерация остаётся)",
+                  _keys("market"), _is_market_command),
+    EarningSource("boss", "👹 Боссы", "«босс», «боссы» (призыв админом остаётся)",
+                  _keys("boss_status"), _is_boss_command),
+    EarningSource("lootbox", "🎁 Лутбоксы", "«!лутбокс», «!лутбокс купить/открыть»",
+                  _keys("lootbox_info", "lootbox_buy", "lootbox_open", "lootbox_top"),
+                  _is_lootbox_command),
+    # Зонтик над всем казино. Отдельные игры ниже остаются — ими гасят
+    # точечно, — но «выключить казино» должно означать ровно это, включая
+    # кошелёк: пока «!казино баланс» отвечает, казино для человека работает.
+    EarningSource("casino", "🎰 Казино целиком",
+                  "все игры казино + «!казино баланс/пополнить/вывести»",
+                  _keys("casino_balance", "casino_topup", "casino_withdraw"),
+                  covers=frozenset({"dice", "coin", "roulette", "poker", "racing"})),
+    EarningSource("dice", "🎲 Кости", "«!кости {ставка} {число}»",
+                  _keys("casino_dice")),
+    EarningSource("coin", "🪙 Орёл/решка", "«!орёл {ставка}», «!решка {ставка}»",
+                  _keys("casino_coin")),
+    EarningSource("roulette", "🎰 Рулетка (казино)",
+                  "«рулетка {ставка} {цвет}», в том числе с «!» и «.»",
+                  _keys("casino_roulette"), _is_roulette_command),
+    EarningSource("poker", "🃏 Покер", "«!покер {ставка}»",
+                  _keys("casino_poker"), _is_poker_command),
+    EarningSource("racing", "🐎 Гонки", "«!гонки {ставка}»",
+                  _keys("race_play"), _is_race_command),
+)
+
+EARNING_SOURCE_BY_KEY: dict[str, EarningSource] = {s.key: s for s in EARNING_SOURCES}
+
+# Занятие из сводки «чем заняться» → источник заработка, который его гасит.
+# Ежедневного бонуса здесь нет: рубильником он не выключается.
+ACTIVITY_EARNING_SOURCE: dict[str, str] = {
+    "farm": "farm",
+    "profession": "work",
+    "side_job": "side_job",
+    "fishing": "fishing",
+    "treasure": "treasure",
+    "business": "business",
+    "robbery": "robbery",
+    "raid": "raid",
+    "hat": "hat",
+}
+
+# Ключи выключенных источников. Кэш в памяти, потому что заслон стоит на КАЖДОМ
+# сообщении: ходить за этим в базу — лишний запрос на каждую реплику в чате.
+# Наполняется в load_caches() и правится вместе с записью в базу (см.
+# set_earning_enabled).
+earnings_off: set[str] = set()
+
+_EARNINGS_DATA_PREFIX = "earn_off:"
+
+
+def earning_source_for(text: Optional[str]) -> Optional[EarningSource]:
+    """Какой источник заработка вызывает этот текст (None — не вызывает).
+
+    Опознаём тем же resolve_command_key, которым бот уже решает, чей это
+    уровень доступа и через сколько удалять сообщение: новой трактовки того,
+    «что считается командой», не вводим. Реестр знает не все написания —
+    остатки добираются своим выражением (см. EarningSource.extra).
+    """
+    if not text:
+        return None
+    try:
+        key = resolve_command_key(text)
+    except Exception:
+        # Рубильник — надстройка, а не условие работы бота: сломавшись, он не
+        # должен уносить с собой чужую команду.
+        log_suppressed("earning_source_for", None)
+        return None
+    for source in EARNING_SOURCES:
+        if key is not None and key in source.command_keys:
+            return source
+        if source.extra is not None and source.extra(text):
+            return source
+    return None
+
+
+def earning_enabled(key: str) -> bool:
+    return key not in earnings_off
+
+
+def earnings_switch_chat_id() -> Optional[int]:
+    """Чат, к которому относится рубильник, — игровой (задан «жалобы сюда»).
+
+    Тот же чат, в котором живут роли и автоочистка команд (см.
+    roles_context_chat_id): экономика бота — это экономика одного чата, и
+    гасить её во всех группах, куда бота позвали, админ не просил.
+    """
+    return settings.get("complaint_chat_id")
+
+
+def earning_effective_enabled(key: str) -> bool:
+    """Работает ли источник с учётом зонтика над ним (см. EarningSource.covers).
+
+    Отдельно от earning_enabled: та отвечает «что нажато», а эта — «что на
+    самом деле происходит». Кнопку переключают по первой, а метку рисуют по
+    второй, иначе экран врёт: казино выключено, а кости помечены «работает».
+    """
+    if key in earnings_off:
+        return False
+    return not any(s.key in earnings_off and key in s.covers for s in EARNING_SOURCES)
+
+
+def earning_off_in(chat_id: Optional[int], key: str) -> bool:
+    """Выключен ли источник ДЛЯ ЭТОГО чата."""
+    if earning_effective_enabled(key):
+        return False
+    target = earnings_switch_chat_id()
+    # Чат не настроен — гасим везде: иначе выключатель молча не делал бы
+    # ничего, а это худший вид настройки.
+    return target is None or chat_id == target
+
+
+async def set_earning_enabled(key: str, enabled: bool, actor_id: Optional[int] = None) -> None:
+    """Включает/выключает источник — и в базе, и в кэше.
+
+    Пишем «выключен» отдельной строкой, а не флагом у каждого источника:
+    включённое состояние — обычное, и хранить о нём нечего.
+    """
+    if enabled:
+        earnings_off.discard(key)
+        await db.delete_data(_EARNINGS_DATA_PREFIX + key)
+    else:
+        earnings_off.add(key)
+        await db.set_data(_EARNINGS_DATA_PREFIX + key, "1", actor_id)
+    await db.add_log("earning_switch", actor_id=actor_id,
+                     details=f"{key}:{'on' if enabled else 'off'}")
+
+
+async def load_earnings_off() -> None:
+    """Читает выключенные источники в кэш (вызывается из load_caches)."""
+    try:
+        rows = await db.list_data_by_prefix(_EARNINGS_DATA_PREFIX)
+    except Exception:
+        logger.exception("Не удалось прочитать рубильник заработка")
+        return
+    earnings_off.clear()
+    for row in rows or []:
+        key = row["data_key"][len(_EARNINGS_DATA_PREFIX):]
+        if key in EARNING_SOURCE_BY_KEY:
+            earnings_off.add(key)
+
+
+class EarningsSwitchMiddleware(BaseMiddleware):
+    """Молчаливый заслон выключенных источников заработка.
+
+    Стоит ПОСЛЕ заслона по уровням и по той же причине, что и он: сообщение
+    должно доехать до статистики и фильтра мата — выключенный источник не
+    отменяет того, что человек написал в чат.
+    """
+
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message) or not earnings_off:
+            return await handler(event, data)
+        source = earning_source_for(event.text or event.caption)
+        if source is not None and earning_off_in(event.chat.id, source.key):
+            # Ровно ничего: ни ответа, ни реакции. Выключенная команда должна
+            # выглядеть как несуществующая.
+            return None
+        return await handler(event, data)
+
+
+router.message.outer_middleware(EarningsSwitchMiddleware())
+relationships_v2.router.message.outer_middleware(EarningsSwitchMiddleware())
 
 
 # ----------------------------------------------------------------------------
@@ -959,6 +1297,9 @@ async def load_caches() -> None:
     command_cleanup_overrides.update(await db.list_command_cleanup())
     cleanup_extra_phrases[:] = await db.list_cleanup_extra_commands()
     rebuild_cleanup_extra_forms()
+    # Рубильник заработка: заслон читает этот кэш на каждом сообщении, поэтому
+    # состояние обязано подняться из базы здесь, а не спрашиваться на лету.
+    await load_earnings_off()
     reward_degree_level_overrides = await db.list_reward_degree_levels()
     pending_complaints_count = await db.count_pending_complaints()
     user_registry = {
@@ -1470,6 +1811,9 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "cleanup_list":    {"phrase": "чк — что убирает автоочистка команд", "category": "Настройка", "level": LEVEL_ADMIN},
     "cleanup_add":     {"phrase": "+чк {команда} — добавить команду в чистку", "category": "Настройка", "level": LEVEL_ADMIN},
     "cleanup_del":     {"phrase": "-чк {команда} — убрать команду из чистки", "category": "Настройка", "level": LEVEL_ADMIN},
+    # «античк» — про одно сообщение, а не про команду, поэтому форма полная:
+    # аргументов у неё нет, цель показывается ответом.
+    "cleanup_keep":    {"phrase": "античк — оставить это сообщение в чате (ответом)", "category": "Настройка", "level": LEVEL_ADMIN},
     # Все три формы — полные, без плейсхолдеров: панель не принимает
     # аргументов, а открытая форма сделала бы командой любую фразу,
     # начинающуюся словами «что делать».
@@ -2022,8 +2366,10 @@ _cleanup_context: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextV
 _cleanup_pending_tasks: set = set()
 
 
-def _queue_cleanup(chat_id: int, message_id: int, delete_at: datetime) -> None:
-    task = asyncio.create_task(db.add_cleanup_entry(chat_id, message_id, delete_at))
+def _queue_cleanup(
+    chat_id: int, message_id: int, delete_at: datetime, root_message_id: Optional[int] = None
+) -> None:
+    task = asyncio.create_task(db.add_cleanup_entry(chat_id, message_id, delete_at, root_message_id))
     _cleanup_pending_tasks.add(task)
     task.add_done_callback(_cleanup_pending_tasks.discard)
 
@@ -2047,7 +2393,7 @@ async def cleanup_tracking_middleware(make_request, bot_obj, method):
     response = await make_request(bot_obj, method)
     ctx = _cleanup_context.get()
     if ctx:
-        chat_id, delete_at = ctx
+        chat_id, delete_at, root_message_id = ctx
         if delete_at <= datetime.utcnow():
             return response
         result = response
@@ -2058,7 +2404,9 @@ async def cleanup_tracking_middleware(make_request, bot_obj, method):
             message_id = result[0].message_id
         method_chat_id = getattr(method, "chat_id", None)
         if message_id is not None and method_chat_id is not None and int(method_chat_id) == int(chat_id):
-            _queue_cleanup(chat_id, message_id, delete_at)
+            # root_message_id — id команды, из-за которой бот это отправил:
+            # «античк» по любому сообщению группы должен находить остальные.
+            _queue_cleanup(chat_id, message_id, delete_at, root_message_id)
     return response
 
 PERMISSION_LEVEL_WORDS = {
@@ -2227,6 +2575,8 @@ class AdminStates(StatesGroup):
     waiting_rest_limit = State()
     # Настройка розыгрыша «&варн» — один переключатель, см. fake_warns.py
     menu_fake_warns = State()
+    # Рубильник заработка: пять переключателей на одном экране (см. EARNING_SOURCES)
+    menu_earnings = State()
     menu_testmode = State()
     menu_admins = State()
     menu_admin_level_pick = State()
@@ -2361,6 +2711,16 @@ LBL_TEXT_GROUP_JOIN = "Приветствие в группе (вход)"
 LBL_REST = "Настройки реста"
 LBL_REST_TEMPLATE = "Памятка о ресте"
 LBL_FAKE_WARNS = "Шуточные варны"
+LBL_EARNINGS = "Заработок"
+# Русская рулетка — не источник дохода, а игра на вылет из чата, и выключатель
+# у неё свой («+рулетка»/«-рулетка» в чате, настройка чата). В панели она стоит
+# рядом с казиношной рулеткой намеренно: их постоянно путают, а спрятанный
+# выключатель второй «рулетки» выглядит как «выключил, а она работает».
+LBL_RUSSIAN_ROULETTE = "🔫 Русская рулетка"
+# Метки состояния на кнопках источников. Выключенный помечаем явно и одним и
+# тем же знаком — по нему же тесты и админ понимают, что именно погашено.
+EARNINGS_ON_MARK = "✅"
+EARNINGS_OFF_MARK = "🚫"
 
 # Настраиваемые лимиты реста: ключ настройки → как он выглядит в меню и что
 # спросить у админа. Кнопка показывает текущее значение, поэтому отдельный
@@ -2466,6 +2826,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         f"🐾 {LBL_PETS}",
         f"🌴 {LBL_REST}",
         f"🃏 {LBL_FAKE_WARNS}",
+        f"💰 {LBL_EARNINGS}{f' ({len(earnings_off)} выкл)' if earnings_off else ''}",
         f"🎭 {LBL_SPECIAL} ({len(custom_responses)})",
         f"💌 {LBL_RP} ({len(RP_ACTIONS)})",
         f"🙋 {LBL_SELF} ({len(SELF_ACTIONS)})",
@@ -2480,6 +2841,28 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 def back_kb() -> ReplyKeyboardMarkup:
     return _reply_kb([[BTN_BACK]])
+
+
+def earnings_menu_kb(russian_roulette_on: Optional[bool] = None) -> ReplyKeyboardMarkup:
+    """Меню «Заработок»: по кнопке на источник, состояние — прямо на кнопке.
+
+    Одно нажатие переключает: отдельного экрана «вкл/выкл» нет, потому что
+    выбора там ровно два, и он уже виден по метке.
+
+    russian_roulette_on — состояние ЧУЖОГО выключателя (см. LBL_RUSSIAN_ROULETTE):
+    русскаяру живёт своей настройкой чата, панель её только показывает. None —
+    игровой чат не задан, показывать нечего.
+    """
+    items = [
+        f"{EARNINGS_ON_MARK if earning_effective_enabled(s.key) else EARNINGS_OFF_MARK} {s.label}"
+        for s in EARNING_SOURCES
+    ]
+    if russian_roulette_on is not None:
+        items.append(f"{EARNINGS_ON_MARK if russian_roulette_on else EARNINGS_OFF_MARK} "
+                     f"{LBL_RUSSIAN_ROULETTE}")
+    rows = _grid(items)
+    rows.append([BTN_BACK])
+    return _reply_kb(rows)
 
 
 def texts_menu_kb() -> ReplyKeyboardMarkup:
@@ -3972,6 +4355,135 @@ async def _show_fake_warns_menu(message: Message, state: FSMContext) -> None:
         "Снять один обманный варн: <code>&-варн</code> ответом.",
         reply_markup=fake_warns_kb(is_on),
     )
+
+
+# ---------- Рубильник заработка ----------
+# Пять источников дохода, каждый гасится отдельно. Выключенный молчит совсем —
+# см. EarningsSwitchMiddleware выше.
+
+async def _show_earnings_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(AdminStates.menu_earnings)
+    chat_id = earnings_switch_chat_id()
+    где = (f"Действует в игровом чате <code>{chat_id}</code> "
+           "(тот, что задан командой «жалобы сюда»)."
+           if chat_id else
+           "⚠️ Игровой чат не задан («жалобы сюда» в нужной группе) — "
+           "пока рубильник действует во всех чатах бота.")
+    lines = [
+        "💰 <b>Заработок</b>",
+        "",
+        "Нажатие переключает источник. Выключенный не отвечает <b>совсем</b>: "
+        "человек пишет команду, и бот молчит — как будто такой команды нет.",
+        где,
+        "",
+    ]
+    for source in EARNING_SOURCES:
+        работает = earning_effective_enabled(source.key)
+        mark = EARNINGS_ON_MARK if работает else EARNINGS_OFF_MARK
+        # «погашен зонтиком» — не то же самое, что «выключен сам»: кнопка
+        # источника при этом не нажата, и вернуть его можно только через зонтик.
+        state_text = ("работает" if работает
+                      else "выключен" if source.key in earnings_off
+                      else "выключен вместе с зонтиком выше")
+        lines.append(f"{mark} <b>{html.escape(source.label)}</b> — {state_text}")
+        lines.append(f"   {html.escape(source.hint)}")
+
+    # Русская рулетка — чужая настройка чата, показываем её тут же: игру с
+    # похожим названием ищут именно здесь (см. LBL_RUSSIAN_ROULETTE).
+    рулетка_он: Optional[bool] = None
+    if chat_id:
+        try:
+            рулетка_он = await is_roulette_enabled(chat_id)
+        except Exception:
+            logger.exception("Не удалось прочитать настройку русскаяру")
+        if рулетка_он is not None:
+            mark = EARNINGS_ON_MARK if рулетка_он else EARNINGS_OFF_MARK
+            lines.append(f"{mark} <b>{html.escape(LBL_RUSSIAN_ROULETTE)}</b> — "
+                         f"{'работает' if рулетка_он else 'выключена'}")
+            lines.append("   «русскаяру» — прокрут барабана, 1 из 6 на кик из чата. "
+                         "Та же настройка, что «+рулетка»/«-рулетка» в чате")
+
+    lines += [
+        "",
+        "Настройки самих источников (например «биржа цена») остаются "
+        "доступными — выключается только заработок.",
+    ]
+    await message.answer("\n".join(lines), reply_markup=earnings_menu_kb(рулетка_он))
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_main),
+                F.text.func(lambda t: LBL_EARNINGS in (t or "")))
+async def cfg_earnings(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    await _show_earnings_menu(message, state)
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_earnings),
+                F.text == BTN_BACK)
+async def cfg_earnings_back(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    await _show_main_menu(message, state)
+
+
+def _earning_source_by_button(text: Optional[str]) -> Optional[EarningSource]:
+    """Кнопка приходит с меткой состояния впереди, поэтому ищем по названию."""
+    if not text:
+        return None
+    for source in EARNING_SOURCES:
+        if source.label in text:
+            return source
+    return None
+
+
+@router.message(
+    F.chat.type == "private",
+    StateFilter(AdminStates.menu_earnings),
+    F.text.func(lambda t: bool(t) and LBL_RUSSIAN_ROULETTE in t),
+)
+async def cfg_earnings_russian_roulette(message: Message, state: FSMContext):
+    """Кнопка чужой настройки: правит ровно то же, что «+рулетка»/«-рулетка»."""
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    chat_id = earnings_switch_chat_id()
+    if not chat_id:
+        await message.answer(
+            "Игровой чат не задан — русскаяру настраивается в самом чате: "
+            "<code>-рулетка</code> / <code>+рулетка</code>."
+        )
+        return
+    включить = not await is_roulette_enabled(chat_id)
+    await set_roulette_enabled(chat_id, включить, actor_id=message.from_user.id)
+    await message.answer(
+        f"🔫 Русскаяру снова доступна в чате <code>{chat_id}</code>."
+        if включить else
+        f"🚫 Русскаяру выключена в чате <code>{chat_id}</code> — «русскаяру» молчит."
+    )
+    await _show_earnings_menu(message, state)
+
+
+@router.message(
+    F.chat.type == "private",
+    StateFilter(AdminStates.menu_earnings),
+    F.text.func(lambda t: _earning_source_by_button(t) is not None),
+)
+async def cfg_earnings_toggle(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    source = _earning_source_by_button(message.text)
+    включить = not earning_enabled(source.key)
+    await set_earning_enabled(source.key, включить, actor_id=message.from_user.id)
+    await message.answer(
+        f"✅ {source.label} снова работает."
+        if включить else
+        f"🚫 {source.label} выключен — теперь эти команды не отвечают совсем."
+    )
+    await _show_earnings_menu(message, state)
 
 
 @router.message(F.chat.type == "private", StateFilter(AdminStates.menu_main), F.text.func(lambda t: LBL_FAKE_WARNS in (t or "")))
@@ -6587,6 +7099,11 @@ def _cleanup_status_text() -> str:
     body.append("  Добавить: +чк команда · убрать: -чк команда")
     body.append("  Или ответом на сообщение с командой — просто +чк / -чк:")
     body.append("  бот сам отбросит аргументы («.рулетка 400 красное» → «.рулетка»).")
+    body.append("")
+    body.append("🕊 ОСТАВИТЬ ОДНО СООБЩЕНИЕ:")
+    body.append("  античк ответом — это сообщение и его пара (команда ↔ ответ")
+    body.append("  бота) не удалятся; помечу реакцией 🕊.")
+    body.append("  Список выше не меняется: следующая такая же команда уберётся.")
 
     if command_cleanup_overrides:
         body.append("")
@@ -6706,6 +7223,55 @@ async def cmd_cleanup_del(message: Message):
     хвост = ("" if cleanup_extra_phrases
              else "\nСписок опустел — чистка теперь не трогает ничего.")
     await message.reply(f"✅ «{html.escape(phrase)}» больше не убирается.{хвост}")
+
+
+# Пометка «это сообщение останется в чате». Реакцией, а не текстом: текст сам
+# стал бы очередным сообщением в чате, который чистка и разгружает.
+CLEANUP_KEEP_REACTION = "🕊"
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) == "античк"),
+)
+async def cmd_cleanup_keep(message: Message):
+    """«античк» ответом — снять с удаления одно сообщение вместе с его парой.
+
+    Отличие от «-чк»: список чистки не меняется вообще. Команда остаётся в
+    чистке, и следующее такое же сообщение снова уберётся — исключение выдаётся
+    ровно этому сообщению. Нужно, когда ценен единичный ответ бота (крупный
+    выигрыш в казино), а не команда как таковая.
+
+    Снимается вся группа «команда + ответы бота на неё»: сохранить выигрыш без
+    вызвавшей его команды — значит оставить в чате реплику без вопроса.
+    """
+    if not has_level(message.from_user.id, required_level("cleanup_keep")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(f"⛔ Команда доступна только с уровнем "
+                                f"«{level_name(required_level('cleanup_keep'))}» и выше.")
+        return
+    target = message.reply_to_message
+    if target is None:
+        await message.reply(
+            "Использование: <b>ответом</b> на сообщение, которое должно остаться в чате, "
+            "напишите <code>античк</code>.\n"
+            "Снимется с удаления и оно, и его пара (команда ↔ ответ бота): "
+            f"помечу реакцией {CLEANUP_KEEP_REACTION}.\n"
+            "Список чистки при этом не меняется — см. <code>чк</code>."
+        )
+        return
+    снято = await db.cancel_cleanup_group(message.chat.id, target.message_id)
+    if not снято:
+        # Реакция означает «останется в чате», и ставить её на сообщение, за
+        # которое мы не отвечаем, нельзя: пометка перестала бы что-то значить.
+        await message.reply(
+            "Это сообщение и так не удаляется — его нет в очереди чистки "
+            "(не команда из <code>чк</code>, либо срок уже прошёл)."
+        )
+        return
+    await react(message.chat.id, target.message_id, CLEANUP_KEEP_REACTION)
+    await db.add_log("cleanup_keep_message", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=str(target.message_id))
 
 
 def _is_timezone_command(t: Optional[str]) -> bool:
@@ -8327,11 +8893,20 @@ async def handle_user_message(message: Message):
 
 
 async def prompt_role_pick_for_applicant(user_id: int) -> None:
-    """Отправляет заявителю обязательный выбор роли (если в чате, куда он
-    подаёт заявку, вообще настроен список ролей). Пока роль не выбрана —
-    «Дать ссылку» для админов будет заблокирована, см. handle_give_link()."""
-    chat_id = settings.get("notify_chat_id")
+    """Отправляет заявителю обязательный выбор роли (если список ролей вообще
+    настроен). Пока роль не выбрана — «Дать ссылку» для админов будет
+    заблокирована, см. handle_give_link().
+
+    Чат берём ровно тот, с которым работает обработчик кнопки (rpick →
+    roles_context_chat_id): раньше здесь стоял notify_chat_id, и когда «чат
+    сюда» и «жалобы сюда» привязаны к разным группам, заявителю уезжал список
+    ролей чужого чата. Кнопки вели на id, которых в чате ролей нет («Эта роль
+    больше не существует»), а выбранную роль потом не видела проверка в
+    handle_give_link."""
+    chat_id = await roles_context_chat_id(None)
     if not chat_id:
+        # Чат ролей не настроен — сам rpick тоже ничего не смог бы сохранить,
+        # так что не требуем от заявителя невыполнимого шага.
         return
     rows = await db.list_roles(chat_id)
     if not rows:
@@ -8370,15 +8945,26 @@ async def prompt_role_pick_after_join(chat_id: int, user_id: int) -> None:
     с ботом — не обязательный шаг (в отличие от prompt_role_pick_for_applicant,
     который блокирует выдачу ссылки ДО вступления), а мягкое напоминание уже
     после входа: пригодится тем, кто попал в группу не через обычную заявку
-    (например, по прямой ссылке-приглашению)."""
-    rows = await db.list_roles(chat_id)
-    if not rows:
-        # Модуль ролей в этом чате не используется.
+    (например, по прямой ссылке-приглашению).
+
+    chat_id — куда человек вошёл, а список ролей один на всё (см.
+    roles_context_chat_id): кнопки собираем из чата ролей, иначе они ведут на
+    id из другого чата и rpick отвечает «Эта роль больше не существует»."""
+    roles_chat_id = await roles_context_chat_id(None)
+    if not roles_chat_id:
+        # Чат ролей не настроен — выбирать нечего и негде.
         return
-    if await db.get_user_role(chat_id, user_id) or await db.get_user_reservation(chat_id, user_id):
+    rows = await db.list_roles(roles_chat_id)
+    if not rows:
+        # Модуль ролей не используется.
+        return
+    if (
+        await db.get_user_role(roles_chat_id, user_id)
+        or await db.get_user_reservation(roles_chat_id, user_id)
+    ):
         # Роль/бронь уже есть — ничего просить не нужно.
         return
-    text, kb = await role_pick_page(chat_id, 0)
+    text, kb = await role_pick_page(roles_chat_id, 0)
     if kb is None:
         # Свободных ролей нет — просто молчим, не дёргаем человека почём зря.
         return
@@ -8449,7 +9035,9 @@ async def handle_give_link(callback: CallbackQuery):
     # Модуль «Роли»: если в чате настроены роли, заявитель ОБЯЗАН сначала
     # выбрать одну из свободных (см. prompt_role_pick_for_applicant) — без
     # этого ссылку выдать нельзя (ТЗ, сценарий «роли участников», п.1).
-    roles_chat_id = settings.get("notify_chat_id")
+    # Чат — тот же, в котором роль закрепляет кнопка выбора (rpick), иначе
+    # проверка смотрит в чат без ролей заявителя и ссылку не выдать никогда.
+    roles_chat_id = await roles_context_chat_id(None)
     if roles_chat_id and await db.list_roles(roles_chat_id):
         has_role = await db.get_user_role(roles_chat_id, target_user_id)
         has_reservation = await db.get_user_reservation(roles_chat_id, target_user_id)
@@ -11818,6 +12406,22 @@ async def is_roulette_enabled(chat_id: int) -> bool:
     if row is None:
         return True  # по умолчанию включена
     return row.get("data_value") != "0"
+
+
+async def set_roulette_enabled(chat_id: int, enabled: bool,
+                               actor_id: Optional[int] = None) -> None:
+    """Включает/выключает русскаяру в чате.
+
+    Одна функция на два входа — команду «+рулетка»/«-рулетка» в чате и кнопку в
+    админ-панели. Второй способ хранить то же самое означал бы расхождение:
+    панель показывала бы «работает» там, где в чате выключено.
+    """
+    if enabled:
+        await db.delete_data(_roulette_enabled_key(chat_id))
+    else:
+        await db.set_data(_roulette_enabled_key(chat_id), "0", updated_by=actor_id)
+    await db.add_log("roulette_toggle", chat_id=chat_id, actor_id=actor_id,
+                     details=str(enabled))
 # «Рулетка {N}» — N прокруток барабана подряд одной командой (см. п.1 доработки).
 # Без числа — обычная одиночная игра, как раньше. Верхний предел — чтобы
 # командой с большим числом нельзя было заспамить чат простынёй строк.
@@ -11947,13 +12551,9 @@ async def cmd_roulette_toggle(message: Message):
             await message.reply(f"⛔ Включать/выключать русскаяру может «{level_name(min_level)}» и выше.")
         return
     enable = message.text.strip().casefold() == "+рулетка"
-    if enable:
-        await db.delete_data(_roulette_enabled_key(message.chat.id))
-        await message.reply("🔫 Русскаяру снова доступна в этом чате.")
-    else:
-        await db.set_data(_roulette_enabled_key(message.chat.id), "0", updated_by=message.from_user.id)
-        await message.reply("🚫 Русскаяру отключена в этом чате.")
-    await db.add_log("roulette_toggle", chat_id=message.chat.id, actor_id=message.from_user.id, details=str(enable))
+    await set_roulette_enabled(message.chat.id, enable, actor_id=message.from_user.id)
+    await message.reply("🔫 Русскаяру снова доступна в этом чате." if enable
+                        else "🚫 Русскаяру отключена в этом чате.")
 
 
 
@@ -14544,10 +15144,8 @@ async def _farm_execute(chat_id: int, user_id: int) -> str:
     # «Трактор» (предмет за ачивку «Фермер») укорачивает ожидание. Считаем
     # кулдаун ОДИН раз и дальше пользуемся только им, иначе в тексте окажется
     # общее время, а пускать будет по укороченному — и наоборот.
-    cooldown = FARM_COOLDOWN
-    cut = await _item_perk(chat_id, user_id, shop_effects.PERK_FARM_COOLDOWN)
-    if cut:
-        cooldown = timedelta(seconds=FARM_COOLDOWN.total_seconds() * (100 - cut) / 100)
+    cooldown = await _perk_cooldown(chat_id, user_id, FARM_COOLDOWN,
+                                    shop_effects.PERK_FARM_COOLDOWN)
     if wallet.get("last_farm_at"):
         elapsed = now - wallet["last_farm_at"]
         if elapsed < cooldown:
@@ -15519,12 +16117,16 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
     stats = await db.get_fishing_stats(chat_id, user_id)
     now = datetime.utcnow()
     last = stats.get("last_fish_at")
+    # «Ледобур» (крафт мастерской) укорачивает ожидание. Считаем срок ОДИН раз
+    # и дальше пользуемся только им — см. _perk_cooldown.
+    cooldown = await _perk_cooldown(chat_id, user_id, FISHING_COOLDOWN,
+                                    shop_effects.PERK_FISH_COOLDOWN)
     if last:
         elapsed = now - last
-        if elapsed < FISHING_COOLDOWN:
+        if elapsed < cooldown:
             return (
                 f"🎣 Клёва не будет — рыба ещё не вернулась. "
-                f"Следующий заброс через {format_duration_ru(FISHING_COOLDOWN - elapsed)}"
+                f"Следующий заброс через {format_duration_ru(cooldown - elapsed)}"
                 + await activity_hint(chat_id, user_id, "fishing")
             )
 
@@ -15980,12 +16582,15 @@ async def _treasure_execute(chat_id: int, user_id: int) -> str:
     now = datetime.utcnow()
     digger = await db.get_digger(chat_id, user_id)
     last = digger.get("last_dig_at")
+    # «Металлоискатель» (крафт мастерской) укорачивает ожидание — см. _perk_cooldown.
+    cooldown = await _perk_cooldown(chat_id, user_id, TREASURE_COOLDOWN,
+                                    shop_effects.PERK_TREASURE_COOLDOWN)
     if last:
         elapsed = now - last
-        if elapsed < TREASURE_COOLDOWN:
+        if elapsed < cooldown:
             return (
                 "⛏ Лопата затупилась, руки в мозолях. "
-                f"Копать снова можно через {format_duration_ru(TREASURE_COOLDOWN - elapsed)}"
+                f"Копать снова можно через {format_duration_ru(cooldown - elapsed)}"
                 + await activity_hint(chat_id, user_id, "treasure")
             )
 
@@ -19585,6 +20190,33 @@ async def _item_perk(chat_id: int, user_id: int, perk: str) -> int:
     return shop_effects.perk_percent(keys, perk)
 
 
+# Сколько процентов кулдауна снаряжение может срезать в сумме. Не «сколько
+# сейчас дают предметы» (сейчас максимум 25), а предел на будущее — см.
+# _perk_cooldown.
+MAX_COOLDOWN_CUT_PERCENT = 90
+
+
+async def _perk_cooldown(chat_id: int, user_id: int, base: timedelta,
+                         perk: str) -> timedelta:
+    """Кулдаун занятия с учётом снаряжения, которое его укорачивает.
+
+    Один helper на все занятия, а не арифметика по месту, ровно по той причине,
+    которая уже описана у фермы: срок нужен ДВАЖДЫ — чтобы решить, пускать ли,
+    и чтобы назвать остаток в отказе, — плюс третий раз в сводке «чем заняться».
+    Посчитай его в этих местах по-разному, и бот начнёт обещать одно, а пускать
+    по другому; заметно это станет только по жалобе.
+    """
+    cut = await _item_perk(chat_id, user_id, perk)
+    if not cut:
+        return base
+    # Потолок: фишки одного вида складываются (см. shop_effects.perk_percent), и
+    # третий предмет с тем же срезом однажды перевалит за 100%. Без потолка это
+    # даёт отрицательный кулдаун — то есть занятие без ожидания вообще, и
+    # заметно это стало бы не по ошибке, а по сломанной экономике.
+    cut = min(cut, MAX_COOLDOWN_CUT_PERCENT)
+    return timedelta(seconds=base.total_seconds() * (100 - cut) / 100)
+
+
 async def _with_passive(chat_id: int, user_id: int, activity: str,
                         amount: int) -> tuple[int, int]:
     """Награда с учётом пассивной прибавки. Возвращает (сумма, процент)."""
@@ -20244,7 +20876,8 @@ async def cmd_craft_list(message: Message):
         lines.append(f"   {spec.description}")
     lines += ["", "Что нужно для рецепта: <code>крафт {ключ}</code>",
               "Собрать: <code>крафт {ключ} да</code>",
-              "Хлам для крафта продаётся в «магазин» — он для того и нужен."]
+              "Хлам и материалы мастерской (🪵 доска, ⚙️ шестерёнка и прочее) "
+              "продаются в «магазин» — они для того и нужны."]
     await message.reply("\n".join(lines))
 
 
@@ -22318,6 +22951,13 @@ async def collect_activity_states(chat_id: int, user_id: int) -> tuple[list, Opt
     states: list[activities.ActivityState] = []
 
     def add(key: str, *, left=None, blocked=None, wait_note=None) -> None:
+        # Выключенный рубильником источник в сводку не попадает вовсе. Показать
+        # его «готов» значило бы посоветовать команду, которая молчит, а
+        # написать «выключено» — проговориться о том, что админ погасил
+        # намеренно и молча (см. EarningsSwitchMiddleware).
+        source_key = ACTIVITY_EARNING_SOURCE.get(key)
+        if source_key and earning_off_in(chat_id, source_key):
+            return
         states.append(activities.ActivityState(
             activities.BY_KEY[key], left=left, blocked=blocked, wait_note=wait_note
         ))
@@ -22359,23 +22999,32 @@ async def collect_activity_states(chat_id: int, user_id: int) -> tuple[list, Opt
         add("profession", blocked="нет профессии, устроиться: "
                                   "<code>!работа устроиться {профессия}</code>")
     else:
-        add("profession", left=_left_or_none(prof.get("last_work_at"),
-                                             PROFESSION_WORK_COOLDOWN, now))
+        # Кулдауны, которые режет снаряжение, считаем ТЕМ ЖЕ helper'ом, что и
+        # сами команды (см. _perk_cooldown): иначе панель обещает одно, а бот
+        # пускает по другому — и наоборот.
+        add("profession", left=_left_or_none(
+            prof.get("last_work_at"),
+            await _perk_cooldown(chat_id, user_id, PROFESSION_WORK_COOLDOWN,
+                                 shop_effects.PERK_WORK_COOLDOWN),
+            now))
 
     fishing = await db.get_fishing_stats(chat_id, user_id)
-    add("fishing", left=_left_or_none(fishing.get("last_fish_at"), FISHING_COOLDOWN, now))
+    add("fishing", left=_left_or_none(
+        fishing.get("last_fish_at"),
+        await _perk_cooldown(chat_id, user_id, FISHING_COOLDOWN,
+                             shop_effects.PERK_FISH_COOLDOWN),
+        now))
 
     digger = await db.get_digger(chat_id, user_id)
-    add("treasure", left=_left_or_none(digger.get("last_dig_at"), TREASURE_COOLDOWN, now))
+    add("treasure", left=_left_or_none(
+        digger.get("last_dig_at"),
+        await _perk_cooldown(chat_id, user_id, TREASURE_COOLDOWN,
+                             shop_effects.PERK_TREASURE_COOLDOWN),
+        now))
 
-    # 🌾 Ферма: «Трактор» укорачивает кулдаун, и считать его надо тем же
-    # способом, что и сама команда, — иначе панель обещает одно, а бот пускает
-    # по другому.
     wallet = await db.get_wallet(chat_id, user_id)
-    farm_cooldown = FARM_COOLDOWN
-    cut = await _item_perk(chat_id, user_id, shop_effects.PERK_FARM_COOLDOWN)
-    if cut:
-        farm_cooldown = timedelta(seconds=FARM_COOLDOWN.total_seconds() * (100 - cut) / 100)
+    farm_cooldown = await _perk_cooldown(chat_id, user_id, FARM_COOLDOWN,
+                                         shop_effects.PERK_FARM_COOLDOWN)
     add("farm", left=_left_or_none(wallet.get("last_farm_at"), farm_cooldown, now))
 
     # 🏢 Бизнес — единственное занятие, где ждут не время, а сумму. Поддельный
@@ -23622,6 +24271,12 @@ def _stock_holding_lines(price: float, holding: dict) -> list[str]:
 # Старые одиночные формы «!купить»/«!продать» неоднозначны и теперь отвечают
 # подсказкой (cmd_legacy_buy_hint / cmd_legacy_sell_amount_hint), а «!дивиденды»
 # однозначна и работает молчаливым алиасом.
+# Что именно выключает рубильник заработка (см. EARNING_SOURCES): сама биржа и
+# сделки по ней. Админские «биржа цена», «биржа настройки» и «биржа вкл/выкл»
+# сюда намеренно не попадают — управлять выключенной биржей admin должен.
+STOCK_EARNING_RE = ru_text.rx(
+    r"(?i)^!?биржа(?:\s+(?:купить|продать|дивиденды)(?:\s+\S+)?)?$"
+)
 STOCK_BUY_RE = ru_text.rx(r"(?i)^!?биржа\s+купить(?:\s+(\S+))?$")
 STOCK_SELL_RE = ru_text.rx(r"(?i)^!?биржа\s+продать(?:\s+(\S+))?$")
 STOCK_TOGGLE_RE = ru_text.rx(r"(?i)^!?биржа\s+(вкл|включить|выкл|выключить)$")
@@ -24950,12 +25605,15 @@ async def _profession_execute_work(chat_id: int, user_id: int, *,
     now = datetime.utcnow()
     last = stats.get("last_work_at")
     office_note = ""
-    if last and (now - last) < PROFESSION_WORK_COOLDOWN:
+    # «Кофемашина» (крафт мастерской) укорачивает ожидание — см. _perk_cooldown.
+    cooldown = await _perk_cooldown(chat_id, user_id, PROFESSION_WORK_COOLDOWN,
+                                    shop_effects.PERK_WORK_COOLDOWN)
+    if last and (now - last) < cooldown:
         # «Собственный офис» даёт одну внеочередную смену в сутки — до этого
         # улучшение стоило 1500 i¢ и не делало ровно ничего.
         if not await db.has_profession_upgrade(chat_id, user_id, "офис") \
                 or not await db.use_profession_office(chat_id, user_id, utc_today()):
-            remaining = PROFESSION_WORK_COOLDOWN - (now - last)
+            remaining = cooldown - (now - last)
             отказ = f"❌ НЕЗАЧЁТ! Следующая смена через {format_duration_ru(remaining)}."
             # with_hint=False приходит от «работа вместе»: там этот текст
             # показывают НЕ его владельцу, а тому, кто позвал напарника.
@@ -26289,11 +26947,22 @@ async def _shop_buy(message: Message, item_key: str, qty,
     #
     # Распродажа (событие чата) снижает цену только в момент покупки —
     # ценники в самом магазине не переписываем.
-    price = max(1, round(int(item["price"]) * await event_multiplier(message.chat.id, chat_events.T_SHOP)))
+    # Цену события держим отдельно от личных скидок: «распродажа» ниже — про
+    # событие чата, и объявлять её из-за своей клубной карты нельзя, иначе её
+    # владелец видит распродажу при каждой покупке.
+    event_price = max(1, round(int(item["price"]) * await event_multiplier(message.chat.id, chat_events.T_SHOP)))
+    price = event_price
     # «Торгаш» (питомец) сбивает цену.
     torgash = await game_actions._pet_bonus(message.chat.id, message.from_user.id, "discount_shop")
     if torgash:
         price = max(1, price - price * torgash // 100)
+    # Скидка снаряжения («Клубная карта», «Торговый знак» — крафт мастерской).
+    # Считается ЗДЕСЬ, вместе с остальными скидками, и до разворота «все»:
+    # ниже по цене упирается и количество, и списание, и текст ответа.
+    discount = await _item_perk(message.chat.id, message.from_user.id,
+                                shop_effects.PERK_SHOP_DISCOUNT)
+    if discount:
+        price = max(1, price - price * discount // 100)
 
     if сколько_влезет:
         wallet = await db.get_wallet(message.chat.id, message.from_user.id)
@@ -26340,7 +27009,7 @@ async def _shop_buy(message: Message, item_key: str, qty,
                      actor_id=message.from_user.id, details=f"{item_key}:{qty}")
     updated_item = await db.get_shop_item(message.chat.id, item_key)
     left_text = f" (осталось: {updated_item['stock']})" if updated_item and updated_item.get("stock") is not None else ""
-    sale_text = f" <s>{item['price']}</s> — распродажа!" if price < int(item["price"]) else ""
+    sale_text = f" <s>{item['price']}</s> — распродажа!" if event_price < int(item["price"]) else ""
     qty_text = f" ×{qty}" if qty > 1 else ""
     await message.reply(
         f"✅ Куплено: {item['emoji']} <b>{html.escape(item['name'])}</b>{qty_text} "
@@ -27379,7 +28048,15 @@ def _timer_runnable_commands() -> dict[str, Callable[[int, int], Awaitable[str]]
 TIMER_RUNNABLE_COMMANDS = _timer_runnable_commands()
 
 
-def _timer_runnable_command(text: str) -> Optional[Callable[[int, int], Awaitable[str]]]:
+def _timer_runnable_command(text: str, chat_id: Optional[int] = None
+                            ) -> Optional[Callable[[int, int], Awaitable[str]]]:
+    # Выключенный источник заработка таймер тоже не выполняет: он ходит мимо
+    # обработчиков и мимо заслона (EarningsSwitchMiddleware), то есть рубильник
+    # обходился бы одной строчкой «таймер 5м ферма». Само напоминание остаётся —
+    # _fire_timer просто пришлёт его текстом, как любой другой таймер.
+    source = earning_source_for(text)
+    if source is not None and earning_off_in(chat_id, source.key):
+        return None
     return TIMER_RUNNABLE_COMMANDS.get(text.strip().casefold())
 
 
@@ -27394,7 +28071,7 @@ async def _fire_timer(timer_id: int, chat_id: int, delay: float, text: str) -> N
     if row is None:
         return  # успели удалить командой «-Таймер» до срабатывания
 
-    runnable = _timer_runnable_command(text)
+    runnable = _timer_runnable_command(text, chat_id)
     try:
         if runnable is not None:
             result = await runnable(chat_id, row["user_id"])
@@ -27434,7 +28111,7 @@ async def _create_timer(message: Message, fire_at: datetime, text: str) -> None:
     delay = (fire_at - datetime.utcnow()).total_seconds()
     asyncio.create_task(_fire_timer(timer_id, message.chat.id, max(delay, 0), text))
 
-    is_runnable = _timer_runnable_command(text) is not None
+    is_runnable = _timer_runnable_command(text, message.chat.id) is not None
     action_line = (
         f"⚙️ По готовности сам выполнит команду «{html.escape(text[:300])}» от вашего имени"
         if is_runnable
@@ -27532,7 +28209,7 @@ async def cmd_list_timers(message: Message):
         fire_at: datetime = row["fire_at"]
         remaining = fire_at - datetime.utcnow()
         remaining_text = format_duration_ru(remaining) if remaining.total_seconds() > 0 else "вот-вот"
-        is_runnable = _timer_runnable_command(row["text"]) is not None
+        is_runnable = _timer_runnable_command(row["text"], message.chat.id) is not None
         preview = f"⚙️ выполнит «{html.escape(row['text'][:60])}»" if is_runnable else html.escape(row["text"][:60])
         lines.append(
             f"• #{row['id']} — через {remaining_text} ({fmt_dt(fire_at)})\n"
@@ -36531,13 +37208,20 @@ def roles_status_emoji(status: str) -> str:
 
 
 async def roles_context_chat_id(message) -> Optional[int]:
-    """Чат, роли которого имеются в виду. Всегда один и тот же — тот,
-    что закреплён командой «чат сюда» (settings.notify_chat_id), — и
+    """Чат, роли которого имеются в виду. Всегда один и тот же — тот, что
+    закреплён командой «жалобы сюда» (settings.complaint_chat_id), — и
     неважно, откуда пришло сообщение: из группы или из личных сообщений
     боту. Раньше при обращении из группы бралась именно та группа, из
     которой писали, из-за чего список ролей мог отличаться от списка
-    в личке (если «чат сюда» была написана в другой группе). Теперь
-    список ролей всегда один — синхронизирован между чатом и лс."""
+    в личке (если чат был закреплён в другой группе). Теперь список ролей
+    всегда один — синхронизирован между чатом и лс.
+
+    ВАЖНО: это единственный источник «чата ролей». Всё, что показывает роли
+    или проверяет их (включая флоу заявки на вход — выбор роли заявителем и
+    «Дать ссылку»), обязано брать чат отсюда. Стоит взять notify_chat_id — и
+    при разных группах в «чат сюда»/«жалобы сюда» роли записываются в один
+    чат, а читаются из другого: кнопки ролей ломаются, а админам пишет
+    «Заявитель ещё не выбрал роль» по уже выбранной роли."""
     return settings.get("complaint_chat_id")
 
 

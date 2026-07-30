@@ -25,6 +25,7 @@ def _all_catalog_items():
         ("REWARD_ITEMS", SE.REWARD_ITEMS),
         ("ACHIEVEMENT_ITEMS", SE.ACHIEVEMENT_ITEMS),
         ("CRAFT_ITEMS", SE.CRAFT_ITEMS),
+        ("MATERIAL_ITEMS", SE.MATERIAL_ITEMS),
     ):
         for item in items:
             yield name, item

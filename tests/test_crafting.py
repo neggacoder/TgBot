@@ -78,16 +78,18 @@ def test_рецепты_требуют_только_существующие_п�
     """Рецепт с опечаткой в ключе собрать нельзя НИКОГДА, и понять это по
     сообщению бота невозможно: он честно скажет «не хватает материалов».
 
-    Источников три: хлам из магазина, урожай с грядки (farming) и продукт
-    хлева (livestock). Все три — настоящие каталоги; всё, чего нет ни в одном
-    из них, — опечатка.
+    Источников четыре: хлам из магазина, урожай с грядки (farming), продукт
+    хлева (livestock) и материалы мастерской (shop_effects.MATERIAL_ITEMS).
+    Все четыре — настоящие каталоги; всё, чего нет ни в одном из них, —
+    опечатка.
     """
     import db
     import farming
     import livestock
     known = (set(db.JUNK_ITEM_KEYS)
              | {c.item_key for c in farming.CROPS}
-             | {a.item_key for a in livestock.ANIMALS})
+             | {a.item_key for a in livestock.ANIMALS}
+             | set(SE.MATERIAL_KEYS))
     for recipe in C.RECIPES:
         for req in recipe.reqs:
             if req.kind == C.REQ_ITEM:

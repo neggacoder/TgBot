@@ -388,7 +388,8 @@ def test_очистка_игнорирует_протухший_срок(monkeyp
     появления."""
     queued = []
     monkeypatch.setattr(bot_module, "_queue_cleanup",
-                        lambda chat_id, message_id, delete_at: queued.append(message_id))
+                        lambda chat_id, message_id, delete_at, root_message_id=None:
+                        queued.append(message_id))
 
     class FakeResult:
         message_id = 77
@@ -400,7 +401,7 @@ def test_очистка_игнорирует_протухший_срок(monkeyp
         return FakeResult()
 
     async def run(delete_at):
-        token = bot_module._cleanup_context.set((CHAT_ID, delete_at))
+        token = bot_module._cleanup_context.set((CHAT_ID, delete_at, 1))
         try:
             await bot_module.cleanup_tracking_middleware(make_request, None, FakeMethod())
         finally:

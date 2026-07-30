@@ -184,6 +184,55 @@ EFFECT_ITEMS: tuple[ShopEffectItem, ...] = (
 BY_KEY: dict[str, ShopEffectItem] = {i.key: i for i in EFFECT_ITEMS}
 
 
+# ----------------------------------------------------------------------------
+# МАТЕРИАЛЫ МАСТЕРСКОЙ. Единственные предметы, которые покупаются, но сами
+# ничего не делают — и это не хлам: из них собирается снаряжение (рецепты в
+# crafting.py, результаты — в CRAFT_ITEMS ниже).
+#
+# Зачем отдельный список, а не db.DEFAULT_SHOP_ITEMS, где лежит хлам: тот
+# засевается только в ПУСТОЙ магазин (db.seed_default_shop_items), то есть в
+# чат, где витрину уже открывали, новая строка не попадёт никогда. Всё, что
+# уезжает через shop_rows(), досевается и в наполненные чаты.
+#
+# Цены держим выше хламового этажа (1-15 i¢): материал — не сувенир, его
+# покупают пачками под конкретный рецепт, и путать его с фантиком в витрине
+# незачем. Верх — 150 i¢: дороже уже сам крафт, который просит десятки тысяч.
+# ----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MaterialItem:
+    key: str
+    name: str
+    emoji: str
+    price: int
+    description: str
+
+    def as_shop_row(self) -> tuple[str, str, int, str, str]:
+        return (self.key, self.name, self.price, self.description, self.emoji)
+
+
+MATERIAL_ITEMS: tuple[MaterialItem, ...] = (
+    MaterialItem("doska", "Доска", "🪵", 25,
+                 "Материал мастерской: идёт в снаряжение. Что из неё собирают — «крафты»"),
+    MaterialItem("provoloka", "Проволока", "🧵", 35,
+                 "Материал мастерской: гнётся во что угодно. Рецепты — «крафты»"),
+    MaterialItem("shesterenka", "Шестерёнка", "⚙️", 60,
+                 "Материал мастерской: без неё не крутится ничего. Рецепты — «крафты»"),
+    MaterialItem("lampochka", "Лампочка", "💡", 70,
+                 "Материал мастерской: светит и пищит в приборах. Рецепты — «крафты»"),
+    MaterialItem("steklo", "Стекло", "🔍", 80,
+                 "Материал мастерской: линзы и экраны. Рецепты — «крафты»"),
+    MaterialItem("pruzhina", "Пружина", "🌀", 90,
+                 "Материал мастерской: всё, что должно щёлкать. Рецепты — «крафты»"),
+    MaterialItem("magnit", "Магнит", "🧲", 120,
+                 "Материал мастерской: тянет железо из земли. Рецепты — «крафты»"),
+    MaterialItem("podshipnik", "Подшипник", "🛞", 150,
+                 "Материал мастерской: держит вращение. Рецепты — «крафты»"),
+)
+
+MATERIAL_BY_KEY: dict[str, MaterialItem] = {i.key: i for i in MATERIAL_ITEMS}
+MATERIAL_KEYS: frozenset[str] = frozenset(MATERIAL_BY_KEY)
+
+
 # --- трофеи за награды ------------------------------------------------------
 @dataclass(frozen=True)
 class RewardItem:
@@ -276,6 +325,13 @@ PERK_BREAK_RESIST = "break_resist"         # −N% к шансу поломки 
 PERK_STREAK_SHIELD = "streak_shield"       # серия не сгорает за один пропуск
 PERK_FARM_NO_PESTS = "farm_no_pests"       # на грядки не садятся вредители
 PERK_FARM_PLOTS = "farm_plots"             # +N грядок, пока предмет в инвентаре
+# Снаряжение мастерской (крафт из покупных материалов). Кулдаунные фишки
+# устроены как PERK_FARM_COOLDOWN и считаются тем же bot._perk_cooldown:
+# срок обязан быть один и тот же в отказе, в допуске и в сводке «чем заняться».
+PERK_FISH_COOLDOWN = "fish_cooldown"           # −N% к кулдауну рыбалки
+PERK_TREASURE_COOLDOWN = "treasure_cooldown"   # −N% к кулдауну клада
+PERK_WORK_COOLDOWN = "work_cooldown"           # −N% к кулдауну смены
+PERK_SHOP_DISCOUNT = "shop_discount"           # −N% к цене покупки в магазине
 
 # Привилегии-переключатели: у них нет процента, важен сам факт наличия.
 FLAG_PERKS = frozenset({
@@ -543,6 +599,93 @@ CRAFT_ITEMS = CRAFT_ITEMS + (
     ),
 )
 
+CRAFT_ITEMS = CRAFT_ITEMS + (
+    # --- Мастерская: снаряжение из покупных материалов ---------------------
+    #
+    # Третья ветка крафта, и у неё своя роль. Хламовая ветка даёт вторую жизнь
+    # мусору, ферма — смысл выращенному, а мастерская отвечает на другой
+    # вопрос: куда девать монеты, когда всё уже куплено. Материалы стоят
+    # копейки, а рецепты просят десятки тысяч и доказательства (ачивка,
+    # звёздность, уровень профессии) — платят здесь не пачкой досок.
+    #
+    # Что дают — то, чего в боте не было ни у одного предмета: КУЛДАУНЫ. До
+    # этого ускорить можно было только ферму («Трактор»), а рыбалка, клад и
+    # смена ждали ровно столько же у всех и навсегда.
+    AchievementItem(
+        "ledobur", "Ледобур", "🧊", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — рыбалка ждёт на 25% меньше",
+        perk=PERK_FISH_COOLDOWN, perk_percent=25,
+        perk_text="кулдаун рыбалки короче на 25%",
+    ),
+    AchievementItem(
+        "echolot", "Эхолот", "📡", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — рыбалка приносит на 25% больше, "
+        "а улов не бывает пустым",
+        activity=ACTIVITY_FISHING, percent=25,
+        perk=PERK_NO_EMPTY_FISHING,
+        perk_text="улов никогда не бывает пустым",
+    ),
+    AchievementItem(
+        "metalloiskatel", "Металлоискатель", "🔎", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — копать можно на 25% чаще",
+        perk=PERK_TREASURE_COOLDOWN, perk_percent=25,
+        perk_text="кулдаун клада короче на 25%",
+    ),
+    AchievementItem(
+        "almaznaya_kirka", "Алмазная кирка", "💠", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — найденный клад на 30% больше",
+        activity=ACTIVITY_TREASURE, percent=30,
+    ),
+    AchievementItem(
+        "kofemashina", "Кофемашина", "☕", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — смена ждёт на 25% меньше",
+        perk=PERK_WORK_COOLDOWN, perk_percent=25,
+        perk_text="кулдаун смены короче на 25%",
+    ),
+    AchievementItem(
+        "kombinezon", "Комбинезон", "🦺", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — смены приносят на 25% больше, "
+        "а энергии тратят на 15% меньше",
+        activity=ACTIVITY_WORK, percent=25,
+        perk=PERK_ENERGY_SAVE, perk_percent=15,
+        perk_text="смена отнимает на 15% меньше энергии",
+    ),
+    # Две скидки СКЛАДЫВАЮТСЯ осознанно (8% + 12% = 20%): это разные рецепты,
+    # и второй заметно дороже. До бесплатного не доходит даже вместе с
+    # «Торгашом» — цена в магазине всегда не меньше одной монеты.
+    AchievementItem(
+        "klubnaya_karta", "Клубная карта", "💳", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — покупки в магазине дешевле на 8%",
+        perk=PERK_SHOP_DISCOUNT, perk_percent=8,
+        perk_text="покупки в магазине дешевле на 8%",
+    ),
+    AchievementItem(
+        "torgovyy_znak", "Торговый знак", "🏷", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской. Пока в инвентаре — покупки дешевле ещё на 12% "
+        "(складывается с клубной картой)",
+        perk=PERK_SHOP_DISCOUNT, perk_percent=12,
+        perk_text="покупки в магазине дешевле на 12%",
+    ),
+    # Вершина ветки. Меньше Короны мастера (25%) намеренно: Корона требует
+    # эволюционировавшего питомца и собранную коллекцию — её нельзя обогнать
+    # тем, что собирается из железа за монеты.
+    AchievementItem(
+        "vezdehod", "Вездеход", "🚙", "",
+        EFFECT_PASSIVE_BOOST,
+        "Крафт мастерской, вершина ветки. Пока в инвентаре — ВСЕ занятия "
+        "приносят на 15% больше",
+        activity=ACTIVITY_ANY, percent=15,
+    ),
+)
+
 CRAFT_BY_KEY: dict[str, AchievementItem] = {i.key: i for i in CRAFT_ITEMS}
 
 # Крафтовые предметы лежат в том же справочнике, что и предметы за ачивки, —
@@ -639,6 +782,7 @@ def shop_rows() -> list[tuple[str, str, int, str, str]]:
     незачем.
     """
     return ([i.as_shop_row() for i in EFFECT_ITEMS]
+            + [i.as_shop_row() for i in MATERIAL_ITEMS]
             + [i.as_shop_row() for i in ACHIEVEMENT_ITEMS]
             + [i.as_shop_row() for i in CRAFT_ITEMS])
 
