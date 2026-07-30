@@ -14444,7 +14444,7 @@ async def cmd_ship_reset(message: Message):
 # коины и звёздность хранятся per-chat, не общие между чатами бота.
 # ============================================================================
 FARM_COOLDOWN = timedelta(hours=4)
-STOCK_MAX_INVEST = 100_000       # максимум вложений на человека
+STOCK_MAX_INVEST = 10_000_000       # максимум вложений на человека
 # Границы шага курса и процент дивидендов задаются на чат и живут в БД:
 # значения по умолчанию — в DEFAULT таблицы stock_settings (db.py), рабочие
 # читает stock_market_loop через db.get_stock_settings, правит админ в
@@ -22967,9 +22967,9 @@ _CASINO_ROULETTE_USAGE = (
     "Играют с баланса казино: <code>казино баланс</code>, "
     "<code>казино пополнить {сумма}</code>."
 )
-CASINO_ROULETTE_MAX_BET = 100_000  # предохранитель от переполнения/абсурдных ставок
-CASINO_DAILY_BONUS = 100
-CASINO_MAX_BET = 100_000
+CASINO_ROULETTE_MAX_BET = 100_000_000  # предохранитель от переполнения/абсурдных ставок
+CASINO_DAILY_BONUS = 1_000
+CASINO_MAX_BET = 100_000_000
 CASINO_DICE_RE = ru_text.rx(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
 CASINO_COIN_RE = ru_text.rx(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
 CASINO_POKER_RE = ru_text.rx(r"(?i)^!?покер\s+(\S+)$")
@@ -32380,8 +32380,8 @@ async def weekly_digest_loop() -> None:
 # 23:00, при МСК это 20:00 UTC — итог подводился бы за неполный день, и
 # сообщения последних четырёх часов не попадали бы ни в один расчёт.
 DAILY_TOP_REWARD_HOUR_UTC = 23
-DAILY_TOP_REWARD_COUNT = 10
-DAILY_TOP_REWARD_PER_MESSAGE = 5
+DAILY_TOP_REWARD_COUNT = 20
+DAILY_TOP_REWARD_PER_MESSAGE = 50
 DAILY_TOP_REWARD_CHECK_INTERVAL = 300  # проверяем каждые 5 минут, срабатывает раз в сутки
 _DAILY_TOP_LAST_KEY = "dailytop_last_date"
 
