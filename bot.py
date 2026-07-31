@@ -1538,7 +1538,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "item_use": {"phrase": "использовать {ключ предмета} @username[или reply] — 10 применений на предмет, потом пропадает", "category": "Экономика", "level": 0},
     "item_sell": {"phrase": "магазин продать {ключ предмета} [количество] — продать предмет за 80% цены (только если ни разу не использован)", "category": "Экономика", "level": 0},
     "grant_level":     {"phrase": "+модератор/+админ/+старший (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
-    "revoke_admin":    {"phrase": "-админ / снять (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
+    "revoke_admin":    {"phrase": "-админ / снять(выключено) (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "promote_demote":  {"phrase": "повысить / понизить [@username|ID] [уровень 0-3] (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "tg_admin_grant":  {"phrase": "+тг админ [должность] (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "tg_admin_revoke": {"phrase": "-тг админ (ответом или @username/ID)",             "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
@@ -8680,7 +8680,7 @@ async def cmd_role_delete(message: Message):
         state = "занята" if role["status"] == "taken" else "забронирована"
         await message.reply(
             f"⛔ Роль «{html.escape(role['name'])}» сейчас {state} ({who}).\n"
-            "Сначала освободите её командой «роль снять», потом удаляйте."
+            "Сначала освободите её командой «роль wснять», потом удаляйте."
         )
         return
 
@@ -28412,7 +28412,7 @@ async def cmd_grant_level(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("-админ","снять")),
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("-админ")),
 )
 async def cmd_revoke_admin(message: Message):
     actor_id = message.from_user.id
