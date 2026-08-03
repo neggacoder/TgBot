@@ -1,0 +1,456 @@
+"""Казино: сыграть и вернуть результат. Ничего не отправляет.
+
+Зачем модуль — та же причина, что у farm_actions: панель отдельный процесс и
+bot.py импортировать не может, а правила игр (что во сколько раз платит, как
+считается фарт и множитель ивента) жили вперемешку с текстами ответов в чат.
+Сайт со своей копией правил означал бы вторую правду о выплатах — то есть о
+деньгах.
+
+Здесь НЕТ бота и НЕТ отправки сообщений. Готовый текст для чата модуль
+возвращает строкой (render_share): чтобы «показать выигрыш всем» показывало
+ровно то, что случилось, а не то, что прислал браузер.
+
+Играют с БАЛАНСА КАЗИНО — отдельного кошелька, который пополняют из основного.
+Ставка списывается ОДНИМ атомарным запросом до розыгрыша: прочитать баланс,
+сравнить и потом вычесть — значит позволить двум ставкам подряд сыграть одними
+и теми же деньгами.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Optional
+
+import chat_events
+import db
+import farm_actions
+import game_actions
+import pins
+import tz_settings
+
+logger = logging.getLogger(__name__)
+
+# Предохранитель от абсурдных ставок и переполнения — тот же, что в чате.
+MAX_BET = 100_000_000
+DAILY_BONUS = 1_000
+
+# --- рулетка ----------------------------------------------------------------
+RED_NUMBERS = frozenset({
+    1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36,
+})
+COLOR_ALIASES = {
+    "красное": "red", "красный": "red", "red": "red", "кр": "red", "р": "red",
+    "черное": "black", "чёрное": "black", "черный": "black", "чёрный": "black",
+    "black": "black", "чб": "black", "ч": "black",
+    "зеленое": "green", "зелёное": "green", "зеленый": "green", "зелёный": "green",
+    "green": "green", "зел": "green", "з": "green",
+}
+COLOR_EMOJI = {"red": "🔴", "black": "⚫", "green": "🟢"}
+COLOR_LABEL = {"red": "Красное", "black": "Чёрное", "green": "Зелёное"}
+COLOR_PAYOUT = {"red": 2, "black": 2, "green": 14}
+
+
+def roulette_number_color(n: int) -> str:
+    if n == 0:
+        return "green"
+    return "red" if n in RED_NUMBERS else "black"
+
+
+# --- покер ------------------------------------------------------------------
+POKER_SUITS = "♠♥♦♣"
+POKER_RANK_NAMES = {11: "J", 12: "Q", 13: "K", 14: "A"}
+
+
+def poker_rank_label(rank: int) -> str:
+    return POKER_RANK_NAMES.get(rank, str(rank))
+
+
+def draw_poker_hand() -> list[tuple[int, str]]:
+    deck = [(rank, suit) for rank in range(2, 15) for suit in POKER_SUITS]
+    return random.sample(deck, 5)
+
+
+def evaluate_poker_hand(cards: list[tuple[int, str]]) -> tuple[int, str]:
+    """(множитель выигрыша, название комбинации). 0 — без выигрыша."""
+    ranks = sorted((r for r, _ in cards), reverse=True)
+    suits = [s for _, s in cards]
+    is_flush = len(set(suits)) == 1
+
+    unique_ranks = sorted(set(ranks), reverse=True)
+    is_straight = False
+    if len(unique_ranks) == 5:
+        if unique_ranks[0] - unique_ranks[4] == 4:
+            is_straight = True
+        elif unique_ranks == [14, 5, 4, 3, 2]:  # туз как низшая карта (А-2-3-4-5)
+            is_straight = True
+
+    counts: dict[int, int] = {}
+    for r in ranks:
+        counts[r] = counts.get(r, 0) + 1
+    count_values = sorted(counts.values(), reverse=True)
+
+    if is_straight and is_flush:
+        return 10, "стрит-флеш"
+    if count_values[0] == 4:
+        return 10, "каре"
+    if count_values[0] == 3 and count_values[1] == 2:
+        return 8, "фулл-хаус"
+    if is_flush:
+        return 6, "флеш"
+    if is_straight:
+        return 5, "стрит"
+    if count_values[0] == 3:
+        return 3, "тройка"
+    if count_values[0] == 2 and count_values[1] == 2:
+        return 2, "две пары"
+    return 0, "пусто (пара или меньше)"
+
+
+def format_poker_hand(cards: list[tuple[int, str]]) -> str:
+    return " ".join(f"{poker_rank_label(r)}{s}" for r, s in cards)
+
+
+async def local_today() -> date:
+    """Сегодня по зоне ЧАТА, а не сервера: ежедневный бонус обязан обновляться
+    в ту же полночь, что и в боте (см. local_today в bot.py). Зона лежит в
+    общих настройках, и панель читает её оттуда же."""
+    try:
+        зона = (await db.fetch_settings() or {}).get("timezone")
+    except Exception as exc:
+        logger.warning("local_today: %s", exc)
+        зона = None
+    return datetime.now(tz_settings.tzinfo_from_name(зона)).date()
+
+
+# --- надбавки ---------------------------------------------------------------
+async def event_multiplier(chat_id: int) -> float:
+    """Во сколько раз событие чата («фартовый час», «крупье не в духе») меняет
+    ВЫИГРЫШ. Ставку событие не трогает — так же, как в чате.
+
+    Читателя события держит farm_actions: он появился там первым, и заводить
+    второй значило бы завести второй ключ, который однажды разъедется."""
+    return chat_events.multiplier(await farm_actions.active_event(chat_id),
+                                  chat_events.T_CASINO)
+
+
+async def pet_lucky(chat_id: int, user_id: int, amount: int) -> int:
+    """Прибавка «Везунчика» к выигрышу: питомец плюс закреп профиля.
+
+    Ошибку глотаем: надбавка — надстройка, и непрочитавшаяся карточка не
+    должна отменять уже случившийся выигрыш."""
+    ability = "casino_win"
+    try:
+        percent = await game_actions._pet_bonus(chat_id, user_id, ability)
+        card = await db.get_profile_card(chat_id, user_id)
+        if card:
+            percent += pins.achievement_bonus(card.get("pinned_achievement"), ability)
+    except Exception as exc:
+        logger.warning("pet_lucky: %s", exc)
+        return amount
+    if not percent:
+        return amount
+    return amount + amount * percent // 100
+
+
+# --- результат --------------------------------------------------------------
+@dataclass
+class RoundResult:
+    """Что случилось за один заход. ok=False — игра не состоялась, и `error`
+    объясняет почему словами, которые можно показать как есть."""
+    ok: bool
+    error: str = ""
+    game: str = ""
+    bet: int = 0
+    won: bool = False
+    delta: int = 0            # чистая прибыль (проигрыш — отрицательная)
+    multiplier: int = 0
+    balance: int = 0
+    # Чем именно кончился розыгрыш — это рисует экран: номер и цвет рулетки,
+    # грань кости, сторона монеты, карты и комбинация.
+    detail: dict = field(default_factory=dict)
+    achievements: list[str] = field(default_factory=list)
+    user_id: int = 0
+
+
+GAMES = ("roulette", "dice", "coin", "poker")
+GAME_TITLE = {"roulette": "Рулетка", "dice": "Кости",
+              "coin": "Орёл и решка", "poker": "Покер"}
+GAME_EMOJI = {"roulette": "🎰", "dice": "🎲", "coin": "🪙", "poker": "🃏"}
+
+# Кто засчитывается в счётчик «сто игр». Ровно как в чате: у рулетки его нет.
+# Не «забыли», а как есть — иначе одна и та же сотня игр набиралась бы на
+# сайте быстрее, чем в чате, и ачивка приходила бы за разное.
+COUNTED_GAMES = frozenset({"dice", "coin", "poker"})
+
+
+async def _finish(chat_id: int, user_id: int, result: RoundResult) -> RoundResult:
+    """Общий хвост любой игры: счётчик игр и ачивки."""
+    result.user_id = user_id
+    if result.game in COUNTED_GAMES:
+        сыграно = await db.increment_casino_games(chat_id, user_id)
+        if сыграно >= 100:
+            result.achievements.append("casino_100_games")
+        if result.won and result.delta >= 5000:
+            result.achievements.append("casino_jackpot")
+    return result
+
+
+async def _take_bet(chat_id: int, user_id: int, bet: int) -> bool:
+    return await db.try_spend_casino_balance(chat_id, user_id, bet)
+
+
+async def _payout(chat_id: int, user_id: int, bet: int, множитель: int) -> int:
+    """Сколько чистыми принёс выигрыш. Ставка уже списана, поэтому возвращаем
+    её вместе с прибылью — как и в чате."""
+    delta = bet * множитель - bet
+    delta = max(1, round(delta * await event_multiplier(chat_id)))
+    delta = await pet_lucky(chat_id, user_id, delta)
+    await db.add_casino_balance(chat_id, user_id, bet + delta)
+    return delta
+
+
+async def _check_bet(chat_id: int, user_id: int, bet) -> tuple[Optional[int], str]:
+    """(ставка, ошибка). «все» — весь баланс казино, как в чате."""
+    wallet = await db.get_casino_wallet(chat_id, user_id)
+    баланс = int(wallet.get("balance") or 0)
+    if isinstance(bet, str):
+        if bet.strip().casefold() not in ("все", "всё", "all"):
+            return None, "Ставка — число или слово «все»."
+        bet = баланс
+    bet = int(bet or 0)
+    if bet <= 0:
+        return None, "Ставка должна быть больше нуля."
+    if bet > MAX_BET:
+        return None, f"Ставка должна быть от 1 до {MAX_BET} i¢."
+    if bet > баланс:
+        return None, (f"Недостаточно средств в казино: у вас {баланс} i¢, "
+                      f"ставка {bet} i¢.")
+    return bet, ""
+
+
+# --- игры -------------------------------------------------------------------
+async def roulette(chat_id: int, user_id: int, bet, color: str, *,
+                   lucky: bool = False) -> RoundResult:
+    """Красное/чёрное — x2, зелёное — x14.
+
+    lucky — подкрученный фарт («фарт» в личке у владельца). Заряд снимает и
+    передаёт вызывающий: живёт он в боте, а не здесь."""
+    цвет = COLOR_ALIASES.get((color or "").strip().casefold())
+    if цвет is None:
+        return RoundResult(False, "Цвет — красное, чёрное или зелёное.")
+    ставка, ошибка = await _check_bet(chat_id, user_id, bet)
+    if ставка is None:
+        return RoundResult(False, ошибка)
+    if not await _take_bet(chat_id, user_id, ставка):
+        return RoundResult(False, "Не хватило средств в казино.")
+
+    if lucky:
+        число = random.choice([n for n in range(37) if roulette_number_color(n) == цвет])
+    else:
+        число = random.randint(0, 36)
+    выпал = roulette_number_color(число)
+
+    итог = RoundResult(True, game="roulette", bet=ставка,
+                       detail={"number": число, "color": выпал,
+                               "picked": цвет,
+                               "emoji": COLOR_EMOJI[выпал],
+                               "label": COLOR_LABEL[выпал]})
+    if выпал == цвет:
+        итог.won = True
+        итог.multiplier = COLOR_PAYOUT[цвет]
+        итог.delta = await _payout(chat_id, user_id, ставка, итог.multiplier)
+    else:
+        итог.delta = -ставка
+    итог.balance = int((await db.get_casino_wallet(chat_id, user_id))["balance"])
+    return await _finish(chat_id, user_id, итог)
+
+
+async def dice(chat_id: int, user_id: int, bet, guess: int) -> RoundResult:
+    """Угадал грань — x6."""
+    try:
+        число = int(guess)
+    except (TypeError, ValueError):
+        число = 0
+    if not 1 <= число <= 6:
+        return RoundResult(False, "Загадывают число от 1 до 6.")
+    ставка, ошибка = await _check_bet(chat_id, user_id, bet)
+    if ставка is None:
+        return RoundResult(False, ошибка)
+    if not await _take_bet(chat_id, user_id, ставка):
+        return RoundResult(False, "Не хватило средств в казино.")
+
+    выпало = random.randint(1, 6)
+    итог = RoundResult(True, game="dice", bet=ставка,
+                       detail={"roll": выпало, "guess": число})
+    if выпало == число:
+        итог.won = True
+        итог.multiplier = 6
+        итог.delta = await _payout(chat_id, user_id, ставка, 6)
+    else:
+        итог.delta = -ставка
+    итог.balance = int((await db.get_casino_wallet(chat_id, user_id))["balance"])
+    return await _finish(chat_id, user_id, итог)
+
+
+COIN_SIDES = {"орёл": "орёл", "орел": "орёл", "решка": "решка"}
+
+
+async def coin(chat_id: int, user_id: int, bet, side: str) -> RoundResult:
+    """Орёл или решка — x2."""
+    сторона = COIN_SIDES.get((side or "").strip().casefold())
+    if сторона is None:
+        return RoundResult(False, "Сторона — орёл или решка.")
+    ставка, ошибка = await _check_bet(chat_id, user_id, bet)
+    if ставка is None:
+        return RoundResult(False, ошибка)
+    if not await _take_bet(chat_id, user_id, ставка):
+        return RoundResult(False, "Не хватило средств в казино.")
+
+    выпало = random.choice(["орёл", "решка"])
+    итог = RoundResult(True, game="coin", bet=ставка,
+                       detail={"side": выпало, "guess": сторона})
+    if выпало == сторона:
+        итог.won = True
+        итог.multiplier = 2
+        итог.delta = await _payout(chat_id, user_id, ставка, 2)
+    else:
+        итог.delta = -ставка
+    итог.balance = int((await db.get_casino_wallet(chat_id, user_id))["balance"])
+    return await _finish(chat_id, user_id, итог)
+
+
+async def poker(chat_id: int, user_id: int, bet) -> RoundResult:
+    """Пять карт: от двух пар (x2) до стрит-флеша (x10)."""
+    ставка, ошибка = await _check_bet(chat_id, user_id, bet)
+    if ставка is None:
+        return RoundResult(False, ошибка)
+    if not await _take_bet(chat_id, user_id, ставка):
+        return RoundResult(False, "Не хватило средств в казино.")
+
+    рука = draw_poker_hand()
+    множитель, комбинация = evaluate_poker_hand(рука)
+    итог = RoundResult(True, game="poker", bet=ставка,
+                       detail={"hand": [[r, s] for r, s in рука],
+                               "hand_text": format_poker_hand(рука),
+                               "combo": комбинация})
+    if множитель > 0:
+        итог.won = True
+        итог.multiplier = множитель
+        итог.delta = await _payout(chat_id, user_id, ставка, множитель)
+    else:
+        итог.delta = -ставка
+    итог.balance = int((await db.get_casino_wallet(chat_id, user_id))["balance"])
+    return await _finish(chat_id, user_id, итог)
+
+
+PLAY = {"roulette": roulette, "dice": dice, "coin": coin, "poker": poker}
+
+
+# --- кошелёк ----------------------------------------------------------------
+async def topup(chat_id: int, user_id: int, amount) -> RoundResult:
+    """Из основного кошелька в казино."""
+    wallet = await db.get_wallet(chat_id, user_id) or {}
+    монеты = int(wallet.get("coins") or 0)
+    if isinstance(amount, str):
+        amount = монеты if amount.strip().casefold() in ("все", "всё", "all") else 0
+    amount = int(amount or 0)
+    if amount <= 0:
+        return RoundResult(False, "Сумма пополнения должна быть больше нуля.")
+    if amount > монеты:
+        return RoundResult(False, f"В кошельке только {монеты} i¢.")
+    if not await db.try_spend_coins(chat_id, user_id, amount):
+        return RoundResult(False, "Не хватило монет в кошельке.")
+    баланс = await db.add_casino_balance(chat_id, user_id, amount)
+    return RoundResult(True, game="topup", delta=amount, balance=int(баланс))
+
+
+async def withdraw(chat_id: int, user_id: int, amount) -> RoundResult:
+    """Из казино в основной кошелёк."""
+    wallet = await db.get_casino_wallet(chat_id, user_id)
+    баланс = int(wallet.get("balance") or 0)
+    if isinstance(amount, str):
+        amount = баланс if amount.strip().casefold() in ("все", "всё", "all") else 0
+    amount = int(amount or 0)
+    if amount <= 0:
+        return RoundResult(False, "Сумма вывода должна быть больше нуля.")
+    if amount > баланс:
+        return RoundResult(False, f"В казино только {баланс} i¢.")
+    остаток = await db.add_casino_balance(chat_id, user_id, -amount)
+    await db.add_coins(chat_id, user_id, amount)
+    return RoundResult(True, game="withdraw", delta=amount, balance=int(остаток))
+
+
+async def daily_bonus(chat_id: int, user_id: int, *,
+                      today: Optional[date] = None) -> RoundResult:
+    """Ежедневный бонус. «Сегодня» считает вызывающий: местные сутки чата, а
+    не зона сервера, — иначе бонус обновлялся бы в чужую полночь."""
+    выдан, баланс = await db.claim_daily_bonus(chat_id, user_id, DAILY_BONUS,
+                                               today=today)
+    if not выдан:
+        return RoundResult(False, "Бонус на сегодня уже получен.",
+                           balance=int(баланс))
+    return RoundResult(True, game="bonus", delta=DAILY_BONUS, balance=int(баланс))
+
+
+# --- состояние и текст для чата ---------------------------------------------
+async def state(chat_id: int, user_id: int, *,
+                today: Optional[date] = None) -> dict:
+    """Всё, что рисует экран казино, за один заход."""
+    wallet = await db.get_casino_wallet(chat_id, user_id)
+    основной = await db.get_wallet(chat_id, user_id) or {}
+    today = today or datetime.utcnow().date()
+    множитель = await event_multiplier(chat_id)
+    return {
+        "balance": int(wallet.get("balance") or 0),
+        "coins": int(основной.get("coins") or 0),
+        "bonus_ready": wallet.get("last_bonus_date") != today,
+        "bonus_amount": DAILY_BONUS,
+        "max_bet": MAX_BET,
+        "games_played": int(await db.get_casino_games(chat_id, user_id)),
+        # Событие чата умножает выигрыш: об этом обязано быть видно ДО ставки,
+        # иначе «фартовый час» проходит мимо тех, кто не читал чат.
+        "event_multiplier": множитель,
+        "colors": [{"key": k, "emoji": COLOR_EMOJI[k], "label": COLOR_LABEL[k],
+                    "payout": COLOR_PAYOUT[k]} for k in ("red", "black", "green")],
+        # Красные числа — чтобы лента на экране красилась теми же, что решают
+        # исход. Своим списком в браузере это разъехалось бы молча: цвет на
+        # картинке перестал бы совпадать с выплатой.
+        "reds": sorted(RED_NUMBERS),
+        "games": [{"key": g, "title": GAME_TITLE[g], "emoji": GAME_EMOJI[g]}
+                  for g in GAMES],
+    }
+
+
+def render_share(result: RoundResult, name: str) -> str:
+    """Текст для чата. Строит его модуль, а не браузер: «покажи всем» обязано
+    показывать то, что случилось на самом деле, а не то, что прислали.
+
+    Имя ставится в первую строку — в чате бот отвечает на сообщение игрока, и
+    так понятно, кто играл, а сюда результат приходит с сайта, сам по себе.
+    """
+    d = result.detail
+    строки = [f"{GAME_EMOJI[result.game]} <b>Казино: {GAME_TITLE[result.game]}</b>",
+              f"Играет: <b>{name}</b>"]
+    if result.game == "roulette":
+        строки.append(f"Ставка: {result.bet} i¢ на {COLOR_LABEL[d['picked']]}")
+        строки.append(f"Выпало: {d['emoji']} <b>{d['number']}</b> ({d['label']})")
+    elif result.game == "dice":
+        строки.append(f"Ставка: {result.bet} i¢ на число {d['guess']}")
+        строки.append(f"Выпало: 🎲 <b>{d['roll']}</b>")
+    elif result.game == "coin":
+        строки.append(f"Ставка: {result.bet} i¢ на {d['guess']}")
+        строки.append(f"Выпало: 🪙 <b>{d['side']}</b>")
+    else:
+        строки.append(f"Ставка: {result.bet} i¢")
+        строки.append(f"Рука: {d['hand_text']}")
+    if result.won:
+        хвост = f" («{d['combo']}»)" if result.game == "poker" else ""
+        строки.append(f"✅ <b>Выигрыш!</b> +{result.delta} i¢ "
+                      f"(x{result.multiplier}){хвост}")
+    else:
+        хвост = f" ({d['combo']})" if result.game == "poker" else ""
+        строки.append(f"❌ <b>Проигрыш.</b> {result.delta} i¢{хвост}")
+    return "\n".join(строки)

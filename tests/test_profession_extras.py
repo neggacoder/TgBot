@@ -120,6 +120,7 @@ def _work_setup(monkeypatch, stats, colleagues=1, upgrades=(), income=1000):
     monkeypatch.setattr(bot_module, "grant_achievement", _returns(False))
     monkeypatch.setattr(bot_module, "display_name_by_id", _returns("Наставник"))
     monkeypatch.setattr(bot_module, "utc_today", lambda: date(2026, 7, 27))
+    monkeypatch.setattr(bot_module, "local_today", lambda: date(2026, 7, 27))
     monkeypatch.setattr(random_stub := bot_module.random, "randint",
                         lambda a, b: income if b > 100 else 100)
     monkeypatch.setattr(random_stub, "random", lambda: 1.0)   # без случайного события
@@ -319,6 +320,7 @@ def _order_setup(monkeypatch, spy, order=None, stats=None):
     db = bot_module.db
     monkeypatch.setattr(bot_module, "_check_misc_access", lambda *a, **k: True)
     monkeypatch.setattr(bot_module, "utc_today", lambda: date(2026, 7, 27))
+    monkeypatch.setattr(bot_module, "local_today", lambda: date(2026, 7, 27))
     monkeypatch.setattr(bot_module, "display_name", _returns("Тестер"))
     monkeypatch.setattr(bot_module, "display_name_by_id", _returns("Другой"))
     monkeypatch.setattr(bot_module, "_check_coin_achievements", _noop)
@@ -410,10 +412,18 @@ def test_аналитика_показывает_рейтинг(monkeypatch):
 
 def test_все_улучшения_теперь_что_то_делают():
     """Раньше «офис», «стиль» и «аналитика» списывали 2 800 i¢ суммарно и не
-    читались нигде в коде. Список нужен, чтобы это не повторилось."""
+    читались нигде в коде. Список нужен, чтобы это не повторилось.
+
+    Считаем ПРИМЕНЕНИЯ, а не упоминания: сам каталог теперь в professions.py
+    (им пользуется и сайт), и его строка — не доказательство того, что
+    улучшение на что-то влияет."""
     import io
-    src = io.open(bot_module.__file__.replace(".pyc", ".py"), encoding="utf-8").read()
+    import pathlib
+    корень = pathlib.Path(bot_module.__file__).parent
+    места = [корень / "bot.py"] + sorted(корень.glob("*_actions.py"))
+    исходники = "\n".join(
+        io.open(f, encoding="utf-8").read() for f in места if f.exists())
     for key in bot_module.PROFESSION_UPGRADES:
-        assert src.count(f'"{key}"') >= 2, (
-            f"улучшение «{key}» нигде не используется — оно продаётся впустую"
+        assert исходники.count(f'"{key}"') >= 1, (
+            f"улучшение «{key}» нигде не применяется — оно продаётся впустую"
         )

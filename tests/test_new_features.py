@@ -23,6 +23,18 @@ os.environ.setdefault("OWNER_IDS", "1")
 
 import bot as bot_module  # noqa: E402
 
+# Проверка «+бесконечность» стала асинхронной: список читается из базы на
+# каждый вопрос, иначе рубильник с сайта для бота не существует до
+# перезапуска (см. owner_flags). Синхронная заглушка отдавала bool, а его
+# нельзя await'ить.
+async def _не_бесконечность(user_id):
+    return False
+
+
+async def _бесконечность(user_id):
+    return True
+
+
 @pytest.fixture(autouse=True)
 def _обычный_множитель_дохода(monkeypatch):
     """Заработок с некоторых пор домножается на настройку чата
@@ -111,7 +123,7 @@ def test_продление_брака_списывает_цену_за_кажд
                         _returns({"id": 1, "partner_id": PARTNER_ID,
                                   "married_at": datetime.utcnow(), "expires_at": None}))
     monkeypatch.setattr(bot_module.db, "get_wallet", _returns({"coins": 10_000}))
-    monkeypatch.setattr(bot_module, "has_infinite_money", lambda uid: False)
+    monkeypatch.setattr(bot_module, "has_infinite_money", _не_бесконечность)
 
     charged = {}
 
@@ -141,7 +153,7 @@ def test_продление_без_денег_ничего_не_списывае
                         _returns({"id": 1, "partner_id": PARTNER_ID,
                                   "married_at": datetime.utcnow(), "expires_at": None}))
     monkeypatch.setattr(bot_module.db, "get_wallet", _returns({"coins": 100}))
-    monkeypatch.setattr(bot_module, "has_infinite_money", lambda uid: False)
+    monkeypatch.setattr(bot_module, "has_infinite_money", _не_бесконечность)
 
     extended = []
 

@@ -39,7 +39,9 @@ def _права(monkeypatch, пороги: dict | None = None, мой_урове
         return []
 
     async def fetch_settings():
-        return {}
+        # Кабинет читает отсюда рабочий чат (см. chats.py): пустые настройки
+        # означают «чат не привязан», и все обращения отвечали бы отказом.
+        return {"complaint_chat_id": -100, "notify_chat_id": -100222}
 
     monkeypatch.setattr(db, "list_command_registry", list_command_registry, raising=False)
     monkeypatch.setattr(db, "list_command_levels", list_command_levels, raising=False)
@@ -73,6 +75,18 @@ def client(monkeypatch):
         # настоящий вызов упал бы TypeError'ом мимо этой заглушки.
         return game_actions.ActionResult(True, "🐾 Ваши питомцы: Кот")
 
+    async def my_pets_cards(chat_id, user_id):
+        # Экран рисует карточки из ЧИСЕЛ, а не из текста (см.
+        # game_actions.my_pets_cards) — значит и заглушка обязана их отдать,
+        # иначе обработчик пойдёт за ними в настоящую базу.
+        return {"pets": [{"key": "kot", "name": "Кот", "species": "Кот",
+                          "emoji": "🐈", "level": 3, "max_level": 10,
+                          "is_max": False, "hunger": 71, "mood": 51,
+                          "state": "всё хорошо", "xp": 93, "xp_need": 145,
+                          "xp_percent": 64, "abilities": [], "evolved": False,
+                          "pinned": False, "active": True}],
+                "food": 5, "food_emoji": "🥫", "food_price": 120}
+
     async def my_pets_list(chat_id, user_id):
         # Настоящую проверку этого поля делает test_список_отдаёт_питомцев_
         # отдельным_полем поверх подменённой db; здесь заглушка нужна, чтобы
@@ -91,6 +105,7 @@ def client(monkeypatch):
     monkeypatch.setattr(member_game.game_actions, "feed_pet", feed_pet)
     monkeypatch.setattr(member_game.game_actions, "my_pets_text", my_pets_text)
     monkeypatch.setattr(member_game.game_actions, "my_pets_list", my_pets_list)
+    monkeypatch.setattr(member_game.game_actions, "my_pets_cards", my_pets_cards)
     monkeypatch.setattr(member_game, "get_bot", lambda: _Bot())
     monkeypatch.setattr(member_game, "require_member_in_chat", in_chat)
     monkeypatch.setattr(panel.auth, "verify_csrf", lambda request: None)
@@ -116,15 +131,21 @@ def _as_member(tg_user_id=7):
 
 def test_список_питомцев_отдаётся(client):
     _as_member()
-    r = client.get("/api/member/game/pets?chat_id=-100")
+    r = client.get("/api/member/game/pets")
     assert r.status_code == 200
-    assert "Кот" in r.json()["text"]
+    данные = r.json()
+    assert "Кот" in данные["text"]
+    # Рядом с текстом едут числа: экран рисует по ним карточки, а текст
+    # остаётся запасным путём.
+    assert данные["cards"][0]["hunger"] == 71
+    assert данные["cards"][0]["key"] == "kot"
+    assert данные["food"] == 5
 
 
 def test_кормление_с_сайта_не_пишет_отчёт_в_чат(client):
     _as_member()
     r = client.post("/api/member/game/pets/feed",
-                    json={"chat_id": -100, "key": "kot"})
+                    json={"key": "kot"})
     assert r.status_code == 200
     assert r.json()["ok"] is True
     assert "накормлен" in r.json()["text"]
@@ -134,7 +155,7 @@ def test_кормление_с_сайта_не_пишет_отчёт_в_чат(c
 
 def test_награда_всё_равно_объявляется(client):
     _as_member()
-    client.post("/api/member/game/pets/feed", json={"chat_id": -100, "key": "kot"})
+    client.post("/api/member/game/pets/feed", json={"key": "kot"})
     тексты = [t for _chat, t in client.отправлено]
     assert any("уровня 2" in t for t in тексты), "ачивки и уровни объявлять надо"
 
@@ -156,7 +177,7 @@ def test_упавшее_объявление_не_отменяет_действ�
     monkeypatch.setattr(db, "add_log", add_log, raising=False)
     _as_member()
     r = client.post("/api/member/game/pets/feed",
-                    json={"chat_id": -100, "key": "kot"})
+                    json={"key": "kot"})
     assert r.status_code == 200, r.text
     assert "накормлен" in r.json()["text"], "отчёт о сделанном обязан вернуться"
     assert записи == ["member_game"], "действие пропало из журнала"
@@ -183,12 +204,20 @@ def test_запись_в_журнал_идёт_до_объявлений():
         "её с собой")
 
 
-def test_чужой_чат_отбивается(client):
+def test_чужой_чат_в_запросе_ничего_не_меняет(client):
+    """Раньше кабинет брал чат из тела запроса, и подсунуть чужой было можно —
+    отбивала его проверка. Теперь чат приходит из настроек, а поле в теле
+    просто игнорируется: подделывать нечего.
+
+    Проверяем именно это: лишнее поле не мешает действию и не уводит его в
+    чужой чат."""
     _as_member()
     r = client.post("/api/member/game/pets/feed",
                     json={"chat_id": -999, "key": "kot"})
-    assert r.status_code == 403
-    assert not client.сделано
+    assert r.status_code == 200
+    assert client.сделано, "действие должно было выполниться в рабочем чате"
+    _что, чат, _кто, _ключ = client.сделано[-1]
+    assert чат == -100, f"действие ушло в чат {чат}, а не в рабочий"
 
 
 def test_поднятый_порог_закрывает_действие_и_на_сайте(client, monkeypatch):
@@ -199,7 +228,7 @@ def test_поднятый_порог_закрывает_действие_и_на
     _права(monkeypatch, пороги={"pet_care": 2}, мой_уровень=0)
     _as_member()
     r = client.post("/api/member/game/pets/feed",
-                    json={"chat_id": -100, "key": "kot"})
+                    json={"key": "kot"})
     assert r.status_code == 403, r.text
     assert not client.сделано, "действие всё-таки выполнилось"
 
@@ -209,7 +238,7 @@ def test_поднятый_порог_закрывает_и_список(client, 
     на сайте это тот же экран."""
     _права(monkeypatch, пороги={"pet_list": 3}, мой_уровень=0)
     _as_member()
-    assert client.get("/api/member/game/pets?chat_id=-100").status_code == 403
+    assert client.get("/api/member/game/pets").status_code == 403
 
 
 def test_хватающий_уровень_пропускает(client, monkeypatch):
@@ -219,7 +248,7 @@ def test_хватающий_уровень_пропускает(client, monkeypa
     _права(monkeypatch, пороги={"pet_care": 2}, мой_уровень=2)
     _as_member()
     r = client.post("/api/member/game/pets/feed",
-                    json={"chat_id": -100, "key": "kot"})
+                    json={"key": "kot"})
     assert r.status_code == 200, r.text
 
 
@@ -237,7 +266,7 @@ def test_у_каждого_действия_есть_право():
 def test_неизвестное_действие(client):
     _as_member()
     r = client.post("/api/member/game/pets/станцевать",
-                    json={"chat_id": -100})
+                    json={})
     assert r.status_code == 400
 
 
@@ -248,7 +277,7 @@ def test_неудача_по_правилам_это_не_ошибка_http(clie
     monkeypatch.setattr(member_game.game_actions, "feed_pet", feed_fail)
     _as_member()
     r = client.post("/api/member/game/pets/feed",
-                    json={"chat_id": -100, "key": "kot"})
+                    json={"key": "kot"})
     assert r.status_code == 200
     assert r.json()["ok"] is False
 
@@ -262,7 +291,7 @@ def test_покупка_и_продажа_кабинету_недоступны(
     выставляем — но отвечаем объяснением, а не «такого действия нет»."""
     _as_member()
     r = client.post(f"/api/member/game/pets/{action}",
-                    json={"chat_id": -100, "key": "kot", "confirm": True})
+                    json={"key": "kot", "confirm": True})
     assert r.status_code == 400, r.text
     assert "в чате" in r.json()["detail"], "отказ должен объяснять, куда идти"
     assert not client.сделано
@@ -280,14 +309,14 @@ def test_переименование_без_имени_это_400_а_не_500(c
     была AttributeError, до панели доехавшая как 500."""
     _as_member()
     r = client.post("/api/member/game/pets/rename",
-                    json={"chat_id": -100, "key": "kot"})
+                    json={"key": "kot"})
     assert r.status_code == 400
 
 
 def test_переименование_без_ключа_это_400(client):
     _as_member()
     r = client.post("/api/member/game/pets/rename",
-                    json={"chat_id": -100, "name": "Барсик"})
+                    json={"name": "Барсик"})
     assert r.status_code == 400
 
 
@@ -297,7 +326,7 @@ def test_приласкать_всех_с_неизвестным_verb_это_400
     глагол, и не мог тут же повторить нужным: кулдаун уже общий на все три."""
     _as_member()
     r = client.post("/api/member/game/pets/care_all",
-                    json={"chat_id": -100, "verb": "станцевать"})
+                    json={"verb": "станцевать"})
     assert r.status_code == 400
 
 
@@ -497,7 +526,7 @@ def test_список_отдаёт_питомцев_отдельным_поле�
     отдельным полем, рядом с текстом, а не вместо него."""
     c, world = мир_клиент
     world.pets.append(dict(world.pets[0], pet_key="pes"))
-    r = c.get("/api/member/game/pets?chat_id=-100")
+    r = c.get("/api/member/game/pets")
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["text"], "текст списка никуда не делся"
@@ -511,7 +540,7 @@ def test_поштучное_действие_доносит_ключ_до_лог
     доехать от кнопки до game_actions, а не потеряться в роутере."""
     _as_member()
     r = client.post("/api/member/game/pets/feed",
-                    json={"chat_id": -100, "key": "pes"})
+                    json={"key": "pes"})
     assert r.status_code == 200, r.text
     assert client.сделано[-1][3] == "pes", "ключ до game_actions не доехал"
 
@@ -524,7 +553,7 @@ def test_массовые_действия_кабинету_доступны(м�
     for action, body in (("feed_all", {}), ("walk_all", {}),
                          ("care_all", {"verb": "pet"})):
         r = c.post(f"/api/member/game/pets/{action}",
-                   json={"chat_id": -100, **body})
+                   json={**body})
         assert r.status_code == 200, f"{action}: {r.text}"
 
 

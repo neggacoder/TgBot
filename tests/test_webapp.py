@@ -103,13 +103,21 @@ def client(monkeypatch):
 
 
 def _member_chats(monkeypatch, chat_ids=(-100,)):
-    async def list_user_chats(tg_user_id):
-        return list(chat_ids)
+    """Кабинет отдаёт РАБОЧИЙ чат, а не все, где бота видели вместе с
+    человеком: список брался из истории и предлагал выбрать чат, где бот
+    давно не работает. Поэтому заглушка теперь про настройки и про то, что
+    бот человека в этом чате видел."""
+    async def fetch_settings():
+        return {"complaint_chat_id": chat_ids[0], "notify_chat_id": -100222}
+
+    async def get_known_user(chat_id, user_id):
+        return {"user_id": user_id} if chat_id in chat_ids else None
 
     async def get_chat(chat_id):
         raise RuntimeError("в тестах в Telegram не ходим")
 
-    monkeypatch.setattr(db, "list_user_chats", list_user_chats)
+    monkeypatch.setattr(db, "fetch_settings", fetch_settings, raising=False)
+    monkeypatch.setattr(db, "get_known_user", get_known_user, raising=False)
     monkeypatch.setattr(panel, "get_bot", lambda: type("B", (), {"get_chat": get_chat})())
 
 

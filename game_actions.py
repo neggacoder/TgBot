@@ -1221,6 +1221,81 @@ async def my_pets_list(chat_id: int, user_id: int) -> list[dict]:
             for row, spec in pairs]
 
 
+async def my_pets_cards(chat_id: int, user_id: int) -> dict:
+    """Питомцы ДАННЫМИ: уровень, сытость, настроение, опыт, способности.
+
+    Зачем отдельно от my_pets_text. Тот собирает готовую строку для чата — с
+    полосками из ▰▱ и эмодзи, — и на сайте она читается как стена текста.
+    Разбирать её обратно нельзя (см. my_pets_list: разбор ломается от любой
+    правки формулировки, молча и не у всех), поэтому те же числа отдаются
+    отдельно, а рисует их уже экран.
+
+    Числа считаются ЗДЕСЬ же, теми же функциями, что и текст: сытость с
+    настроением падают лениво (_pet_now), опыт растёт лениво (_pet_xp_now), и
+    посчитай их страница сама — она разойдётся с чатом ровно на время между
+    двумя обращениями.
+    """
+    rows = await db.list_pets(chat_id, user_id)
+    if not rows:
+        return {"pets": [], "food": 0, "food_emoji": pets_catalog.FOOD_ITEM_EMOJI}
+
+    specs = await _pet_specs(chat_id)
+    pinned_key = await _pinned_pet_key(chat_id, user_id)
+    aura = _pet_aura(rows, specs, pinned_key)
+
+    карточки = []
+    for row in rows:
+        spec = specs.get(row["pet_key"])
+        hunger, mood = _pet_now(row, aura.mood, aura.hunger)
+        xp = _pet_xp_now(row)
+        level, gained, needed = pets_catalog.level_progress(xp)
+        evolved = bool(row.get("evolved"))
+        активен = _pet_is_active(row, hunger, mood, pinned_key)
+
+        способности = []
+        for ability_key in (_effective_abilities(row, spec) if spec else ()):
+            found = pets_catalog.ABILITY_BY_KEY.get(ability_key)
+            if found is None:
+                continue
+            percent = pets_catalog.ability_percent(ability_key, level, evolved)
+            способности.append({
+                "key": ability_key,
+                "text": html.unescape(found.description.format(p=percent)),
+                "percent": percent,
+                "works": активен,
+            })
+
+        карточки.append({
+            "key": row["pet_key"],
+            # Имя и эмодзи В ИСХОДНОМ виде: в каталоге они уже экранированы
+            # для HTML, а отсюда уходят в JSON, где экранирует уже страница.
+            "name": html.unescape(row.get("name") or (spec.name if spec else row["pet_key"])),
+            "species": html.unescape(spec.name) if spec else "",
+            "emoji": html.unescape(spec.emoji) if spec else "🐾",
+            "level": level,
+            "max_level": pets_catalog.MAX_PET_LEVEL,
+            "is_max": level >= pets_catalog.MAX_PET_LEVEL,
+            "hunger": hunger,
+            "mood": mood,
+            "state": pets_catalog.state_text(hunger, mood),
+            "xp": gained,
+            "xp_need": needed,
+            "xp_percent": (round(100 * gained / needed) if needed else 100),
+            "abilities": способности,
+            "evolved": evolved,
+            "pinned": row["pet_key"] == pinned_key,
+            "active": активен,
+        })
+
+    return {
+        "pets": карточки,
+        "food": await db.get_inventory_quantity(chat_id, user_id,
+                                                pets_catalog.FOOD_ITEM_KEY),
+        "food_emoji": pets_catalog.FOOD_ITEM_EMOJI,
+        "food_price": pets_catalog.FOOD_ITEM_PRICE,
+    }
+
+
 async def catalog_text(chat_id: int, user_id: int, *,
                        achievement_info: Optional[Callable[[str], Optional[dict]]] = None
                        ) -> ActionResult:

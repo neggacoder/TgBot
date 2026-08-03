@@ -568,7 +568,13 @@ def test_владельца_с_бесконечными_деньгами_взы�
     вовсе, — долга у него быть не может, и взыскивать не с чего."""
     fake = _FakeLoopDB(_one_pass_row(seize_after_days=1))
     monkeypatch.setattr(bot_module.bot, "send_message", _noop_send)
-    monkeypatch.setattr(bot_module, "INFINITE_MONEY_USERS", {USER_ID})
+
+    # Раньше здесь подменялось множество в памяти бота. Множества больше нет:
+    # список читается из базы на каждый вопрос, иначе рубильник, нажатый на
+    # сайте, для бота не существовал бы до перезапуска (см. owner_flags).
+    async def _бесконечность(user_id):
+        return user_id == USER_ID
+    monkeypatch.setattr(bot_module, "has_infinite_money", _бесконечность)
     asyncio.run(_run_passes(monkeypatch, fake))
 
     assert fake.seized == [], "долг взыскан у владельца с «+бесконечностью»"

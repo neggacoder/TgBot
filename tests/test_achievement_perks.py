@@ -229,7 +229,10 @@ def _bonus_setup(monkeypatch, keys, last_day):
     monkeypatch.setattr(bot_module.db, "add_coins", _noop)
     monkeypatch.setattr(bot_module.db, "add_log", _noop)
     monkeypatch.setattr(bot_module, "_check_coin_achievements", _noop)
+    # Бонус живёт по МЕСТНЫМ суткам (своя колонка last_day), но фиксируем
+    # обе даты: тест про серию, а не про то, по каким часам она считается.
     monkeypatch.setattr(bot_module, "utc_today", lambda: date(2026, 7, 27))
+    monkeypatch.setattr(bot_module, "local_today", lambda: date(2026, 7, 27))
 
 
 def test_вечный_огонь_прощает_один_пропуск(monkeypatch):

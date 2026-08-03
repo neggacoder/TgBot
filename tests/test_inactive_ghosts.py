@@ -125,6 +125,110 @@ def test_все_живы_никого_не_трогаем(world):
     assert world["deleted"] == []
 
 
+# ---------------------------------------------------------------------------
+# Плановая сверка ростера (roster_sweep_loop). Разовая чистка на показе списка
+# лечит только тех, кто в этот список попал; призраки же сидят во ВСЕХ топах,
+# потому что после разделения таблиц все выборки спрашивают current_users.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def roster(monkeypatch):
+    # bot.id разбирается aiogram'ом из тестового токена; сверка начинается с
+    # вопроса про самого бота — «а этот чат вообще существует и я в нём?».
+    state = {
+        "deleted": [],
+        "checked": [],
+        "statuses": {bot_module.bot.id: "administrator",
+                     1: "member", 2: "left", 3: "member"},
+        "rows": [{"user_id": 1}, {"user_id": 2}, {"user_id": 3}],
+    }
+
+    async def get_chat_member(chat_id, user_id):
+        state["checked"].append(user_id)
+        status = state["statuses"].get(user_id)
+        if isinstance(status, Exception):
+            raise status
+        return _member(status)
+
+    async def delete_current_user(chat_id, user_id):
+        state["deleted"].append(user_id)
+
+    async def list_stale_roster_members(chat_id, limit=300):
+        return state["rows"]
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(bot_module.bot, "get_chat_member", get_chat_member, raising=False)
+    monkeypatch.setattr(bot_module.db, "delete_current_user", delete_current_user, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_stale_roster_members",
+                        list_stale_roster_members, raising=False)
+    monkeypatch.setattr(bot_module.asyncio, "sleep", no_sleep)
+    return state
+
+
+def _sweep():
+    return asyncio.run(bot_module._sweep_chat_roster(CHAT_ID))
+
+
+def test_сверка_убирает_вышедшего_из_ростера(roster):
+    assert _sweep() == 1
+    assert roster["deleted"] == [2]
+
+
+def test_сверка_не_трогает_живых(roster):
+    roster["statuses"] = {1: "member", 2: "administrator", 3: "creator"}
+    assert _sweep() == 0
+    assert roster["deleted"] == []
+
+
+def test_потеря_доступа_к_чату_прерывает_сверку(roster):
+    """TelegramForbiddenError здесь про самого бота (выгнали, забрали права),
+    а не про участника. Вычистить на этом основании весь ростер — потерять
+    состав чата целиком, поэтому останавливаемся."""
+    from aiogram.exceptions import TelegramForbiddenError
+    roster["statuses"][1] = TelegramForbiddenError(method=None, message="bot was kicked")
+
+    assert _sweep() == 0
+    assert roster["deleted"] == []
+    assert roster["checked"] == [bot_module.bot.id, 1], "после отказа дальше не идём"
+
+
+def test_несуществующий_чат_не_обнуляет_ростер(roster):
+    """Самое опасное место сверки. Удалённая группа и старый chat_id после
+    миграции в супергруппу отвечают «chat not found» — тем же
+    TelegramBadRequest, что и «участника тут нет». Разбирайся мы по ответу на
+    участника — вычистили бы ростер такого чата целиком, по 300 человек за
+    заход. Поэтому первый вопрос — про самого бота."""
+    from aiogram.exceptions import TelegramBadRequest
+    roster["statuses"][bot_module.bot.id] = TelegramBadRequest(
+        method=None, message="chat not found")
+
+    assert _sweep() == 0
+    assert roster["deleted"] == []
+    assert roster["checked"] == [bot_module.bot.id], "до участников дело не дошло"
+
+
+def test_бота_выгнали_из_чата_ростер_цел(roster):
+    roster["statuses"][bot_module.bot.id] = "left"
+
+    assert _sweep() == 0
+    assert roster["deleted"] == []
+
+
+def test_сетевой_сбой_не_чистит_но_и_не_останавливает(roster):
+    roster["statuses"][1] = RuntimeError("сеть отвалилась")
+
+    assert _sweep() == 1
+    assert roster["deleted"] == [2], "сбойного оставили, вышедшего убрали"
+    assert roster["checked"] == [bot_module.bot.id, 1, 2, 3]
+
+
+def test_сверка_включена_в_запуск():
+    """Цикл бесполезен, если его забыли создать при старте."""
+    import inspect
+    assert "create_task(roster_sweep_loop())" in inspect.getsource(bot_module.main)
+
+
 def test_списки_берут_с_запасом_и_режут_после_чистки():
     """Если запрашивать ровно 30 и часть отсеять, список окажется короче
     запрошенного — поэтому берём больше и режем уже после сверки."""

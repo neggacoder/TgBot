@@ -47,7 +47,9 @@ function previewText(v, n = 90) {
 
 function say(where, text, kind = "ok") {
   const box = $(where);
-  box.innerHTML = `<div class="msg ${kind}">${icon(kind === "ok" ? "check" : "alert")}<span>${escapeHtml(text)}</span></div>`;
+  // Серверные строки приходят с эмодзи («🧊 Ваш счёт заморожен…») — панель
+  // их не показывает, у сообщения и так есть своя иконка.
+  box.innerHTML = `<div class="msg ${kind}">${icon(kind === "ok" ? "check" : "alert")}<span>${escapeHtml(безЭмодзи(text))}</span></div>`;
   if (kind === "ok") setTimeout(() => { box.innerHTML = ""; }, 4000);
 }
 
@@ -86,7 +88,136 @@ const MEDIA_KINDS = [
   { match: /файл|документ/i, icon: "file", label: "Файл" },
 ];
 
-const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{20E3}]/gu;
+const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2300}-\u{23FF}\u{FE0F}\u{FE0E}\u{200D}\u{20E3}]/gu;
+
+// Кабинет не показывает эмодзи вовсе: имена титулов, товаров и серверные
+// строки приходят с ними, а рисуем мы своё. Заодно вырезаем чатовые теги
+// <tg-emoji> из РП-фраз.
+function безЭмодзи(s) {
+  return String(s ?? "")
+    .replace(/<\/?tg-emoji[^>]*>/g, "")
+    .replace(EMOJI_RE, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Иконка предмета игры из реестра GAME_ICONS (game_icons.js). Домен без
+// иконки падает на штриховой символ спрайта — пусто не бывает никогда.
+const GICON_FALLBACK = {
+  crop: "sprout", animal: "paw", product: "basket", fish: "fish",
+  game: "casino", biz: "building", bizup: "wrench", coll: "gift",
+  house: "barn", rar: "spark", prof: "work", petfam: "paw",
+  cat: "gift", weather: "sun", misc: "spark",
+};
+
+function gicon(domain, key, cls = "") {
+  const inner = typeof GAME_ICONS !== "undefined" && GAME_ICONS[`${domain}:${key}`];
+  if (inner) {
+    return `<svg class="gicon${cls ? " " + cls : ""}" viewBox="0 0 24 24" aria-hidden="true">${inner}</svg>`;
+  }
+  return icon(GICON_FALLBACK[domain] || "gift");
+}
+
+// Товары магазина — открытый набор (админ заводит любые), поэтому иконка
+// выбирается КАТЕГОРИЕЙ по ключу товара. Неизвестный ключ падает на подарок:
+// имя всё равно написано рядом, категория — только настроение.
+const SHOP_CATS = {
+  food: ["pizza", "burger", "sushi", "blin", "vilka", "kartoshka", "yabloko", "syr", "pirog"],
+  drink: ["coffee", "chay", "kofe", "probka", "energetik", "termos", "kofemashina", "chek"],
+  sweet: ["pechenka", "tort", "chocolate", "morojenoe", "fantik", "zhvachka"],
+  jewel: ["ring", "diamond", "kolco", "gem", "slitok", "treasure", "monetka", "fishka", "lucky_coin"],
+  medal: ["medal", "kubok", "trophy", "korona", "crown_gold", "vip_badge", "medal_bronze",
+          "medal_iron", "medal_silver", "medal_gold", "order_leaf", "order_shield",
+          "order_star", "order_crown", "korona_mastera", "bilet_star", "klubnaya_karta",
+          "torgovyy_znak", "zvezda"],
+  tool: ["remkomplekt", "aptechka", "skrepka", "gvozd", "provod", "shesterenka", "lampochka",
+         "magnit", "podshipnik", "pruzhina", "doska", "provoloka", "steklo", "otmychka",
+         "master_otmychka", "medvezhatnik", "lopata_master", "ledobur", "nosok", "nitka",
+         "perchatka", "zont", "strahovka", "kirpich"],
+  weapon: ["sword", "shield", "bronik", "bdsm_pletka", "sabotazh", "kompromat", "dymovushka"],
+  tech: ["robot", "nautbuk", "teleskop", "mototsikl", "rocket", "echolot", "metalloiskatel",
+         "binokl", "survilence_pass", "getaway_car", "vezdehod", "traktor", "robot_worker",
+         "kamera", "signalizaciya", "slepok", "kryshka"],
+  nature: ["cvetok", "kaktus", "ostrov", "kamen", "pyl", "banan_kozhura", "puzyr",
+           "yashchik", "pugalo", "teplica", "gold_pig", "rabbit_paw", "korm"],
+  party: ["sharik", "firework", "gift", "bilet", "gitara", "shchedrost", "megafon", "ringbell",
+          "mayak", "yahta", "sharf", "tulup", "kombinezon", "portfel"],
+  mystic: ["wand", "magicbook", "magicwand", "skull", "ghost", "pumpkin", "phoenix", "dragon",
+           "zerkalo", "obereg", "amulet_serii", "elixir", "talisman", "kometa", "planeta",
+           "zamok", "book", "dosye", "vabank", "lyod", "biznesplan", "ogon", "kompas",
+           "karta", "snasti", "set_rybaka", "almaznaya_kirka"],
+};
+const SHOP_CAT_BY_KEY = {};
+Object.entries(SHOP_CATS).forEach(([cat, keys]) => keys.forEach((k) => { SHOP_CAT_BY_KEY[k] = cat; }));
+
+function shopIcon(key, cls = "") {
+  const cat = SHOP_CAT_BY_KEY[key];
+  return cat ? gicon("cat", cat, cls) : gicon("cat", "gift", cls);
+}
+
+// Ачивки: полсотни штук, и рисовать каждой свой арт — дорого и незачем;
+// иконка берётся по СМЫСЛУ ключа из штрихового спрайта.
+const ACH_ICONS = [
+  [/^msg_|^quotes_/, "message"], [/^streak_/, "spark"], [/^days_/, "clock"],
+  [/^rewarded_|^season_/, "medal"], [/night_owl/, "moon"], [/early_bird/, "sun"],
+  [/^duel_/, "shield-x"], [/married|matchmaker/, "ring"], [/role_taken/, "mask"],
+  [/^clan_/, "shield"], [/popular/, "star"], [/investor/, "xp"],
+  [/lootbox|generous/, "gift"], [/^coins_/, "coins"], [/^casino_/, "casino"],
+  [/robber/, "eye-off"], [/club_founder/, "chats"], [/bookmarks/, "pin"],
+  [/^prof_|^work_|^sidejob_/, "work"], [/family/, "user"], [/^pets_/, "paw"],
+  [/house_built/, "barn"], [/^race_/, "walk"], [/^farm_/, "sprout"],
+  [/^fish_/, "fish"], [/treasure/, "key"], [/^collection_/, "gift"],
+];
+function achIcon(key) {
+  const метка = ACH_ICONS.find(([re]) => re.test(key));
+  return icon(метка ? метка[1] : "trophy");
+}
+
+// Питомцы: видов уже 25 и админ может добавить новых — рисуем семейство,
+// а не каждого зверя. Неизвестный вид — просто лапа.
+const PET_FAMILIES = {
+  homyak: "rodent", mysh: "rodent", ulitka: "rodent", svinka: "rodent",
+  popugay: "bird", volnistiy: "bird", sova: "bird", lebed: "bird",
+  kot: "cat", pes: "dog",
+  lisa: "wild", enot: "wild", panda: "wild", martyshka: "wild",
+  olenenok: "wild", vydra: "wild",
+  yashcherka: "reptile", cherepaha: "reptile",
+  osminog: "aqua", akula: "aqua",
+  muravey: "insect", pchela: "insect",
+  drakon: "mythic", edinorog: "mythic", tirex: "mythic",
+};
+function petIcon(speciesKey, cls = "") {
+  const fam = PET_FAMILIES[speciesKey];
+  return fam ? gicon("petfam", fam, cls) : icon("paw");
+}
+
+// Топы: эмодзи вида с сервера меняем на штрих по ключу вида.
+const TOP_ICONS = {
+  messages: "message", week: "clock", coins: "coins",
+  fishing: "fish", work: "work", achievements: "trophy",
+};
+
+// События смены приходят СТРОКОЙ с эмодзи в начале («🎉 Премия…») —
+// эмодзи срезается, иконка подбирается по слову.
+const WORK_EVENT_ICONS = [
+  [/премия/i, "gift"], [/несчастный/i, "alert"], [/озарение/i, "spark"],
+  [/краж/i, "eye-off"], [/коллега/i, "coffee"], [/курс/i, "xp"],
+];
+function workEventHtml(text) {
+  const чистый = безЭмодзи(text);
+  const метка = WORK_EVENT_ICONS.find(([re]) => re.test(чистый));
+  return `${icon(метка ? метка[1] : "spark")}${escapeHtml(чистый)}`;
+}
+
+// Состояния питомца («🍽 проголодался») — тем же приёмом.
+const PET_STATE_ICONS = [
+  [/голодает|проголодался/i, "bowl"], [/скучает/i, "alert"], [/хорошо/i, "smile"],
+];
+function petStateHtml(text) {
+  const чистый = безЭмодзи(text);
+  const метка = PET_STATE_ICONS.find(([re]) => re.test(чистый));
+  return `${icon(метка ? метка[1] : "smile")}${escapeHtml(чистый)}`;
+}
 
 function mediaKind(kind) {
   const raw = String(kind || "").trim();
@@ -232,7 +363,12 @@ $("#member-logout").addEventListener("click", async () => {
 $("#member-theme").addEventListener("click", toggleTheme);
 
 // Какие вкладки участника уже загружены (ленивая загрузка при первом открытии).
-const _memberLoaded = { rel: false, family: false, clans: false, caps: false };
+// Рабочий чат для старых вкладок (отношения, семья, кланы). Раньше он
+// читался из выпадающего списка; список убран — чат один, и сервер отдаёт
+// именно его.
+const _членство = { rel: null, family: null, clans: null };
+
+const _memberLoaded = { prof: false, tops: false, shop: false, pets: false, rel: false, family: false, clans: false, caps: false, farm: false, casino: false, biz: false, fish: false, work: false, stock: false, bank: false };
 
 function showMember() {
   $("#auth").classList.add("hidden");
@@ -243,7 +379,11 @@ function showMember() {
   // напрямую при входе и возвращаться ему некуда.
   $("#member-back-to-panel").classList.toggle("hidden", !me || me.role === "member");
   _memberLoaded.rel = _memberLoaded.family = _memberLoaded.clans = _memberLoaded.caps = false;
-  switchMemberTab("rel");
+  _memberLoaded.farm = _memberLoaded.casino = _memberLoaded.biz = false;
+  _memberLoaded.fish = _memberLoaded.work = false;
+  _memberLoaded.prof = _memberLoaded.tops = false;
+  _memberLoaded.shop = _memberLoaded.pets = false;
+  switchMemberTab("prof");
 }
 
 $("#member-back-to-panel").addEventListener("click", () => {
@@ -251,21 +391,74 @@ $("#member-back-to-panel").addEventListener("click", () => {
   showApp();
 });
 
+// Бургер: на телефоне ряд вкладок свёрнут в одну кнопку. Открывается по
+// нажатию, закрывается выбором раздела, повторным нажатием, Escape и кликом
+// мимо — все четыре пути обязательны: любой пропущенный оставляет человека с
+// открытым списком, который он не знает, как убрать.
+const _burger = $("#member-burger");
+
+function setBurger(open) {
+  const tabs = $("#member-tabs");
+  if (!tabs || !_burger) return;
+  tabs.classList.toggle("open", open);
+  _burger.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+if (_burger) {
+  _burger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setBurger(_burger.getAttribute("aria-expanded") !== "true");
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#member-tabs") && !e.target.closest("#member-burger")) {
+      setBurger(false);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setBurger(false);
+  });
+}
+
 function switchMemberTab(name) {
   $$(".member-tab").forEach((b) => b.classList.toggle("active", b.dataset.mtab === name));
+  // Название текущего раздела на кнопке: свёрнутый список иначе не говорит,
+  // где ты находишься.
+  const выбранная = $$(".member-tab").find((b) => b.dataset.mtab === name);
+  const подпись = $("#member-burger-label");
+  if (подпись && выбранная) подпись.textContent = выбранная.textContent.trim();
+  setBurger(false);
   $$(".member-panel").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
-  if (name === "rel" && !_memberLoaded.rel) { _memberLoaded.rel = true; loadMemberRelationship(); }
+  if (name === "prof" && !_memberLoaded.prof) { _memberLoaded.prof = true; loadMemberProf(); }
+  else if (name === "tops" && !_memberLoaded.tops) { _memberLoaded.tops = true; loadMemberTops(); }
+  else if (name === "rel" && !_memberLoaded.rel) { _memberLoaded.rel = true; loadMemberRelationship(); }
   else if (name === "family" && !_memberLoaded.family) { _memberLoaded.family = true; loadMemberFamily(); }
   else if (name === "clans" && !_memberLoaded.clans) { _memberLoaded.clans = true; loadMemberClans(); }
   else if (name === "caps" && !_memberLoaded.caps) { _memberLoaded.caps = true; loadMemberCapabilities(); }
+  else if (name === "farm" && !_memberLoaded.farm) { _memberLoaded.farm = true; loadMemberFarm(); }
+  else if (name === "casino" && !_memberLoaded.casino) { _memberLoaded.casino = true; loadMemberCasino(); }
+  else if (name === "biz" && !_memberLoaded.biz) { _memberLoaded.biz = true; loadMemberBiz(); }
+  else if (name === "fish" && !_memberLoaded.fish) { _memberLoaded.fish = true; loadMemberFish(); }
+  else if (name === "work" && !_memberLoaded.work) { _memberLoaded.work = true; loadMemberWork(); }
+  else if (name === "shop" && !_memberLoaded.shop) { _memberLoaded.shop = true; loadMemberShop(); }
+  else if (name === "stock" && !_memberLoaded.stock) { _memberLoaded.stock = true; loadMemberStock(); }
+  else if (name === "bank" && !_memberLoaded.bank) { _memberLoaded.bank = true; loadMemberBank(); }
+  else if (name === "pets" && !_memberLoaded.pets) { _memberLoaded.pets = true; loadMemberPets(); }
+  if (name !== "biz") { if (typeof stopBizTick === "function") stopBizTick(); }
+  if (name !== "fish" && name !== "work") {
+    if (typeof stopActivityTick === "function") stopActivityTick();
+  }
+  // Таймеры фермы тикают раз в секунду. Уходя с вкладки, их надо гасить:
+  // невидимый экран не должен жечь батарею и дёргать сервер, когда грядка
+  // поспеет.
+  if (name !== "farm") { if (typeof stopFarmTick === "function") stopFarmTick(); }
+  else if (_memberLoaded.farm && _farm.state) startFarmTick();
 }
 
 // ===== Вкладка «Кланы» =====================================================
 const CLAN_ROLE = { leader: "Лидер", deputy: "Зам", member: "Участник" };
 
 function memberClansChat() {
-  const sel = $("#member-clans-chat");
-  return sel ? Number(sel.value) : NaN;
+  return _членство.clans;
 }
 
 function clansBlock(inner) {
@@ -284,10 +477,10 @@ async function loadMemberClans() {
     }
     const options = chats.map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`).join("");
     box.innerHTML = clansBlock(
-      `<label><span>Чат</span><select id="member-clans-chat">${options}</select></label>
+      `
        <div id="member-clans-status"></div>`
     );
-    $("#member-clans-chat").addEventListener("change", loadMemberClanStatus);
+    _членство.clans = Number(chats[0].chat_id);
     loadMemberClanStatus();
   } catch (err) {
     box.innerHTML = clansBlock(`<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`);
@@ -346,12 +539,12 @@ function renderMyClan(c) {
   h += `</div>`;
   if (canManage) {
     h += `<div class="clan-manage">
-      <label><span>Название</span><input type="text" id="clan-edit-name" value="${escapeHtml(c.name)}"></label>
+      <label><span>Название</span><input type="text" id="clan-edit-name" value="${escapeHtml(c.name)}" autocomplete="off"></label>
       <textarea id="clan-edit-desc" rows="2" placeholder="Описание">${escapeHtml(c.description || "")}</textarea>
       <button class="ghost small" id="clan-edit-btn">${icon("edit")}Сохранить описание</button>
-      <div class="clan-inline"><input type="text" id="clan-title" value="${escapeHtml(c.title || "")}" placeholder="Звание (пусто — снять)">
+      <div class="clan-inline"><input type="text" id="clan-title" value="${escapeHtml(c.title || "")}" placeholder="Звание (пусто — снять)" autocomplete="off">
         <button class="ghost small" id="clan-title-btn">${icon("tag")}Звание</button></div>
-      <div class="clan-inline"><input type="text" id="clan-motto" value="${escapeHtml(c.motto || "")}" placeholder="Девиз (пусто — снять)">
+      <div class="clan-inline"><input type="text" id="clan-motto" value="${escapeHtml(c.motto || "")}" placeholder="Девиз (пусто — снять)" autocomplete="off">
         <button class="ghost small" id="clan-motto-btn">${icon("edit")}Девиз</button></div></div>`;
   }
   h += `<div class="clan-foot">`;
@@ -364,7 +557,7 @@ function renderMyClan(c) {
 
 function renderClanList(clans, my) {
   if (!clans || !clans.length) {
-    return `<div class="muted" style="margin-top:var(--gap-3)">В этом чате пока нет кланов${my ? "" : " — создайте первый"}.</div>`;
+    return `<div class="hint">В этом чате пока нет кланов${my ? "" : " — создайте первый"}.</div>`;
   }
   const myId = my ? my.id : null;
   let h = `<div class="clan-list"><h4>${icon("chart")}Кланы чата</h4>`;
@@ -440,8 +633,7 @@ function memberClanTransfer(uid) {
 
 // ===== Вкладка «Семья»: дом, питомцы, дети =================================
 function memberFamilyChat() {
-  const sel = $("#member-family-chat");
-  return sel ? Number(sel.value) : NaN;
+  return _членство.family;
 }
 
 function familyBlock(inner) {
@@ -460,10 +652,10 @@ async function loadMemberFamily() {
     }
     const options = chats.map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`).join("");
     box.innerHTML = familyBlock(
-      `<label><span>Чат</span><select id="member-family-chat">${options}</select></label>
+      `
        <div id="member-family-status"></div>`
     );
-    $("#member-family-chat").addEventListener("change", loadMemberFamilyStatus);
+    _членство.family = Number(chats[0].chat_id);
     loadMemberFamilyStatus();
   } catch (err) {
     box.innerHTML = familyBlock(`<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`);
@@ -484,7 +676,7 @@ async function loadMemberFamilyStatus() {
     // Дом
     out += `<div class="fam-sec"><h4>${icon("crown")}Дом</h4>`;
     if (d.house) {
-      out += `<div class="fam-row"><b>${escapeHtml(d.house.name)}</b> <span class="muted">· ${d.house.status === "building" ? "строится" : "готов"}</span></div>`;
+      out += `<div class="fam-row"><b>${escapeHtml(безЭмодзи(d.house.name))}</b> <span class="muted">· ${d.house.status === "building" ? "строится" : "готов"}</span></div>`;
       if (d.house.rooms.length) out += `<div class="fam-tags">${d.house.rooms.map((r) => `<span class="chip">${escapeHtml(r.key)} ур.${r.level}</span>`).join("")}</div>`;
       if (d.house.upgrades.length) out += `<div class="fam-tags">${d.house.upgrades.map((u) => `<span class="chip">${escapeHtml(u.key)} ур.${u.level}</span>`).join("")}</div>`;
     } else {
@@ -582,7 +774,8 @@ async function loadMemberCapabilities() {
 }
 
 // Одна read-only секция обзора: действия (сворачиваемые, как в админке, но без
-// кнопок правки) + синонимы. Фразы — данные бота (с эмодзи), показываем как есть.
+// кнопок правки) + синонимы. Фразы — данные бота; эмодзи в них панель
+// срезает, как и везде в кабинете.
 function memberSection(title, set) {
   const actions = (set && set.actions) || [];
   if (!actions.length) {
@@ -597,7 +790,7 @@ function memberSection(title, set) {
       </div>
       <div class="action-body collapsed">
         <div class="action-phrases">
-          ${a.phrases.map((p) => `<div class="phrase-row"><span class="phrase-text">${escapeHtml(p)}</span></div>`).join("")}
+          ${a.phrases.map((p) => `<div class="phrase-row"><span class="phrase-text">${escapeHtml(безЭмодзи(p))}</span></div>`).join("")}
         </div>
       </div>
     </div>`).join("");
@@ -629,10 +822,10 @@ async function loadMemberRelationship() {
     }
     const options = chats.map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`).join("");
     box.innerHTML = relBlock(
-      `<label><span>Чат</span><select id="member-rel-chat">${options}</select></label>
+      `
        <div id="member-rel-status"></div>`
     );
-    $("#member-rel-chat").addEventListener("change", loadMemberRelStatus);
+    _членство.rel = Number(chats[0].chat_id);
     loadMemberRelStatus();
   } catch (err) {
     box.innerHTML = relBlock(`<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`);
@@ -640,7 +833,7 @@ async function loadMemberRelationship() {
 }
 
 function memberCurrentChat() {
-  return Number($("#member-rel-chat").value);
+  return _членство.rel;
 }
 
 async function loadMemberRelStatus() {
@@ -654,9 +847,9 @@ async function loadMemberRelStatus() {
     ]);
     let out = `<div class="member-info-box">${userInfoHtml(info)}</div>`;
     out += `<div class="rel-propose"><label><span>Мой ник в этом чате</span>
-      <div class="row"><input type="text" id="member-nick" maxlength="32" value="${escapeHtml(info.nickname || "")}" placeholder="Без ника">
+      <div class="row"><input type="text" id="member-nick" maxlength="32" value="${escapeHtml(info.nickname || "")}" placeholder="Без ника" autocomplete="off">
         <button class="ghost small" id="member-nick-save">${icon("check")}Сохранить</button></div></label></div>`;
-    out += `<div class="member-target-list" style="margin-bottom: var(--gap-2)">
+    out += `<div class="member-target-list mb-2">
       <button class="ghost small" id="member-top-btn">${icon("chart")}Топ чата</button>
       <button class="ghost small" id="member-warns-btn">${icon("alert")}Мои варны</button>
       <button class="ghost small" id="member-rewards-btn">${icon("medal")}Мои награды</button></div>`;
@@ -689,7 +882,7 @@ async function loadMemberRelStatus() {
           </button>
           <div class="farm-actions-head">
             <span class="muted">Действия отношений — открываются по уровню пары</span>
-            <label class="check quiet-toggle" style="margin-left:auto">
+            <label class="check quiet-toggle push">
               <input type="checkbox" id="member-quiet-toggle" ${memberQuietMode ? "checked" : ""}>
               <span class="muted">Тихо (не публиковать в чат)</span>
             </label>
@@ -702,7 +895,7 @@ async function loadMemberRelStatus() {
         data.can_restore_rel ? `<button class="ghost small" id="member-restore-rel">${icon("undo")}Вернуть отношения (72ч)</button>` : ""}</div>`;
     }
     // Пол — «профиль для отнов»: влияет на подбор фото-реакции в паре.
-    const genders = [["м", "♂ М"], ["ж", "♀ Ж"], ["др", "⚧ Др"]];
+    const genders = [["м", `${icon("mars")} М`], ["ж", `${icon("venus")} Ж`], ["др", `${icon("gender-x")} Др`]];
     out += `<div class="rel-propose"><label><span>Мой пол <span class="muted">(для фото-реакций в паре)</span></span></label>
       <div class="member-target-list">${genders.map(([g, lbl]) =>
         `<button class="ghost small member-gender${data.gender === g ? " active" : ""}" data-gender="${g}">${lbl}</button>`).join("")}</div></div>`;
@@ -818,7 +1011,7 @@ async function openMemberTop() {
     const rows = (d.top || []).map((t) =>
       `<div class="info-row"><span>${t.rank}. ${escapeHtml(t.name)}${t.me ? " <span class='muted'>(вы)</span>" : ""}</span><b>${t.messages}</b></div>`
     ).join("") || `<div class="muted">Пусто</div>`;
-    memberModal(`${icon("chart")}Топ по сообщениям`, rows + (d.my_rank ? `<div class="muted" style="margin-top:8px">Ваше место: #${d.my_rank}</div>` : ""));
+    memberModal(`${icon("chart")}Топ по сообщениям`, rows + (d.my_rank ? `<div class="muted mt-1">Ваше место: #${d.my_rank}</div>` : ""));
   } catch (err) { say("#member-toast", err.message, "err"); }
 }
 
@@ -914,7 +1107,7 @@ function wireMemberTargetSearch() {
       const q = input.value.trim();
       if (!q) { list.innerHTML = ""; return; }
       try {
-        const data = await api(`/api/member/chat-members?chat_id=${memberCurrentChat()}&q=${encodeURIComponent(q)}`);
+        const data = await api(`/api/member/chat-members?q=${encodeURIComponent(q)}`);
         const members = data.members || [];
         list.innerHTML = members.length
           ? members.map((m) => `<button class="ghost small member-target" data-id="${m.user_id}">${
@@ -1052,6 +1245,11 @@ async function refreshMe() {
   }
 }
 
+// Слушатель вешаем один раз при загрузке страницы, как у соседних кнопок
+// этого экрана: настройки перерисовывают только свой список, а карточка
+// рубильника живёт в разметке и никуда не девается.
+$("#infinite-toggle").addEventListener("change", saveInfiniteMoney);
+
 $("#tg-link-save").addEventListener("click", async () => {
   const code = $("#tg-link-code").value.trim();
   if (!code) return;
@@ -1085,10 +1283,39 @@ async function loadRoles() {
   }
 }
 
+// Мобильный бургер админки: раскрывает список разделов. На широком экране
+// кнопки не видно, обработчик просто не срабатывает.
+function навБургер() { return $("#nav-burger"); }
+
+function закрытьНавМеню() {
+  const бургер = навБургер();
+  if (!бургер) return;
+  бургер.closest(".sidebar").classList.remove("open");
+  бургер.setAttribute("aria-expanded", "false");
+}
+
+// Подпись на бургере — название текущего раздела, без цифры-бейджа жалоб:
+// текст берём только из текстовых узлов кнопки.
+function подписьРаздела(btn) {
+  return [...btn.childNodes]
+    .filter((n) => n.nodeType === Node.TEXT_NODE)
+    .map((n) => n.textContent).join("").trim();
+}
+
+if (навБургер()) {
+  навБургер().addEventListener("click", () => {
+    const открыт = навБургер().closest(".sidebar").classList.toggle("open");
+    навБургер().setAttribute("aria-expanded", открыт ? "true" : "false");
+  });
+}
+
 $$(".nav-btn").forEach((btn) => {
   btn.addEventListener("click", () => {
     $$(".nav-btn").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
+    const метка = $("#nav-burger-label");
+    if (метка) метка.textContent = подписьРаздела(btn);
+    закрытьНавМеню();
     const view = btn.dataset.view;
     $$(".view").forEach((v) => v.classList.add("hidden"));
     $(`#view-${view}`).classList.remove("hidden");
@@ -1157,7 +1384,7 @@ function renderCommandTree() {
       <input type="number" class="cmd-cleanup" data-key="${escapeHtml(c.key)}" min="0"
         max="${_cmdTree.cleanup_max}" step="1" placeholder="${dflt}"
         title="Через сколько минут убирать эту команду из чата жалоб. Пусто — общий срок (${dflt} мин.), 0 — не убирать."
-        value="${c.cleanup_minutes === null || c.cleanup_minutes === undefined ? "" : c.cleanup_minutes}">
+        value="${c.cleanup_minutes === null || c.cleanup_minutes === undefined ? "" : c.cleanup_minutes}" autocomplete="off">
       <span class="muted">мин</span></span>`;
   };
   let out = "";
@@ -1322,23 +1549,24 @@ async function rewardSetLevel(degree, level) {
 
 // --- чаты -----------------------------------------------------------------
 
+// Чат у панели один — рабочий. Раньше в каждом разделе висел выбор чата, и
+// это был обман: бот работает только в рабочем, а остальные строки — остаток
+// от прежнего использования. Админ выбирал чат и смотрел данные, которых нет.
+let рабочийЧат = null;
+
+function чат() {
+  return рабочийЧат;
+}
+
 async function loadChats() {
   try {
     const data = await api("/api/chats");
     chats = data.chats;
-    const options = chats
-      .map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`)
-      .join("");
-    ["#send-chat", "#members-chat", "#mod-chat", "#stats-chat", "#stock-chat", "#events-chat", "#tga-chat", "#chatroles-chat"].forEach((sel) => {
-      $(sel).innerHTML = options || `<option value="">Чатов пока нет</option>`;
-    });
-    // В фильтре журнала «все чаты» — вариант по умолчанию, поэтому список
-    // чатов добавляется к нему, а не заменяет его.
-    if ($("#logs-chat")) $("#logs-chat").innerHTML = `<option value="">Все чаты</option>` + options;
+    рабочийЧат = chats.length ? Number(chats[0].chat_id) : null;
     $("#chats-table").innerHTML = chats.map((c) => `
-      <tr><td><div class="person">${avatar(c.title, c.chat_id)}<span>${escapeHtml(c.title)}</span></div></td>
-          <td class="mono">${c.chat_id}</td>
-          <td class="num">${c.members}</td></tr>`).join("")
+      <tr><td class="tc-head"><div class="person">${avatar(c.title, c.chat_id)}<span>${escapeHtml(c.title)}</span></div></td>
+          <td class="mono" data-label="ID">${c.chat_id}</td>
+          <td class="num" data-label="Людей">${c.members}</td></tr>`).join("")
       || empty(3, "Бот пока не видел ни одного чата");
     if (chats.length) {
       loadMembers();
@@ -1350,7 +1578,7 @@ async function loadChats() {
 }
 
 async function loadMembers() {
-  const chatId = $("#members-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   $("#members-table").innerHTML = skeletonRows(5);
   try {
@@ -1362,12 +1590,12 @@ async function loadMembers() {
     });
     const data = await api(`/api/members?${params}`);
     $("#members-table").innerHTML = data.members.map((m) => `
-      <tr><td><div class="person">${avatar(m.full_name, m.user_id)}<span>${escapeHtml(m.full_name)}</span></div></td>
-          <td>${roleBadge(m)}</td>
-          <td class="muted">${m.username ? "@" + escapeHtml(m.username) : "—"}</td>
-          <td class="mono">${m.message_count ?? 0}</td>
-          <td class="mono">${m.user_id}</td>
-          <td style="text-align:right; white-space:nowrap">
+      <tr><td class="tc-head"><div class="person">${avatar(m.full_name, m.user_id)}<span>${escapeHtml(m.full_name)}</span>${roleBadge(m) ? `<span class="tc-only">${roleBadge(m)}</span>` : ""}</div></td>
+          <td class="tc-skip">${roleBadge(m)}</td>
+          <td class="muted" data-label="Ник">${m.username ? "@" + escapeHtml(m.username) : ""}</td>
+          <td class="mono" data-label="Сообщений">${m.message_count ?? 0}</td>
+          <td class="mono" data-label="ID">${m.user_id}</td>
+          <td class="right nowrap tc-actions">
             <button class="ghost small" data-userinfo="${m.user_id}" title="Информация о пользователе">${icon("id")}Инфо</button>
             <button class="ghost small" data-moderate="${m.user_id}"
               data-name="${escapeHtml(m.full_name)}" data-username="${escapeHtml(m.username || "")}"
@@ -1389,7 +1617,7 @@ async function loadMembers() {
           username: btn.dataset.username || null,
           role: btn.dataset.role || null,
           role_key: btn.dataset.roleKey || null,
-        }, $("#members-chat").value);
+        }, чат());
       });
     });
   } catch (err) {
@@ -1397,7 +1625,6 @@ async function loadMembers() {
   }
 }
 
-$("#members-chat").addEventListener("change", loadMembers);
 $("#members-role").addEventListener("change", loadMembers);
 $("#members-q").addEventListener("input", () => {
   clearTimeout(window._memberSearch);
@@ -1420,7 +1647,7 @@ function userInfoHtml(info) {
     ${info.role ? line("Роль", escapeHtml(info.role)) : ""}
     ${line("Награды / варны", `${icon("medal")}${info.rewards} · ${icon("alert")}${info.warns}`)}
     ${line("Репутация", info.reputation)}
-    <div class="mono muted" style="margin-top:6px">ID: ${info.user_id}</div>`;
+    <div class="mono muted mt-1">ID: ${info.user_id}</div>`;
 }
 
 async function openUserInfo(chatId, userId) {
@@ -1538,7 +1765,7 @@ function renderActions(actions) {
             </div>`).join("")}
         </div>
         <form class="row phrase-add" data-add-to="${escapeHtml(a.key)}">
-          <input type="text" maxlength="512" placeholder="Новая фраза…" required>
+          <input type="text" maxlength="512" placeholder="Новая фраза…" required autocomplete="off">
           <button class="ghost small" type="submit">${icon("plus")}Фраза</button>
         </form>
       </div>
@@ -1705,7 +1932,7 @@ function renderProposeActions(actions, canEdit) {
           </div>
           ${canEdit ? `
             <form class="row propose-phrase-add" data-propose-add-to="${escapeHtml(a.key)}" data-propose-kind="${kind}">
-              <input type="text" maxlength="512" placeholder="Новая фраза…" required>
+              <input type="text" maxlength="512" placeholder="Новая фраза…" required autocomplete="off">
               <button class="ghost small" type="submit">${icon("plus")}Фраза</button>
             </form>` : ""}
         `).join("")}
@@ -1719,15 +1946,15 @@ function renderProposeActions(actions, canEdit) {
         </div>
         ${canEdit ? `
           <form class="row" data-propose-synonym-add-to="${escapeHtml(a.key)}">
-            <input type="text" maxlength="64" placeholder="новый синоним…" required>
+            <input type="text" maxlength="64" placeholder="новый синоним…" required autocomplete="off">
             <button class="ghost small" type="submit">${icon("plus")}Синоним</button>
           </form>
           <form class="row propose-settings" data-propose-settings-for="${escapeHtml(a.key)}">
             <label class="narrow"><span>Кулдаун, сек</span>
-              <input type="number" min="1" max="86400" value="${a.cooldown_seconds}" data-field="cooldown_seconds" required>
+              <input type="number" min="1" max="86400" value="${a.cooldown_seconds}" data-field="cooldown_seconds" required autocomplete="off">
             </label>
             <label class="narrow"><span>Таймаут, сек</span>
-              <input type="number" min="1" max="86400" value="${a.timeout_seconds}" data-field="timeout_seconds" required>
+              <input type="number" min="1" max="86400" value="${a.timeout_seconds}" data-field="timeout_seconds" required autocomplete="off">
             </label>
             <button class="ghost small" type="submit">${icon("check")}Сохранить</button>
           </form>` : `<p class="sub">Кулдаун ${a.cooldown_seconds}с, таймаут ${a.timeout_seconds}с</p>`}
@@ -1869,7 +2096,7 @@ $("#propose-synonym-add").addEventListener("submit", async (e) => {
 
 // --- Отн-жесты (админ): жест + фразы + слова-триггеры + фото ---------------
 
-const GESTURE_PAIR_LABELS = { mf: "♂ + ♀", mm: "♂ + ♂", ff: "♀ + ♀", all: "Общие (любая пара)" };
+const GESTURE_PAIR_LABELS = { mf: "М + Ж", mm: "М + М", ff: "Ж + Ж", all: "Общие (любая пара)" };
 
 $("#gesture-add").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -1929,15 +2156,15 @@ function gestureCard(g) {
       </div>
       <div class="action-body collapsed">
         <label><span>Ответная реакция снизу (моноблоком; <code>{actor}</code>/<code>{target}</code>)</span>
-          <div class="row"><input type="text" maxlength="255" value="${escapeHtml(g.reply_template || "")}" data-greply-input="${k}" placeholder="{target} подмигивает {actor} в ответ.">
+          <div class="row"><input type="text" maxlength="255" value="${escapeHtml(g.reply_template || "")}" data-greply-input="${k}" placeholder="{target} подмигивает {actor} в ответ." autocomplete="off">
             <button class="ghost small" data-greply="${k}">${icon("check")}Сохранить</button></div></label>
         <div class="gsub"><b>Слова-триггеры</b> <span class="muted">(что писать в чате: «отн подмигнуть»)</span>
           <div class="alias-list">${aliases || `<span class="muted">нет</span>`}</div>
-          <form class="row alias-add" data-gkey="${k}"><input type="text" maxlength="64" placeholder="подмигнуть" required>
+          <form class="row alias-add" data-gkey="${k}"><input type="text" maxlength="64" placeholder="подмигнуть" required autocomplete="off">
             <button class="ghost small" type="submit">${icon("plus")}Слово</button></form></div>
         <div class="gsub"><b>Фразы</b> <span class="muted">(<code>{actor}</code>/<code>{target}</code>)</span>
           <div class="action-phrases">${phrases || `<span class="muted">нет</span>`}</div>
-          <form class="row gphrase-add" data-gkey="${k}"><input type="text" maxlength="512" placeholder="{actor} подмигивает {target}." required>
+          <form class="row gphrase-add" data-gkey="${k}"><input type="text" maxlength="512" placeholder="{actor} подмигивает {target}." required autocomplete="off">
             <button class="ghost small" type="submit">${icon("plus")}Фраза</button></form></div>
         <div class="gsub"><b>Фото по полу пары</b>${photos}</div>
       </div>
@@ -2046,9 +2273,9 @@ async function loadComplaints() {
         : `<span class="right-chip">${icon("user")}${escapeHtml(c.reporter?.full_name || `ID ${c.reporter?.user_id}`)}</span>`;
       return `
         <div class="role-row" data-complaint="${c.id}">
-          <div style="flex:1; min-width:0">
+          <div class="grow">
             <div class="role-name">${escapeHtml(c.reason || "без текста")}</div>
-            <div class="role-info" style="justify-content:flex-start; margin-top:4px">
+            <div class="role-info mt-1">
               ${from}
               <span class="muted">${escapeHtml(roleDate(c.created_at) || "")}</span>
               <span class="role-state ${state.cls}">${icon(state.icon)}${state.label}</span>
@@ -2148,7 +2375,7 @@ function restDuration(seconds) {
 }
 
 async function loadRestRequests() {
-  const chatId = $("#mod-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   try {
     const data = await api(`/api/rest-requests?chat_id=${chatId}`);
@@ -2196,7 +2423,6 @@ async function loadRestRequests() {
   }
 }
 
-$("#mod-chat").addEventListener("change", loadRestRequests);
 
 // Выбор участника — общий диалог: поиск тот же, что на вкладке «Чаты и люди»,
 // поэтому и здесь ищется по имени, @нику и ID. Возвращает выбранного человека
@@ -2275,7 +2501,7 @@ function roleActionButtons(role) {
 }
 
 function bindRoleActions() {
-  const chatId = () => Number($("#chatroles-chat").value);
+  const chatId = () => чат();
 
   $$("[data-role-give]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -2384,7 +2610,7 @@ function bindRoleDecisions() {
       try {
         const res = await api(`/api/chat-roles/${btn.dataset.roleDecide}/decision`, {
           method: "POST",
-          body: { chat_id: Number($("#chatroles-chat").value), approve },
+          body: { chat_id: чат(), approve },
         });
         say("#global-msg", approve
           ? (res.reserved ? "Заявка принята, роль забронирована за автором" : "Заявка принята")
@@ -2399,7 +2625,7 @@ function bindRoleDecisions() {
 }
 
 async function loadChatRoles() {
-  const chatId = $("#chatroles-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   if (!$("#chatroles-list").children.length) $("#chatroles-list").innerHTML = skeleton(4);
   try {
@@ -2476,7 +2702,7 @@ $("#chatrole-add").addEventListener("submit", async (e) => {
     await api("/api/chat-roles", {
       method: "POST",
       body: {
-        chat_id: Number($("#chatroles-chat").value),
+        chat_id: чат(),
         name,
         category: $("#chatrole-category").value.trim() || null,
       },
@@ -2494,7 +2720,6 @@ $("#chatrole-add").addEventListener("submit", async (e) => {
   }
 });
 
-$("#chatroles-chat").addEventListener("change", loadChatRoles);
 $("#chatroles-category").addEventListener("change", loadChatRoles);
 $("#chatroles-q").addEventListener("input", () => {
   clearTimeout(window._chatRoleSearch);
@@ -2603,7 +2828,7 @@ function closeFeedStream() {
 }
 
 async function loadFeed() {
-  const chatId = Number($("#send-chat").value);
+  const chatId = чат();
   if (!chatId) return;
 
   closeFeedStream();
@@ -2641,7 +2866,6 @@ async function loadFeed() {
   source.onerror = () => { if (feedSource === source) feedStatus("переподключение…", "warn"); };
 }
 
-$("#send-chat").addEventListener("change", loadFeed);
 
 // В фоновой вкладке лента никому не нужна, а соединение висит и опрашивает БД.
 document.addEventListener("visibilitychange", () => {
@@ -2685,7 +2909,7 @@ $("#send-btn").addEventListener("click", async () => {
     const res = await api("/api/send", {
       method: "POST",
       body: {
-        chat_id: Number($("#send-chat").value),
+        chat_id: чат(),
         text,
         reply_to: Number($("#send-reply").value) || null,
         topic_id: Number($("#send-topic").value) || null,
@@ -2707,7 +2931,7 @@ $("#send-photo-btn").addEventListener("click", async () => {
   const file = $("#send-photo").files[0];
   if (!file) return say("#global-msg", "Выберите файл", "err");
   const form = new FormData();
-  form.append("chat_id", $("#send-chat").value);
+  form.append("chat_id", чат());
   form.append("caption", $("#send-caption").value);
   form.append("photo", file);
   try {
@@ -2736,7 +2960,7 @@ async function loadWarns() {
   if (!modPicked) { card.classList.add("hidden"); return; }
   card.classList.remove("hidden");
   try {
-    const params = new URLSearchParams({ chat_id: $("#mod-chat").value, user_id: modPicked.user_id });
+    const params = new URLSearchParams({ chat_id: чат(), user_id: modPicked.user_id });
     const data = await api(`/api/warns?${params}`);
     $("#mod-warns-count").textContent = `${data.count} из ${data.limit}`;
     $("#mod-warns-hint").textContent = data.count >= data.limit - 1 && data.count < data.limit
@@ -2765,7 +2989,7 @@ $("#mod-warn").addEventListener("click", async () => {
     const res = await api("/api/warns", {
       method: "POST",
       body: {
-        chat_id: Number($("#mod-chat").value),
+        chat_id: чат(),
         user_id: modPicked.user_id,
         days,
         reason: $("#mod-warn-reason").value.trim() || null,
@@ -2791,7 +3015,7 @@ $("#mod-unwarn").addEventListener("click", async () => {
   try {
     const res = await api("/api/warns/remove", {
       method: "POST",
-      body: { chat_id: Number($("#mod-chat").value), user_id: modPicked.user_id },
+      body: { chat_id: чат(), user_id: modPicked.user_id },
     });
     say("#global-msg", `Варн снят. Осталось: ${res.count}`);
     loadWarns();
@@ -2832,12 +3056,16 @@ function pickMember(member, chatId) {
   $("#mod-search").value = "";
   $("#mod-suggest").classList.add("hidden");
 
-  if (chatId) $("#mod-chat").value = chatId;
+  if (chatId) чат() = chatId;
   // переключаемся на вкладку модерации, если пришли из списка участников
   closeFeedStream();   // вкладку «Написать» покидаем — лента больше не нужна
   $$(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === "moderation"));
   $$(".view").forEach((v) => v.classList.add("hidden"));
   $("#view-moderation").classList.remove("hidden");
+  const метка = $("#nav-burger-label");
+  const кнопка = $$(".nav-btn").find((b) => b.dataset.view === "moderation");
+  if (метка && кнопка) метка.textContent = подписьРаздела(кнопка);
+  закрытьНавМеню();
 
   renderPicked();
 }
@@ -2850,7 +3078,7 @@ async function suggestMembers() {
   // пустой запрос осмыслен: «покажи всех модераторов этого чата».
   if (q.length < 1 && !role) { box.classList.add("hidden"); return; }
   try {
-    const params = new URLSearchParams({ chat_id: $("#mod-chat").value, q, role });
+    const params = new URLSearchParams({ chat_id: чат(), q, role });
     const data = await api(`/api/members?${params}`);
     const list = data.members.slice(0, 8);
     if (!list.length) {
@@ -2890,13 +3118,6 @@ $("#mod-search").addEventListener("input", () => {
 });
 $("#mod-search").addEventListener("focus", suggestMembers);
 $("#mod-role").addEventListener("change", suggestMembers);
-$("#mod-chat").addEventListener("change", () => {
-  // сменили чат — прежний выбор к нему уже не относится
-  modPicked = null;
-  $("#mod-user").value = "";
-  renderPicked();
-  $("#mod-suggest").classList.add("hidden");
-});
 // клик мимо подсказок — закрыть их
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#mod-suggest") && e.target !== $("#mod-search") && e.target !== $("#mod-role")) {
@@ -2917,7 +3138,7 @@ $$("[data-mod]").forEach((btn) => {
       const res = await api(`/api/moderation/${action}`, {
         method: "POST",
         body: {
-          chat_id: Number($("#mod-chat").value),
+          chat_id: чат(),
           user_id: userId,
           minutes: Number($("#mod-minutes").value) || null,
           reason: $("#mod-reason").value,
@@ -3020,7 +3241,7 @@ async function loadTgRights() {
 }
 
 async function loadTgAdmins() {
-  const chatId = $("#tga-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   $("#tga-list").innerHTML = skeleton(4);
   try {
@@ -3090,7 +3311,7 @@ function bindTgAdminActions(admins, chatId) {
       box.classList.remove("hidden");
       box.innerHTML = `
         <label class="narrow"><span>Должность</span>
-          <input type="text" maxlength="16" data-title value="${escapeHtml(admin.custom_title || "")}">
+          <input type="text" maxlength="16" data-title value="${escapeHtml(admin.custom_title || "")}" autocomplete="off">
         </label>
         <div data-grid></div>
         <button class="primary small" data-save-rights>${icon("check")}Сохранить права</button>`;
@@ -3148,7 +3369,7 @@ async function suggestTgCandidates() {
   const box = $("#tga-suggest");
   if (q.length < 1) { box.classList.add("hidden"); return; }
   try {
-    const params = new URLSearchParams({ chat_id: $("#tga-chat").value, q });
+    const params = new URLSearchParams({ chat_id: чат(), q });
     const data = await api(`/api/members?${params}`);
     const list = data.members.slice(0, 8);
     box.classList.remove("hidden");
@@ -3200,11 +3421,6 @@ function renderTgPicked() {
   $("#tga-clear").addEventListener("click", () => { tgPicked = null; renderTgPicked(); });
 }
 
-$("#tga-chat").addEventListener("change", () => {
-  tgPicked = null;          // прежний выбор к новому чату не относится
-  renderTgPicked();
-  loadTgAdmins();
-});
 $("#tga-search").addEventListener("input", () => {
   clearTimeout(window._tgSearch);
   window._tgSearch = setTimeout(suggestTgCandidates, 250);
@@ -3217,7 +3433,7 @@ $("#tga-promote").addEventListener("click", async () => {
     await api("/api/tg_admins/promote", {
       method: "POST",
       body: {
-        chat_id: Number($("#tga-chat").value),
+        chat_id: чат(),
         user_id: tgPicked.user_id,
         rights,
         custom_title: $("#tga-title").value,
@@ -3277,8 +3493,8 @@ function lineChart(title, subtitle, points) {
         ${dots}
       </svg>
     </div>
-    <div class="bar-axis"><span>${escapeHtml(first.axis)}</span><span style="text-align:right">${escapeHtml(last.axis)}</span></div>
-    <div class="stat-grid" style="margin-top:var(--gap-3)">
+    <div class="bar-axis"><span>${escapeHtml(first.axis)}</span><span class="right">${escapeHtml(last.axis)}</span></div>
+    <div class="stat-grid mt-3">
       ${statCell(fmt(last.value), "курс сейчас")}
       ${statCell(`${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, "за период")}
       ${statCell(fmt(min), "минимум")}
@@ -3304,7 +3520,7 @@ function stockForecast(lo, hi, div) {
     ? "курс в среднем стоит на месте — деньги не печатаются"
     : (avg > 0 ? "курс в среднем растёт — со временем это разгонит инфляцию"
                : "курс в среднем падает — вложения будут таять");
-  return `<p class="msg ${verdict === "ok" ? "ok" : "err"}" style="margin-top:8px">
+  return `<p class="msg mt-1 ${verdict === "ok" ? "ok" : "err"}">
     Средний шаг: <b>${avg >= 0 ? "+" : ""}${avg.toFixed(2)}%</b> в час → примерно
     <b>${dayText}</b> в сутки. ${escapeHtml(note)}.
     Дивиденды добавляют держателям ещё <b>${div.toFixed(1)}%</b> от вложенного в сутки.</p>`;
@@ -3339,7 +3555,7 @@ function applyStockPreset(name) {
 }
 
 async function loadStockData() {
-  const chatId = $("#stock-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   const period = $("#stock-period").value;
   $("#stock-out").innerHTML = skeleton(3);
@@ -3377,7 +3593,7 @@ async function loadStockData() {
 }
 
 async function saveStockSettings() {
-  const chatId = $("#stock-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   try {
     await api("/api/stock/settings", {
@@ -3399,7 +3615,6 @@ $$("#stock-presets .preset").forEach((btn) => {
   btn.addEventListener("click", () => applyStockPreset(btn.dataset.preset));
 });
 $("#stock-load").addEventListener("click", loadStockData);
-$("#stock-chat").addEventListener("change", loadStockData);
 $("#stock-period").addEventListener("change", loadStockData);
 $("#stock-save").addEventListener("click", saveStockSettings);
 ["#stock-min", "#stock-max", "#stock-div"].forEach((sel) => {
@@ -3426,7 +3641,7 @@ function renderEventsToggle() {
 }
 
 async function loadChatEvents() {
-  const chatId = $("#events-chat")?.value;
+  const chatId = чат();
   if (!chatId) return;
   _eventsEnabled = null;
   renderEventsToggle();
@@ -3443,7 +3658,7 @@ async function loadChatEvents() {
 }
 
 async function toggleChatEvents() {
-  const chatId = $("#events-chat")?.value;
+  const chatId = чат();
   if (!chatId || _eventsEnabled === null) return;
   try {
     const d = await api("/api/chat-events", {
@@ -3457,7 +3672,6 @@ async function toggleChatEvents() {
   }
 }
 
-if ($("#events-chat")) $("#events-chat").addEventListener("change", loadChatEvents);
 if ($("#events-toggle")) $("#events-toggle").addEventListener("click", toggleChatEvents);
 
 // --- статистика -----------------------------------------------------------
@@ -3495,7 +3709,7 @@ function statCell(value, label) {
 }
 
 async function loadStatsData() {
-  const chatId = $("#stats-chat").value;
+  const chatId = чат();
   if (!chatId) return;
   const days = Math.max(1, Number($("#stats-days").value) || 7);
   $("#stats-out").innerHTML = skeleton(5);
@@ -3574,7 +3788,7 @@ function logsQueryString() {
   if (type) p.set("event_type", type);
   const days = $("#logs-days").value;
   if (days && days !== "0") p.set("days", days);
-  const chat = $("#logs-chat").value;
+  const chat = чат();
   if (chat) p.set("chat_id", chat);
   const uid = $("#logs-user").value.trim();
   if (uid) p.set("user_id", uid);
@@ -3605,10 +3819,10 @@ async function loadLogs() {
         l.target_id ? `→ <span class="mono">${l.target_id}</span>` : "",
       ].filter(Boolean).join(" ");
       return `<tr>
-        <td class="muted mono" style="white-space:nowrap" title="${escapeHtml(dt.toLocaleString("ru-RU"))}">${escapeHtml(dt.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }))}</td>
+        <td class="muted mono nowrap" title="${escapeHtml(dt.toLocaleString("ru-RU"))}">${escapeHtml(dt.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }))}</td>
         <td><span class="badge">${escapeHtml(l.event_type)}</span></td>
-        <td class="muted">${who || "—"}</td>
-        <td class="muted">${escapeHtml(l.details || "")}</td></tr>`;
+        <td class="muted" data-label="Кто / кому">${who || ""}</td>
+        <td class="muted tc-details">${escapeHtml(l.details || "")}</td></tr>`;
     }).join("") || empty(4, "Ничего не найдено — попробуйте ослабить фильтры");
 
     const from = _logsTotal ? _logsOffset + 1 : 0;
@@ -3631,7 +3845,7 @@ function scheduleLogsReload() {
 
 if ($("#logs-q")) {
   $("#logs-q").addEventListener("input", scheduleLogsReload);
-  ["#logs-type", "#logs-days", "#logs-chat"].forEach((sel) =>
+  ["#logs-type", "#logs-days"].forEach((sel) =>
     $(sel).addEventListener("change", () => { _logsOffset = 0; loadLogs(); }));
   $("#logs-user").addEventListener("input", scheduleLogsReload);
   $("#logs-prev").addEventListener("click", () => {
@@ -3645,7 +3859,7 @@ if ($("#logs-q")) {
     $("#logs-q").value = "";
     $("#logs-type").value = "";
     $("#logs-days").value = "7";
-    $("#logs-chat").value = "";
+    чат() = "";
     $("#logs-user").value = "";
     _logsOffset = 0;
     loadLogs();
@@ -3692,11 +3906,11 @@ function settingCard(key, item, canEdit) {
           </label>
           <label><span>Или впишите свой</span>
             <input type="text" data-setting="${key}" ${canEdit ? "" : "disabled"}
-              value="${escapeHtml(cur)}" placeholder="мск / GMT+3 / Europe/Moscow">
+              value="${escapeHtml(cur)}" placeholder="мск / GMT+3 / Europe/Moscow" autocomplete="off">
           </label>
           ${canEdit ? `<div class="grow-0"><button class="ghost" data-save="${key}">${icon("check")}Сохранить</button></div>` : ""}
         </div>
-        ${cur && !known ? `<div class="muted" style="font-size:12px">Своё значение: <code>${escapeHtml(cur)}</code></div>` : ""}
+        ${cur && !known ? `<div class="muted tiny">Своё значение: <code>${escapeHtml(cur)}</code></div>` : ""}
       </div>`;
   }
   const placeholder = item.kind === "number"
@@ -3723,7 +3937,53 @@ function settingCard(key, item, canEdit) {
 // в панели: свой список рано или поздно разошёлся бы с тем, что принимает бот.
 let _timezones = [];
 
+// Бесконечные деньги — рубильник владельца, он же «+бесконечность» в чате.
+// Список один на всех владельцев, поэтому экран показывает и чужие включения:
+// иначе выглядело бы, что рубильник только твой.
+async function loadInfiniteMoney() {
+  const карточка = $("#infinite-card");
+  if (!карточка || me.role !== "owner") return;
+  const флажок = $("#infinite-toggle"), подпись = $("#infinite-label"),
+        заметка = $("#infinite-note");
+  try {
+    const d = await api("/api/owner/infinite-money");
+    флажок.checked = !!d.enabled;
+    // Не привязан телеграм — бот не знает, кому включать. Говорим это ДО
+    // нажатия и называем, что делать: отказ по факту читается как поломка.
+    флажок.disabled = !d.linked;
+    подпись.textContent = d.enabled
+      ? "Включены — ваши покупки не списывают i¢"
+      : "Включить бесконечные деньги";
+    заметка.innerHTML = !d.linked
+      ? `${icon("alert")}Сначала привяжите телеграм выше — бот узнаёт вас по нему.`
+      : (d.others.length
+         ? `Включены ещё у ${d.others.length} ${d.others.length === 1 ? "владельца" : "владельцев"}. Выключить чужой отсюда нельзя.`
+         : "");
+  } catch (err) {
+    заметка.textContent = err.message;
+  }
+}
+
+async function saveInfiniteMoney() {
+  const флажок = $("#infinite-toggle");
+  if (!флажок) return;
+  const нужно = флажок.checked;
+  флажок.disabled = true;
+  try {
+    await api("/api/owner/infinite-money", { method: "POST", body: { enabled: нужно } });
+    say("#infinite-msg", нужно
+      ? "Бесконечные деньги включены — покупки больше не списывают i¢."
+      : "Бесконечные деньги выключены — траты снова списываются.");
+  } catch (err) {
+    флажок.checked = !нужно;      // сервер не согласился — возвращаем как было
+    say("#infinite-msg", err.message, "err");
+  }
+  флажок.disabled = false;
+  await loadInfiniteMoney();
+}
+
 async function loadSettings() {
+  loadInfiniteMoney();
   try {
     const data = await api("/api/settings");
     _timezones = data.timezones || [];
@@ -3787,12 +4047,12 @@ async function loadUsers() {
     const data = await api("/api/users");
     $("#users-table").innerHTML = data.users.map((u) => `
       <tr>
-        <td><div class="person">${avatar(u.username, u.id)}<span>${escapeHtml(u.username)}${
+        <td class="tc-head"><div class="person">${avatar(u.username, u.id)}<span>${escapeHtml(u.username)}${
           u.username === me.username ? ' <em class="tip">— это вы</em>' : ""}</span></div></td>
-        <td><span class="badge ${u.role === "owner" ? "owner" : ""}">${
+        <td data-label="Роль"><span class="badge ${u.role === "owner" ? "owner" : ""}">${
           u.role === "owner" ? icon("key") + "владелец" : "администратор"}</span></td>
-        <td class="muted" style="white-space:nowrap">${fmtDate(u.last_login_at)}</td>
-        <td style="text-align:right">${u.username === me.username ? "" :
+        <td class="muted nowrap" data-label="Последний вход">${fmtDate(u.last_login_at)}</td>
+        <td class="right ${u.username === me.username ? "" : "tc-actions"}">${u.username === me.username ? "" :
           `<button class="danger" data-del="${u.id}">${icon("trash")}Удалить</button>`}</td>
       </tr>`).join("");
 
@@ -3810,9 +4070,9 @@ async function loadUsers() {
 
     const logins = await api("/api/logins");
     $("#logins-table").innerHTML = logins.logins.map((l) => `
-      <tr><td class="muted" style="white-space:nowrap">${fmtDate(l.created_at)}</td>
-          <td>${escapeHtml(l.username)}</td>
-          <td class="mono">${escapeHtml(l.ip || "—")}</td>
+      <tr><td class="muted nowrap" data-label="Когда">${fmtDate(l.created_at)}</td>
+          <td data-label="Логин">${escapeHtml(l.username)}</td>
+          <td class="mono" data-label="Адрес">${escapeHtml(l.ip || "—")}</td>
           <td><span class="badge ${l.success ? "ok" : "err"}">${
             icon(l.success ? "check" : "alert")}${l.success ? "успех" : "отказ"}</span></td></tr>`).join("")
       || empty(4, "Входов пока не было");
@@ -3879,25 +4139,31 @@ boot();
 // Появилась настройка в chat_settings.py — появилась и здесь, править нечего.
 
 async function loadChatSettings() {
-  const select = $("#chatsettings-chat");
-  if (!select.options.length) {
-    const { chats } = await api("/api/chats");
-    select.innerHTML = chats
-      .map((c) => `<option value="${c.chat_id}">${escapeHtml(c.title)}</option>`)
-      .join("");
-    select.addEventListener("change", renderChatSettings);
-  }
+  // Чат один, выбирать нечего. Но раздел могли открыть первым — тогда
+  // рабочий чат ещё не загружен, и без этого запроса форма осталась бы пустой.
+  if (!чат()) await loadChats();
   await renderChatSettings();
 }
 
 async function renderChatSettings() {
-  const chatId = $("#chatsettings-chat").value;
+  const chatId = чат();
   const out = $("#chatsettings-out");
   if (!chatId) { out.innerHTML = ""; return; }
   out.innerHTML = skeleton(3);
   try {
     const { groups } = await api(`/api/chat-settings?chat_id=${chatId}`);
-    out.innerHTML = groups.map(chatSettingsGroup).join("");
+    // Секций девять, и раньше до «Дуэлей» можно было добраться только
+    // прокруткой через всё. Лента-оглавление сверху прыгает к секции.
+    const якоря = groups.length > 1
+      ? `<nav class="cs-anchors chips">${groups.map((g, i) =>
+          `<button type="button" class="chip" data-cs-anchor="cs-${i}">${escapeHtml(g.group)}</button>`).join("")}</nav>`
+      : "";
+    out.innerHTML = якоря + groups.map(chatSettingsGroup).join("");
+    $$("#chatsettings-out [data-cs-anchor]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const цель = document.getElementById(b.dataset.csAnchor);
+        if (цель) цель.scrollIntoView({ behavior: "smooth", block: "start" });
+      }));
     $$("#chatsettings-out [data-setting]").forEach((el) =>
       el.addEventListener("change", () => saveChatSetting(el)));
   } catch (e) {
@@ -3905,9 +4171,10 @@ async function renderChatSettings() {
   }
 }
 
-function chatSettingsGroup(group) {
+function chatSettingsGroup(group, i) {
   const rows = group.settings.map(chatSettingField).join("");
-  return `<section class="card"><h2>${escapeHtml(group.group)}</h2>${rows}</section>`;
+  return `<section class="card cs-card" id="cs-${i}">
+    <h2>${escapeHtml(group.group)}</h2><div class="cs-grid">${rows}</div></section>`;
 }
 
 function chatSettingField(s) {
@@ -3923,7 +4190,7 @@ function chatSettingField(s) {
     input = `<select data-setting="${s.key}"${off}>${options}</select>`;
   } else {
     input = `<input type="number" step="any" data-setting="${s.key}" value="${s.value}"${off}
-      min="${s.minimum}" max="${s.maximum}">`;
+      min="${s.minimum}" max="${s.maximum}" autocomplete="off">`;
   }
   const notes = [];
   if (s.hint) notes.push(escapeHtml(s.hint));
@@ -3934,7 +4201,7 @@ function chatSettingField(s) {
 }
 
 async function saveChatSetting(el) {
-  const chatId = $("#chatsettings-chat").value;
+  const chatId = чат();
   const value = el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value;
   try {
     await api("/api/chat-settings", {
@@ -3953,4 +4220,2759 @@ async function saveChatSetting(el) {
     // по-старому.
     await renderChatSettings();
   }
+}
+
+// ===== Вкладка «Ферма» =====================================================
+// Экран живёт по своему времени: сервер присылает сроки абсолютным UTC, а
+// таймеры тикают здесь. Иначе каждая секунда обратного отсчёта стоила бы
+// запроса, а вкладка, полежавшая в фоне, показывала бы прошлое.
+const _farm = { state: null, skew: 0, tick: null, count: 1, slot: null, bound: false };
+
+// Питон отдаёт время без пометки зоны («2026-08-02T12:00:00»), а JS такую
+// строку читает как МЕСТНУЮ. Без этой буквы Z у человека в UTC+3 всё
+// поспевало бы на три часа раньше, чем на самом деле.
+function farmTime(iso) {
+  if (!iso) return null;
+  return Date.parse(/[Zz]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + "Z");
+}
+
+// Часы браузера могут отставать или спешить. Разницу с сервером запоминаем
+// один раз на ответ и дальше считаем по ней — иначе сбитые часы показали бы
+// «готово» на грядке, которая ещё растёт.
+function farmNow() { return Date.now() + _farm.skew; }
+
+function farmLeft(ms) {
+  if (ms <= 0) return "готово";
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h} ч ${String(m).padStart(2, "0")} м`;
+  return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+}
+
+function farmSay(text, kind = "ok") {
+  const box = $("#member-farm-msg");
+  if (box) say("#member-farm-msg", text, kind);
+}
+
+async function loadMemberFarm() {
+  const box = $("#member-farm");
+  box.innerHTML = `<section class="member-block"><h2>${icon("sprout")}Ферма</h2>
+    <div class="card"><div class="muted">Загрузка…</div></div></section>`;
+  try {
+    box.innerHTML = `<section class="member-block"><h2>${icon("sprout")}Ферма</h2>
+      <div class="card">
+        <div id="member-farm-msg"></div>
+        <div id="member-farm-body"><div class="muted">Загрузка…</div></div>
+      </div></section>`;
+    if (!_farm.bound) { $("#member-farm").addEventListener("click", onFarmClick); _farm.bound = true; }
+    loadFarmState();
+  } catch (err) {
+    box.innerHTML = `<section class="member-block"><h2>${icon("sprout")}Ферма</h2><div class="card">
+      <div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div></div></section>`;
+  }
+}
+
+async function loadFarmState() {
+  try {
+    applyFarmState(await api(`/api/member/game/farm`));
+  } catch (err) {
+    const body = $("#member-farm-body");
+    if (body) body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+function applyFarmState(state) {
+  _farm.state = state;
+  _farm.skew = farmTime(state.now) - Date.now();
+  renderFarm();
+}
+
+// Погодная строка: что погода ДЕЛАЕТ, а не только как называется. Без этого
+// «Дождь» — картинка, а не правило, по которому человек выбирает культуру.
+function weatherNote(w) {
+  const части = [];
+  if (w.grow_percent > 0) части.push(`растёт быстрее на ${w.grow_percent}%`);
+  if (w.grow_percent < 0) части.push(`растёт медленнее на ${-w.grow_percent}%`);
+  if (w.yield_percent) части.push(`урожай ${w.yield_percent > 0 ? "+" : ""}${w.yield_percent}%`);
+  if (w.pest_percent > 0) части.push("вредители злее");
+  if (w.pest_percent < 0) части.push("вредителей меньше");
+  return части.length ? части.join(" · ") : "обычный день";
+}
+
+function plotHtml(p) {
+  if (!p.crop) {
+    return `<button type="button" class="plot free" data-act="plant" data-slot="${p.slot}">
+      <span class="plot-plus">+</span><small>посадить</small></button>`;
+  }
+  const ready = p.ready;
+  const классы = ["plot"];
+  if (ready) классы.push("ready");
+  if (p.pests) классы.push("pests");
+  if (p.perished) классы.push("perished");
+  const значок = p.perished ? `<span class="plot-badge warn">${icon("wilt")} сгнила</span>`
+    : p.pests ? `<span class="plot-badge">${icon("bug")} ${p.pest_loss}%</span>` : "";
+  const подпись = p.perished ? "сгнила" : ready ? "готово" : farmLeft(farmTime(p.ready_at) - farmNow());
+  return `<button type="button" class="${классы.join(" ")}" data-act="plot" data-slot="${p.slot}"
+      data-ready="${escapeHtml(p.ready_at)}" data-planted="${escapeHtml(p.planted_at)}"
+      style="--grown:${ready ? 100 : p.progress}">
+    <span class="plot-ring"></span>${значок}
+    <span class="plot-plant">${gicon("crop", p.crop, "xl")}</span>
+    <span class="plot-label">${escapeHtml(подпись)}</span>
+    <span class="plot-crop">${escapeHtml(p.name)}</span>
+  </button>`;
+}
+
+// Продукт хлева по виду животного: набор конечный, ключи продуктов у панели
+// свои (иконки), сервер шлёт только название.
+const ANIMAL_PRODUCT = { kurica: "yayca", utka: "pero", svinya: "myaso", ovca: "sherst", korova: "moloko" };
+
+function barnHtml(a) {
+  const есть = a.quantity > 0;
+  const продукт = gicon("product", ANIMAL_PRODUCT[a.key] || "", "");
+  const строка = есть
+    ? (a.ready > 0
+        ? `${продукт} <b>${a.ready} ${escapeHtml(a.item_name.toLowerCase())}</b> готово`
+        : a.next_at
+          ? `${продукт} следующая порция через <span data-next="${escapeHtml(a.next_at)}">${farmLeft(farmTime(a.next_at) - farmNow())}</span>`
+          : "хлев полон — заберите продукт")
+    : `${продукт} ${escapeHtml(a.item_name.toLowerCase())} · ${a.price} i¢ за голову`;
+  const кнопки = есть
+    ? `<button type="button" class="btn" data-act="barn_buy" data-animal="${a.key}">Купить ещё</button>
+       <button type="button" class="btn ghost" data-act="barn_sell" data-animal="${a.key}">Продать (${a.sell_back} i¢)</button>`
+    : `<button type="button" class="btn" data-act="barn_buy" data-animal="${a.key}">Купить · ${a.price} i¢</button>`;
+  return `<div class="barn-card${есть ? " has" : ""}">
+    <div class="barn-head">
+      <span class="barn-emoji">${gicon("animal", a.key, "lg")}</span>
+      <span class="barn-name">${escapeHtml(a.name)}</span>
+      <span class="barn-qty">${есть ? `×${a.quantity}` : ""}</span>
+    </div>
+    <div class="barn-note">${строка}</div>
+    <div class="barn-buttons">${кнопки}</div>
+  </div>`;
+}
+
+function renderFarm() {
+  const s = _farm.state, body = $("#member-farm-body");
+  if (!s || !body) return;
+  const спелых = s.plots.filter((p) => p.crop && p.ready).length;
+  const вхлеву = s.barn.reduce((n, a) => n + a.ready, 0);
+  const бонусы = [];
+  if (s.aura.speed) бонусы.push(`${icon("clock")} рост +${s.aura.speed}%`);
+  if (s.aura.harvest) бонусы.push(`${icon("bee")} урожай +${s.aura.harvest}%`);
+  if (s.aura.truffle) бонусы.push(`${icon("star")} трюфели ${s.aura.truffle}%`);
+  if (s.pests_off) бонусы.push(`${icon("mask")} пугало на месте`);
+
+  // Сцена рисует погоду сама (солнце, тучи, ливень — по data-weather), эмодзи
+  // ей не нужен; грядки и действия стоят на почве той же сцены.
+  body.innerHTML = `
+    <div class="farm-scene" data-weather="${escapeHtml(s.weather.key || "sun")}">
+      <div class="farm-rain"></div>
+      <div class="farm-sky">
+        <span>
+          <span class="farm-sky-name">${escapeHtml(s.weather.name)}</span>
+          <span class="farm-sky-note">${escapeHtml(weatherNote(s.weather))}</span>
+        </span>
+        <span class="farm-sky-coins"><b>${s.coins.toLocaleString("ru")} i¢</b>
+          <span>${s.plot_total} грядок · свободно ${s.plot_free}</span></span>
+      </div>
+      <div class="farm-field">
+        <div class="farm-plots">
+          ${s.plots.map(plotHtml).join("")}
+          ${s.plot_room > 0
+            ? `<button type="button" class="plot buy" data-act="expand">
+                 <span class="plot-plus">+</span><small>грядка<br>${s.plot_next_price} i¢</small></button>`
+            : ""}
+        </div>
+        <div class="farm-actions">
+          <button type="button" class="btn btn-harvest" data-act="harvest" ${спелых ? "" : "disabled"}>
+            ${icon("basket")}Собрать урожай${спелых ? ` · ${спелых}` : ""}</button>
+          ${вхлеву ? `<button type="button" class="btn" data-act="barn_collect">${icon("barn")}Забрать из хлева · ${вхлеву}</button>` : ""}
+        </div>
+      </div>
+    </div>
+    ${бонусы.length ? `<div class="farm-bonuses muted">${бонусы.join(" · ")}</div>` : ""}
+    <h3 class="block-head">${icon("barn")}Хлев</h3>
+    <div class="barn">${s.barn.map(barnHtml).join("")}</div>`;
+
+  startFarmTick();
+}
+
+// Тикаем по узлам, а не перерисовкой: перерисовка каждую секунду сбрасывала бы
+// нажатие, прокрутку и открытую шторку.
+function startFarmTick() {
+  if (_farm.tick) clearInterval(_farm.tick);
+  _farm.tick = setInterval(() => {
+    const узлы = $$("#member-farm-body .plot[data-ready]");
+    if (!узлы.length && !$$("#member-farm-body [data-next]").length) return;
+    let поспело = false;
+    узлы.forEach((el) => {
+      const ready = farmTime(el.dataset.ready), planted = farmTime(el.dataset.planted);
+      const всего = Math.max(1, ready - planted), прошло = farmNow() - planted;
+      const процент = Math.max(0, Math.min(100, Math.round((прошло / всего) * 100)));
+      el.style.setProperty("--grown", процент);
+      const label = el.querySelector(".plot-label");
+      if (el.classList.contains("perished")) return;
+      if (ready <= farmNow()) {
+        if (!el.classList.contains("ready")) { el.classList.add("ready"); поспело = true; }
+        if (label) label.textContent = "готово";
+      } else if (label) {
+        label.textContent = farmLeft(ready - farmNow());
+      }
+    });
+    $$("#member-farm-body [data-next]").forEach((el) => {
+      const срок = farmTime(el.dataset.next) - farmNow();
+      el.textContent = farmLeft(срок);
+      if (срок <= 0) loadFarmState();
+    });
+    // Грядка поспела прямо на глазах — кнопку сбора надо включить, а её
+    // счётчик обновить. Полная перерисовка тут уместна: событие редкое.
+    if (поспело) loadFarmState();
+  }, 1000);
+}
+
+function stopFarmTick() {
+  if (_farm.tick) { clearInterval(_farm.tick); _farm.tick = null; }
+}
+
+async function farmDo(action, body, успех) {
+  try {
+    const res = await api(`/api/member/game/farm/${action}`, {
+      method: "POST", body: { ...body },
+    });
+    applyFarmState(res.state);
+    farmSay(успех(res));
+  } catch (err) {
+    farmSay(err.message, "err");
+  }
+}
+
+function farmItemsText(items) {
+  const s = _farm.state;
+  const имена = {};
+  (s.crops || []).forEach((c) => { имена[c.key] = c.item_name; });
+  const части = Object.entries(items || {}).map(([k, n]) => `${имена[k] || k} ×${n}`);
+  return части.join(", ");
+}
+
+async function onFarmClick(e) {
+  const el = e.target.closest("[data-act]");
+  // Шторка выбора культуры живёт в document.body, а не внутри экрана: иначе
+  // её перекрывали бы соседние карточки. Поэтому проверка «внутри экрана»
+  // обязана пускать и её — без этого клик по культуре никуда не доходил, и
+  // посадка с сайта не работала вовсе.
+  if (!el) return;
+  const свой = $("#member-farm")?.contains(el) || el.closest("#farm-sheet");
+  if (!свой) return;
+  const act = el.dataset.act;
+  const s = _farm.state;
+  if (act === "plant") {
+    openCropSheet(Number(el.dataset.slot));
+  } else if (act === "plot") {
+    const p = s.plots.find((x) => String(x.slot) === el.dataset.slot);
+    if (!p) return;
+    if (p.perished || p.ready) {
+      farmDo("harvest", {}, (r) => {
+        const части = [];
+        if (r.harvested) части.push(`Собрано: ${farmItemsText(r.items)}`);
+        if (r.truffles) части.push(`трюфель ×${r.truffles}: +${r.coins_gained} i¢`);
+        if (r.perished) части.push(`${r.perished} сгнило`);
+        if (r.pest_loss) части.push(`саранча съела до ${r.pest_loss}%`);
+        return части.join(" · ") || "Грядки освобождены";
+      });
+    } else if (p.pests) {
+      farmSay("Саранчу со своих грядок прогнать нельзя — попросите соседа в чате: «ферма помочь @вы».", "err");
+    } else {
+      farmSay(`${p.name} поспеет через ${farmLeft(farmTime(p.ready_at) - farmNow())}.`);
+    }
+  } else if (act === "harvest") {
+    farmDo("harvest", {}, (r) => {
+      const части = [];
+      if (r.harvested) части.push(`Собрано: ${farmItemsText(r.items)}`);
+      if (r.truffles) части.push(`трюфель ×${r.truffles}: +${r.coins_gained} i¢`);
+      if (r.perished) части.push(`${r.perished} сгнило`);
+      return части.join(" · ") || "Собирать было нечего";
+    });
+  } else if (act === "expand") {
+    farmDo("expand", { count: 1 }, (r) => `Грядка куплена за ${r.coins_spent} i¢`);
+  } else if (act === "barn_collect") {
+    farmDo("barn_collect", {}, (r) => `Забрано из хлева: ${farmItemsText(r.items) || r.harvested}`);
+  } else if (act === "barn_buy") {
+    farmDo("barn_buy", { animal: el.dataset.animal, count: 1 },
+      (r) => `Куплено голов: ${r.planted} за ${r.coins_spent} i¢`);
+  } else if (act === "barn_sell") {
+    farmDo("barn_sell", { animal: el.dataset.animal, count: 1 },
+      (r) => `Продано голов: ${r.harvested}, +${r.coins_gained} i¢`);
+  } else if (act === "sow") {
+    closeCropSheet();
+    farmDo("plant", { crop: el.dataset.crop, count: _farm.count, slot: _farm.slot },
+      (r) => `Посажено грядок: ${r.planted} (−${r.coins_spent} i¢)`);
+  } else if (act === "count") {
+    _farm.count = el.dataset.count === "все" ? "все" : 1;
+    openCropSheet(_farm.slot);
+  } else if (act === "sheet-close") {
+    closeCropSheet();
+  }
+}
+
+function closeCropSheet() {
+  const el = $("#farm-sheet");
+  if (el) el.remove();
+  document.removeEventListener("keydown", onSheetKey);
+}
+
+function onSheetKey(e) { if (e.key === "Escape") closeCropSheet(); }
+
+// Шторка выбора культуры. Цена, срок и «сколько хватит монет» стоят на самой
+// строке: выбор делается здесь, и уходить за этими цифрами в чат человек не
+// должен.
+function openCropSheet(slot) {
+  closeCropSheet();
+  // Запоминаем, по какой грядке нажали: сажать надо туда, куда попал палец, а
+  // не в первую свободную — иначе росток всходит в другом углу экрана.
+  _farm.slot = Number.isFinite(slot) ? slot : null;
+  const s = _farm.state;
+  const строки = s.crops.map((c) => {
+    const срок = farmLeft(c.grow_seconds * 1000);
+    const хватит = Math.min(c.affordable, s.plot_free);
+    const мало = c.locked || хватит < 1;
+    // Причины «нельзя» разные, и валить их в «не хватает монет» нечестно:
+    // с полным кошельком и занятым полем подпись обвиняла кошелёк.
+    const пометка = c.locked ? "только во время ивента"
+      : s.plot_free < 1 ? "нет свободных грядок"
+      : c.affordable < 1 ? "не хватает монет"
+      : `${срок} · ${c.yield_min}–${c.yield_max} шт${c.perish_hours ? ` · сгниёт через ${c.perish_hours} ч` : ""}`;
+    return `<button type="button" class="crop-row" data-act="sow" data-crop="${c.key}" ${мало ? "disabled" : ""}>
+      <span class="crop-emoji">${gicon("crop", c.key, "lg")}</span>
+      <span><span class="crop-name">${escapeHtml(c.name)}</span>
+        <span class="crop-meta">${escapeHtml(пометка)}</span></span>
+      <span class="crop-price">${c.price} i¢<small>хватит на ${хватит}</small></span>
+    </button>`;
+  }).join("");
+  const одна = _farm.count === 1;
+  const sheet = document.createElement("div");
+  sheet.className = "sheet-back";
+  sheet.id = "farm-sheet";
+  sheet.innerHTML = `<div class="sheet" role="dialog" aria-label="Что посадить">
+    <div class="sheet-head"><h3>Что посадить</h3>
+      <button type="button" class="sheet-close" data-act="sheet-close" aria-label="Закрыть">×</button></div>
+    <div class="farm-actions mb-3">
+      <button type="button" class="btn ${одна ? "" : "ghost"}" data-act="count" data-count="1">Одну грядку</button>
+      <button type="button" class="btn ${одна ? "ghost" : ""}" data-act="count" data-count="все">Всё поле · ${s.plot_free}</button>
+    </div>
+    ${строки}</div>`;
+  // Клик по подложке закрывает шторку, клик по культуре идёт в общий
+  // обработчик экрана — он же разбирает и «сажать одну / всё поле».
+  sheet.addEventListener("click", (e) => {
+    if (e.target === sheet) closeCropSheet();
+    else onFarmClick(e);
+  });
+  document.body.appendChild(sheet);
+  document.addEventListener("keydown", onSheetKey);
+}
+
+// ===== Вкладка «Казино» ====================================================
+// Экран играет ставками, поэтому правило здесь одно: всё, что про деньги,
+// решает сервер. Браузер рисует ленту и карты, но исход приходит готовым — и
+// в чат уходит не то, что нарисовано, а то, что сервер у себя записал.
+const _casino = { state: null, game: "roulette", bet: 100,
+                  color: "red", guess: 1, side: "орёл", last: null, bound: false,
+                  // Накопленные углы колеса и шарика. Именно накопленные, а не
+                  // остаток от 360: колесо должно всегда доворачиваться
+                  // вперёд, а не отматываться назад к ближайшему совпадению.
+                  angle: 0, ball: 0, dieX: 0, dieY: 0, coin: 0,
+                  // Предмет игры в движении. Пока true, итог не показывают
+                  // нигде: ни на самом предмете, ни текстом, ни балансом.
+                  spinning: false };
+
+// Порядок чисел по кругу — как на настоящем европейском колесе. Он не
+// случайный и не по возрастанию: красные и чёрные чередуются, а соседи по
+// кругу далеки по значению — так на колесе не остаётся «удачной» четверти.
+// Здесь он ещё и рабочий: по месту числа в этом списке считается, куда
+// довернуть колесо.
+const WHEEL_ORDER = [0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11,
+                     30, 8, 23, 10, 5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18,
+                     29, 7, 28, 12, 35, 3, 26];
+const WHEEL_STEP = 360 / WHEEL_ORDER.length;
+const WHEEL_SPIN_MS = 4200;
+const WHEEL_TURNS = 6;
+const SPIN_SKIP_KEY = "casino-skip-spin";
+
+// Крутить или показать сразу. Выбор человека, а не наш: одному вращение —
+// половина игры, другому оно каждый раз стоит четырёх секунд.
+//
+// Пока не выбрали — спрашиваем систему. «Убрать анимации» в настройках
+// телефона включают ровно из этих соображений, и переспрашивать то же самое
+// ещё раз невежливо. Но выбор в панели всегда сильнее: настройка системы —
+// это умолчание, а не запрет.
+function spinSkipped() {
+  let свой = null;
+  try { свой = localStorage.getItem(SPIN_SKIP_KEY); } catch (e) { свой = null; }
+  if (свой !== null) return свой === "1";
+  return typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+// Шарик катится навстречу колесу — как на настоящем. Оборотов целое число,
+// поэтому он всегда возвращается наверх, к стрелке: там же, где встанет
+// выпавшее число.
+const BALL_TURNS = 10;
+
+// Ближайшее положение с нужным остатком, но не ближе чем через столько-то
+// оборотов вперёд.
+//
+// Углы копятся, а не сбрасываются к остатку от 360: иначе предмет то дёргался
+// бы на месте (когда нужное положение совпало с текущим), то отматывался бы
+// назад — и то и другое выглядит поломкой, а не броском.
+function nextAngle(было, нужен, оборотов) {
+  const цель = ((нужен % 360) + 360) % 360;
+  let угол = Math.floor(было / 360) * 360 + цель;
+  while (угол < было + 360 * оборотов) угол += 360;
+  return угол;
+}
+
+// Куда довернуть колесо, чтобы выпавшее число встало под стрелкой.
+//
+// Вынесено отдельной функцией не для красоты: ошибка здесь не видна. Колесо
+// будет так же красиво крутиться и так же плавно останавливаться — просто не
+// на том числе, и заметить это можно только сверив с текстом итога. Поэтому
+// функция чистая и проверяется отдельно, на всех тридцати семи числах.
+function wheelAngle(было, number, оборотов = WHEEL_TURNS) {
+  const место = WHEEL_ORDER.indexOf(number);
+  if (место < 0) return было;
+  // Сектор с местом i стоит под углом i * шаг по часовой от верха. Чтобы он
+  // оказался под стрелкой, колесо надо повернуть ровно на минус этот угол.
+  return nextAngle(было, -место * WHEEL_STEP, оборотов);
+}
+
+// --- кость -----------------------------------------------------------------
+// Настоящий куб: шесть граней, каждая на своём месте, и кость приземляется
+// выпавшей гранью к зрителю. Точки, а не символы ⚀⚁⚂⚃⚄⚅: те рисуются шрифтом
+// системы и на разных телефонах выглядят по-разному, а на части — квадратами.
+
+// Где какая грань стоит в покое. Противоположные в сумме дают семь, как на
+// настоящей кости.
+const DIE_SIDES = [
+  { n: 1, t: "translateZ(var(--die-half))" },
+  { n: 6, t: "rotateY(180deg) translateZ(var(--die-half))" },
+  { n: 3, t: "rotateY(90deg) translateZ(var(--die-half))" },
+  { n: 4, t: "rotateY(-90deg) translateZ(var(--die-half))" },
+  { n: 5, t: "rotateX(90deg) translateZ(var(--die-half))" },
+  { n: 2, t: "rotateX(-90deg) translateZ(var(--die-half))" },
+];
+
+// Куда повернуть КУБ, чтобы нужная грань смотрела на зрителя, — обратный
+// поворот к тому, которым грань поставлена на место.
+//
+// Каждый поворот здесь вокруг ОДНОЙ оси, и это не случайность: полный оборот
+// есть тождество, поэтому rotateX(360a + X) rotateY(360b + Y) сводится ровно
+// к rotateX(X) rotateY(Y) при любом порядке сомножителей. Понадобись какой-то
+// грани оба угла сразу — порядок начал бы значить, и промахнулась бы она
+// одна: самый трудный для поимки случай.
+const DIE_FACE = {
+  1: { x: 0, y: 0 },
+  6: { x: 0, y: 180 },
+  3: { x: 0, y: -90 },
+  4: { x: 0, y: 90 },
+  5: { x: -90, y: 0 },
+  2: { x: 90, y: 0 },
+};
+const DIE_TURNS_X = 3;
+const DIE_TURNS_Y = 4;   // разное число оборотов по осям: кость кувыркается,
+                         // а не вращается вокруг одной оси, как волчок
+
+function dieAngles(былоX, былоY, roll) {
+  const грань = DIE_FACE[roll];
+  if (!грань) return { x: былоX, y: былоY };
+  return { x: nextAngle(былоX, грань.x, DIE_TURNS_X),
+           y: nextAngle(былоY, грань.y, DIE_TURNS_Y) };
+}
+
+// --- монета ----------------------------------------------------------------
+// Орёл смотрит на зрителя в покое, решка — с обратной стороны.
+const COIN_FACE = { "орёл": 0, "решка": 180 };
+const COIN_TURNS = 5;
+
+// Сколько длится бросок. Колесо крутится долго — на него и смотрят; кость и
+// монета в жизни падают быстро, и растянутое падение читается как задержка,
+// а не как игра.
+const DIE_ROLL_MS = 1500;
+const COIN_FLIP_MS = 1300;
+
+// Игры, у которых есть что пропускать: там итог ждёт конца броска.
+const ANIMATED_GAMES = new Set(["roulette", "dice", "coin"]);
+
+function coinAngle(было, side) {
+  const грань = COIN_FACE[side];
+  if (грань === undefined) return было;
+  return nextAngle(было, грань, COIN_TURNS);
+}
+
+function casinoSay(text, kind = "ok") {
+  if ($("#member-casino-msg")) say("#member-casino-msg", text, kind);
+}
+
+async function loadMemberCasino() {
+  const box = $("#member-casino");
+  box.innerHTML = `<section class="member-block"><h2>${icon("casino")}Казино</h2>
+    <div class="card"><div class="muted">Загрузка…</div></div></section>`;
+  try {
+    box.innerHTML = `<section class="member-block"><h2>${icon("casino")}Казино</h2>
+      <div class="card">
+        <div id="member-casino-msg"></div>
+        <div id="member-casino-body"><div class="muted">Загрузка…</div></div>
+      </div></section>`;
+    if (!_casino.bound) {
+      $("#member-casino").addEventListener("click", onCasinoClick);
+      $("#member-casino").addEventListener("input", onCasinoInput);
+      _casino.bound = true;
+    }
+    loadCasinoState();
+  } catch (err) {
+    box.innerHTML = `<section class="member-block"><h2>${icon("casino")}Казино</h2><div class="card">
+      <div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div></div></section>`;
+  }
+}
+
+async function loadCasinoState() {
+  try {
+    _casino.state = await api(`/api/member/game/casino`);
+    renderCasino();
+  } catch (err) {
+    const body = $("#member-casino-body");
+    if (body) body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+// Колесо рисуется разметкой SVG, а не картинкой: страница запрещает грузить
+// что-либо со стороны, а нарисованное здесь одинаково чётко и на телефоне, и
+// на большом экране.
+//
+// Ширина колеса задаётся стилем (min(100%, …)), поэтому оно физически не
+// может стать шире экрана. Прежняя лента могла и была: сорок одна клетка по
+// 56 пикселей — больше двух тысяч, пять экранов телефона.
+function wheelHtml() {
+  const красные = new Set(_casino.state.reds || []);
+  const Ц = 100, R = 96, r = 56;                 // центр, внешний и внутренний радиус
+  const точка = (ρ, φ) => {
+    const рад = φ * Math.PI / 180;
+    return [(Ц + ρ * Math.sin(рад)).toFixed(2), (Ц - ρ * Math.cos(рад)).toFixed(2)];
+  };
+  const секторы = WHEEL_ORDER.map((n, i) => {
+    const от = i * WHEEL_STEP - WHEEL_STEP / 2, до = от + WHEEL_STEP;
+    const [x1, y1] = точка(R, от), [x2, y2] = точка(R, до);
+    const [x3, y3] = точка(r, до), [x4, y4] = точка(r, от);
+    const цвет = n === 0 ? "green" : красные.has(n) ? "red" : "black";
+    return `<path class="wheel-slot ${цвет}" `
+         + `d="M${x1} ${y1}A${R} ${R} 0 0 1 ${x2} ${y2}L${x3} ${y3}A${r} ${r} 0 0 0 ${x4} ${y4}Z"/>`;
+  }).join("");
+  // Числа поворачиваются вместе с колесом — как на настоящем. Считать это
+  // ошибкой не надо: выпавшее число останавливается под стрелкой ровно
+  // прямым, потому что колесо доворачивается на минус его угол.
+  const числа = WHEEL_ORDER.map((n, i) =>
+    `<text class="wheel-num" x="${Ц}" y="${Ц - (R + r) / 2}" dy=".35em" `
+    + `transform="rotate(${(i * WHEEL_STEP).toFixed(2)} ${Ц} ${Ц})">${n}</text>`).join("");
+  const угол = _casino.angle || 0;
+  // Пока колесо крутится, середина пустая. Число, показанное раньше
+  // остановки, отменяет смысл вращения: смотреть уже не на что.
+  const итог = !_casino.spinning && _casino.last && _casino.last.detail
+    && typeof _casino.last.detail.number === "number" ? _casino.last.detail.number : null;
+  return `<div class="wheel-wrap">
+      <svg class="wheel" id="casino-wheel" viewBox="0 0 200 200" aria-hidden="true"
+           style="transform: rotate(${угол}deg)">
+        <circle class="wheel-rim" cx="${Ц}" cy="${Ц}" r="99"/>
+        ${секторы}
+        <circle class="wheel-hub" cx="${Ц}" cy="${Ц}" r="${r}"/>
+        ${числа}
+      </svg>
+      <div class="wheel-pin" aria-hidden="true"></div>
+      <div class="wheel-ball-orbit" id="casino-ball" aria-hidden="true"
+           style="transform: rotate(${_casino.ball || 0}deg)"><i class="wheel-ball"></i></div>
+      <div class="wheel-face" id="casino-wheel-face" aria-hidden="true">${итог === null ? "" : итог}</div>
+    </div>`;
+}
+
+// Точки на грани. Раскладка настоящая: 1 в центре, 2 и 3 по диагонали, 4 по
+// углам, 5 — углы и центр, 6 — два столбца по три.
+const DIE_PIPS = {
+  1: [[2, 2]],
+  2: [[1, 1], [3, 3]],
+  3: [[1, 1], [2, 2], [3, 3]],
+  4: [[1, 1], [1, 3], [3, 1], [3, 3]],
+  5: [[1, 1], [1, 3], [2, 2], [3, 1], [3, 3]],
+  6: [[1, 1], [2, 1], [3, 1], [1, 3], [2, 3], [3, 3]],
+};
+
+// Грань кости. Одна и та же и в броске, и в строке итога: предмет игры обязан
+// выглядеть одинаково там, где он катится, и там, где записан результат.
+function dieFaceHtml(n, добавка = "") {
+  const точки = (DIE_PIPS[n] || []).map(([ряд, кол]) =>
+    `<i class="pip" style="grid-area:${ряд}/${кол}"></i>`).join("");
+  // Единица — «туз» с красным пипом, как у настоящих казино-костей; класс
+  // работает и на кубе, и на кнопках выбора, и в строке итога.
+  return `<span class="die-face ${добавка}${n === 1 ? " ace" : ""}" role="img" aria-label="${n}">${точки}</span>`;
+}
+
+function die3dHtml() {
+  const грани = DIE_SIDES.map((с) =>
+    `<span class="die-side" style="transform:${с.t}">${dieFaceHtml(с.n)}</span>`).join("");
+  const x = _casino.dieX || 0, y = _casino.dieY || 0;
+  return `<div class="casino-stage die3d">
+      <div class="die3d-cube" id="casino-die"
+           style="transform: rotateX(${x}deg) rotateY(${y}deg)">${грани}</div>
+    </div>`;
+}
+
+// Масти карт — inline-SVG, а не символы ♥♦♠♣: на части телефонов шрифт
+// подменяет их эмодзи (тот же класс бага, что 🂠, с которого покер и
+// рисовал десять битых рубашек вместо пяти).
+const SUIT_PATHS = {
+  "♥": "M12 21C7 16.5 3 13 3 8.8 3 6 5.2 4 7.6 4c1.8 0 3.3.9 4.4 2.6C13.1 4.9 14.6 4 16.4 4 18.8 4 21 6 21 8.8c0 4.2-4 7.7-9 12.2z",
+  "♦": "M12 2l8 10-8 10-8-10z",
+  "♠": "M12 2C8.5 6.8 4 9.3 4 13.2 4 15.8 6 17.5 8.3 17.5c1 0 1.9-.3 2.7-1-.3 1.9-1 3.3-2.3 4.5h6.6c-1.3-1.2-2-2.6-2.3-4.5.8.7 1.7 1 2.7 1C18 17.5 20 15.8 20 13.2 20 9.3 15.5 6.8 12 2z",
+  "♣": "M12 2a4 4 0 0 0-3.2 6.4A4 4 0 1 0 10.9 15c-.2 2-.9 3.5-2.2 4.7h6.6c-1.3-1.2-2-2.7-2.2-4.7a4 4 0 1 0 2.1-6.6A4 4 0 0 0 12 2z",
+};
+
+function suitSvg(suit, cls = "") {
+  return `<svg class="pc-s${cls ? " " + cls : ""}" viewBox="0 0 24 24" aria-hidden="true"><path d="${SUIT_PATHS[suit]}"/></svg>`;
+}
+
+// Сторона монеты. Слово, а не картинка: «орёл» и «решка» — это и есть их
+// имена, и в строке итога написано ровно то же слово. Символы 🦅 и 🪙 рисуются
+// шрифтом системы и на разных телефонах выглядят по-разному.
+function coinHtml() {
+  const угол = _casino.coin || 0;
+  // Пять дисков между лицом (+4px) и изнанкой (−4px): в профиль их рёбра
+  // складываются в толщину — без них rotateY схлопывает монету в линию.
+  const сердцевина = [-3, -1.5, 0, 1.5, 3].map((z) =>
+    `<span class="coin-core" style="transform: translateZ(${z}px)"></span>`).join("");
+  return `<div class="casino-stage coin-scene">
+      <div class="coin-shadow" id="casino-coin-shadow"></div>
+      <div class="coin3d">
+        <div class="coin3d-inner" id="casino-coin" style="transform: rotateY(${угол}deg)">
+          ${сердцевина}
+          <span class="coin-side coin-head">орёл</span>
+          <span class="coin-side coin-tail">решка</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+// Переключатель показывается у всех игр, где есть что пропускать. Отдельной
+// функцией, чтобы у трёх игр он был один и тот же, а не три похожих.
+function skipToggleHtml() {
+  return `<label class="check spin-skip">
+      <input type="checkbox" id="casino-skip" autocomplete="off"
+             ${spinSkipped() ? "checked" : ""}>
+      <span class="muted">Без анимации — сразу результат</span>
+    </label>`;
+}
+
+function casinoTableHtml() {
+  const s = _casino.state;
+  if (_casino.game === "roulette") {
+    const фишки = s.colors.map((c) => `
+      <button type="button" class="chip ${c.key} ${_casino.color === c.key ? "active" : ""}"
+              data-cact="color" data-color="${c.key}">
+        ${escapeHtml(c.label)}<small>x${c.payout}</small></button>`).join("");
+    return `${wheelHtml()}${skipToggleHtml()}
+            <div class="chips">${фишки}</div>`;
+  }
+  if (_casino.game === "dice") {
+    // Кнопка выбора показывает ту же грань, что упадёт: цифра рядом с точками
+    // нужна тем, кому точки считать долго.
+    const грани = [1, 2, 3, 4, 5, 6].map((n) =>
+      `<button type="button" class="btn die-pick ${_casino.guess === n ? "active" : ""}"
+               data-cact="guess" data-guess="${n}">${dieFaceHtml(n, "die-face-sm")}</button>`).join("");
+    return `${die3dHtml()}${skipToggleHtml()}
+            <div class="faces">${грани}</div>
+            <div class="hint">Угадали грань — ставка ×6.</div>`;
+  }
+  if (_casino.game === "coin") {
+    // Кнопки — жетоны с тем же металлом, что у большой монеты: золотой орёл,
+    // серебряная решка. Исход и выбор связываются цветом, не только словом.
+    const стороны = [["орёл", "head"], ["решка", "tail"]].map(([x, k]) =>
+      `<button type="button" class="side-pick ${_casino.side === x ? "active" : ""}"
+               data-cact="side" data-side="${x}">
+         <span class="coin-mini ${k}"></span>${x}<small>×2</small></button>`).join("");
+    return `${coinHtml()}${skipToggleHtml()}
+            <div class="sides">${стороны}</div>
+            <div class="hint">Угадали сторону — ставка ×2.</div>`;
+  }
+  // Покер. Рубашки — циклом по пяти, а не "🂠".repeat(5).split(""): эмодзи
+  // рвался на половины суррогатной пары, и на столе лежали ДЕСЯТЬ битых
+  // карт. Рубашка рисуется CSS-ом, выплаты — пилюлями (комбинация-победитель
+  // подсвечивается после раздачи).
+  const пять = [0, 1, 2, 3, 4].map((i) =>
+    `<div class="playing-card back" style="animation-delay:${i * 60}ms"></div>`).join("");
+  const выплаты = [["две пары", 2], ["тройка", 3], ["стрит", 5], ["флеш", 6],
+                   ["фулл-хаус", 8], ["каре", 10], ["стрит-флеш", 10]]
+    .map(([имя, x]) => `<span class="pay-pill" data-combo="${имя}">${имя} <b>×${x}</b></span>`).join("");
+  return `<div class="casino-stage poker-felt"><div class="hand" id="casino-hand">${пять}</div></div>
+          <div class="poker-pays" id="poker-pays">${выплаты}</div>`;
+}
+
+function casinoResultHtml() {
+  const r = _casino.last;
+  if (!r) return "";
+  // Предмет игры ещё в движении — итога нет. Написать его сейчас значило бы
+  // отдать ответ раньше, чем закончится вопрос.
+  if (_casino.spinning) {
+    const что = { roulette: "Колесо крутится", dice: "Кость катится",
+                  coin: "Монета в воздухе" }[r.game] || "Ещё немного";
+    return `<div class="casino-result waiting">${icon("clock")}${что}…</div>`;
+  }
+  const выиграл = r.won;
+  const сумма = выиграл ? `+${r.delta.toLocaleString("ru")} i¢` : `${r.delta.toLocaleString("ru")} i¢`;
+  // Предмет игры в итоге показан ТЕМ ЖЕ, что и в анимации: кость — теми же
+  // точками, монета — тем же словом. Раньше тут стояли символы шрифта
+  // (⚀⚁⚂⚃⚄⚅, 🦅, 🪙), и они же рисовались в самой игре; теперь и то и другое
+  // нарисовано нами и совпадает на любом телефоне.
+  const строка = r.game === "roulette"
+      ? `Выпало <span class="rdot ${r.detail.number === 0 ? "green" : (_casino.state.reds || []).includes(r.detail.number) ? "red" : "black"}"></span> <b>${r.detail.number}</b>`
+    : r.game === "dice" ? `Выпало ${dieFaceHtml(r.detail.roll, "die-face-sm")} <b>${r.detail.roll}</b> (ставили на ${r.detail.guess})`
+    // В итоге монеты — тот же жетон, что на кнопке: исход совпадает с
+    // выбором и цветом металла, а не только словом.
+    : r.game === "coin" ? `Выпало <span class="coin-mini ${r.detail.side === "орёл" ? "head" : "tail"}"></span> <b>${escapeHtml(r.detail.side)}</b>`
+    // hand_text с бэкенда набран шрифтовыми ♥♦ — те же битые глифы, что 🂠;
+    // карты и так лежат на столе, в итоге достаточно названия комбинации.
+    : `<b>${escapeHtml(r.detail.combo)}</b>`;
+  return `<div class="casino-result ${выиграл ? "win" : "lose"}">
+    <div>${строка}</div>
+    <div class="sum">${выиграл ? `${сумма} (x${r.multiplier})` : сумма}</div>
+    <div class="share">
+      ${r.can_share
+        ? `<button type="button" class="btn" data-cact="share">${icon("megaphone")}Показать в чате</button>`
+        : `<span class="muted">Показано в чате.</span>`}
+    </div></div>`;
+}
+
+function renderCasino() {
+  const s = _casino.state, body = $("#member-casino-body");
+  if (!s || !body) return;
+  const игры = s.games.map((g) => `
+    <button type="button" class="casino-game ${_casino.game === g.key ? "active" : ""}"
+            data-cact="game" data-game="${g.key}">${gicon("game", g.key)} ${escapeHtml(g.title)}</button>`).join("");
+  const множитель = s.event_multiplier && s.event_multiplier !== 1
+    ? `<div class="casino-event">${icon("spark")} Событие чата: выигрыш ×${s.event_multiplier}. Ставка не меняется.</div>` : "";
+
+  body.innerHTML = `
+    <div class="casino-top">
+      <div class="casino-balance"><b>${s.balance.toLocaleString("ru")} i¢</b>
+        <span>в казино · в кошельке ${s.coins.toLocaleString("ru")} i¢</span></div>
+      <div class="casino-money">
+        ${s.bonus_ready
+          ? `<button type="button" class="btn gold" data-cact="bonus" title="Ежедневный бонус">${icon("gift")}<span class="btn-label"> Бонус ${s.bonus_amount} i¢</span></button>`
+          : `<button type="button" class="btn" disabled title="Бонус уже получен">${icon("gift")}<span class="btn-label"> Бонус завтра</span></button>`}
+        <button type="button" class="btn" data-cact="topup" title="Пополнить из кошелька">${icon("in")}<span class="btn-label"> Пополнить</span></button>
+        <button type="button" class="btn" data-cact="withdraw" title="Вывести в кошелёк">${icon("out")}<span class="btn-label"> Вывести</span></button>
+      </div>
+      ${множитель}
+    </div>
+    <div class="casino-games" id="casino-games">${игры}</div>
+    <div class="casino-table">
+      ${casinoTableHtml()}
+      <label class="bet-field">
+        <span>Ставка · не больше ${s.max_bet.toLocaleString("ru")} i¢</span>
+        <input type="number" id="casino-bet" min="1" max="${s.max_bet}" value="${_casino.bet}"
+               inputmode="numeric" autocomplete="off">
+      </label>
+      <div class="bet-quick">
+        <button type="button" class="btn ghost" data-cact="bet" data-bet="100">100</button>
+        <button type="button" class="btn ghost" data-cact="bet" data-bet="1000">1 000</button>
+        <button type="button" class="btn ghost" data-cact="bet" data-bet="10000">10 000</button>
+        <button type="button" class="btn ghost" data-cact="bet" data-bet="x2">×2</button>
+        <button type="button" class="btn ghost" data-cact="bet" data-bet="все">Всё</button>
+      </div>
+      <button type="button" class="btn casino-play" data-cact="play"
+              ${_casino.spinning ? "disabled" : ""}>${_casino.spinning ? "Крутится…" : "Играть"}</button>
+      ${casinoResultHtml()}
+    </div>`;
+
+  // На телефоне лента игр листается, и выбранная вкладка могла остаться за
+  // краем: без этого на открытом покере лента показывала «Рулетка, Кости…»
+  // и никак не выдавала, что открыт покер. nearest — если вкладка и так
+  // видна, ничего не прокручивается и страница не дёргается.
+  const активная = body.querySelector(".casino-game.active");
+  if (активная && активная.scrollIntoView) {
+    активная.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+function onCasinoInput(e) {
+  if (e.target.id === "casino-bet") _casino.bet = Number(e.target.value) || 0;
+  if (e.target.id === "casino-skip") {
+    try { localStorage.setItem(SPIN_SKIP_KEY, e.target.checked ? "1" : "0"); } catch (err) { /* приватный режим */ }
+  }
+}
+
+// Повернуть узел от одного угла к другому.
+//
+// Ключевыми кадрами, а НЕ переходом между двумя стилями, и это не вкусовщина.
+// Переход браузер запускает только между двумя ПОСЧИТАННЫМИ состояниями, а
+// разметку перед вращением перерисовывают целиком: колесо — новый элемент,
+// стиль ему ещё ни разу не считали, начальный и конечный угол попадают в один
+// пересчёт — и перехода не возникает вовсе. Колесо просто оказывается в новом
+// положении. Ровно так это и выглядело: «телепортируется».
+//
+// Лечить это принудительным пересчётом (чтением offsetWidth) можно, но
+// лекарство держится на строке, которая выглядит бессмысленной и потому
+// однажды будет убрана. Ключевые кадры знают начало и конец сами и ни от
+// какого предыдущего состояния не зависят.
+function крутить(узел, от, до, мс, плавность, ось = "rotate") {
+  if (!узел) return;
+  // Куда встать, когда всё кончится: анимация перекрывает стиль, пока идёт, и
+  // отдаёт ему управление на выходе — без «повисания» на последнем кадре.
+  узел.style.transform = `${ось}(${до}deg)`;
+  if (typeof узел.animate !== "function") return;
+  узел.animate([{ transform: `${ось}(${от}deg)` }, { transform: `${ось}(${до}deg)` }],
+               { duration: мс, easing: плавность });
+}
+
+// То же для кости: две оси сразу. Порядок сомножителей одинаков в кадрах и в
+// стиле — иначе кость приземлилась бы не туда, куда её посчитали.
+function кувыркать(узел, отX, отY, доX, доY, мс) {
+  if (!узел) return;
+  const вид = (x, y) => `rotateX(${x}deg) rotateY(${y}deg)`;
+  узел.style.transform = вид(доX, доY);
+  if (typeof узел.animate !== "function") return;
+  узел.animate([{ transform: вид(отX, отY) }, { transform: вид(доX, доY) }],
+               // Кость бросают, а не раскручивают: резкий старт, короткий
+               // выкат и лёгкая осадка в конце.
+               { duration: мс, easing: "cubic-bezier(.2,.75,.25,1)" });
+}
+
+// Колесо останавливается на выпавшем числе. Анимация — ПОСЛЕ ответа сервера:
+// крутить заранее и подгонять под результат значило бы показывать заход,
+// которого ещё не было, и врать при ошибке сети.
+//
+// Колесо здесь — картинка происходящего, а не источник правды: что выпало,
+// написано текстом в итоге, и текст не ждёт окончания вращения.
+function spinWheel(number, мгновенно, кончилось) {
+  const колесо = $("#casino-wheel");
+  if (!колесо) { кончилось(); return; }
+  const было = _casino.angle || 0;
+  const стало = wheelAngle(было, number);
+  _casino.angle = стало;
+  const шарик = $("#casino-ball");
+  const шарик_было = _casino.ball || 0;
+  const шарик_стало = шарик_было - 360 * BALL_TURNS;
+  _casino.ball = шарик_стало;
+
+  const мс = мгновенно ? 0 : WHEEL_SPIN_MS;
+  // Резкий старт и долгий выкат: так крутится настоящее колесо — сначала не
+  // уследить за числами, потом последние полоборота ползёт.
+  крутить(колесо, было, стало, мс, "cubic-bezier(.08,.62,.16,1)");
+  // Шарик останавливается чуть раньше колеса: он падает в лунку, а колесо
+  // после этого ещё доезжает.
+  крутить(шарик, шарик_было, шарик_стало, Math.round(мс * 0.82),
+          "cubic-bezier(.1,.55,.2,1)");
+  // Число, баланс и итог показывает уже вызвавший — вместе с остановкой.
+  setTimeout(кончилось, мс);
+}
+
+// Кость кувыркается по двум осям и падает выпавшей гранью к зрителю.
+function rollDie(roll, мгновенно, кончилось) {
+  const куб = $("#casino-die");
+  if (!куб) { кончилось(); return; }
+  const былоX = _casino.dieX || 0, былоY = _casino.dieY || 0;
+  const { x, y } = dieAngles(былоX, былоY, roll);
+  _casino.dieX = x;
+  _casino.dieY = y;
+  const мс = мгновенно ? 0 : DIE_ROLL_MS;
+  кувыркать(куб, былоX, былоY, x, y, мс);
+  setTimeout(кончилось, мс);
+}
+
+// Монета подлетает и переворачивается, приземляясь нужной стороной.
+function flipCoin(side, мгновенно, кончилось) {
+  const монета = $("#casino-coin");
+  if (!монета) { кончилось(); return; }
+  const было = _casino.coin || 0;
+  const стало = coinAngle(было, side);
+  _casino.coin = стало;
+  const мс = мгновенно ? 0 : COIN_FLIP_MS;
+  крутить(монета, было, стало, мс, "cubic-bezier(.25,.5,.3,1)", "rotateY");
+  // Подброс — на внешней обёртке: она не участвует в трёхмерном повороте, и
+  // взлёт не мешает вращению, а складывается с ним.
+  const подброс = монета.parentElement;
+  if (подброс && typeof подброс.animate === "function" && мс) {
+    подброс.animate([
+      { transform: "translateY(0)" },
+      { transform: "translateY(-38%)", offset: .32 },
+      { transform: "translateY(0)" },
+    ], { duration: мс, easing: "cubic-bezier(.35,0,.35,1)" });
+  }
+  // Тень на сукне сжимается синхронно с верхней точкой подброса (offset .32):
+  // именно она продаёт высоту полёта.
+  const тень = $("#casino-coin-shadow");
+  if (тень && typeof тень.animate === "function" && мс) {
+    тень.animate([
+      { transform: "translateX(-50%) scale(1)", opacity: .5 },
+      { transform: "translateX(-50%) scale(.55)", opacity: .18, offset: .32 },
+      { transform: "translateX(-50%) scale(1)", opacity: .5 },
+    ], { duration: мс, easing: "cubic-bezier(.35,0,.35,1)" });
+  }
+  // Итог, баланс и кнопку возвращает вызвавший — вместе с приземлением.
+  // Без этой строки монета «крутится вечно»: сама она садится, а экран
+  // остаётся в полёте — итога нет, «Играть» не нажать. Ровно так и было.
+  setTimeout(кончилось, мс);
+}
+
+async function casinoPlay() {
+  const s = _casino.state;
+  const тело = { bet: _casino.bet };
+  if (_casino.game === "roulette") тело.color = _casino.color;
+  if (_casino.game === "dice") тело.guess = _casino.guess;
+  if (_casino.game === "coin") тело.side = _casino.side;
+  const кнопка = $(".casino-play");
+  if (кнопка) кнопка.disabled = true;
+  try {
+    const r = await api(`/api/member/game/casino/play/${_casino.game}`,
+                        { method: "POST", body: тело });
+    _casino.last = r;
+    const мгновенно = spinSkipped();
+    const оживает = ANIMATED_GAMES.has(_casino.game) && !мгновенно;
+    // Баланс ждёт вместе с предметом игры. Иначе исход виден по нему —
+    // подскочил, значит выиграл, — и бросок происходит уже впустую.
+    _casino.spinning = оживает;
+    if (!оживает) s.balance = r.balance;
+    renderCasino();
+
+    const показать = () => {
+      _casino.spinning = false;
+      s.balance = r.balance;
+      renderCasino();
+    };
+
+    if (_casino.game === "roulette") {
+      spinWheel(r.detail.number, мгновенно, показать);
+    } else if (_casino.game === "dice") {
+      rollDie(r.detail.roll, мгновенно, показать);
+    } else if (_casino.game === "coin") {
+      flipCoin(r.detail.side, мгновенно, показать);
+    } else if (_casino.game === "poker") {
+      // Карты раскрываются по одной — задержка считается на месте, поэтому
+      // разметка строится здесь, а не в общей отрисовке.
+      const рука = $("#casino-hand");
+      if (рука) {
+        рука.classList.toggle("win", r.won);
+        рука.innerHTML = r.detail.hand.map(([rank, suit], i) => {
+          const имя = { 11: "J", 12: "Q", 13: "K", 14: "A" }[rank] || rank;
+          const красная = suit === "♥" || suit === "♦";
+          return `<div class="playing-card${красная ? " red" : ""}" style="animation-delay:${i * 110}ms">
+            <span class="pc-corner">${имя}${suitSvg(suit)}</span>
+            ${suitSvg(suit, "pc-pip")}
+            <span class="pc-corner pc-corner-b">${имя}${suitSvg(suit)}</span>
+          </div>`;
+        }).join("");
+        // Подсветить пилюлю выигравшей комбинации. Совпадение берём самое
+        // ДЛИННОЕ: иначе «стрит-флеш» зажёг бы заодно «стрит» и «флеш».
+        const комбо = (r.detail.combo || "").toLowerCase();
+        let лучшая = null;
+        $$("#poker-pays .pay-pill").forEach((p) => {
+          p.classList.remove("hit");
+          if (r.won && комбо.includes(p.dataset.combo)
+              && (!лучшая || p.dataset.combo.length > лучшая.dataset.combo.length)) лучшая = p;
+        });
+        if (лучшая) лучшая.classList.add("hit");
+      }
+    }
+  } catch (err) {
+    casinoSay(err.message, "err");
+  } finally {
+    // Пока предмет игры в движении, кнопку не возвращаем: второй заход
+    // поверх первого показал бы итоги вперемешку. Её включит отрисовка после
+    // остановки — она же знает, что движение кончилось.
+    const b = $(".casino-play");
+    if (b && !_casino.spinning) b.disabled = false;
+  }
+}
+
+async function casinoMoney(action) {
+  let сумма = null;
+  if (action === "topup" || action === "withdraw") {
+    const ответ = prompt(action === "topup"
+      ? "Сколько перевести в казино? Можно слово «все»."
+      : "Сколько вывести в кошелёк? Можно слово «все».", "1000");
+    if (ответ === null) return;
+    сумма = /^\s*(все|всё|all)\s*$/i.test(ответ) ? "все" : Number(ответ);
+  }
+  try {
+    const r = await api(`/api/member/game/casino/${action}`,
+                        { method: "POST", body: { amount: сумма } });
+    if (r.state) _casino.state = { ..._casino.state, ...r.state };
+    renderCasino();
+    casinoSay(action === "bonus" ? `Бонус получен: +${r.delta} i¢`
+      : action === "topup" ? `Переведено в казино: ${r.delta} i¢`
+      : `Выведено в кошелёк: ${r.delta} i¢`);
+  } catch (err) {
+    casinoSay(err.message, "err");
+  }
+}
+
+async function onCasinoClick(e) {
+  const el = e.target.closest("[data-cact]");
+  if (!el) return;
+  const act = el.dataset.cact;
+  if (act === "game") { _casino.game = el.dataset.game; _casino.last = null; renderCasino(); }
+  else if (act === "color") { _casino.color = el.dataset.color; renderCasino(); }
+  else if (act === "guess") { _casino.guess = Number(el.dataset.guess); renderCasino(); }
+  else if (act === "side") { _casino.side = el.dataset.side; renderCasino(); }
+  else if (act === "bet") {
+    const v = el.dataset.bet;
+    _casino.bet = v === "все" ? (_casino.state.balance || 0)
+      : v === "x2" ? Math.max(1, _casino.bet * 2) : Number(v);
+    renderCasino();
+  }
+  else if (act === "play") casinoPlay();
+  else if (act === "bonus" || act === "topup" || act === "withdraw") casinoMoney(act);
+  else if (act === "share") {
+    try {
+      await api("/api/member/game/casino/share",
+                { method: "POST", body: {} });
+      if (_casino.last) _casino.last.can_share = false;
+      renderCasino();
+      casinoSay("Отправлено в чат.");
+    } catch (err) {
+      casinoSay(err.message, "err");
+    }
+  }
+}
+
+// ===== Вкладка «Бизнесы» ===================================================
+// Копилка считается лениво (на сервере, от времени последнего обращения),
+// поэтому экран её не «тикает», а перечитывает: рисовать растущее число самому
+// значило бы разойтись с тем, что реально начислится при сборе.
+const _biz = { state: null, bound: false, timer: null };
+
+function bizSay(text, kind = "ok") {
+  if ($("#member-biz-msg")) say("#member-biz-msg", text, kind);
+}
+
+async function loadMemberBiz() {
+  const box = $("#member-biz");
+  box.innerHTML = `<section class="member-block"><h2>${icon("building")}Бизнесы</h2>
+    <div class="card"><div class="muted">Загрузка…</div></div></section>`;
+  try {
+    box.innerHTML = `<section class="member-block"><h2>${icon("building")}Бизнесы</h2>
+      <div class="card">
+        <div id="member-biz-msg"></div>
+        <div id="member-biz-body"><div class="muted">Загрузка…</div></div>
+      </div></section>`;
+    if (!_biz.bound) { $("#member-biz").addEventListener("click", onBizClick); _biz.bound = true; }
+    loadBizState();
+  } catch (err) {
+    box.innerHTML = `<section class="member-block"><h2>${icon("building")}Бизнесы</h2><div class="card">
+      <div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div></div></section>`;
+  }
+}
+
+async function loadBizState() {
+  try {
+    _biz.state = await api(`/api/member/game/business`);
+    renderBiz();
+  } catch (err) {
+    const body = $("#member-biz-body");
+    if (body) body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+// Копилка перечитывается раз в полминуты: доход капает часами, и чаще
+// спрашивать не о чем.
+function startBizTick() {
+  if (_biz.timer) clearInterval(_biz.timer);
+  _biz.timer = setInterval(() => { if (_biz.state) loadBizState(); }, 30000);
+}
+
+function stopBizTick() {
+  if (_biz.timer) { clearInterval(_biz.timer); _biz.timer = null; }
+}
+
+function bizCardHtml(b, gear) {
+  const процент = b.full_percent;
+  const полная = процент >= 100;
+  const оснащение = gear.map((g) => {
+    const стоит = b.upgrades.includes(g.key);
+    const цена = (b.gear_prices || {})[g.key] || 0;
+    return `<button type="button" class="${стоит ? "on" : ""}" ${стоит ? "disabled" : ""}
+      data-bact="equip" data-key="${b.key}" data-gear="${g.key}"
+      title="${escapeHtml(g.hint)}">${gicon("bizup", g.key)} ${escapeHtml(g.name)}${стоит ? "" : ` · ${цена} i¢`}</button>`;
+  }).join("");
+  return `<div class="biz-card ${b.broken ? "broken" : ""}">
+    <div class="biz-head">
+      <span class="biz-name">${gicon("biz", b.key, "lg")} ${escapeHtml(безЭмодзи(b.name))}</span>
+      <span class="biz-level">${b.level}/${b.max_level} ур.</span>
+      <span class="biz-income">${b.income.toLocaleString("ru")} i¢/час</span>
+    </div>
+    ${b.broken
+      ? `<div class="biz-broken">${icon("wrench")} Сломан (${escapeHtml(b.broken)}) — доход не капает.</div>`
+      : ""}
+    <div class="vault ${полная ? "full" : ""} ${b.accrued ? "" : "empty"}">
+      <div class="vault-fill" style="width:${процент}%"></div>
+      <div class="vault-text">${b.accrued.toLocaleString("ru")} / ${b.cap.toLocaleString("ru")} i¢${
+        полная ? " · полная" : b.hours_to_full ? ` · полная через ${b.hours_to_full} ч` : ""}</div>
+    </div>
+    <div class="biz-gear">${оснащение}</div>
+    <div class="biz-buttons">
+      <button type="button" class="btn" data-bact="collect" data-key="${b.key}"
+              ${b.accrued ? "" : "disabled"}>Забрать</button>
+      ${b.broken
+        ? `<button type="button" class="btn" data-bact="repair" data-key="${b.key}">Починить · ${b.repair_cost} i¢</button>`
+        : b.upgrade_cost
+          ? `<button type="button" class="btn" data-bact="upgrade" data-key="${b.key}">Улучшить · ${b.upgrade_cost.toLocaleString("ru")} i¢</button>`
+          : `<button type="button" class="btn" disabled>Максимум</button>`}
+      <button type="button" class="btn ghost" data-bact="sell" data-key="${b.key}">Боту · ${b.sell_price.toLocaleString("ru")} i¢</button>
+      <button type="button" class="btn ghost" data-bact="offer" data-key="${b.key}">Игроку…</button>
+    </div>
+  </div>`;
+}
+
+function renderBiz() {
+  const s = _biz.state, body = $("#member-biz-body");
+  if (!s || !body) return;
+  const карточки = s.mine.map((b) => bizCardHtml(b, s.gear)).join("");
+  const витрина = s.catalog.map((c) => `
+    <div class="biz-offer ${c.owned ? "owned" : ""}">
+      <span><span class="name">${gicon("biz", c.key)} ${escapeHtml(безЭмодзи(c.name))}</span>
+        <span class="meta">${c.income.toLocaleString("ru")} i¢/час · копилка ${c.cap.toLocaleString("ru")}</span></span>
+      ${c.owned
+        ? `<span class="meta">уже ваш</span>`
+        : `<button type="button" class="btn" data-bact="buy" data-key="${c.key}"
+                   ${c.affordable ? "" : "disabled"}>${c.price.toLocaleString("ru")} i¢</button>`}
+    </div>`).join("");
+
+  body.innerHTML = `
+    <div class="biz-summary">
+      <div><span class="total">${s.pending_total.toLocaleString("ru")} i¢</span>
+        <span class="muted">в копилках<small>налог при сборе: ${s.tax_now.toLocaleString("ru")} i¢ · в кошельке ${s.coins.toLocaleString("ru")} i¢</small></span></div>
+      <button type="button" class="btn btn-collect" data-bact="collect"
+              ${s.pending_total ? "" : "disabled"}>${icon("coins")}Забрать со всех</button>
+    </div>
+    ${s.mine.length
+      ? `<div class="biz-list">${карточки}</div>`
+      : `<div class="empty">${icon("empty")}<span>Бизнесов пока нет — купите первый ниже.</span></div>`}
+    <h3 class="block-head">${icon("store")}Купить</h3>
+    <div class="biz-shop">${витрина}</div>`;
+  startBizTick();
+}
+
+async function bizDo(action, тело, успех) {
+  try {
+    const r = await api(`/api/member/game/business/${action}`,
+                        { method: "POST", body: { ...тело } });
+    _biz.state = r.state;
+    renderBiz();
+    bizSay(успех(r));
+  } catch (err) {
+    bizSay(err.message, "err");
+  }
+}
+
+async function onBizClick(e) {
+  const el = e.target.closest("[data-bact]");
+  if (!el) return;
+  const act = el.dataset.bact, key = el.dataset.key || null;
+  if (act === "collect") {
+    // Налог считается от всей суммы разом, поэтому «забрать со всех» — не то
+    // же самое, что несколько сборов подряд: об этом сказано в шапке.
+    bizDo("collect", { key }, (r) =>
+      `Забрали ${r.gross.toLocaleString("ru")} i¢ с ${r.count} бизнес(-ов) · налог ${r.tax.toLocaleString("ru")} · на руки ${r.net.toLocaleString("ru")}`);
+  } else if (act === "buy") {
+    bizDo("buy", { key }, (r) => `Куплено за ${r.spent.toLocaleString("ru")} i¢`);
+  } else if (act === "upgrade") {
+    bizDo("upgrade", { key }, (r) =>
+      r.free ? `Улучшено до ${r.level} ур. по «бизнес-плану» — бесплатно`
+             : `Улучшено до ${r.level} ур. за ${r.spent.toLocaleString("ru")} i¢`);
+  } else if (act === "repair") {
+    bizDo("repair", { key }, (r) => `Починено за ${r.spent.toLocaleString("ru")} i¢`);
+  } else if (act === "equip") {
+    bizDo("equip", { key, gear: el.dataset.gear }, (r) => `Оснащение поставлено за ${r.spent.toLocaleString("ru")} i¢`);
+  } else if (act === "sell") {
+    if (!confirm("Продать бизнес боту? Оснащение снимется, копилка вернётся вместе с ценой.")) return;
+    bizDo("sell", { key }, (r) => `Продано, получено ${r.net.toLocaleString("ru")} i¢`);
+  } else if (act === "offer") {
+    // Сделка с человеком: сайт только ПРЕДЛАГАЕТ. Согласие второй стороны
+    // приходит кнопкой в чате — иначе бизнес переходил бы без спроса.
+    const кому = prompt("Кому? Укажите @ник (бот должен был видеть его в этом чате).", "@");
+    if (!кому) return;
+    const цена = prompt("За сколько i¢? Оставьте 0 или пусто — передать в дар.", "0");
+    if (цена === null) return;
+    const сумма = Number(цена) || 0;
+    bizDo(сумма > 0 ? "offer" : "give", { key, target: кому, price: сумма },
+      () => сумма > 0
+        ? "Предложение отправлено в чат — ждём согласия покупателя."
+        : "Предложение отправлено в чат — ждём согласия получателя.");
+  }
+}
+
+// ===== Вкладки «Рыбалка» и «Работа» ========================================
+// Общий каркас на два занятия: выбрать чат, показать состояние, нажать —
+// перерисовать. Разное у них только внутри карточки, поэтому и код общий:
+// две почти одинаковые копии разъезжаются на первой же правке.
+const _act = { fish: { state: null }, work: { state: null },
+               bound: false, timer: null };
+
+function actSay(вид, text, kind = "ok") {
+  if ($(`#member-${вид}-msg`)) say(`#member-${вид}-msg`, text, kind);
+}
+
+function actLeft(iso) {
+  const мс = farmTime(iso) - Date.now();
+  return мс > 0 ? farmLeft(мс) : "";
+}
+
+async function loadActivity(вид, заголовок) {
+  const box = $(`#member-${вид}`);
+  box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2>
+    <div class="card"><div class="muted">Загрузка…</div></div></section>`;
+  try {
+    box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2>
+      <div class="card">
+        <div id="member-${вид}-msg"></div>
+        <div id="member-${вид}-body"><div class="muted">Загрузка…</div></div>
+      </div></section>`;
+    if (!_act.bound) {
+      $("#member-fish").addEventListener("click", (e) => onActivityClick("fish", e));
+      $("#member-work").addEventListener("click", (e) => onActivityClick("work", e));
+      _act.bound = true;
+    }
+    loadActivityState(вид);
+  } catch (err) {
+    box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2><div class="card">
+      <div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div></div></section>`;
+  }
+}
+
+const loadMemberFish = () => loadActivity("fish", `${icon("fish")}Рыбалка`);
+const loadMemberWork = () => loadActivity("work", `${icon("work")}Работа`);
+
+async function loadActivityState(вид) {
+  const адрес = вид === "fish" ? "fishing" : "work";
+  try {
+    _act[вид].state = await api(`/api/member/game/${адрес}`);
+    if (вид === "fish") renderFish(); else renderWork();
+    startActivityTick();
+  } catch (err) {
+    const body = $(`#member-${вид}-body`);
+    if (body) body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+// Один тикер на оба занятия: они показывают одно и то же — сколько ждать.
+function startActivityTick() {
+  if (_act.timer) clearInterval(_act.timer);
+  _act.timer = setInterval(() => {
+    let живо = false;
+    $$("[data-until]").forEach((el) => {
+      const осталось = farmTime(el.dataset.until) - Date.now();
+      if (осталось > 0) { el.textContent = farmLeft(осталось); живо = true; }
+      else { el.textContent = "готово"; }
+    });
+    if (!живо && _act.timer) { clearInterval(_act.timer); _act.timer = null; }
+  }, 1000);
+}
+
+function stopActivityTick() {
+  if (_act.timer) { clearInterval(_act.timer); _act.timer = null; }
+}
+
+// --- рыбалка ---------------------------------------------------------------
+function fishCardHtml(f) {
+  // Свежесть цветом, а не подписью: решение «продать или ждать Клёва»
+  // принимается взглядом.
+  const класс = f.hours >= 48 ? "rot" : f.hours >= 24 ? "stale" : "";
+  return `<div class="fish-card ${класс} ${f.pinned ? "pinned" : ""}">
+    <div class="fish-card-head">${gicon("fish", f.key, "lg")}
+      <span class="rarity ${f.rarity}">${escapeHtml(f.rarity_label)}</span></div>
+    <div class="fish-name">${escapeHtml(f.name)}${f.pinned ? ` ${icon("pin")}` : ""}</div>
+    <div class="fish-meta">${escapeHtml(f.weight)} · ${escapeHtml(f.freshness)}</div>
+    <div class="fish-price">${f.price.toLocaleString("ru")} i¢</div>
+    <div class="row-btns">
+      <button type="button" class="btn" data-aact="sell" data-id="${f.id}"
+              ${f.pinned ? "disabled" : ""}>Продать</button>
+      <button type="button" class="btn ghost btn-ic" data-aact="pin" data-id="${f.id}"
+              title="${f.pinned ? "Открепить" : "Закрепить — не продастся и не выпустится"}">
+        ${icon(f.pinned ? "undo" : "pin")}</button>
+      <button type="button" class="btn ghost btn-ic" data-aact="release" data-id="${f.id}"
+              ${f.pinned ? "disabled" : ""} title="Выпустить обратно в воду">${icon("out")}</button>
+    </div>
+  </div>`;
+}
+
+function renderFish() {
+  const s = _act.fish.state, body = $("#member-fish-body");
+  if (!s || !body) return;
+  const ждать = s.next_at ? actLeft(s.next_at) : "";
+  // Вода — сцена: глубина градиентом, гребешки волн, поплавок у поверхности.
+  body.innerHTML = `
+    <div class="fish-scene">
+      <div class="fish-waves"></div>
+      <div class="fish-bobber"></div>
+      <div class="fish-top">
+        <div><span class="value">${s.net_value.toLocaleString("ru")} i¢</span>
+          <small>в сетке ${s.net.length}/${s.capacity}${
+            s.multiplier > 1 ? ` · ${icon("fish")} Клёв ×${s.multiplier}` : ""}</small></div>
+        <div class="fish-actions">
+          <button type="button" class="btn primary" data-aact="cast" ${ждать ? "disabled" : ""}>
+            ${icon("fish")}Забросить${ждать ? ` · <span data-until="${escapeHtml(s.next_at)}">${ждать}</span>` : ""}</button>
+          <button type="button" class="btn" data-aact="sell" ${s.net.length ? "" : "disabled"}>
+            ${icon("coins")}Продать всё</button>
+        </div>
+      </div>
+    </div>
+    ${s.net.length
+      ? `<div class="net">${s.net.map(fishCardHtml).join("")}</div>`
+      : `<div class="empty">${icon("empty")}<span>Сетка пуста — забросьте удочку.</span></div>`}
+    <div class="hint">
+      Рекорд: ${(s.best_weight / 1000).toFixed(1)} кг · уловов всего: ${s.total_catches}.
+      Рыба портится: до 24 ч свежая, после 48 ч дешевеет вдвое. Цену поднимает «Клёв» — придержать улов бывает выгодно.
+    </div>`;
+}
+
+// --- работа ----------------------------------------------------------------
+// Классы meters/meter, а не bars/bar: те заняты столбчатым графиком
+// статистики, и общее имя уже один раз молча ломало ему масштаб.
+function barHtml(вид, подпись, значение) {
+  return `<div class="bar-row"><span class="bar-label">${подпись}</span>
+    <span class="meter ${вид}"><i style="width:${Math.max(0, Math.min(100, значение))}%"></i></span>
+    <span class="bar-value">${значение}/100</span></div>`;
+}
+
+function renderWork() {
+  const s = _act.work.state, body = $("#member-work-body");
+  if (!s || !body) return;
+  if (!s.profession) {
+    body.innerHTML = `<div class="empty">${icon("empty")}<span>Профессии пока нет.
+      Устроиться можно в чате: <code>!работа устроиться {профессия}</code>.</span></div>
+      <div class="prof-list mt-3">${s.catalog.map((p) => `
+        <div class="prof-card"><div class="name">${gicon("prof", (p.name || "").toLowerCase())} ${escapeHtml(p.name)}</div>
+          <div class="meta">${p.income[0].toLocaleString("ru")}–${p.income[1].toLocaleString("ru")} i¢ · ${icon("spark")}${p.energy}
+          ${p.req_days ? ` · от ${p.req_days} дн.` : ""}</div></div>`).join("")}</div>`;
+    return;
+  }
+  const ждать = s.next_at ? actLeft(s.next_at) : "";
+  const перерыв = s.break_at ? actLeft(s.break_at) : "";
+  const доля = s.xp_next ? Math.min(100, Math.round(s.xp * 100 / s.xp_next)) : 100;
+  const заметки = [];
+  if (s.burnout) заметки.push(`<div class="work-note bad">${icon("alert")} Выгорание: доход урезан на ${s.burnout_penalty}%. Помогает перерыв.</div>`);
+  else if (s.shifts_since_break >= s.burnout_after - 2)
+    заметки.push(`<div class="work-note warn">${icon("clock")} Смен без перерыва: ${s.shifts_since_break} из ${s.burnout_after}.</div>`);
+  if (s.union) заметки.push(`<div class="work-note">${icon("chats")} Профсоюз (${s.colleagues} чел.): смена даётся легче.</div>`);
+  if (s.streak) заметки.push(`<div class="work-note">${icon("star")} Серия смен: ${s.streak} дн.</div>`);
+
+  body.innerHTML = `
+    <div class="work-head">
+      <div><div class="work-prof">${gicon("prof", (s.name || "").toLowerCase(), "lg")} ${escapeHtml(s.name)}</div>
+        <div class="work-level">${s.level}/${s.max_level} уровень · ${s.income[0].toLocaleString("ru")}–${s.income[1].toLocaleString("ru")} i¢ за смену</div>
+        <div class="xp-bar"><i style="width:${доля}%"></i></div>
+        <div class="work-level">${s.xp} / ${s.xp_next} XP</div></div>
+      <button type="button" class="btn btn-shift" data-aact="shift" ${ждать ? "disabled" : ""}>
+        ${icon("work")}На смену${ждать ? ` · <span data-until="${escapeHtml(s.next_at)}">${ждать}</span>` : ""}</button>
+    </div>
+    <div class="meters">
+      ${barHtml("energy", `${icon("spark")} Энергия`, s.energy)}
+      ${barHtml("mood", `${icon("smile")} Настроение`, s.mood)}
+      ${barHtml("health", `${icon("heart")} Здоровье`, s.health)}
+    </div>
+    <div class="farm-actions">
+      <button type="button" class="btn" data-aact="rest" ${перерыв ? "disabled" : ""}>
+        ${icon("coffee")}Перерыв${перерыв ? ` · <span data-until="${escapeHtml(s.break_at)}">${перерыв}</span>` : ""}</button>
+    </div>
+    ${заметки.join("")}
+    <div class="hint">
+      Силы восстанавливаются сами: примерно ${s.regen_per_hour} в час.</div>`;
+}
+
+async function onActivityClick(вид, e) {
+  const el = e.target.closest("[data-aact]");
+  if (!el) return;
+  const act = el.dataset.aact;
+  const адрес = вид === "fish" ? "fishing" : "work";
+  const тело = { };
+  if (el.dataset.id) тело.fish_id = Number(el.dataset.id);
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/${адрес}/${act}`, { method: "POST", body: тело });
+    _act[вид].state = r.state;
+    if (вид === "fish") renderFish(); else renderWork();
+    startActivityTick();
+    actSay(вид, activityReport(вид, act, r));
+  } catch (err) {
+    actSay(вид, err.message, "err");
+    el.disabled = false;
+  }
+}
+
+// Эмодзи в отчётах ниже — не забытые: отчёт уходит в say(), а тот экранирует
+// текст (иначе любое имя с «<» ломало бы страницу). Разметку туда вставить
+// нельзя, и значок остаётся единственным способом показать, о чём речь.
+function activityReport(вид, act, r) {
+  if (вид === "fish") {
+    if (act === "cast") {
+      if (r.junk) return `${r.name} — сдали в приёмку: +${r.coins} i¢`;
+      if (r.released) return "Сетка полна, а улов самый скромный — отпустили.";
+      const части = [`${r.name}, ${(r.grams / 1000).toFixed(2)} кг ≈ ${r.price} i¢`];
+      if (r.lucky) части.push("талисман: вдвое крупнее");
+      if (r.record) части.push("новый рекорд");
+      if (r.evicted) части.push(`выбросили ${r.evicted}`);
+      return части.join(" · ");
+    }
+    if (act === "sell") {
+      const части = [`Продано ${r.sold} шт. на ${r.coins.toLocaleString("ru")} i¢`];
+      if (r.multiplier > 1) части.push(`Клёв ×${r.multiplier}`);
+      if (r.passive) части.push(`снасти +${r.passive}%`);
+      return части.join(" · ");
+    }
+    if (act === "release") return "Рыбу выпустили — место освободилось.";
+    return "Готово.";
+  }
+  if (act === "rest") return "Отдохнули." + (r.burnout ? " Выгорание снято." : "");
+  const части = [`Смена: +${r.income.toLocaleString("ru")} i¢, +${r.xp} XP`];
+  if (r.level_up) части.push(`повышение до ${r.level}`);
+  if (r.office) части.push("вне очереди");
+  if (r.event) части.push(безЭмодзи(r.event));
+  if (r.mentor_share) части.push(`наставнику ${r.mentor_share} i¢`);
+  if (r.graduated) части.push("стажировка окончена");
+  return части.join(" · ");
+}
+
+// ===== Вкладки «Профиль» и «Топы» ==========================================
+// Только чтение, поэтому никаких «нажал — перерисовать»: загрузили и показали.
+const _prof = { state: null, tops: null, kind: "messages", bound: false };
+
+// Цвет кружка с буквой — из имени, как у аватарок в списках: у одного
+// человека он всегда один и тот же, и список не выглядит серым.
+function profColor(имя) {
+  let сумма = 0;
+  for (const c of String(имя)) сумма = (сумма + c.codePointAt(0)) % 997;
+  return PALETTE[сумма % PALETTE.length];
+}
+
+async function loadMemberProf() { await loadProfScreen("prof", `${icon("user")}Профиль`); }
+async function loadMemberTops() { await loadProfScreen("tops", `${icon("trophy")}Топы`); }
+
+async function loadProfScreen(вид, заголовок) {
+  const box = $(`#member-${вид}`);
+  box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2>
+    <div class="card"><div class="muted">Загрузка…</div></div></section>`;
+  try {
+    box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2>
+      <div class="card">
+        <div id="member-${вид}-body"><div class="muted">Загрузка…</div></div>
+      </div></section>`;
+    if (!_prof.bound) {
+      $("#member-tops").addEventListener("click", onTopsClick);
+      _prof.bound = true;
+    }
+    // Анкета и титулы живут в «Профиле». Слушатели вешаем на сам экран, а не
+    // на поля: разметка перерисовывается после каждой правки, и слушатели на
+    // полях пришлось бы вешать заново каждый раз.
+    if (вид === "prof" && !_card.bound) {
+      const экран = $("#member-prof");
+      экран.addEventListener("click", onCardClick);
+      экран.addEventListener("click", onGalleryClick);
+      экран.addEventListener("change", onCardChange);
+      // focusout, а не blur: blur не всплывает, и на самом экране его не
+      // поймать — правка молча терялась бы.
+      экран.addEventListener("focusout", onCardBlur);
+      // Запоминаем, раскрыт ли магазин титулов: toggle не всплывает,
+      // ловим на фазе захвата.
+      экран.addEventListener("toggle", (e) => {
+        if (e.target.classList.contains("title-shop")) _card.shopOpen = e.target.open;
+      }, true);
+      _card.bound = true;
+    }
+    вид === "prof" ? loadProfile() : loadTops();
+  } catch (err) {
+    box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2><div class="card">
+      <div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div></div></section>`;
+  }
+}
+
+async function loadProfile() {
+  const body = $("#member-prof-body");
+  if (!body) return;
+  try {
+    _prof.state = await api(`/api/member/game/profile`);
+    renderProfile();
+  } catch (err) {
+    body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+function tile(значение, подпись, класс = "") {
+  return `<div class="tile ${класс}"><div class="v">${значение}</div><div class="k">${подпись}</div></div>`;
+}
+
+function renderProfile() {
+  const p = _prof.state, body = $("#member-prof-body");
+  if (!p || !body) return;
+  const буква = (p.name || "?").trim()[0] || "?";
+  const звёзды = p.star_progress.need
+    ? Math.round(p.star_progress.have * 100 / p.star_progress.need) : 100;
+  const плитки = [
+    tile(p.messages.toLocaleString("ru"), "сообщений", "accent"),
+    tile(p.rank ? `#${p.rank}` : "—", "место в чате"),
+    tile(p.coins.toLocaleString("ru"), "монет", "gold"),
+    tile(`${p.stars} ${icon("star")}`, "звёздность", "gold"),
+    tile(p.achievements, "достижений"),
+    p.businesses ? tile(p.businesses, "бизнесов") : "",
+    p.pets ? tile(p.pets, "питомцев") : "",
+    p.clan ? tile(escapeHtml(p.clan), "клан") : "",
+  ].join("");
+
+  const занятия = [];
+  if (p.work.name) {
+    занятия.push(`<div class="tile"><div class="v">${gicon("prof", (p.work.name || "").toLowerCase())} ${escapeHtml(p.work.name)}</div>
+      <div class="k">${p.work.level} ур. · ${p.work.shifts} смен${p.work.streak ? ` · серия ${p.work.streak}` : ""}</div></div>`);
+  }
+  if (p.fishing.catches) {
+    занятия.push(`<div class="tile"><div class="v">${icon("fish")} ${escapeHtml(p.fishing.best_weight_text)}</div>
+      <div class="k">рекорд${p.fishing.best_species ? ` · ${escapeHtml(p.fishing.best_species)}` : ""} · уловов ${p.fishing.catches}</div></div>`);
+  }
+
+  body.innerHTML = `
+    <div class="prof-card">
+      <div class="prof-ava" style="background:${profColor(p.name)}">${escapeHtml(буква.toUpperCase())}</div>
+      <div class="grow">
+        <div class="prof-name">${escapeHtml(p.name)}</div>
+        <div class="prof-sub">${p.username ? "@" + escapeHtml(p.username) : `id ${p.user_id}`}</div>
+        ${p.title ? `<span class="prof-title">${escapeHtml(p.title)}</span>` : ""}
+        <div class="star-line" title="До следующей звезды"><i style="width:${звёзды}%"></i></div>
+      </div>
+    </div>
+    <div class="tiles">${плитки}</div>
+    ${занятия.length ? `<h3 class="block-head">Занятия</h3>
+      <div class="tiles">${занятия.join("")}</div>` : ""}
+    <h3 class="block-head">Активность</h3>
+    <div class="tiles">
+      ${tile(p.activity.day.toLocaleString("ru"), "за сегодня")}
+      ${tile(p.activity.week.toLocaleString("ru"), "за неделю")}
+      ${tile(p.activity.month.toLocaleString("ru"), "за месяц")}
+      ${tile(p.activity.all.toLocaleString("ru"), "всего")}
+    </div>
+    <div id="member-gallery-block"></div>
+    <div id="member-card-block"></div>`;
+  loadGallery();
+  loadCardBlock();
+}
+
+// --- достижения и коллекции -------------------------------------------------
+// Только просмотр. Стоят в «Профиле», где уже есть счётчик достижений: до сих
+// пор он показывал число, по которому нельзя было понять, что именно собрано
+// и что осталось.
+//
+// Неполученные показываются тоже — и это половина смысла экрана: список
+// одного собранного отвечает на вопрос «что у меня есть» и молчит о том, ради
+// чего сюда и заходят. В чате так же: полученные списком, остальные под катом.
+const _gallery = { data: null, open: false };
+
+async function loadGallery() {
+  const блок = $("#member-gallery-block");
+  if (!блок) return;
+  try {
+    _gallery.data = await api(`/api/member/game/gallery`);
+  } catch (err) {
+    блок.innerHTML = "";
+    return;
+  }
+  renderGallery();
+}
+
+function renderGallery() {
+  const d = _gallery.data, блок = $("#member-gallery-block");
+  if (!d || !блок) return;
+  const a = d.achievements || { items: [], earned: 0, total: 0 };
+  const собраны = a.items.filter((x) => x.earned);
+  const остались = a.items.filter((x) => !x.earned);
+
+  блок.innerHTML = `
+    <h3 class="block-head">${icon("medal")}Достижения · ${a.earned} из ${a.total}</h3>
+    ${собраны.length
+      ? `<div class="ach-list">${собраны.map(achHtml).join("")}</div>`
+      : `<div class="muted mb-2">Пока ни одного. Они выдаются сами — за
+         активность, стаж и события в чате.</div>`}
+    ${остались.length ? `
+      <button type="button" class="btn ghost small" data-gallery="toggle">
+        ${_gallery.open ? "Скрыть" : `Показать оставшиеся · ${остались.length}`}</button>
+      ${_gallery.open ? `<div class="ach-list mt-2">${остались.map(achHtml).join("")}</div>` : ""}` : ""}
+
+    <h3 class="block-head">${icon("basket")}Коллекции</h3>
+    <div class="coll-list">${(d.collections?.items || []).map((c) => {
+      const доля = c.total ? Math.round(c.done * 100 / c.total) : 0;
+      return `<div class="coll-row ${c.rewarded ? "done" : ""}">
+        <div class="coll-head">${gicon("coll", c.key, "lg")} <b>${escapeHtml(c.name)}</b>
+          ${c.rewarded ? `<span class="coll-mark">${icon("check")}титул получен</span>` : ""}
+          <span class="push">${c.done}/${c.total}</span></div>
+        <div class="coll-bar"><i style="width:${доля}%"></i></div>
+        <div class="coll-desc">${escapeHtml(c.description)}</div>
+      </div>`;
+    }).join("")}</div>
+    <div class="hint">За полный сбор — титул, который нельзя купить.</div>`;
+}
+
+function achHtml(x) {
+  return `<div class="ach ${x.earned ? "got" : "left"}">
+    <span class="ach-emoji">${x.earned ? achIcon(x.key) : icon("lock")}</span>
+    <span class="ach-body"><b>${escapeHtml(x.title)}</b>
+      <span class="muted">${escapeHtml(x.desc)}</span></span>
+  </div>`;
+}
+
+function onGalleryClick(e) {
+  if (!e.target.closest("[data-gallery]")) return;
+  _gallery.open = !_gallery.open;
+  renderGallery();
+}
+
+// --- анкета и титулы --------------------------------------------------------
+// Стоят в «Профиле», под тем, что они и описывают. Правится всё на месте: поле
+// сохраняется, когда из него уходят, — отдельная кнопка «сохранить» у шести
+// коротких строк дала бы шесть кнопок и ни одной подсказки, какая из них ещё
+// не нажата.
+// shopOpen — раскрыт ли магазин титулов: после покупки блок перерисовывается,
+// и без этого флага свёрнутый по умолчанию список захлопывался бы в руках.
+const _card = { state: null, titles: null, bound: false, shopOpen: false };
+
+async function loadCardBlock() {
+  const блок = $("#member-card-block");
+  if (!блок) return;
+  try {
+    const d = await api(`/api/member/game/card`);
+    _card.state = d.card;
+    _card.titles = d.titles;
+  } catch (err) {
+    блок.innerHTML = "";
+    return;
+  }
+  renderCardBlock();
+}
+
+function cardField(поле, подпись, значение, предел, многострочно) {
+  const общее = `id="card-${поле}" data-card-field="${поле}" maxlength="${предел}"`;
+  return `<label class="bet-field card-field">
+    <span>${escapeHtml(подпись)} <em class="tip">до ${предел} симв. · пусто — убрать</em></span>
+    ${многострочно
+      ? `<textarea ${общее} rows="3" autocomplete="off">${escapeHtml(значение)}</textarea>`
+      : `<input type="text" ${общее} value="${escapeHtml(значение)}" autocomplete="off">`}
+  </label>`;
+}
+
+function renderCardBlock() {
+  const c = _card.state, t = _card.titles, блок = $("#member-card-block");
+  if (!c || !t || !блок) return;
+
+  // Списки берём с запасом: половина ответа роняла бы весь «Профиль», а он
+  // тут главный — анкета внизу и приложена к нему.
+  const все = (t.for_sale || []).concat(t.earned_only || []);
+  const надет = все.find((x) => x.key === t.active);
+  const свои = все.filter((x) => x.owned);
+
+  блок.innerHTML = `
+    <h3 class="block-head">${icon("id")}Анкета</h3>
+    ${cardField("title", "Звание", c.title, c.limits.title, false)}
+    ${cardField("motto", "Девиз", c.motto, c.limits.motto, false)}
+    ${cardField("city", "Город", c.city, c.limits.city, false)}
+    ${cardField("about", "О себе", c.about, c.limits.about, true)}
+    <label class="check">
+      <input type="checkbox" id="card-citizen" data-card-flag="citizen"
+             ${c.citizen ? "checked" : ""} autocomplete="off">
+      <span>Гражданин(ка) чата</span>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="card-visible" data-card-flag="visible"
+             ${c.visible ? "checked" : ""} autocomplete="off">
+      <span>Анкету видно другим</span>
+    </label>
+
+    <h3 class="block-head">${icon("medal")}Титулы</h3>
+    <div class="card-title-now">
+      ${надет ? `Надет: <b>${escapeHtml(безЭмодзи(надет.name))}</b>` : `<span class="muted">Титул не надет</span>`}
+      ${t.active ? `<button type="button" class="btn ghost small" data-title-act="unequip">Снять</button>` : ""}
+    </div>
+    ${свои.length ? `<div class="card-titles">${свои.map((x) => `
+      <button type="button" class="btn ghost small ${x.key === t.active ? "active" : ""}"
+              data-title-act="equip" data-key="${escapeHtml(x.key)}">${escapeHtml(безЭмодзи(x.name))}</button>`).join("")}</div>`
+      : `<div class="muted mb-2">Своих титулов пока нет.</div>`}
+
+    ${(t.for_sale || []).filter((x) => !x.owned).length ? `
+      <details class="fold fold-quiet title-shop"${_card.shopOpen ? " open" : ""}>
+        <summary>В продаже · ${(t.for_sale || []).filter((x) => !x.owned).length} титулов
+          <span class="muted">· в кошельке ${t.coins.toLocaleString("ru")} i¢</span></summary>
+        <div class="card-titles">${(t.for_sale || []).filter((x) => !x.owned).map((x) => `
+          <button type="button" class="btn ${t.coins >= x.price ? "" : "ghost"}"
+                  data-title-act="buy" data-key="${escapeHtml(x.key)}"
+                  ${t.coins >= x.price ? "" : "disabled"}>
+            ${escapeHtml(безЭмодзи(x.name))} · ${x.price.toLocaleString("ru")} i¢</button>`).join("")}</div>
+      </details>` : ""}
+
+    ${(t.earned_only || []).filter((x) => !x.owned).length ? `
+      <div class="muted mt-2">За достижения, не продаются:
+        ${(t.earned_only || []).filter((x) => !x.owned).map((x) => escapeHtml(безЭмодзи(x.name))).join(" · ")}</div>` : ""}
+    <div id="member-card-msg"></div>`;
+}
+
+async function saveCardField(поле, значение) {
+  try {
+    const r = await api(`/api/member/game/card/field`, {
+      method: "POST", body: { field: поле, value: значение },
+    });
+    _card.state = r.card;
+    say("#member-card-msg", r.cleared ? "Убрано." : "Сохранено.");
+  } catch (err) {
+    say("#member-card-msg", err.message, "err");
+  }
+}
+
+async function saveCardFlag(поле, включено) {
+  try {
+    const r = await api(`/api/member/game/card/field`, {
+      method: "POST", body: { field: поле, on: включено },
+    });
+    _card.state = r.card;
+    say("#member-card-msg", "Сохранено.");
+  } catch (err) {
+    say("#member-card-msg", err.message, "err");
+  }
+}
+
+async function onCardClick(e) {
+  const el = e.target.closest("[data-title-act]");
+  if (!el || el.disabled) return;
+  const act = el.dataset.titleAct;
+  const путь = act === "buy" ? "buy" : "equip";
+  const тело = act === "unequip" ? { key: null } : { key: el.dataset.key };
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/card/title/${путь}`, { method: "POST", body: тело });
+    _card.titles = r.titles;
+    say("#member-card-msg",
+        r.action === "buy" ? `Куплено: ${безЭмодзи(r.name)} за ${r.price.toLocaleString("ru")} i¢.`
+        : r.action === "equip" ? `Надет титул: ${безЭмодзи(r.name)}.` : "Титул снят.");
+    renderCardBlock();
+  } catch (err) {
+    say("#member-card-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+// Поле сохраняется, когда из него уходят: набирать и жать «сохранить» на
+// каждой из шести строк — работа, которой здесь взяться неоткуда.
+function onCardBlur(e) {
+  const поле = e.target.closest("[data-card-field]");
+  if (поле) { saveCardField(поле.dataset.cardField, поле.value); return; }
+}
+
+function onCardChange(e) {
+  const флаг = e.target.closest("[data-card-flag]");
+  if (флаг) saveCardFlag(флаг.dataset.cardFlag, флаг.checked);
+}
+
+async function loadTops() {
+  const body = $("#member-tops-body");
+  if (!body) return;
+  try {
+    _prof.tops = await api(`/api/member/game/tops`);
+    renderTops();
+  } catch (err) {
+    body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+function renderTops() {
+  const t = _prof.tops, body = $("#member-tops-body");
+  if (!t || !body) return;
+  const выбор = t.kinds.map((k) => `
+    <button type="button" class="top-kind ${_prof.kind === k.key ? "active" : ""}"
+            data-top="${k.key}">${icon(TOP_ICONS[k.key] || "trophy")} ${escapeHtml(k.title)}</button>`).join("");
+  const таблица = t.tables[_prof.kind] || { rows: [], unit: "" };
+  const мой = _prof.state ? _prof.state.user_id : null;
+  const строки = таблица.rows.map((r) => `
+    <div class="top-row ${r.user_id === мой ? "me" : ""}">
+      <span class="top-place">${r.place}</span>
+      <span class="top-who">${escapeHtml(r.name)}${
+        r.note ? `<small>${escapeHtml(безЭмодзи(r.note))}</small>` : ""}</span>
+      <span class="top-value">${escapeHtml(r.text || r.value.toLocaleString("ru"))}
+        ${таблица.unit ? `<small>${escapeHtml(таблица.unit)}</small>` : ""}</span>
+    </div>`).join("");
+
+  body.innerHTML = `<div class="top-kinds">${выбор}</div>
+    ${строки
+      ? `<div class="top-list">${строки}</div>`
+      : `<div class="empty">${icon("empty")}<span>Здесь пока пусто.</span></div>`}`;
+}
+
+function onTopsClick(e) {
+  const el = e.target.closest("[data-top]");
+  if (!el) return;
+  _prof.kind = el.dataset.top;
+  renderTops();
+}
+
+// ===== Вкладки «Магазин» и «Питомцы» =======================================
+const _shop = { state: null, bound: false, tab: "shop" };
+const _pets = { data: null, bound: false };
+
+async function loadMemberShop() {
+  await loadSimpleScreen("shop", `${icon("cart")}Магазин`, _shop, loadShopState, onShopClick);
+}
+async function loadMemberPets() {
+  await loadSimpleScreen("pets", `${icon("paw")}Питомцы`, _pets, loadPetsState, onPetsClick);
+}
+
+// Общий каркас «выбрать чат → показать → нажать»: третий экран подряд с одним
+// и тем же началом — повод не копировать его в третий раз.
+async function loadSimpleScreen(вид, заголовок, состояние, загрузка, нажатие) {
+  const box = $(`#member-${вид}`);
+  box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2>
+    <div class="card"><div class="muted">Загрузка…</div></div></section>`;
+  try {
+    box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2>
+      <div class="card">
+        <div id="member-${вид}-msg"></div>
+        <div id="member-${вид}-body"><div class="muted">Загрузка…</div></div>
+      </div></section>`;
+    if (!состояние.bound) { box.addEventListener("click", нажатие); состояние.bound = true; }
+    загрузка();
+  } catch (err) {
+    box.innerHTML = `<section class="member-block"><h2>${заголовок}</h2><div class="card">
+      <div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div></div></section>`;
+  }
+}
+
+// --- магазин ---------------------------------------------------------------
+async function loadShopState() {
+  const body = $("#member-shop-body");
+  if (!body) return;
+  try {
+    _shop.state = await api(`/api/member/game/shop`);
+    renderShop();
+  } catch (err) {
+    body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+function goodHtml(g) {
+  const остаток = g.stock === null || g.stock === undefined
+    ? "" : `<div class="good-stock">на полке: ${g.stock}</div>`;
+  return `<div class="good ${g.sale ? "sale" : ""} ${g.affordable ? "" : "dear"}">
+    <div class="good-head"><span class="good-emoji">${shopIcon(g.key, "lg")}</span>
+      <span class="good-name">${escapeHtml(g.name)}</span></div>
+    ${g.description ? `<div class="good-desc">${escapeHtml(g.description)}</div>` : ""}
+    <div class="good-price"><b>${g.price.toLocaleString("ru")} i¢</b>
+      ${g.sale ? `<s>${g.base_price.toLocaleString("ru")}</s>` : ""}
+      ${g.discount && !g.sale ? `<s>${g.base_price.toLocaleString("ru")}</s>` : ""}</div>
+    ${остаток}
+    <button type="button" class="btn" data-sact="buy" data-key="${escapeHtml(g.key)}"
+            data-bm="${g.black_market ? "1" : ""}" ${g.affordable ? "" : "disabled"}>Купить</button>
+  </div>`;
+}
+
+function invHtml(i) {
+  return `<div class="inv-card ${i.reward ? "reward" : ""}">
+    <div class="good-head"><span class="good-emoji">${shopIcon(i.key, "lg")}</span>
+      <span class="good-name">${escapeHtml(i.name)}</span>
+      <span class="inv-qty">×${i.quantity}</span></div>
+    ${i.sellable
+      ? `<div class="good-price"><b>${i.sell_price.toLocaleString("ru")} i¢</b>
+           <span class="good-stock">за штуку</span></div>
+         <div class="inv-actions">
+           <button type="button" class="btn" data-sact="sell" data-key="${escapeHtml(i.key)}">Продать</button>
+           <button type="button" class="btn ghost" data-sact="sellall" data-key="${escapeHtml(i.key)}">Всё</button>
+         </div>`
+      : `<div class="good-stock">${i.reward ? `${icon("medal")} награда — не продаётся` : "продать нельзя"}</div>`}
+  </div>`;
+}
+
+function renderShop() {
+  const s = _shop.state, body = $("#member-shop-body");
+  if (!s || !body) return;
+  const лавка = s.black_market.length
+    ? `<h3 class="block-head">${icon("mask")}Лавка · завоз на сегодня</h3>
+       <div class="shop-goods">${s.black_market.map(goodHtml).join("")}</div>` : "";
+  body.innerHTML = `
+    <div class="biz-summary">
+      <div><span class="total">${s.coins.toLocaleString("ru")} i¢</span>
+        <span class="muted">в кошельке<small>магазин принимает предметы обратно за ${s.sell_percent}%</small></span></div>
+    </div>
+    <h3 class="mb-2">${icon("store")}Витрина</h3>
+    ${s.items.length
+      ? `<div class="shop-goods">${s.items.map(goodHtml).join("")}</div>`
+      : `<div class="empty">${icon("empty")}<span>В магазине пусто.</span></div>`}
+    ${лавка}
+    <h3 class="block-head">${icon("bag")}Инвентарь</h3>
+    ${s.inventory.length
+      ? `<div class="inv-list">${s.inventory.map(invHtml).join("")}</div>`
+      : `<div class="empty">${icon("empty")}<span>Инвентарь пуст.</span></div>`}
+    <div id="market-block"></div>
+    <div id="lootbox-block"></div>
+    <div id="steal-block"></div>`;
+  loadMarket();
+  loadLootboxes();
+  loadStealState();
+}
+
+// --- рынок участников -------------------------------------------------------
+// Товары людей, а не бота: цену назначает сам продавец, и с каждой сделки в
+// казну чата уходит комиссия. Заявку на свой товар одобряет администрация —
+// экран говорит об этом до подачи, а не после.
+const _market = { state: null };
+
+async function loadMarket() {
+  const блок = $("#market-block");
+  if (!блок) return;
+  try {
+    _market.state = await api(`/api/member/game/market`);
+  } catch (err) {
+    блок.innerHTML = "";
+    return;
+  }
+  renderMarket();
+}
+
+function renderMarket() {
+  const s = _market.state, блок = $("#market-block");
+  if (!s || !блок) return;
+  const чужие = (s.goods || []).filter((g) => !g.mine);
+
+  блок.innerHTML = `
+    <h3 class="block-head">${icon("basket")}Рынок участников</h3>
+    <div class="bank-meta">Товары людей, а не бота. С каждой покупки
+      ${s.commission_percent}% уходит в казну чата. Свой товар: до
+      ${s.max_goods} шт., цена до ${s.max_price.toLocaleString("ru")} i¢.</div>
+
+    ${чужие.length ? `<div class="market-list">${чужие.map((g) => `
+      <div class="market-row">
+        <div class="market-name">${shopIcon(g.key)} <b>${escapeHtml(безЭмодзи(g.name))}</b>
+          <code class="steal-item-key">${escapeHtml(g.key)}</code>
+          <span class="muted">${g.price.toLocaleString("ru")} i¢${g.sold ? ` · продано ${g.sold}` : ""}</span></div>
+        <div class="market-acts">
+          <input type="number" class="market-qty" data-key="${escapeHtml(g.key)}"
+                 min="1" max="${s.max_qty}" value="1" inputmode="numeric" autocomplete="off">
+          <button type="button" class="btn small" data-market="buy" data-key="${escapeHtml(g.key)}"
+                  ${s.coins >= g.price ? "" : "disabled"}>Купить</button>
+        </div>
+      </div>`).join("")}</div>`
+      : `<div class="muted mb-2">На рынке пока пусто.</div>`}
+
+    ${(s.mine || []).length ? `
+      <div class="muted mt-2 mb-2">Мои товары</div>
+      <div class="market-list">${s.mine.map((g) => `
+        <div class="market-row">
+          <div class="market-name"><b>${escapeHtml(g.name)}</b>
+            <code class="steal-item-key">${escapeHtml(g.key)}</code>
+            <span class="muted">${g.price.toLocaleString("ru")} i¢ · ${marketStatus(g.status)}${
+              g.sold ? ` · продано ${g.sold}` : ""}</span></div>
+          <div class="market-acts">
+            ${g.status !== "withdrawn"
+              ? `<button type="button" class="btn ghost small" data-market="withdraw"
+                         data-key="${escapeHtml(g.key)}">Снять</button>` : ""}
+          </div>
+        </div>`).join("")}</div>` : ""}
+
+    ${s.accepts_requests ? `
+      <div class="muted mt-2 mb-2">Выйти на рынок${s.auto_accept
+        ? " · заявки принимаются сразу"
+        : " · заявку одобряет администрация"}</div>
+      <div class="market-apply">
+        <input type="text" id="market-new-key" placeholder="ключ: ogurcy" autocomplete="off">
+        <input type="text" id="market-new-name" placeholder="Название" maxlength="${s.name_max}" autocomplete="off">
+        <input type="number" id="market-new-price" placeholder="Цена" min="1" max="${s.max_price}"
+               inputmode="numeric" autocomplete="off">
+        <button type="button" class="btn" data-market="apply">Подать заявку</button>
+      </div>`
+      : `<div class="bank-blocked mt-2">${icon("alert")}Приём заявок в чате сейчас закрыт.</div>`}
+    <div id="market-msg"></div>`;
+}
+
+function marketStatus(s) {
+  return { approved: "на витрине", pending: "ждёт одобрения",
+           withdrawn: "снят", rejected: "отклонён" }[s] || s;
+}
+
+async function onMarketClick(e) {
+  const el = e.target.closest("[data-market]");
+  if (!el || el.disabled) return;
+  const act = el.dataset.market;
+  const тело = { key: el.dataset.key || "" };
+  if (act === "buy") {
+    const поле = $$(".market-qty").find((i) => i.dataset.key === el.dataset.key);
+    тело.quantity = Number(поле && поле.value) || 1;
+  }
+  if (act === "apply") {
+    тело.key = ($("#market-new-key") || {}).value || "";
+    тело.name = ($("#market-new-name") || {}).value || "";
+    тело.price = Number(($("#market-new-price") || {}).value) || 0;
+  }
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/market/${act === "apply" ? "apply" : act}`,
+                        { method: "POST", body: тело });
+    _market.state = r.state;
+    renderMarket();
+    say("#market-msg", marketSaid(r), "ok");
+  } catch (err) {
+    say("#market-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+function marketSaid(r) {
+  if (r.action === "buy") {
+    const сбор = r.fee ? ` Комиссия чата: ${r.fee} i¢.` : "";
+    return `Куплено «${r.name}» × ${r.quantity} за ${r.total.toLocaleString("ru")} i¢.${сбор}`;
+  }
+  if (r.action === "withdraw") return `Товар «${r.key}» снят с витрины.`;
+  return r.pending
+    ? `Заявка отправлена администрации. Товар появится на витрине после одобрения.`
+    : `Товар «${r.name}» на витрине.`;
+}
+
+// --- лутбоксы ---------------------------------------------------------------
+// В «Магазине», над медвежатником: это тоже покупка, только с неизвестным
+// содержимым. Открытие показывает выпавшее списком — и отдельно помечает
+// редкое, потому что ради него коробку и берут.
+const _loot = { state: null };
+
+async function loadLootboxes() {
+  const блок = $("#lootbox-block");
+  if (!блок) return;
+  try {
+    _loot.state = await api(`/api/member/game/lootbox`);
+  } catch (err) {
+    блок.innerHTML = "";
+    return;
+  }
+  renderLootboxes();
+}
+
+function renderLootboxes() {
+  const s = _loot.state, блок = $("#lootbox-block");
+  if (!s || !блок) return;
+  блок.innerHTML = `
+    <h3 class="block-head">${icon("gift")}Лутбоксы</h3>
+    <div class="loot-list">${s.kinds.map((k) => `
+      <div class="loot-row">
+        <div class="loot-name">${gicon("rar", k.key, "lg")} <b>${escapeHtml(k.name)}</b>
+          <span class="muted">${k.price.toLocaleString("ru")} i¢ · редкое ${k.rare_chance}%</span></div>
+        <div class="loot-have">${k.owned ? `${k.owned} шт.` : ""}</div>
+        <div class="loot-acts">
+          <button type="button" class="btn ghost small" data-loot="buy" data-key="${k.key}"
+                  ${s.coins >= k.price ? "" : "disabled"}>Купить</button>
+          <button type="button" class="btn small" data-loot="open" data-key="${k.key}"
+                  ${k.owned ? "" : "disabled"}>Открыть</button>
+        </div>
+      </div>`).join("")}</div>
+    <div id="loot-result"></div>`;
+}
+
+async function onLootboxClick(e) {
+  const el = e.target.closest("[data-loot]");
+  if (!el || el.disabled) return;
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/lootbox/${el.dataset.loot}`, {
+      method: "POST", body: { rarity: el.dataset.key, count: 1 },
+    });
+    _loot.state = r.state;
+    renderLootboxes();
+    const место = $("#loot-result");
+    if (место) место.innerHTML = r.action === "buy"
+      ? `<div class="msg ok">Куплено за ${r.total_price.toLocaleString("ru")} i¢.</div>`
+      : lootRewardsHtml(r);
+  } catch (err) {
+    say("#member-shop-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+function lootRewardsHtml(r) {
+  return `<div class="loot-open">
+    ${r.rewards.map((n) => `
+      <div class="loot-prize ${n.rare ? "rare" : ""}">
+        ${n.rare ? `<span class="loot-rare">${icon("spark")}редкое</span>` : ""}
+        <b>${escapeHtml(безЭмодзи(n.name))}</b>
+        <span class="muted">ценность ${n.price.toLocaleString("ru")} i¢</span>
+        ${n.note ? `<span class="muted">· ${escapeHtml(n.note)}</span>` : ""}
+      </div>`).join("")}
+  </div>`;
+}
+
+// --- медвежатник -----------------------------------------------------------
+// Живёт в «Магазине», под инвентарём, и появляется только когда инструмент
+// есть на руках — ровно как команда в чате, которая без него не работает.
+//
+// Чужой инвентарь здесь НЕ показывается. Ключ предмета вводят руками, как и в
+// чате: список чужих вещей выдал бы даром то, за чем существует отдельный
+// платный предмет «Досье», и превратил бы медвежатник из риска в выбор из
+// меню. Кража остаётся ставкой вслепую.
+const _steal = { state: null, target: null, targetName: "", loot: null };
+
+async function loadStealState() {
+  const блок = $("#steal-block");
+  if (!блок) return;
+  try {
+    _steal.state = await api(`/api/member/game/steal`);
+  } catch (err) {
+    блок.innerHTML = "";
+    return;
+  }
+  renderSteal();
+}
+
+function renderSteal() {
+  const s = _steal.state, блок = $("#steal-block");
+  if (!s || !блок) return;
+  if (!s.has_tool) { блок.innerHTML = ""; return; }
+
+  const ждать = s.wait_seconds > 0
+    ? `Замки ещё не остыли — ${Math.ceil(s.wait_seconds / 3600)} ч. до следующего дела.`
+    : "";
+  const мешает = s.curfew ? "Комендантский час — на улицах патрули." : ждать;
+
+  блок.innerHTML = `
+    <h3 class="block-head">${icon("key")}Медвежатник</h3>
+    <div class="steal-card">
+      <div class="bank-meta">Одна вещь из чужих закромов, раз в ${s.cooldown_hours} ч.
+        Ключ предмета нужно знать заранее — здесь его не подскажут.
+        У жертвы может стоять «Сигнализация»: глушит кражу с шансом
+        ${s.signal_chance}%, и тогда инструмент сгорает впустую.
+        ${s.has_slepok ? `Слепок ключа на руках — сократит откат на ${Math.round(s.slepok_cut * 100)}%.` : ""}</div>
+      ${мешает ? `<div class="bank-blocked">${icon("alert")}${escapeHtml(мешает)}</div>` : `
+      <label class="bet-field">
+        <span>Кого вскрываем</span>
+        <input type="text" id="steal-q" placeholder="Имя или @username" autocomplete="off">
+      </label>
+      <div class="member-target-list" id="steal-targets"></div>
+      <div class="steal-chosen" id="steal-chosen">${
+        _steal.target ? `Цель: <b>${escapeHtml(_steal.targetName)}</b>` : ""}</div>
+      <div id="steal-loot">${stealLootHtml()}</div>
+      <label class="bet-field">
+        <span>Ключ предмета — тот, что виден в инвентаре</span>
+        <input type="text" id="steal-key" placeholder="например, diamond" autocomplete="off">
+      </label>
+      <button type="button" class="btn steal-go" data-steal="go"
+              ${_steal.target ? "" : "disabled"}>${icon("key")}Вскрыть закрома</button>`}
+    </div>`;
+  wireStealSearch();
+}
+
+// Что лежит у цели. Список приходит с сервера и уже без двух вещей: наград
+// (их не украсть) и сигнализации — защита не должна выдавать сама себя, иначе
+// вор просто обходил бы тех, у кого она есть.
+function stealLootHtml() {
+  if (!_steal.target) return "";
+  const добыча = _steal.loot;
+  if (добыча === null) return `<span class="muted">Смотрим, что там…</span>`;
+  if (!добыча.length) {
+    return `<span class="muted">Взять нечего — карманы пусты.</span>`;
+  }
+  return `<div class="steal-loot">${добыча.map((и) => `
+    <button type="button" class="btn ghost small steal-item" data-key="${escapeHtml(и.key)}">
+      <span class="steal-item-name">${shopIcon(и.key)} ${escapeHtml(безЭмодзи(и.name))}${
+        и.quantity > 1 ? ` ×${и.quantity}` : ""}</span>
+      <code class="steal-item-key">${escapeHtml(и.key)}</code>
+    </button>`).join("")}</div>`;
+}
+
+async function loadStealLoot() {
+  if (!_steal.target) return;
+  _steal.loot = null;
+  const место = $("#steal-loot");
+  if (место) место.innerHTML = stealLootHtml();
+  try {
+    const d = await api(`/api/member/game/steal/loot?target_id=${_steal.target}`);
+    _steal.loot = d.items || [];
+  } catch (err) {
+    _steal.loot = [];
+  }
+  const снова = $("#steal-loot");
+  if (снова) снова.innerHTML = stealLootHtml();
+}
+
+function wireStealSearch() {
+  const поле = $("#steal-q"), список = $("#steal-targets");
+  if (!поле || !список) return;
+  let таймер = null;
+  поле.addEventListener("input", () => {
+    clearTimeout(таймер);
+    таймер = setTimeout(async () => {
+      const q = поле.value.trim();
+      if (!q) { список.innerHTML = ""; return; }
+      try {
+        const d = await api(`/api/member/chat-members?q=${encodeURIComponent(q)}`);
+        const люди = d.members || [];
+        список.innerHTML = люди.length
+          ? люди.map((m) => `<button type="button" class="btn ghost small steal-pick" data-id="${m.user_id}">${
+              escapeHtml(m.full_name || (m.username ? "@" + m.username : String(m.user_id)))}</button>`).join("")
+          : `<span class="muted">Никого не найдено</span>`;
+      } catch (err) {
+        список.innerHTML = `<span class="muted">${escapeHtml(err.message)}</span>`;
+      }
+    }, 300);
+  });
+}
+
+async function onStealClick(e) {
+  const выбор = e.target.closest(".steal-pick");
+  if (выбор) {
+    _steal.target = Number(выбор.dataset.id);
+    _steal.targetName = выбор.textContent.trim();
+    const строка = $("#steal-chosen");
+    if (строка) строка.innerHTML = `Цель: <b>${escapeHtml(_steal.targetName)}</b>`;
+    const кнопка = $(".steal-go");
+    if (кнопка) кнопка.disabled = false;
+    loadStealLoot();
+    return;
+  }
+  // Нажали по вещи из списка — подставляем её ключ в поле. Поле остаётся
+  // доступным для ручного ввода: список показывает не всё, что у человека
+  // есть, и знающий ключ не должен упираться в меню.
+  const вещь = e.target.closest(".steal-item");
+  if (вещь) {
+    const поле = $("#steal-key");
+    if (поле) поле.value = вещь.dataset.key;
+    return;
+  }
+  const el = e.target.closest("[data-steal]");
+  if (!el || el.disabled) return;
+  const ключ = ($("#steal-key") || {}).value || "";
+  if (!_steal.target) { say("#member-shop-msg", "Не выбрана цель.", "err"); return; }
+  if (!ключ.trim()) { say("#member-shop-msg", "Не сказано, что красть.", "err"); return; }
+  // Кража громкая: о ней узнают все в чате и сама жертва. Предупреждаем — с
+  // сайта это не так очевидно, как из чата, где сообщение видно сразу.
+  if (!confirm(`Вскрыть закрома «${_steal.targetName}»? О краже узнает весь чат, `
+               + `а жертве придёт личное сообщение.`)) return;
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/steal`, {
+      method: "POST", body: { target_id: _steal.target, item_key: ключ.trim() },
+    });
+    _steal.state = r.state;
+    say("#member-shop-msg", stealSaid(r), r.outcome === "stolen" ? "ok" : "err");
+    _steal.target = null;
+    _steal.targetName = "";
+    _steal.loot = null;
+    renderSteal();
+    await loadShopState();
+  } catch (err) {
+    say("#member-shop-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+function stealSaid(r) {
+  if (r.outcome === "blocked") {
+    return "Взвыла сигнализация — ушли с пустыми руками. Медвежатник потрачен.";
+  }
+  if (r.outcome === "gone") {
+    return "Предмет успели потратить — вскрывать оказалось нечего.";
+  }
+  const промах = r.signal_missed ? " Сигнализация не сработала." : "";
+  const слепок = r.slepok_used ? " Слепок ключа сократил откат." : "";
+  return `Унесли «${r.item_name || r.item_key}».${промах}${слепок}`;
+}
+
+async function onShopClick(e) {
+  // Медвежатник живёт на этом же экране, поэтому его нажатия разбираются
+  // здесь же: второй слушатель на тот же узел означал бы два места, где
+  // решают, что делать с одним и тем же кликом.
+  if (e.target.closest("[data-market]")) return onMarketClick(e);
+  if (e.target.closest("[data-loot]")) return onLootboxClick(e);
+  if (e.target.closest("[data-steal]") || e.target.closest(".steal-pick")
+      || e.target.closest(".steal-item")) {
+    return onStealClick(e);
+  }
+  const el = e.target.closest("[data-sact]");
+  if (!el) return;
+  const act = el.dataset.sact, key = el.dataset.key;
+  let тело = { key };
+  let адрес = "buy";
+  if (act === "buy") {
+    тело.black_market = el.dataset.bm === "1";
+    const сколько = prompt("Сколько купить? Можно слово «все».", "1");
+    if (сколько === null) return;
+    тело.qty = /^\s*(все|всё|all)\s*$/i.test(сколько) ? "все" : Number(сколько) || 1;
+  } else {
+    адрес = "sell";
+    тело.qty = act === "sellall" ? "все" : 1;
+  }
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/shop/${адрес}`, { method: "POST", body: тело });
+    _shop.state = r.state;
+    renderShop();
+    say("#member-shop-msg", адрес === "buy"
+      ? `Куплено: ${r.name} ×${r.qty} за ${r.total.toLocaleString("ru")} i¢${r.sale ? " (распродажа)" : ""}`
+      : `Продано: ${r.name} ×${r.qty} за ${r.total.toLocaleString("ru")} i¢`);
+  } catch (err) {
+    say("#member-shop-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+// --- питомцы ---------------------------------------------------------------
+async function loadPetsState() {
+  const body = $("#member-pets-body");
+  if (!body) return;
+  try {
+    _pets.data = await api(`/api/member/game/pets`);
+    renderPets();
+  } catch (err) {
+    body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+function petStat(вид, иконка, значение, максимум, подпись) {
+  const доля = максимум ? Math.max(0, Math.min(100, Math.round(значение * 100 / максимум))) : 0;
+  // Ниже трети — предупреждение: пока значение низкое, способности не
+  // работают, и понять это надо не читая подпись.
+  const тревога = вид !== "xp" && доля < 34 ? " low" : "";
+  return `<div class="pet-stat ${вид}${тревога}">
+    ${icon(иконка)}<span class="bar"><i style="width:${доля}%"></i></span>
+    <span class="val">${подпись}</span></div>`;
+}
+
+function petCardHtml(p) {
+  const классы = ["pet-card"];
+  if (p.evolved) классы.push("evolved");
+  if (p.pinned) классы.push("pinned");
+  if (!p.active) классы.push("sleepy");
+  const способности = p.abilities.map((a) => `
+    <div class="pet-ability ${a.works ? "" : "sleeping"}">
+      ${icon(a.works ? "spark" : "sleep")}
+      <span>${escapeHtml(безЭмодзи(a.text))}${a.works ? "" : " — спит"}</span>
+    </div>`).join("");
+  return `<div class="${классы.join(" ")}">
+    <div class="pet-head">
+      <span class="pet-emoji">${petIcon(p.key, "xl")}</span>
+      <span class="grow">
+        <span class="pet-name">${escapeHtml(p.name)}</span>
+        <span class="pet-key">${escapeHtml(p.key)}${
+          p.species && p.species !== p.name ? ` · ${escapeHtml(p.species)}` : ""}</span>
+      </span>
+      <span class="pet-lvl-badge">${icon("star")} ${p.is_max ? "MAX" : `${p.level}/${p.max_level}`}</span>
+    </div>
+    ${petStat("hunger", "bowl", p.hunger, 100, p.hunger)}
+    ${petStat("mood", "smile", p.mood, 100, p.mood)}
+    ${p.is_max ? "" : petStat("xp", "xp", p.xp, p.xp_need, `${p.xp}/${p.xp_need}`)}
+    <div class="pet-state">${petStateHtml(p.state)}${p.evolved ? " · эволюционировал(а)" : ""}</div>
+    ${способности}
+    <div class="inv-actions">
+      <button type="button" class="btn" data-pact="feed" data-key="${escapeHtml(p.key)}">${icon("bowl")} Покормить</button>
+      <button type="button" class="btn ghost" data-pact="pet" data-key="${escapeHtml(p.key)}">${icon("heart")} Приласкать</button>
+    </div>
+    <div class="inv-actions">
+      <button type="button" class="btn ghost" data-pact="walk" data-key="${escapeHtml(p.key)}">${icon("walk")} Погулять</button>
+      <button type="button" class="btn ghost" data-pact="${p.pinned ? "unpin" : "pin"}" data-key="${escapeHtml(p.key)}">
+        ${icon("pin")} ${p.pinned ? "Открепить" : "Закрепить"}</button>
+    </div>
+  </div>`;
+}
+
+function renderPets() {
+  const d = _pets.data, body = $("#member-pets-body");
+  if (!d || !body) return;
+  // Карточки строятся из ЧИСЕЛ (cards), а не из текста бота: тот собран для
+  // чата, с полосками из ▰▱, и на сайте читается как стена. Текст оставлен
+  // запасным путём — если сервер старый и чисел не прислал.
+  const карточки = d.cards || [];
+  if (!карточки.length) {
+    body.innerHTML = d.pets && d.pets.length
+      ? `<div class="card">${escapeHtml(безЭмодзи(String(d.text || "").replace(/<[^>]+>/g, "")))}</div>`
+      : `<div class="empty">${icon("empty")}<span>Питомцев пока нет. Завести — в чате:
+          <code>пет купить {ключ}</code>.</span></div>`;
+    return;
+  }
+  body.innerHTML = `
+    <div class="pet-food">${icon("bowl")}
+      <span>Корма у вас: <b>${d.food ?? 0}</b> шт.</span>
+      <span class="muted push">питомцев: ${карточки.length}</span></div>
+    <div class="pet-list">${карточки.map(petCardHtml).join("")}</div>
+    <div class="farm-actions">
+      <button type="button" class="btn" data-pact="feed_all">${icon("bowl")} Покормить всех</button>
+      <button type="button" class="btn" data-pact="care_all" data-verb="pet">${icon("heart")} Приласкать всех</button>
+      <button type="button" class="btn" data-pact="walk_all">${icon("walk")} Погулять со всеми</button>
+    </div>`;
+}
+
+async function onPetsClick(e) {
+  const el = e.target.closest("[data-pact]");
+  if (!el) return;
+  const act = el.dataset.pact;
+  const тело = {};
+  if (el.dataset.key) тело.key = el.dataset.key;
+  if (el.dataset.verb) тело.verb = el.dataset.verb;
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/pets/${act}`, { method: "POST", body: тело });
+    say("#member-pets-msg", String(r.text || "Готово.").replace(/<[^>]+>/g, ""), r.ok ? "ok" : "err");
+    await loadPetsState();
+  } catch (err) {
+    say("#member-pets-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+// ===== Вкладка «Биржа» =====================================================
+// Курс, свои акции, дивиденды и график. График рисует lineChart — тот же, что
+// в админской панели: две реализации одного графика по одним и тем же данным
+// разъедутся, и разъедутся молча.
+const _stock = { state: null, bound: false };
+
+async function loadMemberStock() {
+  await loadSimpleScreen("stock", `${icon("chart")}Биржа`, _stock, loadStockState, onStockClick);
+}
+
+async function loadStockState() {
+  const body = $("#member-stock-body");
+  if (!body) return;
+  try {
+    _stock.state = await api(`/api/member/game/stock`);
+    renderStock();
+  } catch (err) {
+    body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+// Точки истории → то, что понимает lineChart. Подписи считаются здесь, а не на
+// сервере: сервер отдаёт цену и время, а как их назвать — дело экрана.
+function stockPoints(история) {
+  const когда = (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? "" : d.toLocaleString("ru-RU",
+      { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  };
+  return (история || []).map((т) => ({
+    value: т.price,
+    title: `${когда(т.at)} — ${т.price} i¢`,
+    axis: когда(т.at),
+  }));
+}
+
+function renderStock() {
+  const s = _stock.state, body = $("#member-stock-body");
+  if (!s || !body) return;
+
+  // Выключенная биржа заморожена целиком: смотреть можно, торговать нельзя.
+  // Кнопки не прячем, а объясняем — исчезнувшие кнопки читаются как поломка.
+  const заморожена = !s.enabled
+    ? `<div class="stock-frozen">${icon("alert")}${escapeHtml(s.disabled_text)}</div>` : "";
+  const выкл = s.enabled ? "" : "disabled";
+
+  const прибыль = s.value - s.invested;
+  const знак = прибыль > 0 ? "+" : "";
+  const цвет = прибыль > 0 ? "up" : (прибыль < 0 ? "down" : "");
+
+  body.innerHTML = `
+    <div class="stock-top">
+      <div class="stock-price"><b>${s.price.toLocaleString("ru")} i¢</b>
+        <span>за акцию · в кошельке ${s.coins.toLocaleString("ru")} i¢</span></div>
+      <div class="stock-mine ${цвет}">
+        <b>${s.value.toLocaleString("ru")} i¢</b>
+        <span>${s.shares} шт.${s.invested ? ` · ${знак}${прибыль.toLocaleString("ru")} i¢` : ""}</span>
+      </div>
+    </div>
+    ${заморожена}
+    ${lineChart("Курс акций", `За последние ${s.chart_days} дней · дивиденды ${s.dividend_percent}% в сутки от вложенного`,
+                stockPoints(s.history))}
+
+    <div class="stat-grid mt-3">
+      ${statCell(`${s.invested.toLocaleString("ru")}`, "вложено i¢")}
+      ${statCell(`${s.room.toLocaleString("ru")}`, "можно ещё i¢")}
+      ${statCell(`${Math.round(s.pending_dividends).toLocaleString("ru")}`, "дивиденды ждут")}
+      ${statCell(`${s.total_profit.toLocaleString("ru")}`, "заработано всего")}
+    </div>
+
+    <label class="bet-field">
+      <span>Сумма сделки · в кошельке ${s.coins.toLocaleString("ru")} i¢</span>
+      <input type="number" id="stock-amount" min="1" step="1" value="${Math.min(1000, s.coins) || 1}"
+             inputmode="numeric" autocomplete="off" ${выкл}>
+    </label>
+    <div class="bet-quick">
+      <button type="button" class="btn ghost" data-sact="set" data-amount="1000" ${выкл}>1 000</button>
+      <button type="button" class="btn ghost" data-sact="set" data-amount="10000" ${выкл}>10 000</button>
+      <button type="button" class="btn ghost" data-sact="set" data-amount="100000" ${выкл}>100 000</button>
+      <button type="button" class="btn ghost" data-sact="set" data-amount="wallet" ${выкл}>Весь кошелёк</button>
+    </div>
+    <div class="stock-ops">
+      <button type="button" class="btn stock-buy" data-sact="buy" ${выкл}>${icon("in")}Купить</button>
+      <button type="button" class="btn stock-sell" data-sact="sell" ${выкл}>${icon("out")}Продать</button>
+      <button type="button" class="btn stock-all" data-sact="sell-all" ${выкл}>Продать всё</button>
+    </div>
+    <button type="button" class="btn stock-div" data-sact="dividends"
+            ${s.enabled && s.pending_dividends >= 1 ? "" : "disabled"}>
+      ${icon("coins")}Забрать дивиденды${s.pending_dividends >= 1
+        ? ` · ${Math.round(s.pending_dividends).toLocaleString("ru")} i¢` : ""}
+    </button>
+    <div class="hint">Дивиденды капают раз в сутки от вложенной суммы. Максимум
+      вложений на человека — ${s.max_invest.toLocaleString("ru")} i¢.</div>`;
+}
+
+async function onStockClick(e) {
+  const el = e.target.closest("[data-sact]");
+  if (!el || el.disabled) return;
+  const act = el.dataset.sact;
+  const поле = $("#stock-amount");
+
+  if (act === "set") {
+    if (!поле) return;
+    поле.value = el.dataset.amount === "wallet"
+      ? (_stock.state ? _stock.state.coins : 0) : el.dataset.amount;
+    return;
+  }
+
+  const тело = {};
+  if (act === "buy" || act === "sell") {
+    const сумма = Number(поле && поле.value) || 0;
+    if (сумма <= 0) { say("#member-stock-msg", "Сколько монет?", "err"); return; }
+    тело.amount = сумма;
+  }
+  // «Всё» уходит на сервер словом: во сколько монет оно разворачивается,
+  // знают только доли и курс, а посчитанное здесь после округления стабильно
+  // промахивается мимо предела продажи на копейку.
+  if (act === "sell-all") тело.amount = "все";
+  const путь = act === "dividends" ? "dividends" : (act === "buy" ? "buy" : "sell");
+
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/stock/${путь}`, { method: "POST", body: тело });
+    _stock.state = r.state;
+    say("#member-stock-msg", stockSaid(r), "ok");
+    renderStock();
+  } catch (err) {
+    say("#member-stock-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+function stockSaid(r) {
+  if (r.action === "buy") {
+    return `Куплено ${r.shares} акций по ${r.price} i¢ на сумму ${r.amount.toLocaleString("ru")} i¢.`;
+  }
+  if (r.action === "sell") {
+    const итог = r.profit > 0 ? `прибыль +${Math.round(r.profit)} i¢`
+      : (r.profit < 0 ? `убыток ${Math.round(r.profit)} i¢` : "без прибыли и убытка");
+    return `Продано на ${r.amount.toLocaleString("ru")} i¢ по курсу ${r.price} (${итог}).`;
+  }
+  return `Получены дивиденды: +${r.amount.toLocaleString("ru")} i¢`;
+}
+
+// ===== Вкладка «Банк» ======================================================
+// Вклад, кредит и погашение. Главное отличие от остальных экранов: кредит НЕ
+// выдаётся по нажатию — заявку одобряет админ кнопкой в телеграме. Поэтому
+// экран заранее говорит, почему кредит недоступен (чёрный список, автоотказ,
+// минус на балансе, уже поданная заявка), а не сообщает об этом после
+// нажатия: отказ по факту читается как поломка, а не как правило.
+const _bank = { state: null, bound: false, days: 1 };
+
+async function loadMemberBank() {
+  await loadSimpleScreen("bank", `${icon("coins")}Банк`, _bank, loadBankState, onBankClick);
+  // Общий каркас вешает только нажатия, а здесь считается ещё и на ввод:
+  // сколько получишь и сколько вернёшь, пока набираешь сумму.
+  const box = $("#member-bank");
+  if (box && !_bank.boundInput) {
+    box.addEventListener("input", onBankInput);
+    _bank.boundInput = true;
+  }
+}
+
+async function loadBankState() {
+  const body = $("#member-bank-body");
+  if (!body) return;
+  try {
+    _bank.state = await api(`/api/member/game/bank`);
+    renderBank();
+  } catch (err) {
+    body.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+// Когда созреет вклад или когда истекает кредит — словами. Точное время в
+// подсказке: «через 2 дня» отвечает на вопрос, а дата и час нужны редко.
+function bankWhen(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const осталось = d - new Date();
+  if (осталось <= 0) return "уже";
+  const часы = Math.floor(осталось / 3600000);
+  const дни = Math.floor(часы / 24);
+  if (дни >= 1) return `через ${дни} дн. ${часы % 24} ч.`;
+  if (часы >= 1) return `через ${часы} ч.`;
+  return `через ${Math.max(1, Math.round(осталось / 60000))} мин.`;
+}
+
+function bankWhenTitle(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleString("ru-RU");
+}
+
+// Почему кредит недоступен. Причина одна и первая по важности: перечислять
+// все сразу незачем, человеку нужно знать, что делать дальше.
+function bankCreditBlocker(s) {
+  if (s.credit) return "Сначала погасите текущий кредит.";
+  if (s.pending) return "Заявка уже подана и ждёт решения администраторов.";
+  if (s.blacklisted) return "Вам закрыт доступ к кредитам — вы в чёрном списке.";
+  if (s.in_the_red) return "Баланс отрицательный после взыскания. Кредит дадут, когда выйдете в ноль.";
+  if (s.auto_reject) return "Кредиты в чате временно не выдаются.";
+  if (!s.gate_ready) return "Кредиты пока некому одобрять — админы не настроили чат заявок.";
+  return "";
+}
+
+function renderBank() {
+  const s = _bank.state, body = $("#member-bank-body");
+  if (!s || !body) return;
+
+  const вклад = s.deposit
+    ? `<div class="bank-card ${s.deposit.ready ? "ready" : ""}">
+         <div class="bank-card-head">${icon("coins")}Вклад</div>
+         <div class="bank-sum">${s.deposit.amount.toLocaleString("ru")} i¢</div>
+         <div class="bank-meta">${s.deposit.days} дн. под ${s.deposit.rate}%/день ·
+           выплата <b>${s.deposit.payout.toLocaleString("ru")} i¢</b></div>
+         <div class="bank-meta" title="${escapeHtml(bankWhenTitle(s.deposit.matures_at))}">
+           ${s.deposit.ready ? "созрел — можно снимать"
+             : `созреет ${escapeHtml(bankWhen(s.deposit.matures_at))}`}</div>
+         <button type="button" class="btn bank-take" data-bact="withdraw"
+                 ${s.deposit.ready ? "" : "disabled"}>
+           ${s.deposit.ready ? "Снять вклад" : "Досрочно снять нельзя"}</button>
+       </div>`
+    : `<div class="bank-card">
+         <div class="bank-card-head">${icon("coins")}Вклад</div>
+         <div class="bank-meta">Вклада нет. Проценты простые: ставка фиксируется
+           в момент открытия и не меняется до конца срока.</div>
+         <div class="bank-terms">
+           ${s.terms.map((t) => `
+             <button type="button" class="btn bank-term ${_bank.days === t.days ? "active" : ""}"
+                     data-bact="term" data-days="${t.days}">
+               <b>${t.days} дн.</b><span>${t.rate}%/день</span></button>`).join("")}
+         </div>
+         <label class="bet-field">
+           <span>Сумма вклада · минимум ${s.min_deposit.toLocaleString("ru")} i¢</span>
+           <input type="number" id="bank-amount" min="1" step="1"
+                  value="${Math.max(s.min_deposit, 0) || 1}" inputmode="numeric" autocomplete="off">
+         </label>
+         <div class="bank-payout" id="bank-payout"></div>
+         <button type="button" class="btn bank-open" data-bact="deposit">Открыть вклад</button>
+       </div>`;
+
+  const мешает = bankCreditBlocker(s);
+  const кредит = s.credit
+    ? `<div class="bank-card ${s.credit.overdue ? "overdue" : ""}">
+         <div class="bank-card-head">${icon("alert")}Кредит</div>
+         <div class="bank-sum">${s.credit.debt.toLocaleString("ru")} i¢</div>
+         <div class="bank-meta" title="${escapeHtml(bankWhenTitle(s.credit.due_at))}">
+           ${s.credit.overdue
+             ? `просрочен — капает пеня ${s.credit_penalty_percent}%/день`
+             : `вернуть ${escapeHtml(bankWhen(s.credit.due_at))}`}</div>
+         <label class="bet-field">
+           <span>Сколько погасить · в кошельке ${s.coins.toLocaleString("ru")} i¢</span>
+           <input type="number" id="bank-repay-amount" min="1" step="1"
+                  value="${Math.min(s.credit.debt, Math.max(s.coins, 1))}"
+                  inputmode="numeric" autocomplete="off">
+         </label>
+         <div class="stock-ops">
+           <button type="button" class="btn bank-pay" data-bact="repay">Погасить</button>
+           <button type="button" class="btn ghost" data-bact="repay-all">Погасить весь долг</button>
+         </div>
+       </div>`
+    : `<div class="bank-card">
+         <div class="bank-card-head">${icon("alert")}Кредит</div>
+         <div class="bank-meta">Комиссия ${s.credit_fee_percent}% · срок
+           ${s.credit_term_days} дн. · пеня за просрочку ${s.credit_penalty_percent}%/день.
+           Выдаётся не сразу: заявку одобряет администратор.</div>
+         ${мешает ? `<div class="bank-blocked">${icon("alert")}${escapeHtml(мешает)}</div>` : `
+         <label class="bet-field">
+           <span>Сумма кредита</span>
+           <input type="number" id="bank-credit-amount" min="1" step="1" value="1000"
+                  inputmode="numeric" autocomplete="off">
+         </label>
+         <div class="bank-payout" id="bank-debt"></div>
+         <button type="button" class="btn bank-ask" data-bact="credit">Подать заявку</button>`}
+       </div>`;
+
+  body.innerHTML = `
+    <div class="bank-top">
+      <div class="bank-wallet"><b>${s.coins.toLocaleString("ru")} i¢</b>
+        <span>в кошельке</span></div>
+    </div>
+    <div class="bank-grid">${вклад}${кредит}</div>`;
+  bankRefreshHints();
+}
+
+// Сколько получишь и сколько вернёшь — считаем сразу, теми же формулами, что
+// на сервере. Число, которое видно ДО нажатия, и есть главная часть этого
+// экрана: без него «7% в день» ничего не говорит.
+function bankRefreshHints() {
+  const s = _bank.state;
+  if (!s) return;
+  const вклад = $("#bank-amount"), итог = $("#bank-payout");
+  if (вклад && итог) {
+    const сумма = Number(вклад.value) || 0;
+    const срок = s.terms.find((t) => t.days === _bank.days) || s.terms[0];
+    const выплата = срок ? Math.floor(сумма + сумма * срок.rate / 100 * срок.days) : сумма;
+    итог.innerHTML = сумма >= s.min_deposit && срок
+      ? `Через ${срок.days} дн. получите <b>${выплата.toLocaleString("ru")} i¢</b>
+         <span class="muted">(+${(выплата - сумма).toLocaleString("ru")})</span>`
+      : `<span class="muted">Минимум ${s.min_deposit.toLocaleString("ru")} i¢</span>`;
+  }
+  const кредит = $("#bank-credit-amount"), долг = $("#bank-debt");
+  if (кредит && долг) {
+    const сумма = Number(кредит.value) || 0;
+    const вернуть = Math.round(сумма * (1 + s.credit_fee_percent / 100));
+    долг.innerHTML = сумма > 0
+      ? `Вернуть придётся <b>${вернуть.toLocaleString("ru")} i¢</b>
+         <span class="muted">за ${s.credit_term_days} дн.</span>`
+      : "";
+  }
+}
+
+function onBankInput(e) {
+  if (["bank-amount", "bank-credit-amount"].includes(e.target.id)) bankRefreshHints();
+}
+
+async function onBankClick(e) {
+  const el = e.target.closest("[data-bact]");
+  if (!el || el.disabled) return;
+  const act = el.dataset.bact;
+
+  if (act === "term") {
+    _bank.days = Number(el.dataset.days);
+    renderBank();
+    return;
+  }
+
+  const тело = {};
+  if (act === "deposit") {
+    тело.amount = Number(($("#bank-amount") || {}).value) || 0;
+    тело.days = _bank.days;
+  }
+  if (act === "repay") тело.amount = Number(($("#bank-repay-amount") || {}).value) || 0;
+  if (act === "repay-all") тело.amount = "всё";
+  if (act === "credit") тело.amount = Number(($("#bank-credit-amount") || {}).value) || 0;
+
+  const путь = act === "repay-all" ? "repay" : act;
+  el.disabled = true;
+  try {
+    const r = await api(`/api/member/game/bank/${путь}`, { method: "POST", body: тело });
+    _bank.state = r.state;
+    say("#member-bank-msg", bankSaid(r), "ok");
+    renderBank();
+  } catch (err) {
+    say("#member-bank-msg", err.message, "err");
+    el.disabled = false;
+  }
+}
+
+function bankSaid(r) {
+  if (r.action === "deposit") {
+    return `Вклад открыт: ${r.amount.toLocaleString("ru")} i¢ на ${r.days} дн. под ${r.rate}%/день. Получите ${r.payout.toLocaleString("ru")} i¢.`;
+  }
+  if (r.action === "withdraw") {
+    return `Вклад закрыт, получено ${r.payout.toLocaleString("ru")} i¢.`;
+  }
+  if (r.action === "repay") {
+    return r.closed
+      ? `Погашено ${r.amount.toLocaleString("ru")} i¢. Кредит полностью закрыт.`
+      : `Погашено ${r.amount.toLocaleString("ru")} i¢. Остаток долга: ${r.debt.toLocaleString("ru")} i¢.`;
+  }
+  return `Заявка на ${r.amount.toLocaleString("ru")} i¢ отправлена администраторам. К возврату ${r.debt.toLocaleString("ru")} i¢ за ${r.term_days} дн.`;
 }

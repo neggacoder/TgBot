@@ -244,67 +244,80 @@ def test_у_каждой_степени_награды_свой_трофей():
 
 # ---------------------------------------------------------------------------
 # Регрессия: покупка животного отвечала «уже куплено» с первого раза
+#
+# Ответ брался из сравнения записанной bought_at с переданной датой. Но
+# bought_at — это DATETIME, MySQL режет микросекунды, а datetime.utcnow() их
+# приносит: равенство не выполнялось НИКОГДА. Первая же покупка отвечала
+# «животное уже куплено» и возвращала деньги за корову, которая при этом
+# преспокойно стояла в хлеву.
+#
+# Теперь голов может быть несколько, и ответ — это РАЗНИЦА поголовья до и
+# после: целые числа, которые база не округляет. Дата в ответе не участвует
+# вовсе, и вернуться баг уже не может.
 # ---------------------------------------------------------------------------
 
-def test_покупка_отвечает_по_вставке_а_не_по_сравнению_дат(monkeypatch):
-    """Тот самый баг: «у меня нет коровы, но пишет, что уже была».
-
-    Ответ брался из сравнения записанной bought_at с переданной датой. Но
-    bought_at — это DATETIME, MySQL режет микросекунды, а datetime.utcnow()
-    их приносит: равенство не выполнялось НИКОГДА. Первая же покупка отвечала
-    «животное уже куплено» и возвращала деньги за корову, которая при этом
-    преспокойно стояла в хлеву.
-
-    Проверяем именно источник ответа: он обязан приходить из rowcount самой
-    вставки, а не из чтения обратно.
-    """
+def _стенд_поголовья(monkeypatch, до: int, после: int) -> list[str]:
     import db as db_module
 
-    запросы = []
+    запросы: list[str] = []
+    состояние = {"вызовов": 0}
 
     async def execute(query, params=()):
         запросы.append(" ".join(query.split()))
-        return 1        # INSERT IGNORE вставил строку
+        return 1
 
     async def fetchone(query, params=()):
-        raise AssertionError("ответ не должен зависеть от чтения обратно")
+        состояние["вызовов"] += 1
+        return {"quantity": до if состояние["вызовов"] == 1 else после}
 
     monkeypatch.setattr(db_module, "_execute", execute)
     monkeypatch.setattr(db_module, "_fetchone", fetchone)
-
-    ок = asyncio.run(db_module.add_farm_animal(
-        CHAT_ID, USER_ID, "korova", datetime.utcnow()))
-
-    assert ок is True
-    assert any("INSERT IGNORE INTO farm_animals" in q for q in запросы)
+    return запросы
 
 
-def test_повторная_покупка_отвечает_отказом(monkeypatch):
-    """INSERT IGNORE по существующему ключу даёт rowcount 0 — это и есть
-    «уже есть», без всяких сравнений."""
+def test_покупка_отвечает_разницей_поголовья(monkeypatch):
     import db as db_module
 
-    async def execute(query, params=()):
-        return 0
+    запросы = _стенд_поголовья(monkeypatch, до=0, после=3)
 
-    monkeypatch.setattr(db_module, "_execute", execute)
+    добавлено = asyncio.run(db_module.add_farm_animals(
+        CHAT_ID, USER_ID, "korova", datetime.utcnow(), quantity=3, max_per_kind=10))
 
-    ок = asyncio.run(db_module.add_farm_animal(
-        CHAT_ID, USER_ID, "korova", datetime.utcnow()))
+    assert добавлено == 3
+    assert any("INSERT INTO farm_animals" in q for q in запросы)
 
-    assert ок is False
+
+def test_упор_в_потолок_виден_по_ответу(monkeypatch):
+    """Потолок держит сама база (LEAST), а вызывающий по этому же числу
+    возвращает деньги за неполученных."""
+    import db as db_module
+
+    _стенд_поголовья(monkeypatch, до=9, после=10)
+
+    добавлено = asyncio.run(db_module.add_farm_animals(
+        CHAT_ID, USER_ID, "korova", datetime.utcnow(), quantity=5, max_per_kind=10))
+
+    assert добавлено == 1
 
 
 def test_микросекунды_даты_на_ответ_не_влияют(monkeypatch):
-    """Смысл правки одной строкой: какой бы ни была дата, ответ решает вставка."""
+    """Смысл давней правки: какой бы ни была дата, ответ решает поголовье."""
     import db as db_module
 
-    async def execute(query, params=()):
-        return 1
+    for дата in (datetime(2026, 7, 29, 12, 0, 0, 123456), datetime(2026, 7, 29, 12, 0, 0)):
+        _стенд_поголовья(monkeypatch, до=0, после=1)
+        assert asyncio.run(db_module.add_farm_animals(
+            CHAT_ID, USER_ID, "korova", дата, quantity=1, max_per_kind=10)) == 1
 
-    monkeypatch.setattr(db_module, "_execute", execute)
 
-    с_микро = datetime(2026, 7, 29, 12, 0, 0, 123456)
-    без_микро = datetime(2026, 7, 29, 12, 0, 0)
-    assert asyncio.run(db_module.add_farm_animal(CHAT_ID, USER_ID, "korova", с_микро))
-    assert asyncio.run(db_module.add_farm_animal(CHAT_ID, USER_ID, "korova", без_микро))
+def test_продать_больше_чем_есть_нельзя(monkeypatch):
+    """База считает сама: между проверкой в коде и удалением помещается вторая
+    команда, и продать одну корову дважды было бы можно."""
+    import db as db_module
+
+    _стенд_поголовья(monkeypatch, до=2, после=0)
+
+    продано = asyncio.run(db_module.remove_farm_animals(
+        CHAT_ID, USER_ID, "korova", quantity=99))
+
+    assert продано == 2

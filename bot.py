@@ -70,13 +70,25 @@ import rest_rules
 import word_filter
 import robbery
 import black_market
+import business_actions
+import casino_actions
 import farming
+import farm_actions
 import fishing
 import market
 import collectors
 import activities
 import chat_settings
 import livestock
+import bank_actions
+import achievements_meta
+import gallery_actions
+import card_actions
+import lootbox_actions
+import owner_flags
+import steal_actions
+import stock_actions
+from stock_chart import render_stock_chart
 from activity_chart import (
     ACTIVITY_CHART_DAYS,
     ACTIVITY_CHART_MIN_DAYS,
@@ -364,6 +376,98 @@ class MessageStatsMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+# ----------------------------------------------------------------------------
+# Область работы бота: свой чат и ничего лишнего
+#
+# Бот отвечал в ЛЮБОЙ группе, куда его добавили: игры, экономика, репутация,
+# магазин. Побочный след этого — чужие чаты в shop_items, из-за которых
+# ежедневный завоз объявлялся по разу на каждый накопившийся чат.
+#
+# Заслон сделан ДВУХУРОВНЕВЫМ, а не глухой стеной, потому что «жалобы сюда» и
+# «чат сюда» здесь РАЗНЫЕ чаты (см. настройки complaint_chat_id и
+# notify_chat_id). Закрой чат заявок целиком — и перестанут работать ответы
+# админов заявителям, ради которых он и заведён.
+#
+# Решение вынесено в отдельную функцию, а не написано внутри middleware,
+# сознательно: middleware не проверить ни одним из существующих тестов
+# маршрутизации (handler.check() их не исполняет), а функцию — можно.
+# ----------------------------------------------------------------------------
+_SETUP_PHRASES = frozenset({"чат сюда", "топик сюда", "жалобы сюда"})
+
+
+def chat_scope_allows(
+    chat_id: int, chat_type: Optional[str],
+    text: Optional[str] = None, is_reply_to_bot: bool = False,
+) -> bool:
+    """Пускать ли сообщение дальше входа.
+
+    Личка не трогается вовсе: там живут панель админа, анкеты, анонимки и
+    заявки на рест. Пока рабочий чат не привязан — пускаем всё, иначе свежая
+    установка оказалась бы кирпичом, который нечем настроить.
+    """
+    if chat_type not in ("group", "supergroup"):
+        return True
+
+    working_chat = settings.get("complaint_chat_id")
+    if not working_chat:
+        return True
+    if chat_id == working_chat:
+        return True
+
+    # Настроечные фразы проходят откуда угодно — иначе бота нельзя
+    # перепривязать: заслон закрыл бы ту самую команду, которой меняют чат.
+    if text and text.strip().casefold() in _SETUP_PHRASES:
+        return True
+
+    # Чат заявок: только ответы админов заявителю (handle_admin_reply). Именно
+    # ответы НА СООБЩЕНИЕ БОТА — заявка это его сообщение. Пускать любой reply
+    # значило бы оставить там игры и экономику: ответил на соседа — и команда
+    # прошла. Игры в чате заявок не работают: он не для жизни.
+    if chat_id == settings.get("notify_chat_id") and is_reply_to_bot:
+        return True
+
+    return False
+
+
+def callback_scope_allows(chat_id: int, chat_type: Optional[str]) -> bool:
+    """То же для нажатий на кнопки.
+
+    Чат заявок пускаем целиком: у самой заявки кнопки «принять/отклонить», и
+    без них модерация вступлений встанет.
+    """
+    if chat_type not in ("group", "supergroup"):
+        return True
+    working_chat = settings.get("complaint_chat_id")
+    if not working_chat:
+        return True
+    return chat_id in (working_chat, settings.get("notify_chat_id"))
+
+
+class ChatScopeMiddleware(BaseMiddleware):
+    """Молча обрывает всё, что пришло из чужого чата.
+
+    Стоит ПЕРВОЙ из всех — раньше статистики и очистки: в чужом чате бот не
+    должен ни считать сообщения, ни планировать удаления, ни отвечать. Молча,
+    без «сюда нельзя»: посторонний чат не обязан узнавать о существовании
+    настроек бота, а на каждое сообщение он получал бы отказ.
+    """
+
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message):
+            reply = event.reply_to_message
+            if not chat_scope_allows(
+                event.chat.id, event.chat.type,
+                event.text or event.caption,
+                bool(reply and reply.from_user and reply.from_user.is_bot),
+            ):
+                return None
+        elif isinstance(event, CallbackQuery):
+            chat = event.message.chat if event.message else None
+            if chat is not None and not callback_scope_allows(chat.id, chat.type):
+                return None
+        return await handler(event, data)
+
+
 class MessageGuardMiddleware(BaseMiddleware):
     """Фильтр мата и медленный режим — то, что решает, дойдёт ли сообщение до
     обработчиков вообще.
@@ -431,7 +535,10 @@ class CommandCleanupMiddleware(BaseMiddleware):
             # что начинается со служебного знака, — то есть решение «убирать
             # или нет» принимал бот, а не админ. Теперь наоборот: пустой
             # список означает, что не убирается ничего.
-            and matches_cleanup_extra(event.text or event.caption)
+            and (matches_cleanup_extra(event.text or event.caption)
+                 # Групповая «рп» — отдельным вызовом и только по тексту, см.
+                 # matches_cleanup_rp_group.
+                 or matches_cleanup_rp_group(event.text))
             and not is_cleanup_exempt(event.text or event.caption)
         ):
             minutes = cmd_cleanup_minutes_for(event.text or event.caption)
@@ -454,8 +561,12 @@ class CommandCleanupMiddleware(BaseMiddleware):
                 _cleanup_context.reset(cleanup_token)
 
 
-# Порядок важен: статистика — снаружи очистки (см. её docstring про стикер и
-# копию контекста), очистка — снаружи роутеров, чтобы видеть и команды rel2.
+# Порядок важен: заслон по чату — снаружи всего (в чужом чате не должно быть
+# ни счётчиков, ни очистки, ни ответов), статистика — снаружи очистки (см. её
+# docstring про стикер и копию контекста), очистка — снаружи роутеров, чтобы
+# видеть и команды rel2.
+dp.message.outer_middleware(ChatScopeMiddleware())
+dp.callback_query.outer_middleware(ChatScopeMiddleware())
 dp.message.outer_middleware(MessageStatsMiddleware())
 dp.message.outer_middleware(CommandCleanupMiddleware())
 router.message.outer_middleware(MessageGuardMiddleware())
@@ -612,7 +723,13 @@ def _is_market_command(text: str) -> bool:
     return bool(_MARKET_USER_RE.match(t)) or t in MARKET_OWN_TRIGGERS
 
 
-def _is_raid_command(text: str) -> bool:
+def _is_raid_command(text: Optional[str]) -> bool:
+    # Определение ОДНО на весь файл. Раньше их было два: это и ещё одно рядом
+    # с самим обработчиком налёта. Второе молча затирало первое, и получалось,
+    # что рубильник «Заработок» проверял команду одним правилом, а обработчик
+    # ловил другим: правь любое из них — и половина поведения не менялась.
+    if not text:
+        return False
     t = _norm(text)
     return t in RAID_TRIGGERS or bool(RAID_RE.match(t))
 
@@ -1042,7 +1159,6 @@ async def track_member_left_update(event: ChatMemberUpdated):
 # ----------------------------------------------------------------------------
 admin_levels: dict[int, int] = {}  # user_id -> уровень (1-3), из таблицы admins
 admin_levels: dict[int, int] = {}  # user_id -> уровень (1-3), из таблицы admins
-INFINITE_MONEY_USERS: set[int] = set()  # владельцы с включённым "+бесконечность"
 test_mode_admins: set[int] = set()
 # owner_id -> уровень, «на который владелец временно себя понизил» (0-3), чтобы
 # посмотреть на бота глазами участника/модератора/админа/старшего. Реальные
@@ -1205,7 +1321,6 @@ admin_icon: str = DEFAULT_ADMIN_ICON
 
 
 async def load_caches() -> None:
-    global INFINITE_MONEY_USERS
     global admin_levels, test_mode_admins, settings, custom_responses, command_level_overrides
     global pending_complaints_count, reward_degree_level_overrides, user_registry
     global custom_level_names, admin_icon, owner_role_view
@@ -1244,17 +1359,6 @@ async def load_caches() -> None:
     WORD_FILTER.clear()
     WORD_FILTER.update(word_filter.normalize(w) for w in await db.list_filter_words())
 
-    # Модуль «Отношения» — уровни/очки/партнёрские фразы, тоже теперь из БД.
-    rel_levels = await db.list_relationship_levels()
-    RELATIONSHIP_LEVELS[:] = rel_levels or _RELATIONSHIP_LEVELS_DEFAULT
-
-    REL_ACTION_POINTS.clear()
-    REL_ACTION_POINTS.update(await db.list_relationship_actions() or _REL_ACTION_POINTS_DEFAULT)
-
-    rel_phrases = await db.list_relationship_action_phrases()
-    REL_ONLY_PARTNER_ACTIONS.clear()
-    REL_ONLY_PARTNER_ACTIONS.update(rel_phrases or _REL_ONLY_PARTNER_ACTIONS_DEFAULT)
-
     # Производные от RP_ACTIONS/RP_ACTION_SYNONYMS — при первом импорте модуля
     # считались один раз из дефолтов; теперь пересчитываем при каждом рефреше
     # кэшей, чтобы хелп и матчинг в чате не расходились с правками на сайте.
@@ -1271,11 +1375,6 @@ async def load_caches() -> None:
     admin_levels = {row["user_id"]: int(row["level"]) for row in await db.list_admins()}
     test_mode_admins = set(await db.list_test_mode_admins())
     settings = await db.fetch_settings()
-    row = await db.get_data("infinite_money_users")
-    INFINITE_MONEY_USERS = {
-        int(x) for x in (row["data_value"].split(",") if row and row.get("data_value") else [])
-        if x.strip().lstrip("-").isdigit()
-    }
 
     # WARN_LIMIT/ROLE_RESERVE_TIMEOUT_HOURS/TIMER_LIMIT — раньше читались из
     # переменных окружения один раз при старте; теперь live-настройки в
@@ -1442,6 +1541,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "stat_period":     {"phrase": "стата / топ {период}", "category": "Статистика", "level": 0},
     "stat_chart_toggle": {"phrase": "+Стата / -Стата — вкл/выкл график в «Чат инфо» и «Профиль»", "category": "Статистика", "level": LEVEL_MODERATOR},
     "join_leave_notify": {"phrase": "+входы / -входы / +выходы / -выходы / +входы-выходы", "category": "Настройка", "level": LEVEL_MODERATOR},
+    "shop_restock_notify": {"phrase": "+завоз / -завоз — вкл/выкл сводку о ежедневном завозе админам в личку", "category": "Настройка", "level": LEVEL_MODERATOR},
     "chat_stat_chart": {"phrase": "Чат стата [число дней от 30 до 5000, по умолчанию 365]", "category": "Статистика", "level": 0},
     "user_hourly_stat": {"phrase": "Стата по часам [ссылка]", "category": "Статистика", "level": 0},
     "chat_hourly_stat": {"phrase": "Чат стата по часам", "category": "Статистика", "level": 0},
@@ -1455,6 +1555,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "rest_request":    {"phrase": "рест {срок} [причина] (в группе или в личке боту)", "category": "Статистика", "level": 0},
     "rest_list":       {"phrase": "список рест",     "category": "Статистика", "level": LEVEL_MODERATOR},
     "set_norm":        {"phrase": "+норма {число} / -норма", "category": "Статистика", "level": LEVEL_ADMIN},
+    "week_start_set":  {"phrase": "начало недели {день} — с какого дня считается неделя (норма, топы, профиль); «начало недели» — посмотреть", "category": "Статистика", "level": LEVEL_ADMIN},
     "norm_check":      {"phrase": "не в норме / вне нормы",      "category": "Статистика", "level": LEVEL_MODERATOR},
     "clear_users":     {"phrase": "/clearUsers — чистка: перманентный бан не набравших недельную норму (с подтверждением)", "category": "Модерация", "level": LEVEL_SENIOR, "overridable": False},
     "participants":    {"phrase": "Участники сообщения {период} {больше/меньше/равно} {число}", "category": "Статистика", "level": LEVEL_MODERATOR},
@@ -1482,7 +1583,6 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "marriage":        {"phrase": "брак (ответом или @username/ID)", "category": "РП", "level": 0},
     "marry_pair":      {"phrase": "поженить пару @ @ (или ответом + @) — поженить двух других", "category": "РП", "level": LEVEL_MODERATOR},
     "divorce":         {"phrase": ".развод / !развод", "category": "РП", "level": 0},
-    "couple":          {"phrase": ".отн",           "category": "РП", "level": 0},
     "marriages":       {"phrase": "браки / браки {номер страницы}", "category": "РП", "level": 0},
 
     # 20-й модуль «Браки» (см. блок в разделе браков ниже)
@@ -1498,12 +1598,15 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "marriages_reset": {"phrase": "!сброс браков — обнулить все браки чата (с подтверждением)", "category": "РП", "level": LEVEL_SENIOR},
     "bot_infa":        {"phrase": "бот инфа",       "category": "РП", "level": 0},
 
-    "relationship_propose":  {"phrase": "отн запрос {ссылка/ответом}", "category": "РП", "level": 0},
-    "relationship_accept":   {"phrase": "+отн",                 "category": "РП", "level": 0},
-    "relationship_break":    {"phrase": "-отн / отн расторгнуть / отн (ответом на партнёра)", "category": "РП", "level": 0},
-    "relationship_status":   {"phrase": "отн я",                "category": "РП", "level": 0},
-    "relationship_actions":  {"phrase": "отн история",          "category": "РП", "level": 0},
-    "relationship_top":      {"phrase": "отн список",           "category": "РП", "level": 0},
+    # Ключи «Отношений 2.0». Раньше эти же фразы висели на ключах удалённого
+    # модуля v1 (relationship_*) — команды при этом обслуживал v2, а права и
+    # справка ссылались на несуществующую систему.
+    "rel2_pair":     {"phrase": "отн запрос {ссылка/ответом} / .отн — карточка пары", "category": "РП", "level": 0},
+    "rel2_accept":   {"phrase": "+отн",                 "category": "РП", "level": 0},
+    "rel2_break":    {"phrase": "-отн / отн расторгнуть / отн (ответом на партнёра)", "category": "РП", "level": 0},
+    "rel2_me":       {"phrase": "отн я",                "category": "РП", "level": 0},
+    "rel2_history":  {"phrase": "отн история",          "category": "РП", "level": 0},
+    "rel2_list":     {"phrase": "отн список",           "category": "РП", "level": 0},
 
     "rp_manage":       {"phrase": "рп (в личке боту, текстом) / кнопка «РП-действия» в админ-панели", "category": "РП", "level": LEVEL_SENIOR},
     "self_manage":     {"phrase": "кнопка «Себяшки» в админ-панели", "category": "РП", "level": LEVEL_SENIOR},
@@ -1536,7 +1639,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "reward_remove_all": {"phrase": "снять все награды (ответом или @username/ID)",    "category": "Награды", "level": LEVEL_ADMIN},
 
     "item_use": {"phrase": "использовать {ключ предмета} @username[или reply] — 10 применений на предмет, потом пропадает", "category": "Экономика", "level": 0},
-    "item_sell": {"phrase": "магазин продать {ключ предмета} [количество] — продать предмет за 80% цены (только если ни разу не использован)", "category": "Экономика", "level": 0},
+    "item_sell": {"phrase": "магазин продать {ключ предмета} [количество или «все»] — продать предмет за 80% цены (только если ни разу не использован)", "category": "Экономика", "level": 0},
     "grant_level":     {"phrase": "+модератор/+админ/+старший (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "revoke_admin":    {"phrase": "-админ / снять(выключено) (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
     "promote_demote":  {"phrase": "повысить / понизить [@username|ID] [уровень 0-3] (ответом или @username/ID)", "category": "Права", "level": LEVEL_SENIOR, "overridable": False},
@@ -1664,7 +1767,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "black_market":     {"phrase": "лавка / чёрный рынок — ассортимент дня", "category": "Экономика", "level": 0},
     "black_market_buy": {"phrase": "лавка купить {ключ} [количество]", "category": "Экономика", "level": 0},
     "inventory_view":  {"phrase": "инвентарь / мой инвентарь", "category": "Экономика", "level": 0},
-    "gift_item":       {"phrase": "магазин подарить {ключ} [сколько] (ответом или @username/ID)", "category": "Экономика", "level": 0},
+    "gift_item":       {"phrase": "магазин подарить {ключ} [сколько или «все»] (ответом или @username/ID)", "category": "Экономика", "level": 0},
     "lootbox_info":    {"phrase": "!лутбокс — список редкостей и ваши боксы", "category": "Экономика", "level": 0},
     "lootbox_buy":     {"phrase": "!лутбокс купить {редкость} [количество]", "category": "Экономика", "level": 0},
     "lootbox_open":    {"phrase": "!лутбокс открыть {редкость} [количество]", "category": "Экономика", "level": 0},
@@ -1804,7 +1907,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "farm_harvest":    {"phrase": "ферма собрать / собрать урожай — забрать всё поспевшее", "category": "Экономика", "level": 0},
     "farm_help":       {"phrase": "ферма помочь @кому — прогнать саранчу с чужих грядок", "category": "Экономика", "level": 0},
     # Хлев. Все формы перечислены: по ним команду опознают автоочистка и права.
-    "farm_barn":       {"phrase": "ферма скот / скот / хлев / ферма купить {животное} / ферма продать {животное} — скот и его продукт", "category": "Экономика", "level": 0},
+    "farm_barn":       {"phrase": "ферма скот / скот / хлев / ферма купить {животное} [сколько или «все»] / ферма продать {животное} [сколько или «все»] — скот и его продукт", "category": "Экономика", "level": 0},
     # Ручной список чистки. Плейсхолдер {команда} у +чк/-чк обязателен: без
     # него форма считается полной, и сама же чистка перестанет узнавать
     # «+чк дом» — команда о чистке уехала бы мимо чистки.
@@ -2141,13 +2244,79 @@ def normalize_cleanup_phrase(text: str) -> tuple[str, ...]:
     return tuple(_command_words(text))
 
 
+# Групповая запись «рп»: одна строка в списке вместо семи десятков.
+#
+# РП-действий 34, у них ещё 23 повелительные формы («обними» к «обнять»), плюс
+# 21 себяшка — и всё это админ правит в панели, то есть завтра список другой.
+# Добавлять их в «чк» поштучно нереально, а добавивший «обнять» получал чистку
+# только на «обнять»: «обними» — уже другая форма, и она оставалась в чате.
+#
+# Поэтому группа проверяется не по словам из списка, а ТЕМ ЖЕ условием, по
+# которому бот решает выполнять действие (_is_rp_action_command /
+# _self_action_match). Правило читается одной фразой: «бот на это отреагировал
+# — значит, уберётся». Отсюда же и разница с ручной записью, и она намеренная:
+# «+чк обнять» ловит по началу сообщения (уберёт и «обнять снова тест» — живую
+# речь), а группа — только настоящие вызовы действий.
+CLEANUP_GROUP_RP = "рп"
+_cleanup_rp_group_on = False
+
+
 def rebuild_cleanup_extra_forms() -> None:
     """Пересобирает разобранные формы из cleanup_extra_phrases."""
+    global _cleanup_rp_group_on
     _cleanup_extra_forms.clear()
     for phrase in cleanup_extra_phrases:
         form = normalize_cleanup_phrase(phrase)
         if form:
             _cleanup_extra_forms.append(form)
+    _cleanup_rp_group_on = (CLEANUP_GROUP_RP,) in _cleanup_extra_forms
+
+
+def _is_rp_action_invocation(text: str) -> bool:
+    """Настоящий ли это вызов РП-действия — то есть ответит ли бот.
+
+    Фильтр обработчика (_is_rp_action_command) для этого не годится: он
+    нарочно пропускает и «обнять снова тест», а сам обработчик такое уже
+    отбрасывает через SkipHandler, не отвечая ничем. Повторять обработчик
+    целиком нельзя: resolve_command_target ходит в базу, а мы здесь на каждом
+    сообщении чата. Хватает хвоста: у настоящего вызова после действия либо
+    пусто (цель — из ответа на сообщение), либо указание цели — @ник, id или
+    местоимение «его/её».
+    """
+    first_line, _ = _split_command_line(text)
+    matched = _match_rp_action_prefix(first_line)
+    if matched is None:
+        return False
+    raw_action, n = matched
+    tail = first_line.split()[n:]
+    if not all(
+        word.startswith("@")
+        or word.lstrip("-").isdigit()
+        or ru_text.yo(word.casefold()).strip(".,!?…") in _RP_TARGET_POINTER_WORDS
+        for word in tail
+    ):
+        return False
+    # Действиям из RP_ACTIONS_RESTRICTED_NO_TEXT_TARGET цель через @ник/id не
+    # выдана — на такое сообщение бот не отвечает, значит и убирать нечего.
+    if tail:
+        action = RP_ACTION_SYNONYMS.get(raw_action, raw_action)
+        return action not in RP_ACTIONS_RESTRICTED_NO_TEXT_TARGET
+    return True
+
+
+def matches_cleanup_rp_group(text: Optional[str]) -> bool:
+    """Попадает ли сообщение под групповую запись «рп» (см. выше).
+
+    Проверяется ТОЛЬКО текст, не подпись к фото: обработчики РП стоят на
+    F.text, и на фото с подписью «обнять» бот не отвечает ничем. Убрать за
+    ним чужую картинку, к которой он не притрагивался, — не чистка команд, а
+    удаление сообщений участников.
+    """
+    if not _cleanup_rp_group_on or not text:
+        return False
+    # Себяшка — «[пукнуть»; хвост после слова обработчик игнорирует и отвечает
+    # всё равно, поэтому здесь его тоже не проверяем.
+    return _is_rp_action_invocation(text) or _self_action_match(text) is not None
 
 
 def _matches_cleanup_extra_words(words: list[str]) -> bool:
@@ -2189,6 +2358,11 @@ def guess_command_form(text: Optional[str]) -> Optional[str]:
     перечислять их в реестре никто не обязан. Такие команды всегда в одно
     слово, поэтому его и берём.
 
+    Последними идут РП-действия: в реестре команд их нет (они правятся в
+    панели), и «+чк» ответом на «обними @vasya» отвечал «не похоже на
+    команду» — при том что бот на это сообщение как раз ответил. Берём ровно
+    ту форму, что написана: админ видит в списке то же слово, что и в чате.
+
     None — на команду не похоже вовсе. Гадать дальше нельзя: ошибка здесь
     кладёт в список кусок живой речи, а список ловит по началу сообщения.
     """
@@ -2206,6 +2380,9 @@ def guess_command_form(text: Optional[str]) -> Optional[str]:
         return " ".join(best)
     if _SIGIL_RE.match(words[0]):
         return words[0]
+    rp = _match_rp_action_prefix(" ".join(words))
+    if rp is not None:
+        return " ".join(words[: rp[1]])
     return None
 
 
@@ -2302,9 +2479,15 @@ def local_now() -> datetime:
 #     пишутся эти строки по UTC (см. increment_daily_count в мидлвари) и в
 #     таблице уже лежит история. Стоит начать читать её по местным суткам —
 #     и «стата за неделю» молча смешает две разные разметки дня навсегда.
-#   * Всё, у чего своя колонка-отметка (ежедневный бонус казино, дедуп
-#     ежедневной награды, дивиденды), можно и НУЖНО считать по настроенной
-#     зоне: там нет чужой истории, а человек ждёт смены суток в свою полночь.
+#   * Всё, у чего своя колонка-отметка, считается по НАСТРОЕННОЙ ЗОНЕ: чужой
+#     истории там нет, а человек ждёт смены суток в свою полночь. Это бонусы
+#     (ежедневный и казиношный), лимит подработок, суточный доход с предмета,
+#     внеочередная смена «офиса», заказ чата, стрик смен, гороскоп с удачей,
+#     погода на грядках, ротация лавки и месяц сезонного зачёта.
+#
+#     Правило это было записано здесь и раньше, но половина перечисленного
+#     жила по UTC — и в чате на МСК «ежедневный» бонус обновлялся в три ночи,
+#     а казиношный в полночь. Ровно та несостыковка, которую видно людям.
 #
 # utc_today() существует отдельно от datetime.utcnow().date() не ради красоты:
 # по имени сразу видно, что UTC здесь выбран осознанно, а не потому что так
@@ -2325,6 +2508,19 @@ def local_today() -> date:
 def local_hour() -> int:
     """Текущий час в настроенной зоне — для суточных задач по расписанию."""
     return local_now().hour
+
+
+def next_local_midnight_utc() -> datetime:
+    """Ближайшая местная полночь, выраженная в UTC.
+
+    Нужна, чтобы показывать «сколько осталось до обновления»: само время бот
+    считает в UTC (datetime.utcnow()), а обновляется всё суточное в местную
+    полночь. Без перевода таймер показывал бы срок до полуночи по Гринвичу —
+    в чате на МСК это три часа мимо.
+    """
+    local_midnight = datetime.combine(local_today() + timedelta(days=1), datetime.min.time())
+    offset = local_midnight.replace(tzinfo=bot_tzinfo()).utcoffset() or timedelta()
+    return local_midnight - offset
 
 
 def utc_offset_hours() -> int:
@@ -2372,6 +2568,96 @@ def _queue_cleanup(
     task = asyncio.create_task(db.add_cleanup_entry(chat_id, message_id, delete_at, root_message_id))
     _cleanup_pending_tasks.add(task)
     task.add_done_callback(_cleanup_pending_tasks.discard)
+
+
+# ----------------------------------------------------------------------------
+# Заслон «сообщение длиннее 4096».
+#
+# Telegram отвергает такое сообщение целиком — то есть команда просто НЕ
+# отвечает. Часть списков это учитывает и режет сама («Участники сообщения»),
+# часть — нет, а список приходит из базы и растёт вместе с чатом: сегодня
+# влезает, завтра нет. Проверять каждое место по отдельности бессмысленно,
+# поэтому ловим уже случившийся отказ и повторяем запрос обрезанным текстом.
+#
+# Обрезаем по границе строки и закрываем теги, которые остались открытыми:
+# оборванный <blockquote> или <b> — это второй отказ, теперь уже за разметку.
+# ----------------------------------------------------------------------------
+TELEGRAM_TEXT_LIMIT = 4096
+LONG_LIST_HEAD = 50          # сколько человек показываем, если список не влез
+_CLIP_NOTE = "\n…(сообщение обрезано — слишком длинное)"
+_CLIP_TAG_RE = re.compile(r"<\s*(/?)\s*([a-zA-Z][a-zA-Z0-9-]*)")
+
+
+def clip_member_list(lines: list[str], total: int, header: int = 2,
+                     keep: int = LONG_LIST_HEAD) -> str:
+    """Склеивает список участников, обрезая его до лимита Telegram.
+
+    Отдельно от clip_html_message: тот — аварийный заслон на уровне отправки,
+    а здесь список режется осмысленно, с честным «…и ещё N». header — сколько
+    первых строк занимает заголовок (их сохраняем всегда).
+    """
+    text = "\n".join(lines)
+    if len(text) <= TELEGRAM_TEXT_LIMIT - 100:
+        return text
+    осталось = max(total - keep, 0)
+    подрезанные = lines[:header] + lines[header:header + keep]
+    if осталось:
+        подрезанные.append(f"…и ещё {осталось}")
+    return clip_html_message("\n".join(подрезанные))
+
+
+def _unclosed_tags(fragment: str) -> list[str]:
+    """Теги, оставшиеся открытыми в куске текста, — в порядке открытия."""
+    открытые: list[str] = []
+    for закрывающий, тег in _CLIP_TAG_RE.findall(fragment):
+        тег = тег.lower()
+        if тег == "br":
+            continue
+        if not закрывающий:
+            открытые.append(тег)
+        elif тег in открытые:
+            # закрывается последний открытый такой же
+            открытые.reverse()
+            открытые.remove(тег)
+            открытые.reverse()
+    return открытые
+
+
+def clip_html_message(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> str:
+    """Обрезает текст под лимит Telegram, не ломая HTML-разметку.
+
+    Длина закрывающих тегов заранее не известна, поэтому итог проверяем и, если
+    не влез, урезаем ещё: молча вернуть строку длиннее лимита — значит второй
+    отказ и снова тишина в чате."""
+    if len(text) <= limit:
+        return text
+    запас = limit - len(_CLIP_NOTE)
+    while запас > 0:
+        кусок = text[:запас]
+        по_строке = кусок.rfind("\n")
+        if по_строке > запас // 2:      # не режем по букве, если есть перевод строки
+            кусок = кусок[:по_строке]
+        хвост = "".join(f"</{тег}>" for тег in reversed(_unclosed_tags(кусок)))
+        итог = кусок + хвост + _CLIP_NOTE
+        if len(итог) <= limit:
+            return итог
+        запас -= len(итог) - limit
+    return text[:limit]
+
+
+@bot.session.middleware()
+async def too_long_retry_middleware(make_request, bot_obj, method):
+    """Отказ «message is too long» — не повод промолчать: шлём обрезанное."""
+    try:
+        return await make_request(bot_obj, method)
+    except TelegramBadRequest as exc:
+        текст = getattr(method, "text", None)
+        if not текст or "too long" not in str(exc).casefold():
+            raise
+        logger.warning("Сообщение не влезло в лимит (%s симв.) — отправляю обрезанным",
+                       len(текст))
+        return await make_request(bot_obj, method.model_copy(
+            update={"text": clip_html_message(текст)}))
 
 
 @bot.session.middleware()
@@ -2486,6 +2772,40 @@ def mention_id(user_id: int, full_name: str | None = None, username: str | None 
 
 DIVIDER = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 
+# ----------------------------------------------------------------------------
+# callback_data у Telegram — не длиннее 64 БАЙТ, и это не совет: клавиатуру с
+# длинной кнопкой сервер не принимает целиком (BUTTON_DATA_INVALID). То есть
+# ломается не одна кнопка, а ВСЁ сообщение — карточка не отправляется вовсе.
+#
+# Опасны здесь не id (они предсказуемой длины), а строковые ключи, которые
+# заводит админ: ключ товара разрешался длиной до 64 символов, и «мой
+# инвентарь» у любого, кому такой предмет попадал, просто переставал
+# открываться. Отсюда две меры: предел на ввод ключа (SHOP_ITEM_KEY_MAX ниже)
+# и этот заслон — на случай ключей, заведённых раньше.
+# ----------------------------------------------------------------------------
+CALLBACK_DATA_LIMIT = 64
+
+
+def callback_fits(data: str) -> bool:
+    """Влезает ли строка в callback_data (лимит считается в байтах)."""
+    return len(data.encode("utf-8")) <= CALLBACK_DATA_LIMIT
+
+
+# 24 — с запасом: «sellitem:» + ключ + два id по 13 цифр + разделители = 63
+# байта в худшем случае. Колонка в базе по-прежнему VARCHAR(64), сужаем только
+# ввод: сломать существующие ключи миграцией хуже, чем оставить их доживать.
+SHOP_ITEM_KEY_MAX = 24
+
+
+def shop_item_key_fits(key: str) -> bool:
+    """Влезет ли ключ в кнопку инвентаря. Считаем не символы, а саму кнопку:
+    кириллический ключ вдвое тяжелее латинского, и «24 символа» для него уже
+    не влезает. Пропусти такой — и карточка инвентаря не откроется совсем."""
+    if len(key) > SHOP_ITEM_KEY_MAX:
+        return False
+    id_макс = "9" * 13          # запас на будущие длинные id Telegram
+    return callback_fits(f"sellitem:{key}:{id_макс}:{id_макс}")
+
 
 def confirm_text(title: str, lines: list[str], irreversible: bool = True) -> str:
     """Единый стиль для всех диалогов подтверждения опасных действий."""
@@ -2573,6 +2893,12 @@ class AdminStates(StatesGroup):
     menu_rest = State()
     waiting_rest_template = State()
     waiting_rest_limit = State()
+    # Меню «Чистка /clearUsers»: норма чата, защита новичков, начало недели.
+    # Сам бан отсюда не запускается — он остаётся в чате, с подтверждением.
+    menu_cleanup = State()
+    waiting_cleanup_norm = State()
+    waiting_cleanup_newcomer = State()
+    waiting_cleanup_week_start = State()
     # Настройка розыгрыша «&варн» — один переключатель, см. fake_warns.py
     menu_fake_warns = State()
     # Рубильник заработка: пять переключателей на одном экране (см. EARNING_SOURCES)
@@ -2710,6 +3036,11 @@ LBL_TEXT_REJECT = "Сообщение об отказе"
 LBL_TEXT_GROUP_JOIN = "Приветствие в группе (вход)"
 LBL_REST = "Настройки реста"
 LBL_REST_TEMPLATE = "Памятка о ресте"
+LBL_CLEANUP = "Чистка /clearUsers"
+BTN_CLEANUP_NORM = "📊 Норма"
+BTN_CLEANUP_NEWCOMER = "🌱 Защита новичков"
+BTN_CLEANUP_WEEK_START = "📅 Неделя с"
+BTN_CLEANUP_PREVIEW = "👥 Кто под чистку"
 LBL_FAKE_WARNS = "Шуточные варны"
 LBL_EARNINGS = "Заработок"
 # Русская рулетка — не источник дохода, а игра на вылет из чата, и выключатель
@@ -2825,6 +3156,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         f"🏪 {LBL_SHOP}",
         f"🐾 {LBL_PETS}",
         f"🌴 {LBL_REST}",
+        f"🧹 {LBL_CLEANUP}",
         f"🃏 {LBL_FAKE_WARNS}",
         f"💰 {LBL_EARNINGS}{f' ({len(earnings_off)} выкл)' if earnings_off else ''}",
         f"🎭 {LBL_SPECIAL} ({len(custom_responses)})",
@@ -2885,6 +3217,21 @@ def rest_menu_kb() -> ReplyKeyboardMarkup:
     items += [
         f"{field['button']}: {rest_limit_display(key, limits)}"
         for key, field in REST_LIMIT_FIELDS.items()
+    ]
+    rows = _grid(items)
+    rows.append([BTN_BACK])
+    return _reply_kb(rows)
+
+
+def cleanup_menu_kb(norm: Optional[int]) -> ReplyKeyboardMarkup:
+    """Меню «Чистка /clearUsers». Как и у реста, значения прямо на кнопках:
+    настройка, от которой зависит массовый бан, не должна прятаться за
+    отдельным экраном «показать»."""
+    items = [
+        f"{BTN_CLEANUP_NORM}: {norm if norm else 'не задана'}",
+        f"{BTN_CLEANUP_NEWCOMER}: {cleanup_newcomer_days()} дн.",
+        f"{BTN_CLEANUP_WEEK_START}: {weekday_name(db.week_start_weekday())}",
+        BTN_CLEANUP_PREVIEW,
     ]
     rows = _grid(items)
     rows.append([BTN_BACK])
@@ -3187,6 +3534,29 @@ async def owner_role_callback(callback: CallbackQuery):
 BTN_RAID_ON = "🚨 РЕЙД НАЧАЛСЯ"
 BTN_RAID_OFF = "✅ РЕЙД ОКОНЧЕН"
 
+# Ту же команду набирают руками, и реестр обещает именно фразу — «рейд
+# начался / рейд окончен». Сравнение с текстом КНОПКИ (с эмодзи) этого не
+# ловило, и получалось худшее из возможного: набранное в личке «рейд начался»
+# уезжало админам ЗАЯВКОЙ НА ВСТУПЛЕНИЕ (см. is_private_passthrough), а в
+# самом чате — где админ и находится, когда рейд идёт, — не делало ничего.
+# Набор намеренно короткий: каждая фраза отсюда ОБЯЗАНА лежать и в
+# PRIVATE_PASSTHROUGH_COMMANDS ниже, иначе в личке она снова уедет заявкой
+# (за этим следит тест). Добавляешь форму сюда — добавь и туда.
+RAID_ON_PHRASES: frozenset[str] = frozenset({
+    ru_text.yo(BTN_RAID_ON.casefold()), "рейд начался",
+})
+RAID_OFF_PHRASES: frozenset[str] = frozenset({
+    ru_text.yo(BTN_RAID_OFF.casefold()), "рейд окончен",
+})
+
+
+def _is_raid_on_phrase(text: Optional[str]) -> bool:
+    return ru_text.yo((text or "").strip().casefold()) in RAID_ON_PHRASES
+
+
+def _is_raid_off_phrase(text: Optional[str]) -> bool:
+    return ru_text.yo((text or "").strip().casefold()) in RAID_OFF_PHRASES
+
 # Кого считать «пришедшим с рейдом». Пять минут — не универсальная истина, а
 # то, что просили: окно должно накрывать сам заход и не задевать тех, кто
 # зашёл до него.
@@ -3230,6 +3600,8 @@ PRIVATE_MENU_BUTTONS: frozenset[str] = frozenset({
 # бы админам как заявка на вступление.
 PRIVATE_PASSTHROUGH_COMMANDS: frozenset[str] = frozenset({
     "фарт", "подкрутить",
+    # Без этих двух набранный руками антирейд уходил админам как заявка.
+    "рейд начался", "рейд окончен",
 })
 
 
@@ -4328,6 +4700,246 @@ async def process_rest_limit(message: Message, state: FSMContext):
     settings[key] = value
     await message.answer(f"✅ Сохранено: <code>{rest_limit_display(key)}</code>")
     await _show_rest_menu(message, state)
+
+
+# ---------- Чистка «/clearUsers» ----------
+# Настройки массового бана собраны в одном экране: норма, защита новичков и
+# начало недели. Все три вместе решают, кого чистка тронет, а раньше жили в
+# трёх разных местах — команда в чате, колонка настроек и код.
+#
+# САМ БАН отсюда не запускается намеренно. Он остаётся командой в чате, с
+# подтверждением и пересчётом списка на момент нажатия: необратимое массовое
+# действие не должно быть в двух шагах от кнопки «Назад».
+async def _cleanup_chat_id() -> Optional[int]:
+    """Чат, для которого настраивается чистка, — рабочий чат бота."""
+    return settings.get("complaint_chat_id")
+
+
+async def _show_cleanup_menu(message: Message, state: FSMContext) -> None:
+    await state.set_state(AdminStates.menu_cleanup)
+    chat_id = await _cleanup_chat_id()
+    if not chat_id:
+        await message.answer(
+            "🧹 <b>Чистка /clearUsers</b>\n\n"
+            "⚠️ Рабочий чат не назначен — настраивать нечего. "
+            "Отправьте в нужной группе «жалобы сюда».",
+            reply_markup=cleanup_menu_kb(None),
+        )
+        return
+    norm = await get_chat_norm(chat_id)
+    week_start = _current_week_start()
+    сколько = "—"
+    if norm:
+        candidates = await _cleanup_candidates(chat_id, norm)
+        сколько = str(len(candidates))
+    await message.answer(
+        "🧹 <b>Чистка /clearUsers</b>\n\n"
+        f"Норма: <b>{norm if norm else 'не задана'}</b> сообщ./неделю\n"
+        f"Неделя считается с <b>{weekday_name(db.week_start_weekday())}</b> "
+        f"(текущая началась {fmt_date(week_start)})\n"
+        f"Защита новичков: <b>{cleanup_newcomer_days()} дн.</b> после входа в чат\n"
+        f"Сейчас под чистку попадает: <b>{сколько}</b>\n\n"
+        "Под чистку идёт только тот, кто вступил <b>до начала недели</b> И пробыл в "
+        "чате дольше защиты новичков. Админы и рестующие не в счёт.\n"
+        "Запускается чистка по-прежнему командой <code>/clearUsers</code> в самом "
+        "чате — с подтверждением.",
+        reply_markup=cleanup_menu_kb(norm),
+    )
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_main),
+                F.text.func(lambda t: LBL_CLEANUP in (t or "")))
+async def cfg_cleanup(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    await _show_cleanup_menu(message, state)
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_cleanup), F.text == BTN_BACK)
+async def cfg_cleanup_back(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    await _show_main_menu(message, state)
+
+
+# Отмена ввода возвращает в меню чистки, а не в главное — как у реста.
+@router.message(
+    F.chat.type == "private",
+    StateFilter(AdminStates.waiting_cleanup_norm, AdminStates.waiting_cleanup_newcomer,
+                AdminStates.waiting_cleanup_week_start),
+    F.text == BTN_CANCEL,
+)
+async def cfg_cleanup_cancel_input(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        return
+    await _show_cleanup_menu(message, state)
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_cleanup),
+                F.text.func(lambda t: BTN_CLEANUP_NORM in (t or "")))
+async def cfg_cleanup_norm(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    chat_id = await _cleanup_chat_id()
+    norm = await get_chat_norm(chat_id) if chat_id else None
+    await message.answer(
+        "📊 <b>Недельная норма</b>\n\n"
+        f"Сейчас: <code>{norm if norm else 'не задана'}</code>\n\n"
+        "Сколько сообщений в неделю участник должен написать, чтобы не попасть "
+        "под чистку. Пришлите число (например, <code>100</code>) или «-», "
+        "чтобы снять норму — тогда чистка работать не будет вовсе.",
+        reply_markup=cancel_kb(),
+    )
+    await state.set_state(AdminStates.waiting_cleanup_norm)
+
+
+@router.message(StateFilter(AdminStates.waiting_cleanup_norm), F.chat.type == "private")
+async def process_cleanup_norm(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        return
+    chat_id = await _cleanup_chat_id()
+    if not chat_id:
+        await message.answer("⚠️ Рабочий чат не назначен — сохранять некуда.")
+        await _show_cleanup_menu(message, state)
+        return
+    raw = (message.text or "").strip()
+    if raw == "-":
+        await db.delete_data(_norm_data_key(chat_id))
+        await db.add_log("norm_unset", chat_id=chat_id, actor_id=message.from_user.id)
+        await message.answer("🗑 Норма снята — чистка теперь никого не тронет.")
+        await _show_cleanup_menu(message, state)
+        return
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.answer("Нужно целое число больше нуля, например <code>100</code>. "
+                             "Или «-», чтобы снять норму.", reply_markup=cancel_kb())
+        return
+    norm = int(raw)
+    await db.set_data(_norm_data_key(chat_id), str(norm), updated_by=message.from_user.id)
+    await db.add_log("norm_set", chat_id=chat_id, actor_id=message.from_user.id, details=str(norm))
+    await message.answer(f"✅ Норма: <b>{norm}</b> сообщ./неделю.")
+    await _show_cleanup_menu(message, state)
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_cleanup),
+                F.text.func(lambda t: BTN_CLEANUP_NEWCOMER in (t or "")))
+async def cfg_cleanup_newcomer(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    await message.answer(
+        "🌱 <b>Защита новичков</b>\n\n"
+        f"Сейчас: <code>{cleanup_newcomer_days()} дн.</code>\n\n"
+        "Сколько дней после входа в чат человек не попадает под чистку. "
+        f"Пришлите число от 0 до {CLEANUP_NEWCOMER_DAYS_MAX}.\n"
+        "0 не отключает защиту совсем: вступившие на текущей неделе не "
+        "попадают под чистку в любом случае — неделю, которая для них "
+        "началась в среду, набрать нельзя.",
+        reply_markup=cancel_kb(),
+    )
+    await state.set_state(AdminStates.waiting_cleanup_newcomer)
+
+
+@router.message(StateFilter(AdminStates.waiting_cleanup_newcomer), F.chat.type == "private")
+async def process_cleanup_newcomer(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or int(raw) > CLEANUP_NEWCOMER_DAYS_MAX:
+        await message.answer(
+            f"Нужно целое число дней от 0 до {CLEANUP_NEWCOMER_DAYS_MAX}.",
+            reply_markup=cancel_kb(),
+        )
+        return
+    days = int(raw)
+    await db.save_setting("cleanup_newcomer_days", days)
+    settings["cleanup_newcomer_days"] = days
+    await db.add_log("cleanup_newcomer_days_set", actor_id=message.from_user.id, details=str(days))
+    await message.answer(f"✅ Новички защищены <b>{days} дн.</b> после входа в чат.")
+    await _show_cleanup_menu(message, state)
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_cleanup),
+                F.text.func(lambda t: BTN_CLEANUP_WEEK_START in (t or "")))
+async def cfg_cleanup_week_start(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    await message.answer(
+        "📅 <b>Начало недели</b>\n\n"
+        f"Сейчас: <code>{weekday_name(db.week_start_weekday())}</code> "
+        f"(текущая началась {fmt_date(_current_week_start())})\n\n"
+        "От этого дня считаются норма, «вне нормы», топы за неделю, итоги и "
+        "строка «Актив» в профиле. Пришлите день словом: "
+        "<code>суббота</code>, <code>понедельник</code>, <code>пн</code>…\n"
+        "⚠️ Смена посреди недели сразу пересчитывает норму — под чистку "
+        "попадут не те же люди, что попали бы до неё.",
+        reply_markup=cancel_kb(),
+    )
+    await state.set_state(AdminStates.waiting_cleanup_week_start)
+
+
+@router.message(StateFilter(AdminStates.waiting_cleanup_week_start), F.chat.type == "private")
+async def process_cleanup_week_start(message: Message, state: FSMContext):
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        return
+    weekday = parse_weekday(message.text or "")
+    if weekday is None:
+        await message.answer(
+            "Не понял день. Напишите словом: <code>суббота</code>, "
+            "<code>понедельник</code>, или коротко — <code>сб</code>, <code>пн</code>.",
+            reply_markup=cancel_kb(),
+        )
+        return
+    await db.save_setting("week_start_weekday", weekday)
+    settings["week_start_weekday"] = weekday
+    await db.fetch_settings()   # обновляет кэш границ в db (см. _remember_week_start)
+    await db.add_log("week_start_set", actor_id=message.from_user.id, details=weekday_name(weekday))
+    await message.answer(
+        f"✅ Неделя считается с <b>{weekday_name(weekday)}</b> — "
+        f"текущая началась {fmt_date(_current_week_start())}."
+    )
+    await _show_cleanup_menu(message, state)
+
+
+@router.message(F.chat.type == "private", StateFilter(AdminStates.menu_cleanup),
+                F.text.func(lambda t: BTN_CLEANUP_PREVIEW in (t or "")))
+async def cfg_cleanup_preview(message: Message, state: FSMContext):
+    """Показать, кого чистка тронет прямо сейчас. Только показать: банить
+    отсюда нельзя, для этого есть команда в чате с подтверждением."""
+    if not has_level(message.from_user.id, LEVEL_SENIOR):
+        await message.answer("Нет доступа")
+        return
+    chat_id = await _cleanup_chat_id()
+    norm = await get_chat_norm(chat_id) if chat_id else None
+    if not chat_id or norm is None:
+        await message.answer("⚠️ Норма не задана — чистить не по чему.")
+        return
+    candidates = await _cleanup_candidates(chat_id, norm)
+    spared = await _cleanup_protected_newcomers(chat_id, norm, candidates)
+    if not candidates:
+        await message.answer(
+            f"🎉 Под чистку сейчас никто не попадает (норма {norm} сообщ./неделю).\n"
+            f"🌱 Новичков защищено: {spared}."
+        )
+        return
+    lines = [
+        f"👥 <b>Под чистку сейчас: {len(candidates)}</b> "
+        f"(норма {norm} сообщ./неделю, с {fmt_date(_current_week_start())})",
+        f"🌱 Новичков защищено: {spared}",
+        DIVIDER,
+    ]
+    for row in candidates[:CLEANUP_PREVIEW_LIMIT]:
+        name = html.escape(row.get("full_name") or str(row["user_id"]))
+        lines.append(f"• {name} — {int(row['message_count'])}/{norm}")
+    more = len(candidates) - CLEANUP_PREVIEW_LIMIT
+    if more > 0:
+        lines.append(f"…и ещё {more}")
+    lines.append("")
+    lines.append("Забанить их — командой <code>/clearUsers</code> в самом чате.")
+    await message.answer("\n".join(lines))
 
 
 # ---------- Шуточные варны («&варн») ----------
@@ -7095,6 +7707,15 @@ def _cleanup_status_text() -> str:
         body.append("  Совпадение — по началу сообщения: «дом» ловит и «дом топ».")
     else:
         body.append("  пусто — добавьте команды, которые нужно убирать")
+    # Про группу говорим ровно там, где перечислен список: строка «рп» в нём
+    # выглядит как обычная запись, а значит гораздо больше.
+    if _cleanup_rp_group_on:
+        body.append(f"  «{CLEANUP_GROUP_RP}» — это ГРУППА: все РП-действия "
+                    f"({len(RP_ACTIONS)} шт. с их формами) и себяшки "
+                    f"({len(SELF_ACTIONS)} шт.), включая добавленные в панели позже.")
+    else:
+        body.append(f"  <code>+чк {CLEANUP_GROUP_RP}</code> — разом все РП-действия "
+                    "и себяшки, в любой форме.")
     body.append("  Чистится ТОЛЬКО этот список: реестр команд бота на неё не влияет.")
     body.append("  Добавить: +чк команда · убрать: -чк команда")
     body.append("  Или ответом на сообщение с командой — просто +чк / -чк:")
@@ -7183,13 +7804,33 @@ async def cmd_cleanup_add(message: Message):
     tail = (f" Убирается через {minutes} мин."
             if minutes and settings.get("complaint_chat_id")
             else " ⚠️ Но сама чистка сейчас выключена — см. <code>чк</code>.")
+    # Группа «рп» — не фраза, а правило, и вести себя в ответе она обязана
+    # иначе: «убирается всё, что с неё начинается» про неё просто неправда.
+    if normalize_cleanup_phrase(phrase) == (CLEANUP_GROUP_RP,):
+        await message.reply(
+            f"✅ «{html.escape(phrase)}» — группа: под чистку попадают все "
+            f"РП-действия ({len(RP_ACTIONS)} шт. вместе с формами вроде "
+            f"«обними») и себяшки ({len(SELF_ACTIONS)} шт., «[пукнуть»).{tail}\n"
+            "Добавите новое действие в панели — оно попадёт под чистку само.\n"
+            "Убирается только настоящий вызов действия: «обнять снова тест» — "
+            "обычная фраза, её бот не тронет."
+        )
+        return
     # При добавлении ответом показываем, что именно бот принял за команду:
     # он отбросил аргументы сам, и человек должен увидеть результат, а не
     # узнать о нём через неделю по неубранным сообщениям.
     взято = " (аргументы отброшены)" if откуда == "реплай" else ""
+    # У РП-действий есть вторая форма («обнять» ↔ «обними»), и добавивший одну
+    # получит чистку только на неё. Молчать об этом нельзя: выглядит как
+    # «работает через раз».
+    подсказка = ""
+    if not _cleanup_rp_group_on and _match_rp_action_prefix(phrase) is not None:
+        подсказка = (f"\n💡 У РП-действий есть и вторая форма — эта запись ловит только "
+                     f"написанную. Разом все РП-действия и себяшки: "
+                     f"<code>+чк {CLEANUP_GROUP_RP}</code>.")
     await message.reply(
         f"✅ «{html.escape(phrase)}»{взято} добавлена в чистку команд.{tail}\n"
-        "Убирается и она, и всё, что с неё начинается."
+        f"Убирается и она, и всё, что с неё начинается.{подсказка}"
     )
 
 
@@ -8983,17 +9624,88 @@ async def prompt_role_pick_after_join(chat_id: int, user_id: int) -> None:
 # ----------------------------------------------------------------------------
 # Ответ администратора заявителю (reply на сообщение-заявку в группе/топике)
 # ----------------------------------------------------------------------------
+_TG_USER_LINK_RE = re.compile(r"tg://user\?id=(\d+)")
+_TG_USERNAME_LINK_RE = re.compile(r"(?:https?://)?(?:t(?:elegram)?\.me)/([A-Za-z0-9_]{4,32})")
+
+
+async def _reply_target_user_id(reply: Message) -> Optional[int]:
+    """Кому адресован ответ админа — по сообщению, на которое он ответил.
+
+    Основной путь — таблица request_messages: там лежат и сама заявка, и все
+    последующие сообщения треда. Но админ отвечает не только на них: на
+    служебное «сообщение закреплено», на карточку с уже отредактированным
+    текстом, на любое другое сообщение бота про этого человека. Раньше в таком
+    случае обработчик молча выходил, и со стороны это выглядело как «админ
+    писать не может» — самый частый вид этой жалобы.
+
+    Поэтому запасной путь — вытащить адресата из самой карточки: бот всегда
+    ставит в неё кликабельное упоминание (mention_id). Оно бывает двух видов:
+    tg://user?id=… (когда юзернейма нет) и ссылка на t.me/{username} — второй
+    случай разбираем через известных боту пользователей.
+    """
+    target = await db.get_user_by_message(reply.message_id)
+    if target is not None:
+        return target
+
+    urls = [e.url for e in (reply.entities or []) + (reply.caption_entities or []) if e.url]
+    # Плюс сам текст: у entity типа «url» ссылка лежит не в .url, а прямо в
+    # тексте, и html_text отдаёт и текст, и подпись к фото разом.
+    urls.append(reply.html_text)
+    for url in urls:
+        found = _TG_USER_LINK_RE.search(url or "")
+        if found:
+            return int(found.group(1))
+    for url in urls:
+        found = _TG_USERNAME_LINK_RE.search(url or "")
+        if not found:
+            continue
+        row = await db.get_known_user_by_username(found.group(1))
+        if row:
+            return int(row["user_id"])
+    return None
+
+
+async def _is_requests_staff(chat_id: int, user_id: int) -> bool:
+    """Может ли этот человек отвечать заявителям.
+
+    Админы бота — само собой. Но чат заявок служебный, и тот, кто в нём
+    администратор в Telegram, — тоже персонал: требовать сверх этого записи в
+    «админке» значит молча не работать для половины команды. Проверка одним
+    запросом на ответ, не на каждое сообщение.
+    """
+    if is_admin(user_id):
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except Exception as exc:
+        log_suppressed("_is_requests_staff", exc)
+        return False
+    return member.status in ("administrator", "creator")
+
+
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.reply_to_message)
 async def handle_admin_reply(message: Message):
     if settings.get("notify_chat_id") != message.chat.id:
         raise SkipHandler
 
-    target_user_id = await db.get_user_by_message(message.reply_to_message.message_id)
+    target_user_id = await _reply_target_user_id(message.reply_to_message)
     if target_user_id is None:
+        # Молчать здесь нельзя: админ уверен, что написал заявителю. Но и
+        # ругаться на КАЖДЫЙ реплай в этом чате тоже нельзя — админы
+        # переговариваются между собой. Объясняем только когда ответили боту:
+        # значит, целились в заявку и промахнулись.
+        reply_from = message.reply_to_message.from_user
+        if reply_from and reply_from.is_bot:
+            await message.reply(
+                "⚠️ Не понял, кому переслать: в этом сообщении нет заявителя.\n"
+                "Ответьте на саму заявку (она закреплена) или на любое сообщение "
+                "этого человека в треде."
+            )
         raise SkipHandler
 
-    if not is_admin(message.from_user.id):
-        await react(message.chat.id, message.message_id, "🤷")
+    if not await _is_requests_staff(message.chat.id, message.from_user.id):
+        await react(message.chat.id, message.message_id, "🤷",
+                    fallback_text="⚠️ Отвечать заявителям могут только администраторы.")
         return
 
     reply_text = message.text or message.caption
@@ -9014,7 +9726,10 @@ async def handle_admin_reply(message: Message):
     # Чтобы дальнейшие ответы пользователя продолжали попадать в этот же тред
     await db.add_request_message(message.message_id, target_user_id, is_anchor=False)
 
-    await react(message.chat.id, message.message_id, "✅")
+    # fallback_text обязателен: без прав на реакции react() молчит, и успешная
+    # пересылка выглядела так же, как несработавшая.
+    await react(message.chat.id, message.message_id, "✅",
+                fallback_text="✅ Отправлено заявителю.")
 
 
 # ----------------------------------------------------------------------------
@@ -10510,7 +11225,7 @@ async def rp_admin_command(message: Message):
 # или @username не требуется: действие происходит с самим автором сообщения
 # «на глазах у всех». Триггер — квадратная скобка «[» сразу перед словом
 # действия, без пробела (напр. «[пукнуть», «[споткнуться»), регистр не важен.
-# Отдельный набор от RP_ACTIONS/REL_ONLY_PARTNER_ACTIONS выше — там нужна
+# Отдельный набор от RP_ACTIONS выше — там нужна
 # цель-собеседник, здесь цель всегда сам автор.
 # ============================================================================
 # Дефолты для сида/фолбэка (см. комментарий у _RP_ACTIONS_DEFAULT выше).
@@ -11084,8 +11799,10 @@ def parse_duration(token: str) -> Optional[timedelta]:
 
 
 
-def has_infinite_money(user_id: int) -> bool:
-    return user_id in INFINITE_MONEY_USERS
+# Читается из базы на каждый вопрос, а не из множества в памяти. Причина в
+# owner_flags: множество наполнялось один раз при запуске, и рубильник,
+# нажатый на сайте, для бота не существовал бы до перезапуска.
+has_infinite_money = owner_flags.has_infinite_money
 
 
 async def spend_coins(chat_id: int, user_id: int, amount: int) -> bool:
@@ -11094,7 +11811,7 @@ async def spend_coins(chat_id: int, user_id: int, amount: int) -> bool:
     проходит, деньги не тратятся ни на что."""
     if amount <= 0:
         return True
-    if has_infinite_money(user_id):
+    if await has_infinite_money(user_id):
         return True
     if await is_account_frozen(chat_id, user_id):
         return False
@@ -11134,7 +11851,7 @@ async def try_spend_casino(chat_id: int, user_id: int, amount: int) -> bool:
     """
     if amount <= 0:
         return True
-    if has_infinite_money(user_id):
+    if await has_infinite_money(user_id):
         return True
     if await is_account_frozen(chat_id, user_id):
         return False
@@ -12214,13 +12931,11 @@ async def cancel_nuke(callback: CallbackQuery):
 async def cmd_infinite_money_toggle(message: Message):
     if not is_owner(message.from_user.id):
         return  # молчание — не подтверждаем и не выдаём существование команды
-    global INFINITE_MONEY_USERS
     enable = message.text.strip().casefold() == "+бесконечность"
-    if enable:
-        INFINITE_MONEY_USERS.add(message.from_user.id)
-    else:
-        INFINITE_MONEY_USERS.discard(message.from_user.id)
-    await db.set_data("infinite_money_users", ",".join(str(u) for u in INFINITE_MONEY_USERS))
+    # Через общий переключатель, а не своим множеством: он перечитывает
+    # список перед записью. Иначе владелец, у которого снимок устарел, молча
+    # затёр бы чужой рубильник — тот просто перестал бы работать.
+    await owner_flags.set_infinite_money(message.from_user.id, enable)
     await db.add_log("infinite_money_toggle", actor_id=message.from_user.id, details=str(enable))
     await message.reply(
         "♾️ Бесконечные деньги включены — ваши покупки больше не списывают i¢."
@@ -12234,8 +12949,11 @@ async def cmd_infinite_money_toggle(message: Message):
 # (db.set_data/get_data/delete_data) под ключом frozen:{chat_id}:{user_id} —
 # как и другие лёгкие тумблеры бота (+чат, +рстик и т.п.).
 # ----------------------------------------------------------------------------
-def _frozen_key(chat_id: int, user_id: int) -> str:
-    return f"frozen:{chat_id}:{user_id}"
+# Ключ заморозки общий с сайтом (farm_actions.frozen_key): разъедься он,
+# сайт читал бы не ту отметку и пускал бы замороженного играть. А вот само
+# чтение остаётся здесь и ходит в БД через модульный db бота — тесты подменяют
+# именно его, и чужая ссылка на базу уводила бы их в настоящий пул.
+_frozen_key = farm_actions.frozen_key
 
 
 async def is_account_frozen(chat_id: int, user_id: int) -> bool:
@@ -12381,7 +13099,8 @@ async def cmd_kick(message: Message):
         target_id=target.id, details=reason,
     )
 
-RED_ROULETTE_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+# Красные числа рулетки — в casino_actions вместе с цветом и выплатами.
+RED_ROULETTE_NUMBERS = casino_actions.RED_NUMBERS
 
 
 # Ниже по файлу эта же функция объявлена второй раз — работала именно та копия,
@@ -13280,7 +13999,7 @@ MY_ARTICLE_TEMPLATES = [
 # ============================================================================
 def _daily_pick(options: list, *seed_parts) -> object:
     """Стабильный выбор на сутки: одинаковый seed — одинаковый ответ."""
-    rng = random.Random(str(seed_parts) + utc_today().isoformat())
+    rng = random.Random(str(seed_parts) + local_today().isoformat())
     return options[rng.randrange(len(options))]
 
 
@@ -13413,7 +14132,7 @@ async def cmd_horoscope(message: Message):
     user_id = message.from_user.id
     mood = _daily_pick(HOROSCOPE_MOODS, "mood", user_id)
     advice = _daily_pick(HOROSCOPE_ADVICE, "advice", user_id)
-    luck = random.Random(f"luck{user_id}{utc_today().isoformat()}").randint(1, 100)
+    luck = random.Random(f"luck{user_id}{local_today().isoformat()}").randint(1, 100)
     who = await display_name(message.chat.id, message.from_user)
     await message.answer(
         f"🔮 <b>Гороскоп на сегодня</b> — {who}\n{DIVIDER}\n"
@@ -13431,7 +14150,7 @@ async def cmd_chat_weather(message: Message):
     if not _check_misc_access(message.from_user.id, "fun_weather"):
         return
     state = _daily_pick(WEATHER_STATES, "weather", message.chat.id)
-    degrees = random.Random(f"deg{message.chat.id}{utc_today().isoformat()}").randint(-30, 40)
+    degrees = random.Random(f"deg{message.chat.id}{local_today().isoformat()}").randint(-30, 40)
     await message.answer(
         f"🌡 <b>Погода в чате</b>\n{state}\nТемпература общения: <b>{degrees:+d}°</b>"
     )
@@ -14727,6 +15446,24 @@ async def cmd_misc_who(message: Message):
     await message.answer(random.choice(_WHO_TEMPLATES).format(who=name, q=html.escape(topic)))
 
 
+# Чем бот отзывается, когда его зовут по имени. Список, а не одна фраза:
+# позвать бота — обычное дело, и десять одинаковых «На месте!» за день
+# читаются как автоответчик, а не как живой чат.
+BOT_CALL_REPLIES = (
+    "Тутачки",
+    "Да?",
+    "Пум-пурум?",
+    "Тут я, тут",
+    "Ась?",
+    "На связи",
+    "Чего звали?",
+    "Мур?",
+    "Здесь. Что случилось?",
+)
+
+# Слова, на которые бот отзывается как на своё имя.
+BOT_CALL_WORDS = frozenset({"бот", "хуйло", "хуйлан"})
+
 _PING_REPLIES = {
     "пинг": "🏓 Понг!",
     "кинг": "👑 Конг!",
@@ -14748,6 +15485,23 @@ _PING_REPLIES = {
 async def cmd_misc_ping(message: Message):
     if not _check_misc_access(message.from_user.id, "misc_ping"):
         return
+    слово = ru_text.yo(message.text.strip().casefold())
+    # Зов по имени — не пинг: ни одной фразы про миллисекунды. «Тутачки
+    # (240 мс)» — это уже телеметрия, а не разговор. И отвечаем ЦИТАТОЙ: в
+    # чате, где говорят трое, ответ в пустоту не показывает, кого позвали.
+    if слово in BOT_CALL_WORDS:
+        # Сначала обращение к позвавшему кликабельным именем, потом с новой
+        # строки сама фраза: так видно, кому бот отвечает, даже когда
+        # сообщение пролистали, а цитата свернулась.
+        #
+        # Имя берём тем же display_name, что и РП-действия: он показывает НИК
+        # этого чата, если человек его задал. mention_id знает только имя из
+        # телеграма — обратись бот по нему, вышло бы, что в «обнял» человек
+        # один, а в ответе на зов другой.
+        кто = await display_name(message.chat.id, message.from_user)
+        await message.reply(f"{кто},\n{random.choice(BOT_CALL_REPLIES)}")
+        return
+
     reply = _PING_REPLIES[message.text.strip().casefold()]
     latency_ms = None
     if message.date is not None:
@@ -15044,7 +15798,9 @@ async def cmd_ship_reset(message: Message):
 # коины и звёздность хранятся per-chat, не общие между чатами бота.
 # ============================================================================
 FARM_COOLDOWN = timedelta(hours=4)
-STOCK_MAX_INVEST = 10_000_000       # максимум вложений на человека
+# Потолок вложений общий с сайтом: разъедься эти два числа — и в чате
+# «максимум 10 млн», а в кабинете уже другой предел на того же человека.
+STOCK_MAX_INVEST = stock_actions.MAX_INVEST
 # Границы шага курса и процент дивидендов задаются на чат и живут в БД:
 # значения по умолчанию — в DEFAULT таблицы stock_settings (db.py), рабочие
 # читает stock_market_loop через db.get_stock_settings, правит админ в
@@ -15060,38 +15816,16 @@ EARNINGS_SCALE = 10
 
 FARM_BASE_MIN = 400
 FARM_BASE_MAX = 1200
-FARM_STAR_CAP = 10
-# Было 20 фармов на звезду. При кулдауне в 4 часа это 3,3 суток игры без
-# единого пропуска ради одной звезды и месяц с лишним ради максимума — рост
-# формально работал, но за ним невозможно было уследить, и звёздности никто
-# не видел. Пять фармов — первая звезда за сутки, максимум примерно за неделю.
-FARM_FARMS_PER_STAR = 5
+# Звёздность считает farm_actions: от неё зависит число грядок, а грядки
+# показывает ещё и сайт. Два места, делящие фармы на звёзды по-своему, —
+# расхождение, которое видно только по жалобе.
+FARM_STAR_CAP = farm_actions.FARM_STAR_CAP
+FARM_FARMS_PER_STAR = farm_actions.FARM_FARMS_PER_STAR
 FARM_STAR_BONUS_PER_LEVEL = 0.05  # +5% к множителю за каждую звезду
 
 
-def farm_star_progress(total_farms: int) -> tuple[int, int, int]:
-    """(звёзд сейчас, фармов в текущей звезде, сколько нужно на следующую).
-
-    На максимуме «набрано» и «нужно» равны — полоса просто полная, а не
-    делится на ноль (так же сделано у уровня питомца, см. pets.level_progress).
-    """
-    total = max(0, int(total_farms))
-    stars = min(FARM_STAR_CAP, total // FARM_FARMS_PER_STAR)
-    if stars >= FARM_STAR_CAP:
-        return stars, FARM_FARMS_PER_STAR, FARM_FARMS_PER_STAR
-    return stars, total % FARM_FARMS_PER_STAR, FARM_FARMS_PER_STAR
-
-
-def wallet_stars(wallet: dict) -> int:
-    """Звёздность кошелька — ВСЕГДА из числа фармов, а не из столбца.
-
-    star_level в базе пересчитывается только внутри record_farm, то есть при
-    фарме. После правки FARM_FARMS_PER_STAR столбец отстаёт до следующего
-    фарма, и кошелёк показывал бы больше звёзд, чем на самом деле даёт бонус
-    к доходу и урону по боссу. Столбец остаётся кэшем для сортировок, а
-    источник правды — total_farms.
-    """
-    return farm_star_progress(int(wallet.get("total_farms") or 0))[0]
+farm_star_progress = farm_actions.farm_star_progress
+wallet_stars = farm_actions.wallet_stars
 
 
 def debt_note(coins: int) -> str:
@@ -15335,103 +16069,38 @@ async def paginate_farm_top(callback: CallbackQuery):
 # трюфели (кладоискатель), пчела опыляет (подработка), муравей ускоряет рост
 # (смена) — сила берётся из того же процента, что и в их основном занятии.
 # ============================================================================
-FARM_PET_HARVEST_ABILITY = "side_job"    # 🐝 пчела — больше урожая
-FARM_PET_SPEED_ABILITY = "work"          # 🐜 муравей — быстрее растёт
-FARM_PET_TRUFFLE_ABILITY = "treasure"    # 🐷 свинка — шанс на трюфель
+# Способности, ключи хранения, аура питомцев и счёт грядок живут в
+# farm_actions: тем же самым пользуется сайт. Два места, считающие грядки и
+# ауру по-своему, — это расхождение, которое замечают по жалобе, а не по тесту.
+FARM_PET_HARVEST_ABILITY = farm_actions.FARM_PET_HARVEST_ABILITY   # 🐝 пчела
+FARM_PET_SPEED_ABILITY = farm_actions.FARM_PET_SPEED_ABILITY       # 🐜 муравей
+FARM_PET_TRUFFLE_ABILITY = farm_actions.FARM_PET_TRUFFLE_ABILITY   # 🐷 свинка
 
-
-@dataclass(frozen=True)
-class FarmAura:
-    """Что питомцы дают огороду. Одной структурой по той же причине, что и
-    PetAura: способностей уже три, и четвёртая иначе потребовала бы править
-    посадку и сбор по отдельности — а забыть одну из двух проще простого."""
-    harvest: int = 0    # + к урожаю при сборе
-    speed: int = 0      # + к скорости роста при посадке
-    truffle: int = 0    # шанс трюфеля в процентах
-
-
-async def _farm_aura(chat_id: int, user_id: int) -> FarmAura:
-    """Все три способности за ОДНУ выборку питомцев.
-
-    Через _pet_bonus по разу на способность это был бы тройной поход в базу
-    (питомцы + каталог + карточка) на каждый показ грядок — ровно та причина,
-    по которой рядом появилась PetAura.
-
-    Ошибку глотаем, как и в _pet_bonus: питомец на грядке — приятная добавка,
-    и упавший запрос не должен ломать посадку.
-    """
-    try:
-        rows = await db.list_pets(chat_id, user_id)
-        if not rows:
-            return FarmAura()
-        specs = await game_actions._pet_specs(chat_id)
-        pinned_key = await game_actions._pinned_pet_key(chat_id, user_id)
-    except Exception as exc:
-        log_suppressed("_farm_aura", exc)
-        return FarmAura()
-    aura = game_actions._pet_aura(rows, specs, pinned_key)
-    percent = game_actions._pet_ability_sums(rows, specs, pinned_key, aura, (
-        FARM_PET_HARVEST_ABILITY, FARM_PET_SPEED_ABILITY, FARM_PET_TRUFFLE_ABILITY))
-    return FarmAura(
-        harvest=percent[FARM_PET_HARVEST_ABILITY],
-        speed=percent[FARM_PET_SPEED_ABILITY],
-        truffle=percent[FARM_PET_TRUFFLE_ABILITY],
-    )
+FarmAura = farm_actions.FarmAura
+_farm_aura = farm_actions.aura
+_farm_bought_plots = farm_actions.bought_plots
+_farm_plots_key = farm_actions.plots_key
+_farm_counter_key = farm_actions.counter_key
+_farm_bump_counter = farm_actions.bump_counter
 
 
 def farm_weather(chat_id: int) -> farming.Weather:
     """Погода этого чата на сегодня. Не хранится — выводится из даты."""
-    return farming.weather_for(chat_id, utc_today())
+    return farm_actions.weather_for(chat_id, local_today())
 
 
-async def _farm_bought_plots(chat_id: int, user_id: int) -> int:
-    """Сколько грядок человек докупил за монеты. Живёт в общем key-value:
-    одно число на человека — не повод заводить таблицу."""
-    row = await db.get_data(_farm_plots_key(chat_id, user_id))
-    try:
-        return max(0, int((row or {}).get("data_value") or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _farm_plots_key(chat_id: int, user_id: int) -> str:
-    return f"farm_plots:{chat_id}:{user_id}"
-
-
-def _farm_counter_key(chat_id: int, user_id: int, what: str) -> str:
-    return f"farm_count_{what}:{chat_id}:{user_id}"
-
-
-async def _farm_bump_counter(chat_id: int, user_id: int, what: str, by: int = 1) -> int:
-    """Счётчик посадок/сборов под ачивки. Считаем ГРЯДКИ, а не команды: «посадил
-    сто раз по одной» и «десять раз по десять» — одинаковый труд, и различать
-    их значило бы награждать за дробление команд."""
-    key = _farm_counter_key(chat_id, user_id, what)
-    row = await db.get_data(key)
-    try:
-        было = int((row or {}).get("data_value") or 0)
-    except (TypeError, ValueError):
-        было = 0
-    стало = было + max(0, by)
-    await db.set_data(key, str(стало), updated_by=user_id)
-    return стало
+async def _farm_stars(chat_id: int, user_id: int) -> int:
+    """Звёздность для расчёта грядок. Отдельной строкой, потому что нужна и
+    здесь, и на сайте, а берётся не из столбца (см. wallet_stars)."""
+    return wallet_stars(await db.get_wallet(chat_id, user_id))
 
 
 async def _farm_plot_sources(chat_id: int, user_id: int) -> dict:
     """Откуда взялась каждая грядка. Разбивка нужна не для красоты: упершись в
     потолок, человек обязан видеть, какой именно источник ещё не выбран, —
     иначе «40 максимум» выглядит как стена без двери."""
-    stars = wallet_stars(await db.get_wallet(chat_id, user_id))
-    bought = await _farm_bought_plots(chat_id, user_id)
-    # Предметы (ачивки и теплица) — тем же способом, что и остальные привилегии.
-    items = await _item_perk(chat_id, user_id, shop_effects.PERK_FARM_PLOTS)
-    return {
-        "stars": stars,
-        "from_stars": farming.plots_from_stars(stars),
-        "bought": bought,
-        "items": items,
-        "total": farming.plots_for(stars, bought, items),
-    }
+    return await farm_actions.plot_sources(
+        chat_id, user_id, await _farm_stars(chat_id, user_id))
 
 
 async def _farm_plot_count(chat_id: int, user_id: int) -> int:
@@ -15787,14 +16456,16 @@ async def _collect_barn(chat_id: int, user_id: int, now: datetime) -> list[str]:
         animal = livestock.BY_KEY.get(row["animal_key"])
         if animal is None:
             continue          # вид убрали из каталога — строку просто пропускаем
-        units = livestock.produced(animal, row["last_collect_at"], now)
+        голов = int(row.get("quantity") or 1)
+        units = livestock.produced(animal, row["last_collect_at"], now, голов)
         if units <= 0:
             continue
         await db.add_inventory_item(chat_id, user_id, animal.item_key, units)
         собрано.append(animal.key)
-        полный = " (был полный хлев)" if units >= animal.cap else ""
+        полный = " (был полный хлев)" if units >= livestock.total_cap(animal, голов) else ""
+        сколько_голов = f" ×{голов}" if голов > 1 else ""
         lines.append(f"{animal.item_emoji} {animal.item_name} ×{units}"
-                     f" — от {animal.name.lower()}{полный}")
+                     f" — от {animal.name.lower()}{сколько_голов}{полный}")
     # Отметка ПОСЛЕ выдачи: упади она — человек получит продукт ещё раз, и это
     # лучше, чем отметить сбор и потерять вещи.
     await db.touch_farm_animals(chat_id, user_id, собрано, now)
@@ -15827,29 +16498,39 @@ async def cmd_barn(message: Message):
             animal = livestock.BY_KEY.get(row["animal_key"])
             if animal is None:
                 continue
-            units = livestock.produced(animal, row["last_collect_at"], now)
-            left = livestock.next_unit_in(animal, row["last_collect_at"], now)
+            голов = int(row.get("quantity") or 1)
+            units = livestock.produced(animal, row["last_collect_at"], now, голов)
+            left = livestock.next_unit_in(animal, row["last_collect_at"], now, голов)
             хвост = ("полный хлев — заберите" if left is None
                      else f"следующее через {format_duration_ru(left)}")
-            lines.append(f"{animal.emoji} <b>{animal.name}</b> — "
-                         f"{animal.item_emoji} {units}/{animal.cap}, {хвост}")
+            сколько_голов = f" × {голов}" if голов > 1 else ""
+            lines.append(f"{animal.emoji} <b>{animal.name}</b>{сколько_голов} — "
+                         f"{animal.item_emoji} {units}/{livestock.total_cap(animal, голов)}, {хвост}")
         lines.append("")
         lines.append("Забрать всё: <code>ферма собрать</code> (заодно и грядки)")
     else:
         lines.append("Пусто. Купить: <code>ферма купить корова</code>")
 
-    есть = {row["animal_key"] for row in rows}
-    свободные = [a for a in livestock.ANIMALS if a.key not in есть]
+    # Показываем не «которых нет», а «где есть место»: вид можно докупать до
+    # потолка, и пропав из списка после первой головы, он выглядел бы
+    # недоступным.
+    поголовье = {row["animal_key"]: int(row.get("quantity") or 1) for row in rows}
+    свободные = [a for a in livestock.ANIMALS
+                 if поголовье.get(a.key, 0) < livestock.MAX_PER_KIND]
     if свободные:
         lines.append("")
         lines.append("🛒 <b>Можно купить:</b>")
-        lines += [
-            f"{a.emoji} {a.name} — {a.price} i¢ · {a.item_emoji} {a.item_name.lower()} "
-            f"{a.per_cycle} шт / {_ru_decimal(a.cycle_hours, 0)} ч (до {a.cap})"
-            for a in свободные
-        ]
+        for a in свободные:
+            место = livestock.MAX_PER_KIND - поголовье.get(a.key, 0)
+            ещё = f" · можно ещё {место}" if поголовье.get(a.key) else ""
+            lines.append(
+                f"{a.emoji} {a.name} — {a.price} i¢ · {a.item_emoji} {a.item_name.lower()} "
+                f"{a.per_cycle} шт / {_ru_decimal(a.cycle_hours, 0)} ч (до {a.cap}){ещё}"
+            )
     lines.append("")
-    lines.append("Продать: <code>ферма продать корова</code> — вернут половину цены")
+    lines.append(f"Сразу несколько: <code>ферма купить корова 3</code> "
+                 f"(до {livestock.MAX_PER_KIND} одного вида) · «все» — сколько хватит монет")
+    lines.append("Продать: <code>ферма продать корова [сколько]</code> — вернут половину цены")
     await message.reply("\n".join(lines))
 
 
@@ -15864,6 +16545,22 @@ def _barn_target(text: str, trigger_words: int) -> Optional[object]:
 
 BARN_BUY_RE = ru_text.rx(r"(?i)^!?ферма\s+купить\s+(\S+)")
 BARN_SELL_RE = ru_text.rx(r"(?i)^!?ферма\s+продать\s+(\S+)")
+
+
+def _barn_quantity(text: str, trigger_words: int = 3) -> object:
+    """Сколько голов просят: число, слово «все» или 1, если не указано.
+
+    None — написано что-то третье; вызывающий обязан ответить отказом, а не
+    молча взять одну: «ферма купить корова тр» — это опечатка в числе, и
+    покупать по ней одну корову значит делать не то, о чём просили.
+    """
+    слова = ru_text.yo(text.strip().casefold()).split()
+    if len(слова) <= trigger_words:
+        return 1
+    хвост = слова[trigger_words]
+    if is_spend_all(хвост):
+        return GIFT_ALL          # тот же маркер «сколько получится», что и у подарка
+    return int(хвост) if хвост.isascii() and хвост.isdigit() else None
 
 
 @router.message(
@@ -15882,35 +16579,78 @@ async def cmd_barn_buy(message: Message):
     if await is_account_frozen(chat_id, user_id):
         await message.reply("🧊 Ваш счёт заморожен администрацией — покупка недоступна.")
         return
-    rows = await db.list_farm_animals(chat_id, user_id)
-    if any(r["animal_key"] == animal.key for r in rows):
-        # Одно каждого вида — как у бизнесов. Пять коров это просто «×5 к
-        # молоку», то есть никакого решения; «на что копить дальше» — решение.
-        await message.reply(f"{animal.emoji} {animal.name} у вас уже есть — "
-                            "вторую такую не заводят.")
+    сколько = _barn_quantity(message.text)
+    if сколько is None:
+        await message.reply("Сколько голов — число или слово «все». "
+                            "Например: <code>ферма купить корова 3</code>.")
         return
-    if not await spend_coins(chat_id, user_id, animal.price):
-        wallet = await db.get_wallet(chat_id, user_id)
+
+    есть = await db.get_farm_animal_quantity(chat_id, user_id, animal.key)
+    место = livestock.MAX_PER_KIND - есть
+    if место <= 0:
         await message.reply(
-            f"Недостаточно монет: {animal.name.lower()} стоит <b>{animal.price}</b> i¢, "
-            f"а у вас {wallet.get('coins', 0)} i¢."
+            f"{animal.emoji} {animal.name.lower()} у вас уже {есть} — "
+            f"больше {livestock.MAX_PER_KIND} одного вида не держат."
+        )
+        return
+
+    wallet = await db.get_wallet(chat_id, user_id)
+    монеты = int(wallet.get("coins", 0))
+    if сколько is GIFT_ALL:
+        # «Все» — сколько влезет: и по деньгам, и по потолку вида.
+        сколько = min(место, монеты // animal.price)
+        if сколько <= 0:
+            await message.reply(
+                f"На {animal.name.lower()} нужно минимум <b>{animal.price}</b> i¢, "
+                f"а у вас {монеты} i¢." + await activity_hint(chat_id, user_id)
+            )
+            return
+    if сколько <= 0:
+        await message.reply("Голов должно быть больше нуля.")
+        return
+    if сколько > место:
+        await message.reply(
+            f"{animal.emoji} Больше {livestock.MAX_PER_KIND} одного вида не держат: "
+            f"у вас {есть}, взять можно ещё {место}."
+        )
+        return
+
+    цена = animal.price * сколько
+    if not await spend_coins(chat_id, user_id, цена):
+        await message.reply(
+            f"Недостаточно монет: {сколько} × {animal.name.lower()} — это "
+            f"<b>{цена}</b> i¢, а у вас {монеты} i¢."
             + await activity_hint(chat_id, user_id)
         )
         return
+
     now = datetime.utcnow()
-    if not await db.add_farm_animal(chat_id, user_id, animal.key, now):
-        # Гонка двух команд подряд: деньги вернуть обязаны.
-        await db.add_coins(chat_id, user_id, animal.price)
-        await message.reply("Не получилось — кажется, животное уже куплено.")
+    # Накопленное забираем ДО прибавления голов: last_collect_at у вида один
+    # на всех, и новые животные иначе надоили бы за время, когда их не было.
+    собрано = await _collect_barn(chat_id, user_id, now)
+    добавлено = await db.add_farm_animals(chat_id, user_id, animal.key, now,
+                                          quantity=сколько,
+                                          max_per_kind=livestock.MAX_PER_KIND)
+    if добавлено < сколько:
+        # Упёрлись в потолок между проверкой и покупкой (две команды подряд) —
+        # за неполученных возвращаем деньги.
+        await db.add_coins(chat_id, user_id, animal.price * (сколько - добавлено))
+    if добавлено <= 0:
+        await message.reply("Не получилось — хлев уже полон.")
         return
     await db.seed_extra_shop_items(chat_id, livestock.SHOP_ITEMS, is_active=False)
-    await db.add_log("barn_buy", chat_id=chat_id, actor_id=user_id, details=animal.key)
+    await db.add_log("barn_buy", chat_id=chat_id, actor_id=user_id,
+                     details=f"{animal.key}x{добавлено}")
+    стало = есть + добавлено
+    хвост = ("\nНакопленное перед покупкой забрали:\n" + "\n".join(собрано)) if собрано else ""
     await message.reply(
-        f"✅ {animal.emoji} <b>{animal.name}</b> в хлеву за {animal.price} i¢.\n"
-        f"Даёт {animal.item_emoji} {animal.item_name.lower()} — "
-        f"{animal.per_cycle} шт раз в {_ru_decimal(animal.cycle_hours, 0)} ч, "
-        f"копится до {animal.cap}.\n"
+        f"✅ {animal.emoji} <b>{animal.name}</b> × {добавлено} в хлеву за "
+        f"{animal.price * добавлено} i¢ — всего голов: {стало}.\n"
+        f"Дают {animal.item_emoji} {animal.item_name.lower()} — "
+        f"{animal.per_cycle * стало} шт раз в {_ru_decimal(animal.cycle_hours, 0)} ч, "
+        f"копится до {livestock.total_cap(animal, стало)}.\n"
         f"Забрать: <code>ферма собрать</code> · что собрать из этого: <code>крафты</code>"
+        f"{хвост}"
     )
 
 
@@ -15926,20 +16666,44 @@ async def cmd_barn_sell(message: Message):
     if animal is None:
         await message.reply("Такого в хлеву не держат. Посмотреть: <code>ферма скот</code>")
         return
+    сколько = _barn_quantity(message.text)
+    if сколько is None:
+        await message.reply("Сколько голов — число или слово «все». "
+                            "Например: <code>ферма продать корова 2</code>.")
+        return
+    есть = await db.get_farm_animal_quantity(chat_id, user_id, animal.key)
+    if есть <= 0:
+        await message.reply(f"{animal.name} у вас и нет. Посмотреть: <code>ферма скот</code>")
+        return
+    if сколько is GIFT_ALL:
+        сколько = есть
+    if сколько <= 0:
+        await message.reply("Голов должно быть больше нуля.")
+        return
+    if сколько > есть:
+        await message.reply(
+            f"{animal.emoji} У вас {есть} — продать {сколько} не выйдет."
+        )
+        return
+
     now = datetime.utcnow()
     # Сначала отдаём накопленное, потом продаём: иначе продажа тихо съедала бы
     # молоко, за которым человек, может, и заходил.
     собрано = await _collect_barn(chat_id, user_id, now)
-    if not await db.remove_farm_animal(chat_id, user_id, animal.key):
+    продано = await db.remove_farm_animals(chat_id, user_id, animal.key, сколько)
+    if продано <= 0:
         await message.reply(f"{animal.name} у вас и нет. Посмотреть: <code>ферма скот</code>")
         return
-    цена = livestock.sell_back(animal)
+    цена = livestock.sell_back(animal) * продано
     await db.add_coins(chat_id, user_id, цена)
-    await db.add_log("barn_sell", chat_id=chat_id, actor_id=user_id, details=animal.key)
+    await db.add_log("barn_sell", chat_id=chat_id, actor_id=user_id,
+                     details=f"{animal.key}x{продано}")
     хвост = ("\nНакопленное перед продажей забрали:\n" + "\n".join(собрано)) if собрано else ""
+    осталось = есть - продано
+    остаток_текст = f" Осталось голов: {осталось}." if осталось else ""
     await message.reply(
-        f"✅ {animal.emoji} {animal.name} продана за {цена} i¢ "
-        f"({livestock.SELL_BACK_PERCENT}% цены).{хвост}"
+        f"✅ {animal.emoji} {animal.name} × {продано} — продано за {цена} i¢ "
+        f"({livestock.SELL_BACK_PERCENT}% цены).{остаток_текст}{хвост}"
     )
 
 
@@ -16745,7 +17509,10 @@ async def _daily_bonus_execute(chat_id: int, user_id: int) -> str:
         return "🧊 Ваш счёт заморожен администрацией — бонус недоступен."
 
     now = datetime.utcnow()
-    today = utc_today()          # тот же отсчёт суток, что и у стрика активности
+    # Сутки бонуса — МЕСТНЫЕ: у него своя колонка last_day, чужой истории по
+    # UTC-суткам здесь нет, а человек ждёт обновления в свою полночь (см.
+    # блок «Границы суток»). По UTC бонус в чате на МСК обновлялся в три ночи.
+    today = local_today()
     row = await db.get_earning_activity(chat_id, user_id, EARN_DAILY_BONUS)
     last_day = row.get("last_day") if row else None
     if last_day == today:
@@ -16831,10 +17598,14 @@ SIDE_JOB_TIP_CHANCE = 0.12      # чаевые: +50% к оплате
 SIDE_JOB_SCAM_CHANCE = 0.06     # заказчик пропал: смена впустую
 
 
-def _until_utc_midnight(now: datetime) -> timedelta:
-    """Сколько осталось до обнуления суточных счётчиков."""
-    завтра = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-    return max(завтра - now, timedelta(seconds=1))
+def _until_daily_reset(now: datetime) -> timedelta:
+    """Сколько осталось до обнуления суточных счётчиков.
+
+    До МЕСТНОЙ полуночи, потому что по ней эти счётчики и обнуляются (своя
+    колонка-отметка, см. блок «Границы суток»). Раньше считалось до полуночи
+    по UTC — в чате на МСК бот обещал обновление в три ночи.
+    """
+    return max(next_local_midnight_utc() - now, timedelta(seconds=1))
 
 
 async def _side_job_left_today(chat_id: int, user_id: int) -> Optional[int]:
@@ -16848,7 +17619,7 @@ async def _side_job_left_today(chat_id: int, user_id: int) -> Optional[int]:
     limit = await db.get_side_job_daily_limit(chat_id)
     if limit <= 0:
         return None
-    done = await db.count_activity_today(chat_id, user_id, EARN_SIDE_JOB, utc_today())
+    done = await db.count_activity_today(chat_id, user_id, EARN_SIDE_JOB, local_today())
     return max(0, limit - done)
 
 
@@ -16875,7 +17646,7 @@ async def _side_job_execute(chat_id: int, user_id: int) -> str:
         limit = await db.get_side_job_daily_limit(chat_id)
         return (
             f"😴 На сегодня хватит — вы уже взяли {limit} подработок.\n"
-            f"Новые появятся через {format_duration_ru(_until_utc_midnight(now))}."
+            f"Новые появятся через {format_duration_ru(_until_daily_reset(now))}."
             + await activity_hint(chat_id, user_id, "side_job")
         )
 
@@ -16904,7 +17675,7 @@ async def _side_job_execute(chat_id: int, user_id: int) -> str:
     await db.touch_earning_activity(chat_id, user_id, EARN_SIDE_JOB, now, earned=amount)
     # Суточный счётчик — рядом с отметкой кулдауна и по той же причине:
     # упади запись, человек останется без денег, но не с обходом лимита.
-    await db.bump_activity_today(chat_id, user_id, EARN_SIDE_JOB, utc_today())
+    await db.bump_activity_today(chat_id, user_id, EARN_SIDE_JOB, local_today())
     if amount:
         await db.add_coins(chat_id, user_id, amount)
         await db.add_log("side_job", chat_id=chat_id, actor_id=user_id, details=str(amount))
@@ -17839,6 +18610,80 @@ async def cb_business_buy_offer(callback: CallbackQuery):
             f"за <b>{price}</b> i¢.\nКопилка обнулена — доход пошёл заново.",
             reply_markup=_business_offer_kb(closed=True),
         )
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Бизнес ваш!")
+
+
+# ---------- Сделка, предложенная С САЙТА ----------
+# Кнопку жмут здесь, а предложение создала панель — в другом процессе. Поэтому
+# сделка лежит в базе (business_actions.offer), а в callback_data едет только
+# её номер: держать её в памяти бота, как для чатовых команд, нельзя — эта
+# память для панели не существует.
+BIZ_DEAL_PREFIX = "bizdeal:"
+
+
+def _biz_deal_kb(chat_id: int, deal_id: int, price: int,
+                 closed: bool = False) -> InlineKeyboardMarkup:
+    if closed:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Сделка закрыта",
+                                 callback_data=f"{BIZ_DEAL_PREFIX}{deal_id}:x")]])
+    беру = "✅ Принять" if not price else f"✅ Купить за {price} i¢"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=беру, callback_data=f"{BIZ_DEAL_PREFIX}{deal_id}:ok"),
+        InlineKeyboardButton(text="✖️ Отказаться",
+                             callback_data=f"{BIZ_DEAL_PREFIX}{deal_id}:no"),
+    ]])
+
+
+@router.callback_query(F.data.startswith(BIZ_DEAL_PREFIX))
+async def cb_business_site_deal(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    try:
+        номер, что = callback.data[len(BIZ_DEAL_PREFIX):].split(":", 1)
+        deal_id = int(номер)
+    except (ValueError, AttributeError):
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+    if что == "x":
+        await callback.answer()
+        return
+
+    if что == "no":
+        итог = await business_actions.decline_deal(chat_id, deal_id, callback.from_user.id)
+        if not итог.ok:
+            await callback.answer(итог.error, show_alert=True)
+            return
+        try:
+            await callback.message.edit_text(
+                "🤝 <b>Сделка отменена.</b>",
+                reply_markup=_biz_deal_kb(chat_id, deal_id, 0, closed=True))
+        except TelegramBadRequest:
+            pass
+        await callback.answer("Отказ принят.")
+        return
+
+    if await is_account_frozen(chat_id, callback.from_user.id):
+        await callback.answer("Ваш счёт заморожен администрацией.", show_alert=True)
+        return
+    итог = await business_actions.accept_deal(chat_id, deal_id, callback.from_user.id)
+    if not итог.ok:
+        await callback.answer(итог.error, show_alert=True)
+        return
+
+    item = business_catalog.BY_KEY.get(итог.key)
+    покупатель = await display_name_by_id(chat_id, итог.user_id)
+    await db.add_log("business_sell_user", chat_id=chat_id,
+                     actor_id=итог.user_id, details=f"{итог.key}:{итог.spent}:site")
+    цена = f"за <b>{итог.spent}</b> i¢" if итог.spent else "в дар"
+    try:
+        await callback.message.edit_text(
+            f"🤝 <b>Сделка состоялась.</b>\n{DIVIDER}\n"
+            f"{item.name if item else итог.key} ({итог.level} ур.) перешёл "
+            f"к {покупатель} {цена}.\n"
+            "Копилка обнулена — доход пошёл заново.",
+            reply_markup=_biz_deal_kb(chat_id, deal_id, 0, closed=True))
     except TelegramBadRequest:
         pass
     await callback.answer("Бизнес ваш!")
@@ -19713,7 +20558,7 @@ SEASON_TICK = timedelta(minutes=30)
 
 
 def _current_season() -> str:
-    return seasons.season_key(utc_today())
+    return seasons.season_key(local_today())
 
 
 async def _add_season_points(chat_id: int, user_id: int, points: int) -> None:
@@ -19795,7 +20640,7 @@ async def seasons_loop() -> None:
     while True:
         try:
             await asyncio.sleep(SEASON_TICK.total_seconds())
-            previous = seasons.previous_season_key(utc_today())
+            previous = seasons.previous_season_key(local_today())
             for chat_id in await db.list_active_chat_ids():
                 try:
                     text = await close_season_for_chat(chat_id, previous)
@@ -19815,34 +20660,17 @@ async def seasons_loop() -> None:
 # Второе место правды рано или поздно разошлось бы с первым.
 
 async def _collection_progress(chat_id: int, user_id: int) -> dict:
-    """Для каждой коллекции — сколько собрано из скольких."""
-    out: dict = {}
+    """Для каждой коллекции — сколько собрано из скольких.
 
-    owned_biz = await db.list_user_businesses(chat_id, user_id)
-    total_biz = len(business_catalog.BUSINESSES)
-    out["tycoon"] = (len(owned_biz), total_biz)
-    maxed = sum(1 for row in owned_biz
-                if int(row["level"]) >= business_catalog.MAX_LEVEL)
-    out["empire"] = (maxed, total_biz)
-
-    specs = await game_actions._pet_specs(chat_id)
-    owned_pets = {row["pet_key"] for row in await db.list_pets(chat_id, user_id)}
-    # Считаем по КАТАЛОГУ ЧАТА, а не по встроенному списку: админ мог завести
-    # своих питомцев, и без них коллекция была бы уже неполной.
-    out["zoo"] = (len(owned_pets & set(specs)), len(specs))
-
-    # Хлам считаем по инвентарю: предметы обычные, спецэффектов у них нет,
-    # и единственный их смысл — собраться полностью.
-    inventory = {row["item_key"] for row in await db.list_inventory(chat_id, user_id)}
-    out["junk"] = (len(inventory & set(db.JUNK_ITEM_KEYS)), len(db.JUNK_ITEM_KEYS))
-
-    titles = {row["title_key"] for row in await db.list_user_titles(chat_id, user_id)}
-    streak = collections_meta.season_streak_keys(_current_season(), seasons.previous_of)
-    got = sum(1 for key in streak
-              if any(f"season_{key}_{place}" in titles
-                     for place in range(1, seasons.PLACES + 1)))
-    out["dynasty"] = (got, collections_meta.SEASON_STREAK)
-    return out
+    Считает общий с сайтом gallery_actions: разъедься расчёт, и одна и та же
+    коллекция оказалась бы собранной в чате и несобранной в кабинете. Каталог
+    питомцев и сезон передаём отсюда — они зависят от чата и его времени.
+    """
+    return await gallery_actions.collection_progress(
+        chat_id, user_id,
+        pet_specs=await game_actions._pet_specs(chat_id),
+        season_key=_current_season(),
+    )
 
 
 async def _check_collections(chat_id: int, user_id: int, announce: bool = True) -> None:
@@ -20080,7 +20908,7 @@ async def cmd_transfer(message: Message):
         await message.reply("🧊 Ваш счёт заморожен — переводы недоступны.")
         return
 
-    if has_infinite_money(message.from_user.id):
+    if await has_infinite_money(message.from_user.id):
         await db.add_coins(message.chat.id, target.id, amount)
     else:
         wallet = await db.get_wallet(message.chat.id, message.from_user.id)
@@ -20242,37 +21070,15 @@ async def _apply_lucky(chat_id: int, user_id: int, amount: int) -> tuple[int, bo
 # инвентаря: страховка от неё не спасает, предупреждения жертве нет. Пока он
 # ограничивался только ценой предмета, богатый чистил чужие сумки подряд.
 # Кулдаун делает его событием, а не занятием.
-STEAL_COOLDOWN = timedelta(hours=10)
+# Откат, ключ и отметка — общие с сайтом (steal_actions): отметка пишется
+# задним числом, и вторая такая арифметика означала бы, что до следующего дела
+# ждать по-разному в зависимости от того, откуда пришли.
+STEAL_COOLDOWN = steal_actions.COOLDOWN
 
 
-def _steal_key(chat_id: int, user_id: int) -> str:
-    return f"steal:{chat_id}:{user_id}"
-
-
-async def _steal_cooldown_left(chat_id: int, user_id: int) -> Optional[timedelta]:
-    """Сколько ещё ждать, или None — можно идти на дело."""
-    row = await db.get_data(_steal_key(chat_id, user_id))
-    if not row or not row.get("data_value"):
-        return None
-    try:
-        last = datetime.fromisoformat(row["data_value"])
-    except ValueError:
-        return None
-    passed = datetime.utcnow() - last
-    return None if passed >= STEAL_COOLDOWN else STEAL_COOLDOWN - passed
-
-
-async def _steal_mark_used(chat_id: int, user_id: int, cut: float = 0.0) -> None:
-    """Отмечает, что медвежатник сработал.
-
-    cut — доля кулдауна, которую снимает слепок ключа. Механика та же, что у
-    «тачки для отхода» у ограбления (см. set_robbery_last_at): отметка
-    пишется задним числом, а не заводится отдельный заряд. Двух механизмов
-    на одну идею быть не должно.
-    """
-    stamp = datetime.utcnow() - STEAL_COOLDOWN * cut
-    await db.set_data(_steal_key(chat_id, user_id),
-                      stamp.isoformat(), updated_by=user_id)
+_steal_key = steal_actions.cooldown_key
+_steal_cooldown_left = steal_actions.cooldown_left
+_steal_mark_used = steal_actions.mark_used
 
 
 MEDVEZHATNIK_RE = ru_text.rx(r"(?i)^!?медвежатник\b\s*(.*)$")
@@ -20343,78 +21149,45 @@ async def cmd_steal_item(message: Message):
         )
         return
 
-    victim_items = {i["item_key"]: i["quantity"] for i in await db.list_inventory(chat_id, target.id)}
-    if victim_items.get(wanted, 0) <= 0:
-        target_name = await display_name(chat_id, target)
-        await message.reply(f"У {target_name} нет предмета «{html.escape(wanted)}».")
+    # Само дело — в steal_actions, общих с сайтом. Здесь остаются разбор
+    # команды и слова: правила у чата и кабинета обязаны быть одни, а порядок
+    # списаний в них такой, что вторая реализация разойдётся молча.
+    итог = await steal_actions.steal(chat_id, user_id, target.id, wanted)
+    if not итог.ok:
+        await message.reply(итог.error)
         return
 
-    # Сигнализация — единственная защита от медвежатника, и она ВЕРОЯТНОСТНАЯ:
-    # снижает шанс кражи, а не отменяет её (см. SIGNAL_BLOCK_CHANCE). Гарантия
-    # означала бы, что предмет за 75 000 упирается в предмет за 20 000 и не
-    # может его обойти никогда.
-    #
-    # Проверяется ПОСЛЕ проверки наличия вещи, чтобы опечатка в ключе не
-    # сжигала ничего. Когда срабатывает — медвежатник сгорает тоже: иначе им
-    # бесплатно проверяли бы, есть ли у цели сигнализация, и защита выдавала
-    # бы сама себя.
-    # Промах сигнализации — не «её нет»: она осталась у жертвы и сработает в
-    # следующий раз. Списывать её за несделанную работу значило бы продавать
-    # за 20 000 один бросок кубика.
-    signal_missed = False
-    if victim_items.get(black_market.SIGNAL_KEY, 0) > 0:
-        if random.randint(1, 100) <= black_market.SIGNAL_BLOCK_CHANCE:
-            await db.remove_inventory_item(chat_id, user_id, spec.key, 1)
-            await db.remove_inventory_item(chat_id, target.id, black_market.SIGNAL_KEY, 1)
-            await _steal_mark_used(chat_id, user_id)
-            await db.add_log("item_steal_blocked", chat_id=chat_id, actor_id=user_id,
-                             target_id=target.id, details=wanted)
-            actor_name = await display_name(chat_id, message.from_user)
-            target_name = await display_name(chat_id, target)
-            await message.answer(
-                f"🚨 {actor_name} вскрыл(а) закрома {target_name}, но взвыла "
-                f"сигнализация — уходить пришлось с пустыми руками."
-            )
-            await _dm_or_none(
-                target.id,
-                f"🚨 Вашу сигнализацию сорвали — кражу предотвратили, предмет "
-                f"«{html.escape(wanted)}» остался у вас. Сигнализация израсходована."
-            )
-            return
-        signal_missed = True
-
-    # Медвежатник тратится в любом случае — иначе его можно было бы жать по
-    # чужому инвентарю без риска, пока не найдётся что-то ценное.
-    await db.remove_inventory_item(chat_id, user_id, spec.key, 1)
-    await _steal_mark_used(chat_id, user_id)
-    if not await db.remove_inventory_item(chat_id, target.id, wanted, 1):
-        await message.reply("Предмет успели потратить — вскрывать оказалось нечего.")
-        return
-    await db.add_inventory_item(chat_id, user_id, wanted, 1)
-    await db.add_log("item_stolen", chat_id=chat_id, actor_id=user_id,
-                     target_id=target.id, details=wanted)
-
-    # Слепок ключа сокращает откат на четверть — но только теперь, когда
-    # кража точно удалась. Отметка выше ставится до того, как исход известен,
-    # и на ветке «предмет успели потратить» слепок сгорел бы зря.
-    thief_items = {i["item_key"]: i["quantity"]
-                   for i in await db.list_inventory(chat_id, user_id)}
-    if thief_items.get(black_market.SLEPOK_KEY, 0) > 0:
-        await db.remove_inventory_item(chat_id, user_id, black_market.SLEPOK_KEY, 1)
-        await _steal_mark_used(chat_id, user_id, cut=black_market.STEAL_COOLDOWN_CUT)
-
-    stolen = await db.get_shop_item(chat_id, wanted)
-    stolen_name = stolen["name"] if stolen else wanted
     actor_name = await display_name(chat_id, message.from_user)
     target_name = await display_name(chat_id, target)
+
+    if итог.outcome == "blocked":
+        await db.add_log("item_steal_blocked", chat_id=chat_id, actor_id=user_id,
+                         target_id=target.id, details=wanted)
+        await message.answer(
+            f"🚨 {actor_name} вскрыл(а) закрома {target_name}, но взвыла "
+            f"сигнализация — уходить пришлось с пустыми руками."
+        )
+        await _dm_or_none(
+            target.id,
+            f"🚨 Вашу сигнализацию сорвали — кражу предотвратили, предмет "
+            f"«{html.escape(wanted)}» остался у вас. Сигнализация израсходована."
+        )
+        return
+
+    if итог.outcome == "gone":
+        await message.reply("Предмет успели потратить — вскрывать оказалось нечего.")
+        return
+
+    await db.add_log("item_stolen", chat_id=chat_id, actor_id=user_id,
+                     target_id=target.id, details=wanted)
     await message.answer(
         f"🗝 {actor_name} вскрыл(а) закрома и унёс(ла) у {target_name} "
-        f"предмет «{html.escape(stolen_name)}»."
+        f"предмет «{html.escape(итог.item_name)}»."
     )
     # Про защиту говорим обязательно, и по-разному. Молчание после промаха
     # выглядит как сломанный предмет: человек купил сигнализацию за 20 000,
     # его всё равно обнесли, и он не знает, сработало ли что-нибудь вообще.
-    if signal_missed:
+    if итог.signal_missed:
         защита = (f"\n🚨 Сигнализация не сработала — она глушит кражу с шансом "
                   f"{black_market.SIGNAL_BLOCK_CHANCE}%. Потрачена не была, "
                   f"остаётся у вас на следующий раз.")
@@ -20423,7 +21196,7 @@ async def cmd_steal_item(message: Message):
                   f"рынке: глушит кражу с шансом {black_market.SIGNAL_BLOCK_CHANCE}%.")
     await _dm_or_none(
         target.id,
-        f"🗝 У вас украли предмет «{html.escape(stolen_name)}». "
+        f"🗝 У вас украли предмет «{html.escape(итог.item_name)}». "
         f"Работал медвежатник.{защита}"
     )
 
@@ -22147,7 +22920,7 @@ async def _use_effect_item(message: Message, item_key: str) -> None:
         # отдельная таблица ради одной даты не нужна.
         stamp_key = f"itemdaily:{chat_id}:{user_id}:{item_key}"
         row = await db.get_data(stamp_key)
-        today = utc_today().isoformat()
+        today = local_today().isoformat()
         if row and row.get("data_value") == today:
             await message.reply(
                 f"{spec.emoji} «{spec.name}» сегодня уже приносил доход. "
@@ -22302,7 +23075,11 @@ async def cmd_item_use(message: Message):
         )
 
 
-SELL_ITEM_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+продать|!продать)\s+(\S+)(?:\s+(\d+))?$")
+# Количество — ЛЮБОЙ токен, а не только цифры: иначе «магазин продать
+# bronik все» не совпадало с командой вовсе, и бот молча уходил в общую
+# подсказку по магазину. Разбирается токен ниже, в самом обработчике, —
+# там уже известно, сколько предметов на руках.
+SELL_ITEM_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+продать|!продать)\s+(\S+)(?:\s+(\S+))?$")
 # «!продать 500» одинаково похоже на продажу акций и на продажу предмета
 # с ключом «500» — раньше эту форму молча забирал продавец предметов, и
 # продажа акций была недостижима. Теперь голое число просит уточнения.
@@ -22340,10 +23117,18 @@ async def cmd_sell_item(message: Message):
     использовался (см. item_usage / ITEM_USE_LIMIT)."""
     match = SELL_ITEM_RE.match(message.text.strip())
     item_key = match.group(1).casefold()
-    amount = int(match.group(2)) if match.group(2) else 1
-    if amount <= 0:
-        await message.reply("Количество должно быть больше нуля.")
-        return
+    сырое_количество = match.group(2)
+    # «все» разворачивается ПОСЛЕ поиска предмета — по тому же правилу, что и
+    # у покупки: сколько именно это «все», знает не разбор команды, а данные.
+    продать_всё = is_spend_all(сырое_количество)
+    if not продать_всё:
+        if сырое_количество is not None and not сырое_количество.isdigit():
+            await message.reply("Количество — число или слово «все».")
+            return
+        amount = int(сырое_количество) if сырое_количество else 1
+        if amount <= 0:
+            await message.reply("Количество должно быть больше нуля.")
+            return
     if shop_effects.is_reward(item_key):
         await message.reply("🎖 Награды не продаются — это знак отличия, а не товар.")
         return
@@ -22355,14 +23140,18 @@ async def cmd_sell_item(message: Message):
     if item is None:
         await message.reply(f"У вас нет предмета «{html.escape(item_key)}».")
         return
+    if продать_всё:
+        amount = int(item["quantity"])
+        if amount <= 0:
+            await message.reply(f"У вас нет предмета «{html.escape(item_key)}».")
+            return
     if item["quantity"] < amount:
         await message.reply(f"У вас только {item['quantity']} шт. — не хватает, чтобы продать {amount}.")
         return
 
-    used = await db.get_item_usage_count(chat_id, user_id, item_key)
-    if used > 0:
-        await message.reply("⚠️ Этот предмет уже был в использовании — продать его нельзя.")
-        return
+    # Запрет на продажу использованного предмета снят по решению владельца:
+    # раньше здесь стоял отказ «уже был в использовании». Теперь продаётся
+    # всё, что лежит в инвентаре, — цена та же, 80%.
 
     shop_item = await db.get_shop_item(chat_id, item_key)
     if shop_item is None or shop_item.get("price") is None:
@@ -22654,13 +23443,6 @@ async def cmd_robbery(message: Message):
 EARN_BUSINESS_RAID = "business_raid"
 RAID_TRIGGERS = {"налёт", "налет", "!налёт", "!налет"}
 RAID_RE = ru_text.rx(r"(?i)^!?(?:бизнес\s+)?нал[её]т\b")
-
-
-def _is_raid_command(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    low = text.strip().casefold()
-    return low in RAID_TRIGGERS or bool(RAID_RE.match(low))
 
 
 async def _best_pot(chat_id: int, user_id: int) -> tuple[Optional[dict], int]:
@@ -22972,8 +23754,8 @@ async def collect_activity_states(chat_id: int, user_id: int) -> tuple[list, Opt
     # (last_day == сегодня), и отсчёт 24 часов от момента получения показывал
     # бы срок, которого на самом деле нет.
     bonus = await db.get_earning_activity(chat_id, user_id, EARN_DAILY_BONUS)
-    if bonus and bonus.get("last_day") == utc_today():
-        midnight = datetime.combine(utc_today() + timedelta(days=1), datetime.min.time())
+    if bonus and bonus.get("last_day") == local_today():
+        midnight = next_local_midnight_utc()
         add("daily_bonus", left=max(midnight - now, timedelta(seconds=1)))
     else:
         add("daily_bonus")
@@ -22984,7 +23766,7 @@ async def collect_activity_states(chat_id: int, user_id: int) -> tuple[list, Opt
     side = await db.get_earning_activity(chat_id, user_id, EARN_SIDE_JOB)
     left_today = await _side_job_left_today(chat_id, user_id)
     if left_today is not None and left_today <= 0:
-        add("side_job", left=_until_utc_midnight(now))
+        add("side_job", left=_until_daily_reset(now))
     else:
         add("side_job", left=_left_or_none((side or {}).get("last_at"),
                                            SIDE_JOB_COOLDOWN, now))
@@ -23385,8 +24167,8 @@ async def _raid_rotate_invite(chat_id: int) -> Optional[str]:
 
 
 @router.message(
-    F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip() == BTN_RAID_ON),
+    F.chat.type.in_({"private", "group", "supergroup"}),
+    F.text.func(_is_raid_on_phrase),
 )
 async def cmd_raid_start(message: Message):
     if not has_level(message.from_user.id, required_level("raid_mode")):
@@ -23445,8 +24227,8 @@ async def cmd_raid_start(message: Message):
 
 
 @router.message(
-    F.chat.type == "private",
-    F.text.func(lambda t: bool(t) and t.strip() == BTN_RAID_OFF),
+    F.chat.type.in_({"private", "group", "supergroup"}),
+    F.text.func(_is_raid_off_phrase),
 )
 async def cmd_raid_stop(message: Message):
     if not has_level(message.from_user.id, required_level("raid_mode")):
@@ -23589,15 +24371,11 @@ async def lucky_picker_choose(callback: CallbackQuery):
     await callback.answer("Фарт выдан 🍀")
 
 
-CASINO_COLOR_ALIASES = {
-    "красное": "red", "красный": "red", "red": "red", "кр": "red", "р": "red",
-    "черное": "black", "чёрное": "black", "черный": "black", "чёрный": "black",
-    "black": "black", "чб": "black", "ч": "black",
-    "зеленое": "green", "зелёное": "green", "зеленый": "green", "зелёный": "green",
-    "green": "green", "зел": "green", "з": "green",
-}
-CASINO_COLOR_EMOJI = {"red": "🔴", "black": "⚫", "green": "🟢"}
-CASINO_COLOR_LABEL = {"red": "Красное", "black": "Чёрное", "green": "Зелёное"}
+# Цвета, выплаты и оценка руки — в casino_actions: тем же самым играет
+# сайт, а две таблицы выплат — это две разные правды о деньгах.
+CASINO_COLOR_ALIASES = casino_actions.COLOR_ALIASES
+CASINO_COLOR_EMOJI = casino_actions.COLOR_EMOJI
+CASINO_COLOR_LABEL = casino_actions.COLOR_LABEL
 # Рулетка вызывается просто словом «рулетка». Точка и «!» перед ним
 # необязательны и оставлены ради тех, кто привык к старой форме «.рулетка».
 # Со словом «русскаяру» (шуточная игра с киком) это не пересекается: у неё
@@ -23616,9 +24394,9 @@ _CASINO_ROULETTE_USAGE = (
     "Играют с баланса казино: <code>казино баланс</code>, "
     "<code>казино пополнить {сумма}</code>."
 )
-CASINO_ROULETTE_MAX_BET = 100_000_000  # предохранитель от переполнения/абсурдных ставок
-CASINO_DAILY_BONUS = 1_000
-CASINO_MAX_BET = 100_000_000
+CASINO_ROULETTE_MAX_BET = casino_actions.MAX_BET
+CASINO_DAILY_BONUS = casino_actions.DAILY_BONUS
+CASINO_MAX_BET = casino_actions.MAX_BET
 CASINO_DICE_RE = ru_text.rx(r"(?i)^!кости\s+(\S+)\s+([1-6])$")
 CASINO_COIN_RE = ru_text.rx(r"(?i)^!(орёл|орел|решка)\s+(\S+)$")
 CASINO_POKER_RE = ru_text.rx(r"(?i)^!?покер\s+(\S+)$")
@@ -23712,57 +24490,12 @@ async def cmd_casino_roulette(message: Message):
         details=f"bet={bet_amount} color={color} number={number}",
     )
 # ---------- Покер: оценка руки из 5 карт ----------
-POKER_SUITS = "♠♥♦♣"
-POKER_RANK_NAMES = {11: "J", 12: "Q", 13: "K", 14: "A"}
-
-
-def _poker_rank_label(rank: int) -> str:
-    return POKER_RANK_NAMES.get(rank, str(rank))
-
-
-def _draw_poker_hand() -> list[tuple[int, str]]:
-    deck = [(rank, suit) for rank in range(2, 15) for suit in POKER_SUITS]
-    return random.sample(deck, 5)
-
-
-def _evaluate_poker_hand(cards: list[tuple[int, str]]) -> tuple[int, str]:
-    """(множитель выигрыша, название комбинации). 0 — без выигрыша."""
-    ranks = sorted((r for r, _ in cards), reverse=True)
-    suits = [s for _, s in cards]
-    is_flush = len(set(suits)) == 1
-
-    unique_ranks = sorted(set(ranks), reverse=True)
-    is_straight = False
-    if len(unique_ranks) == 5:
-        if unique_ranks[0] - unique_ranks[4] == 4:
-            is_straight = True
-        elif unique_ranks == [14, 5, 4, 3, 2]:  # туз как низшая карта (А-2-3-4-5)
-            is_straight = True
-
-    counts: dict[int, int] = {}
-    for r in ranks:
-        counts[r] = counts.get(r, 0) + 1
-    count_values = sorted(counts.values(), reverse=True)
-
-    if is_straight and is_flush:
-        return 10, "стрит-флеш"
-    if count_values[0] == 4:
-        return 10, "каре"
-    if count_values[0] == 3 and count_values[1] == 2:
-        return 8, "фулл-хаус"
-    if is_flush:
-        return 6, "флеш"
-    if is_straight:
-        return 5, "стрит"
-    if count_values[0] == 3:
-        return 3, "тройка"
-    if count_values[0] == 2 and count_values[1] == 2:
-        return 2, "две пары"
-    return 0, "пусто (пара или меньше)"
-
-
-def _format_poker_hand(cards: list[tuple[int, str]]) -> str:
-    return " ".join(f"{_poker_rank_label(r)}{s}" for r, s in cards)
+POKER_SUITS = casino_actions.POKER_SUITS
+POKER_RANK_NAMES = casino_actions.POKER_RANK_NAMES
+_poker_rank_label = casino_actions.poker_rank_label
+_draw_poker_hand = casino_actions.draw_poker_hand
+_evaluate_poker_hand = casino_actions.evaluate_poker_hand
+_format_poker_hand = casino_actions.format_poker_hand
 
 
 # ---------- Казино: баланс + ежедневный бонус ----------
@@ -23861,7 +24594,7 @@ async def cmd_casino_dice(message: Message):
 
     chat_id, user_id = message.chat.id, message.from_user.id
     wallet = await db.get_casino_wallet(chat_id, user_id)
-    if wallet["balance"] < bet and not has_infinite_money(user_id):
+    if wallet["balance"] < bet and not await has_infinite_money(user_id):
         await message.reply(
             f"Недостаточно средств в казино: у вас {wallet['balance']} i¢. "
             "Проверьте бонус — «!казино баланс»."
@@ -23918,7 +24651,7 @@ async def cmd_casino_coin(message: Message):
 
     chat_id, user_id = message.chat.id, message.from_user.id
     wallet = await db.get_casino_wallet(chat_id, user_id)
-    if wallet["balance"] < bet and not has_infinite_money(user_id):
+    if wallet["balance"] < bet and not await has_infinite_money(user_id):
         await message.reply(
             f"Недостаточно средств в казино: у вас {wallet['balance']} i¢. "
             "Проверьте бонус — «!казино баланс»."
@@ -23973,7 +24706,7 @@ async def cmd_casino_poker(message: Message):
 
     chat_id, user_id = message.chat.id, message.from_user.id
     wallet = await db.get_casino_wallet(chat_id, user_id)
-    if wallet["balance"] < bet and not has_infinite_money(user_id):
+    if wallet["balance"] < bet and not await has_infinite_money(user_id):
         await message.reply(
             f"Недостаточно средств в казино: у вас {wallet['balance']} i¢. "
             "Проверьте бонус — «!казино баланс»."
@@ -24194,10 +24927,7 @@ async def _run_race(chat_id: int, race: dict) -> None:
 
     await db.add_log("race_finished", chat_id=chat_id, details=f"winner={winner_num}")
     active_races.pop(chat_id, None)
-def roulette_number_color(n: int) -> str:
-    if n == 0:
-        return "green"
-    return "red" if n in RED_ROULETTE_NUMBERS else "black"
+roulette_number_color = casino_actions.roulette_number_color
 DEFAULT_TITLES: list[tuple] = [
     ("king", "👑 Король чата", 5000, None),
     ("richman", "💰 Магнат", 3000, None),
@@ -24342,6 +25072,29 @@ async def cmd_stock_toggle(message: Message):
         )
 
 
+# Сколько истории показываем на графике. Месяц: за меньший срок кривая не
+# успевает показать характер чата, за больший — точки сливаются в шум.
+STOCK_CHART_DAYS = stock_actions.CHART_DAYS
+
+
+async def _render_stock_chart(chat_id: int, price: float, holding: dict):
+    """Картинка курса или None. Ошибку глотаем: биржа обязана отвечать даже
+    тогда, когда matplotlib почему-то не смог."""
+    try:
+        точки = await db.list_stock_price_history(
+            chat_id, datetime.utcnow() - timedelta(days=STOCK_CHART_DAYS))
+        акций = float(holding.get("shares") or 0)
+        # Рендер синхронный и небыстрый — уводим в поток, иначе на время
+        # отрисовки встаёт весь бот (тот же приём, что у карточки цитаты).
+        return await asyncio.to_thread(
+            render_stock_chart, точки,
+            holding_shares=round(акций, 4),
+            holding_value=int(акций * price))
+    except Exception as exc:
+        log_suppressed("_render_stock_chart", exc)
+        return None
+
+
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("!биржа", "биржа")),
@@ -24364,7 +25117,18 @@ async def cmd_stock_market(message: Message):
     lines.extend(_stock_holding_lines(price, holding))
     lines.append("")
     lines.append("<code>биржа купить {сумма}</code> · <code>биржа продать {сумма}</code> · <code>биржа дивиденды</code>")
-    await message.answer("\n".join(lines))
+    текст = "\n".join(lines)
+
+    # Картинка уходит ВМЕСТЕ с текстом, подписью к фото, а не отдельным
+    # сообщением: два сообщения на одну команду — это два уведомления и
+    # разорванный ответ. Не нарисовалось (истории меньше двух точек, сбой
+    # рендера) — отвечаем текстом, как раньше: график тут добавка, а не суть.
+    фото = await _render_stock_chart(chat_id, price, holding)
+    if фото is None:
+        await message.answer(текст)
+        return
+    await message.answer_photo(
+        BufferedInputFile(фото.read(), filename="stock.png"), caption=текст)
 
 
 @router.message(
@@ -24444,7 +25208,7 @@ async def cmd_stock_sell(message: Message):
     await message.reply(f"✅ Продано акций на {amount} i¢ по курсу {price:.2f} ({profit_text}).")
 
     holding = await db.get_stock_holding(chat_id, user_id)
-    if int(holding["total_profit"]) >= 1000:
+    if int(holding["total_profit"]) >= stock_actions.INVESTOR_PROFIT:
         await grant_achievement(chat_id, user_id, "investor")
 
 
@@ -24467,7 +25231,7 @@ async def cmd_stock_dividends(message: Message):
     await message.reply(f"💰 Получены дивиденды: +{pending:.0f} i¢")
 
     holding = await db.get_stock_holding(chat_id, user_id)
-    if int(holding["total_profit"]) >= 1000:
+    if int(holding["total_profit"]) >= stock_actions.INVESTOR_PROFIT:
         await grant_achievement(chat_id, user_id, "investor")
 
 
@@ -24536,7 +25300,7 @@ async def cmd_bank_status(message: Message):
         matures: datetime = account["deposit_matures_at"]
         rate = float(account["deposit_rate"])
         days = int(account["deposit_days"])
-        payout = int(account["deposit_amount"] + account["deposit_amount"] * rate / 100 * days)
+        payout = bank_actions.payout(int(account["deposit_amount"]), rate, days)
         if datetime.utcnow() >= matures:
             lines.append(
                 f"💰 Вклад готов к снятию: {account['deposit_amount']} i¢ → выплата {payout} i¢\n"
@@ -24612,7 +25376,7 @@ async def cmd_bank_deposit(message: Message):
     rate = float(settings_row[BANK_RATE_COLUMN[str(days)]])
     await db.open_bank_deposit(chat_id, user_id, amount, days, rate)
 
-    payout = int(amount + amount * rate / 100 * days)
+    payout = bank_actions.payout(amount, rate, days)
     await message.reply(
         f"✅ Вклад открыт: {amount} i¢ на {days} дн. под {rate:g}%/день.\n"
         f"По истечении срока получите: {payout} i¢."
@@ -24644,7 +25408,7 @@ async def cmd_bank_withdraw(message: Message):
 
     rate = float(account["deposit_rate"])
     days = int(account["deposit_days"])
-    payout = int(account["deposit_amount"] + account["deposit_amount"] * rate / 100 * days)
+    payout = bank_actions.payout(int(account["deposit_amount"]), rate, days)
     await db.add_coins(chat_id, user_id, payout)
     await db.close_bank_deposit(chat_id, user_id)
     await message.reply(f"✅ Вклад закрыт, получено: {payout} i¢.")
@@ -24694,7 +25458,7 @@ async def cmd_bank_credit(message: Message):
         await message.reply("⚠️ Кредиты пока некому одобрять — админы не настроили «топик сюда»/«чат сюда».")
         return
 
-    pending_key = f"bank_credit_pending:{chat_id}:{user_id}"
+    pending_key = bank_actions.pending_key(chat_id, user_id)
     if await db.get_data(pending_key):
         await message.reply("У вас уже есть заявка на кредит, которая ждёт решения администраторов.")
         return
@@ -24751,7 +25515,7 @@ async def confirm_bank_credit(callback: CallbackQuery):
         await callback.answer("Заявка устарела.", show_alert=True)
         return
 
-    pending_key = f"bank_credit_pending:{chat_id}:{user_id}"
+    pending_key = bank_actions.pending_key(chat_id, user_id)
     row = await db.get_data(pending_key)
     if not row or not row.get("data_value"):
         await callback.answer("Заявка уже обработана.", show_alert=True)
@@ -24804,7 +25568,7 @@ async def decline_bank_credit(callback: CallbackQuery):
         await callback.answer("Заявка устарела.", show_alert=True)
         return
 
-    pending_key = f"bank_credit_pending:{chat_id}:{user_id}"
+    pending_key = bank_actions.pending_key(chat_id, user_id)
     row = await db.get_data(pending_key)
     if not row or not row.get("data_value"):
         await callback.answer("Заявка уже обработана.", show_alert=True)
@@ -24972,8 +25736,9 @@ async def cmd_bank_min_deposit_set(message: Message):
 
 
 
-def _bank_auto_reject_key(chat_id: int) -> str:
-    return f"bank_autoreject:{chat_id}"
+# Ключ общий с сайтом (bank_actions.auto_reject_key): разъедься он — и
+# рубильник «кредиты не выдаём» работал бы в чате, но не в кабинете.
+_bank_auto_reject_key = bank_actions.auto_reject_key
 
 
 async def is_bank_auto_reject_enabled(chat_id: int) -> bool:
@@ -25142,7 +25907,7 @@ async def bank_penalty_loop() -> None:
                 # не может: долг растёт, а зарабатывать нечем. Владельцу с
                 # «+бесконечностью» долг не касается по определению — он не
                 # тратит монеты и не может быть должен.
-                if has_infinite_money(user_id) or await is_account_frozen(chat_id, user_id):
+                if await has_infinite_money(user_id) or await is_account_frozen(chat_id, user_id):
                     continue
                 # Кредитные каникулы (событие чата) — пеню в этот проход
                 # просто пропускаем, долг остаётся как есть.
@@ -25464,19 +26229,31 @@ SHOP_GIFT_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+подарить|пода
 SHOP_GIFT_MAX_QTY = SHOP_BUY_MAX_QTY
 
 
-def _gift_quantity(remaining: str) -> tuple[int, str]:
+# «Подарить всё, что есть» — тем же словом, что и в покупке с продажей.
+GIFT_ALL = "все"          # маркер: сколько именно, знает инвентарь, а не разбор
+
+
+def _gift_quantity(remaining: str) -> tuple[object, str]:
     """(сколько дарим, текст ошибки). Пусто — значит одну штуку.
 
-    Считаем количеством ТОЛЬКО голое число: всё остальное в хвосте — это
-    @username цели, и принимать его за число значило бы дарить втихую не
-    то количество, которое человек назвал.
+    Возвращает либо число, либо маркер GIFT_ALL: слово «все» разворачивается
+    позже, когда известен остаток в инвентаре, — как у «магазин купить … все»
+    и «магазин продать … все».
+
+    Количеством считаем ТОЛЬКО голое число или слово «все»: всё остальное в
+    хвосте — это @username цели, и принимать его за число значило бы дарить
+    втихую не то количество, которое человек назвал. Со словом «все» такой
+    путаницы нет — юзернеймом оно быть не может.
 
     isascii() рядом с isdigit() не придирка: isdigit() истинен и для «²», и
     для арабо-индийской «٣», а int("²") на этом бросает ValueError — ловить
     его тут некому, и весь обработчик подарка падал от одного символа в
     сообщении. Считаем количеством только привычные цифры 0-9.
     """
-    числа = [w for w in (remaining or "").split() if w.isascii() and w.isdigit()]
+    слова = (remaining or "").split()
+    if any(is_spend_all(w) for w in слова):
+        return GIFT_ALL, ""
+    числа = [w for w in слова if w.isascii() and w.isdigit()]
     if not числа:
         return 1, ""
     if len(числа) > 1:
@@ -25516,83 +26293,33 @@ def shop_item_line(item: dict) -> str:
 # Модуль «Профессии» — см. FARM_TRIGGERS выше: «!работа»/«!работать» больше
 # НЕ синонимы «фермы», это отдельная система.
 # ============================================================================
-PROFESSIONS: dict[str, dict] = {
-    "уборщик":     {"emoji": "🧹",         "name": "Уборщик",     "income": (400, 800),      "req_days": 0,   "req_coins": 0,    "expense": 50,   "energy": 20},
-    "курьер":      {"emoji": "📦",         "name": "Курьер",      "income": (600, 1200),     "req_days": 3,   "req_coins": 0,    "expense": 150,  "energy": 25},
-    "повар":       {"emoji": "🍳",         "name": "Повар",       "income": (800, 1600),     "req_days": 0,   "req_coins": 0,    "expense": 200,  "energy": 30},
-    "стриптизер":  {"emoji": "👯",         "name": "Стриптизер",  "income": (900, 1800),     "req_days": 0,   "req_coins": 0,    "expense": 200,  "energy": 30},
-    # Единственная строка, которую при подъёме шкалы в 10 раз НЕ трогали: она
-    # и до этого стояла на порядок выше соседей (900–3000 против 90–180), то
-    # есть уже была в нужном масштабе. Умножь её ещё раз — и одна смена раз
-    # в час обгоняла бы Аэропорт 3 уровня. Теперь она вровень с соседями.
-    "шлюха":       {"emoji": "🍒 ",        "name": "Шлюха",       "income": (900, 3000),   "req_days": 0,   "req_coins": 0,    "expense": 200,  "energy": 30},
-    "сантехник":   {"emoji": "🛠",         "name": "Сантехник",   "income": (1000, 2000),    "req_days": 7,   "req_coins": 0,    "expense": 250,  "energy": 30},
-    "учитель":     {"emoji": "🧑‍🏫",         "name": "Учитель",     "income": (1200, 2400),    "req_days": 10,  "req_coins": 0,    "expense": 100,  "energy": 25},
-    "программист": {"emoji": "💻",         "name": "Программист", "income": (1600, 3200),    "req_days": 20,  "req_coins": 0,    "expense": 300,  "energy": 35},
-    "врач":        {"emoji": "🏥",         "name": "Врач",        "income": (2000, 4000),    "req_days": 30,  "req_coins": 5000,  "expense": 400,  "energy": 35},
-    "юрист":       {"emoji": "⚖️",         "name": "Юрист",       "income": (2500, 5000),    "req_days": 50,  "req_coins": 10000, "expense": 500,  "energy": 30},
-    "банкир":      {"emoji": "🏦",         "name": "Банкир",      "income": (3000, 6000),    "req_days": 100, "req_coins": 20000, "expense": 600,  "energy": 25},
-    "космонавт":   {"emoji": "🚀",         "name": "Космонавт",   "income": (5000, 10000),   "req_days": 200, "req_coins": 50000, "expense": 1000, "energy": 40},
-}
-
-# Кумулятивные пороги XP по уровням (1..10), из ТЗ.
-PROFESSION_LEVEL_XP = {1: 0, 2: 100, 3: 300, 4: 600, 5: 1000, 6: 1500, 7: 2100, 8: 2800, 9: 3600, 10: 4500}
-PROFESSION_MAX_LEVEL = 10
-PROFESSION_LEVEL_INCOME_BONUS = {lvl: (lvl - 1) * 0.10 for lvl in range(1, 11)}
-PROFESSION_WORK_COOLDOWN = timedelta(hours=1)
-
-PROFESSION_UPGRADES: dict[str, dict] = {
-    "инструменты": {"name": "Инструменты премиум", "price": 500,  "effect": "−50% расхода энергии"},
-    "курсы":       {"name": "Курсы повышения",      "price": 800,  "effect": "+20% к доходу навсегда"},
-    "офис":        {"name": "Собственный офис",     "price": 1500, "effect": "одна внеочередная смена в сутки"},
-    "стиль":       {"name": "Фирменный стиль",      "price": 300,  "effect": "+10% к шансу VIP-заказа"},
-    "аналитика":   {"name": "Аналитика рынка",       "price": 1000, "effect": "команда «!работа аналитика»"},
-}
-
-# --- энергия и выгорание ----------------------------------------------------
-# Перерыву нужен кулдаун. Без него «!работа перерыв» жалась подряд, энергия
-# всегда была на сотне, и вместе с ней теряли смысл Аптечка, «!работа буст»,
-# улучшение «инструменты» и привилегия Робота работяги: экономить было нечего.
-# 30 минут при часовом кулдауне смены — это два бесплатных перерыва между
-# сменами, то есть +40 энергии. Дешёвым профессиям хватает, дорогим (космонавт
-# — 40⚡) уже нет, и вот там начинают работать буст с Аптечкой.
-PROFESSION_BREAK_COOLDOWN = timedelta(minutes=30)
-PROFESSION_BREAK_ENERGY = 20
-
-# Выгорание: смены подряд без единого перерыва. Ограничитель по смыслу, а не
-# по энергии — иначе достаточно было бы купить «инструменты» и не отдыхать
-# никогда.
-BURNOUT_AFTER = 10
-BURNOUT_PENALTY = 40           # % от дохода
-BURNOUT_WARN_AT = 8
-
-# Профсоюз: чем больше в чате коллег по профессии, тем легче смена. Даёт повод
-# договариваться о выборе работы, а не брать поодиночке самую дорогую.
-UNION_MIN_MEMBERS = 5
-UNION_ENERGY_CUT = 20          # % расхода энергии
-
-# Напарники: смена вдвоём. Кулдаун и энергию тратят оба.
-PARTNER_BONUS = 25             # % к доходу обоим
-
-# Стажировка: наставнику — процент со смен ученика, ученику — быстрее опыт.
-MENTOR_MIN_LEVEL = 8
-MENTOR_MAX_STUDENTS = 3
-MENTOR_SHARE = 10              # % дохода ученика наставнику
-STUDENT_XP_BONUS = 50          # % к опыту ученика
-STUDENT_MAX_LEVEL = 5          # выпускается, дойдя до этого уровня
-
-# Заказы чата: раз в сутки чат просит человека определённой профессии.
-ORDER_REWARD_MULT = 3
-ORDER_VIP_MULT = 5
-ORDER_VIP_CHANCE = 10          # % базовый, «фирменный стиль» добавляет столько же
-
-
-def profession_level_from_xp(xp: int) -> int:
-    level = 1
-    for lvl in range(1, PROFESSION_MAX_LEVEL + 1):
-        if xp >= PROFESSION_LEVEL_XP[lvl]:
-            level = lvl
-    return level
+# Каталог профессий, пороги уровней, выгорание, профсоюз и стажировка живут в
+# professions.py: тем же самым пользуется экран работы на сайте, а панель
+# bot.py импортировать не может. Числа заработка в двух местах — это две
+# разные правды о деньгах.
+PROFESSIONS = professions.PROFESSIONS
+PROFESSION_LEVEL_XP = professions.LEVEL_XP
+PROFESSION_MAX_LEVEL = professions.MAX_LEVEL
+PROFESSION_LEVEL_INCOME_BONUS = professions.LEVEL_INCOME_BONUS
+PROFESSION_WORK_COOLDOWN = professions.WORK_COOLDOWN
+PROFESSION_UPGRADES = professions.UPGRADES
+PROFESSION_BREAK_COOLDOWN = professions.BREAK_COOLDOWN
+PROFESSION_BREAK_ENERGY = professions.BREAK_ENERGY
+BURNOUT_AFTER = professions.BURNOUT_AFTER
+BURNOUT_PENALTY = professions.BURNOUT_PENALTY
+BURNOUT_WARN_AT = professions.BURNOUT_WARN_AT
+UNION_MIN_MEMBERS = professions.UNION_MIN_MEMBERS
+UNION_ENERGY_CUT = professions.UNION_ENERGY_CUT
+PARTNER_BONUS = professions.PARTNER_BONUS
+MENTOR_MIN_LEVEL = professions.MENTOR_MIN_LEVEL
+MENTOR_MAX_STUDENTS = professions.MENTOR_MAX_STUDENTS
+MENTOR_SHARE = professions.MENTOR_SHARE
+STUDENT_XP_BONUS = professions.STUDENT_XP_BONUS
+STUDENT_MAX_LEVEL = professions.STUDENT_MAX_LEVEL
+ORDER_REWARD_MULT = professions.ORDER_REWARD_MULT
+ORDER_VIP_MULT = professions.ORDER_VIP_MULT
+ORDER_VIP_CHANCE = professions.ORDER_VIP_CHANCE
+profession_level_from_xp = professions.level_from_xp
 
 
 async def _profession_execute_work(chat_id: int, user_id: int, *,
@@ -25612,7 +26339,7 @@ async def _profession_execute_work(chat_id: int, user_id: int, *,
         # «Собственный офис» даёт одну внеочередную смену в сутки — до этого
         # улучшение стоило 1500 i¢ и не делало ровно ничего.
         if not await db.has_profession_upgrade(chat_id, user_id, "офис") \
-                or not await db.use_profession_office(chat_id, user_id, utc_today()):
+                or not await db.use_profession_office(chat_id, user_id, local_today()):
             remaining = cooldown - (now - last)
             отказ = f"❌ НЕЗАЧЁТ! Следующая смена через {format_duration_ru(remaining)}."
             # with_hint=False приходит от «работа вместе»: там этот текст
@@ -25912,7 +26639,7 @@ def _order_key(chat_id: int) -> str:
 async def _get_or_make_order(chat_id: int) -> dict:
     """Заказ чата на сегодня. Заводится лениво, при первом обращении, — так
     не нужен ещё один фоновый цикл ради одной записи в сутки."""
-    today = utc_today().isoformat()
+    today = local_today().isoformat()
     row = await db.get_data(_order_key(chat_id))
     if row:
         try:
@@ -26005,7 +26732,7 @@ async def cmd_prof_order_take(message: Message):
     await db.add_coins(chat_id, user_id, payout)
     await db.update_profession_after_shift(
         chat_id, user_id, int(payout / 10), payout, 0, 0, 0,
-        int(stats.get("work_streak") or 0), utc_today(),
+        int(stats.get("work_streak") or 0), local_today(),
     )
     await db.add_log("prof_order", chat_id=chat_id, actor_id=user_id,
                      details=f"{prof_key}:{payout}")
@@ -26449,8 +27176,11 @@ async def cmd_shop_add(message: Message):
     if price is None or price <= 0:
         await message.reply("Не понял цену. Можно так: 500, 5к, 1.2м.")
         return
-    if len(item_key) > 64 or len(name) > 64:
-        await message.reply("⚠️ Слишком длинный ключ или название (максимум 64 символа).")
+    if not shop_item_key_fits(item_key) or len(name) > 64:
+        await message.reply(
+            f"⚠️ Слишком длинный ключ (максимум {SHOP_ITEM_KEY_MAX} символов, "
+            "кириллических — вдвое меньше: ключ должен влезать в кнопку) "
+            "или название (максимум 64).")
         return
     ok = await db.add_shop_item(message.chat.id, item_key, name[:64], price)
     if not ok:
@@ -26492,6 +27222,24 @@ def shop_menu_text(items: list[dict]) -> str:
 
 def _shop_chat_id() -> Optional[int]:
     return settings.get("complaint_chat_id")
+
+
+def shop_item_restock_line(item: dict) -> str:
+    """Что написать в карточке товара про ежедневный завоз.
+
+    Товарам лавки завоз не положен: list_shop_items_for_restock исключает их
+    намеренно — запас им УСТАНАВЛИВАЕТ суточная ротация. Обещать им «до N
+    шт./день» значит врать в карточке, по которой админ принимает решение.
+
+    Час пишем из SHOP_RESTOCK_HOUR_LOCAL и по зоне чата: цикл сверяется с
+    local_now(), а в карточке годами стояло «15:00 UTC» — человек ждал завоза
+    не в то время.
+    """
+    if item.get("item_key") in black_market.POOL_KEYS:
+        return "не применяется — запас задаёт ротация лавки"
+    if not item.get("restock_max"):
+        return "выкл."
+    return f"до {item['restock_max']} шт./день (в {SHOP_RESTOCK_HOUR_LOCAL}:00 по зоне чата)"
 
 
 async def _show_shop_menu(message: Message, state: FSMContext) -> None:
@@ -26540,8 +27288,11 @@ async def shop_add_cancel(message: Message, state: FSMContext):
 @router.message(StateFilter(AdminStates.waiting_shop_new_key), F.chat.type == "private")
 async def shop_add_key(message: Message, state: FSMContext):
     key = (message.text or "").strip().casefold()
-    if not key or " " in key or len(key) > 64:
-        await message.answer("Ключ должен быть без пробелов, до 64 символов. Попробуйте ещё раз.", reply_markup=cancel_kb())
+    if not key or " " in key or not shop_item_key_fits(key):
+        await message.answer(
+            f"Ключ должен быть без пробелов и до {SHOP_ITEM_KEY_MAX} символов "
+            "(кириллических — вдвое меньше: ключ должен влезать в кнопку). "
+            "Попробуйте ещё раз.", reply_markup=cancel_kb())
         return
     chat_id = _shop_chat_id()
     if await db.get_shop_item(chat_id, key) is not None:
@@ -26630,7 +27381,7 @@ async def shop_open_item(message: Message, state: FSMContext):
     await state.update_data(shop_item_key=item_key)
     await state.set_state(AdminStates.menu_shop_item)
     stock_text = "без лимита" if item.get("stock") is None else str(item["stock"])
-    restock_text = "выкл." if not item.get("restock_max") else f"до {item['restock_max']} шт./день (в 15:00 UTC)"
+    restock_text = shop_item_restock_line(item)
     await message.answer(
         f"🏷 <b>{html.escape(item['name'])}</b> (<code>{html.escape(item_key)}</code>)\n"
         f"Цена: {item['price']} i¢\nОстаток: {stock_text}\nПополнение: {restock_text}\n"
@@ -26699,20 +27450,55 @@ async def shop_item_stock_set(message: Message, state: FSMContext):
             reply_markup=_reply_kb([[BTN_SHOP_UNLIMITED], [BTN_CANCEL]]),
         )
         return
-    await db.set_shop_item_stock(chat_id, data["shop_item_key"], stock)
-    item = await db.get_shop_item(chat_id, data["shop_item_key"])
+    item_key = data["shop_item_key"]
+    hint = ""
+    if item_key in black_market.POOL_KEYS and stock is None:
+        # Безлимит у лавки — это отсутствие дефицита, на котором она вся и
+        # держится (см. black_market.py). Раньше панель его молча принимала:
+        # stock = NULL, rotation_day не тронут — и товар оставался невидимым,
+        # то есть «пополнил из лички, ничего не изменилось».
+        await message.answer(
+            "❌ У товара лавки не может быть безлимитного остатка — она держится "
+            "на дефиците. Введите число: столько штук будет в лавке сегодня.",
+            reply_markup=cancel_kb(),
+        )
+        return
+    if item_key in black_market.POOL_KEYS:
+        # Товар лавки виден только с сегодняшним rotation_day (см.
+        # db.list_rotation_items). Проставить один остаток мало: позиция с
+        # вчерашним днём в лавке не показывается вовсе, и пополнение из лички
+        # не меняло в чате ничего. Поэтому запас и день пишем вместе — тем же
+        # запросом, что и суточная ротация.
+        await db.set_shop_item_rotation(chat_id, item_key, stock, local_today())
+        hint = ("\nЭто товар лавки: запас держится до конца суток, "
+                "ночью его переставит новая ротация.")
+    else:
+        await db.set_shop_item_stock(chat_id, item_key, stock)
+    item = await db.get_shop_item(chat_id, item_key)
     stock_text = "без лимита" if stock is None else str(stock)
     await state.set_state(AdminStates.menu_shop_item)
-    await message.answer(f"✅ Остаток обновлён: {stock_text}.", reply_markup=shop_item_menu_kb(item["is_active"]))
+    await message.answer(f"✅ Остаток обновлён: {stock_text}.{hint}",
+                          reply_markup=shop_item_menu_kb(item["is_active"]))
 
 
 @router.message(F.chat.type == "private", StateFilter(AdminStates.menu_shop_item), F.text == "🔁 Пополнение")
 async def shop_item_restock_start(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get("shop_item_key") in black_market.POOL_KEYS:
+        # Ежедневный завоз товары лавки обходит намеренно (см.
+        # db.list_shop_items_for_restock). Принять здесь число значило бы
+        # ответить «✅ до N шт./день» про то, чего не случится никогда.
+        await message.answer(
+            "❌ Ежедневный завоз к товарам лавки не применяется: их запас "
+            "заново задаёт суточная ротация. Разовый запас на сегодня — «📦 Остаток».",
+        )
+        return
     await state.set_state(AdminStates.waiting_shop_edit_restock)
     await message.answer(
         "Сколько максимум штук этого товара может добавиться при ежедневном пополнении "
-        "в 15:00 (UTC)? Число будет выбрано случайно от 0 до этого максимума и прибавлено "
-        "к текущему остатку. Введите число, либо «Выкл», чтобы не пополнять этот товар.",
+        f"в {SHOP_RESTOCK_HOUR_LOCAL}:00 по зоне чата? Число будет выбрано случайно от 0 "
+        "до этого максимума и прибавлено к текущему остатку. Введите число, либо «Выкл», "
+        "чтобы не пополнять этот товар.",
         reply_markup=_reply_kb([["Выкл"], [BTN_CANCEL]]),
     )
 
@@ -27114,6 +27900,16 @@ async def cmd_gift_item(message: Message):
     # решение, отдавать или нет, принимает сам UPDATE внутри
     # remove_inventory_item — одним запросом, без окна для второй команды.
     have = await db.get_inventory_quantity(message.chat.id, message.from_user.id, item_key)
+    if qty is GIFT_ALL:
+        # «Все» — это сколько лежит в инвентаре, но не больше потолка команды:
+        # он заведён против опечаток и на подарок распространяется так же.
+        qty = min(int(have), SHOP_GIFT_MAX_QTY)
+        if qty < 1:
+            await message.reply(
+                f"У вас нет «{html.escape(item_key)}» — дарить нечего. "
+                "Что есть, видно в «инвентарь»."
+            )
+            return
     if have < qty:
         await message.reply(
             f"У вас {have} шт. «{html.escape(item_key)}» — подарить {qty} не выйдет. "
@@ -27164,7 +27960,7 @@ async def cmd_shop_usage(message: Message):
         "🏪 <b>Магазин</b>",
         "<code>магазин</code> — список товаров",
         "<code>магазин купить {ключ} [количество]</code>",
-        "<code>магазин продать {ключ} [количество]</code>",
+        "<code>магазин продать {ключ} [количество или «все»]</code>",
         "<code>магазин подарить {ключ} [количество]</code> (ответом или @username/ID)",
     ]
     if has_level(message.from_user.id, required_level("shop_manage")):
@@ -27182,95 +27978,34 @@ async def cmd_shop_usage(message: Message):
 # Внутри пула шанс предмета обратно пропорционален его цене — чем дороже
 # вещь, тем реже она выпадает, даже среди «редкого» набора.
 # ============================================================================
-LOOTBOX_TYPES: dict[str, dict] = {
-    "common":    {"name": "Обычный",     "emoji": "🟢", "price": 500,   "rare_chance": 5},
-    "uncommon":  {"name": "Необычный",   "emoji": "🔵", "price": 2000,  "rare_chance": 15},
-    "rare":      {"name": "Редкий",      "emoji": "🟣", "price": 5000,  "rare_chance": 35},
-    "epic":      {"name": "Эпический",   "emoji": "🟠", "price": 10000, "rare_chance": 60},
-    "legendary": {"name": "Легендарный", "emoji": "🔴", "price": 25000, "rare_chance": 85},
-}
-LOOTBOX_ORDER = ["common", "uncommon", "rare", "epic", "legendary"]
-LOOTBOX_ALIASES: dict[str, str] = {
-    "обычный": "common", "обычные": "common", "обычная": "common", "common": "common", "1": "common",
-    "необычный": "uncommon", "необычные": "uncommon", "uncommon": "uncommon", "2": "uncommon",
-    "редкий": "rare", "редкие": "rare", "rare": "rare", "3": "rare",
-    "эпический": "epic", "эпические": "epic", "epic": "epic", "4": "epic",
-    "легендарный": "legendary", "легендарные": "legendary", "legendary": "legendary", "5": "legendary",
-}
-LOOTBOX_MAX_PER_COMMAND = 20     # предохранитель: не купить/не открыть 100000 за раз
-LOOTBOX_RARE_POOL_SHARE = 0.25   # доля самых дорогих позиций каталога — это «редкий» пул
+# Таблицы, доли и шансы — общие с сайтом (lootbox_actions). Разъедься они, и
+# одна и та же коробка стоила бы разного и давала бы редкое с разной
+# вероятностью в зависимости от того, откуда её открыли.
+LOOTBOX_TYPES = lootbox_actions.TYPES
+LOOTBOX_ORDER = lootbox_actions.ORDER
+LOOTBOX_ALIASES = lootbox_actions.ALIASES
+LOOTBOX_MAX_PER_COMMAND = lootbox_actions.MAX_PER_COMMAND
+LOOTBOX_RARE_POOL_SHARE = lootbox_actions.RARE_POOL_SHARE
 
 
-def _lootbox_resolve_rarity(token: str) -> Optional[str]:
-    return LOOTBOX_ALIASES.get(token.strip().casefold())
+_lootbox_resolve_rarity = lootbox_actions.resolve_rarity
 
 
-async def _lootbox_build_pools(chat_id: int) -> tuple[list[dict], list[dict]]:
-    """Собирает пул наград лутбокса из ТЕКУЩЕГО ассортимента: активные товары
-    магазина этого чата + все титулы с ценой (титулы, выдаваемые только за
-    ачивку — price IS NULL — в лутбоксах не участвуют, их нельзя купить).
-    Возвращает (common_pool, rare_pool) — топ LOOTBOX_RARE_POOL_SHARE по цене
-    уходит в rare_pool, остальное в common_pool (rare_pool не бывает пустым,
-    если пул вообще не пуст).
-
-    Если магазин чата ещё ни разу не открывали — досеиваем его дефолтным
-    ассортиментом (как это делает shop_list_page), чтобы лутбокс не оказался
-    пустым просто потому, что никто ещё не писал «магазин» в этом чате.
-    """
-    await db.seed_default_shop_items(chat_id)
-    # Дозасев (не требует пустого магазина): так новые товары доезжают
-    # и в чаты, где магазин давно наполнен, — иначе они не появились бы
-    # никогда, ведь seed_default_shop_items у непустого магазина молчит.
-    await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
-    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
-    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
-
-    pool: list[dict] = []
-    for item in await db.list_shop_items(chat_id, active_only=True):
-        pool.append({
-            "kind": "item", "key": item["item_key"], "name": item["name"],
-            "emoji": item.get("emoji") or "🎁", "price": int(item["price"]),
-        })
-    for title in await db.list_titles():
-        if title.get("price") is not None:
-            pool.append({
-                "kind": "title", "key": title["title_key"], "name": title["name"],
-                "emoji": "🎖", "price": int(title["price"]),
-            })
-    if not pool:
-        return [], []
-
-    pool.sort(key=lambda x: x["price"], reverse=True)
-    rare_count = max(1, round(len(pool) * LOOTBOX_RARE_POOL_SHARE))
-    rare_pool = pool[:rare_count]
-    common_pool = pool[rare_count:] or rare_pool
-    return common_pool, rare_pool
+_lootbox_build_pools = lootbox_actions.build_pools
+_lootbox_weighted_pick = lootbox_actions.weighted_pick
 
 
-def _lootbox_weighted_pick(pool: list[dict]) -> dict:
-    weights = [1 / max(entry["price"], 1) for entry in pool]
-    return random.choices(pool, weights=weights, k=1)[0]
-
-
-async def _lootbox_grant(chat_id: int, user_id: int, reward: dict) -> str:
-    """Выдаёт награду, возвращает короткую пометку для сообщения (например,
-    если титул уже был — вместо повтора выдаётся компенсация i¢)."""
-    if reward["kind"] == "item":
-        await db.add_inventory_item(chat_id, user_id, reward["key"], 1)
-        return ""
-    already = await db.has_title(chat_id, user_id, reward["key"])
-    if already:
-        compensation = max(reward["price"] // 2, 1)
-        await db.add_coins(chat_id, user_id, compensation)
-        return f" (титул уже был — начислена компенсация {compensation} i¢)"
-    await db.grant_title(chat_id, user_id, reward["key"])
-    return ""
+_lootbox_grant = lootbox_actions.grant
 
 
 def _lootbox_reward_line(reward: dict, is_rare: bool, note: str = "") -> str:
     mark = "🌟 РЕДКИЙ ПРЕДМЕТ! " if is_rare else ""
     value = f"{reward['price']:,}".replace(",", " ")
-    return f"{mark}{reward['emoji']} {html.escape(reward['name'])} (ценность: {value} i¢){note}"
+    # Скобки вокруг пометки — здесь, а не в общем модуле: тот отдаёт голый
+    # текст, потому что на сайте он стоит отдельной строкой, а не в хвосте
+    # предложения.
+    tail = f" ({html.escape(note)})" if note else ""
+    return f"{mark}{reward['emoji']} {html.escape(reward['name'])} (ценность: {value} i¢){tail}"
 
 
 LOOTBOX_USAGE = (
@@ -28412,11 +29147,24 @@ async def cmd_grant_level(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() in ("-админ")),
+    # Сравнение через ==, а не «in (...)»: без запятой скобки не делают кортеж,
+    # и проверка становится поиском ПОДСТРОКИ. Совпадало любое первое слово,
+    # которое встречается внутри «-админ» («а», «и», «ад», «мин»), поэтому бот
+    # отвечал «Укажите цель» на обычную речь вроде «И чо это».
+    F.text.func(lambda t: bool(t) and (t.strip().split() or [""])[0].casefold() == "-админ"),
 )
 async def cmd_revoke_admin(message: Message):
     actor_id = message.from_user.id
     actor_level = get_level(actor_id)
+
+    # Уровень проверяем ДО ответов про цель — как в cmd_grant_level рядом.
+    # Иначе посторонний получал бы от бота инструкцию к команде, которой ему
+    # всё равно не выполнить.
+    min_level = required_level("revoke_admin")
+    if not has_level(actor_id, min_level):
+        if actor_level > 0:
+            await message.reply(f"⛔ Снимать права может «{level_name(min_level)}» и выше.")
+        return
 
     target, _remaining = await resolve_command_target(message)
     if target is None and message.reply_to_message:
@@ -30361,7 +31109,9 @@ async def _render_profile_chart(chat_id: int, user_id: int) -> Optional[BytesIO]
     if not rows:
         return None
     try:
-        return await asyncio.to_thread(render_activity_chart, rows, days)
+        # today — тот же UTC-день, по которому размечена message_daily.
+        return await asyncio.to_thread(render_activity_chart, rows, days,
+                                       "Статистика активности", utc_today())
     except Exception:
         logger.exception("Не удалось построить график активности профиля")
         return None
@@ -30790,20 +31540,25 @@ async def _inventory_view(chat_id: int, target_id: int, requester_id: int, viewe
         if perk_text:
             lines.append(f"    ✨ {perk_text}")
         # кнопки закрепления/продажи — только при просмотре своего инвентаря
-        if is_own:
+        pin_cb = f"pinitem:{i['item_key']}:{target_id}:{requester_id}"
+        sell_cb = f"sellitem:{i['item_key']}:{target_id}:{requester_id}"
+        # Ключ товара заводит админ, и у старых чатов он бывает длинным —
+        # с такой кнопкой Telegram отвергает всю карточку (см. callback_fits).
+        # Лучше показать инвентарь без пары кнопок, чем не показать вовсе.
+        if is_own and callback_fits(pin_cb):
             row = [InlineKeyboardButton(
                 text=f"📌 Закрепить «{item_name}»",
-                callback_data=f"pinitem:{i['item_key']}:{target_id}:{requester_id}",
+                callback_data=pin_cb,
             )]
             # Кнопки «Продать» у неотчуждаемого предмета быть не должно:
             # обработчик её всё равно отобьёт, но предлагать то, что запрещено,
             # — само по себе баг интерфейса.
-            if used == 0 and not permanent:
+            if used == 0 and not permanent and callback_fits(sell_cb):
                 shop_item = await db.get_shop_item(chat_id, i["item_key"])
                 if shop_item and shop_item.get("price") is not None:
                     row.append(InlineKeyboardButton(
                         text=f"💰 Продать «{item_name}»",
-                        callback_data=f"sellitem:{i['item_key']}:{target_id}:{requester_id}",
+                        callback_data=sell_cb,
                     ))
             rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"profile_back:{target_id}:{requester_id}")])
@@ -30842,10 +31597,9 @@ async def sell_item_cb(callback: CallbackQuery):
         )
         return
 
-    used = await db.get_item_usage_count(chat_id, target_id, item_key)
-    if used > 0:
-        await callback.answer("Этот предмет уже использовался — продать нельзя.", show_alert=True)
-        return
+    # Запрет на продажу использованного снят и здесь: кнопка обязана вести
+    # себя ровно как текстовая «магазин продать», иначе одно и то же действие
+    # в двух местах даёт разный ответ.
 
     shop_item = await db.get_shop_item(chat_id, item_key)
     if shop_item is None or shop_item.get("price") is None:
@@ -31237,15 +31991,31 @@ STAT_PERIOD_TITLES = {"day": "сутки", "week": "неделю", "month": "м�
 STAT_PAGE_SIZE = 10
 
 
+def _stat_period_title(period: str, cutoff) -> str:
+    """Подпись периода с датой начала: «неделю (с 25.07)».
+
+    Дата нужна именно потому, что неделя календарная: в субботу «за неделю»
+    законно показывает почти ноль, и без даты это читается как поломка. У
+    «суток» дату не пишем — там она и есть сегодняшняя, а у «всего времени»
+    начала нет."""
+    title = STAT_PERIOD_TITLES[period]
+    if cutoff is None or period == "day":
+        return title
+    return f"{title} (с {fmt_date(cutoff)})"
+
+
 def _period_cutoff_day(period: str):
-    today = datetime.utcnow().date()
-    if period == "day":
-        return today
-    if period == "week":
-        return today - timedelta(days=6)
-    if period == "month":
-        return today - timedelta(days=29)
-    return None  # "all" — используем message_stats напрямую, без даты отсечения
+    """Границы «стата/топ {период}» — КАЛЕНДАРНЫЕ, общие со всем ботом
+    (db.period_start_day): неделя с субботы, месяц с 1-го числа.
+
+    Было скользящее окно — «последние 7 суток» и «последние 30». Из-за этого
+    «топ за неделю» не сходился ни с профилем, ни с нормой, ни с «вне нормы»:
+    у них неделя календарная. Совпадали числа ровно по пятницам, когда
+    сегодня-минус-6 случайно попадает на субботу.
+
+    None для «всё время» — рабочее значение: по нему вызывающий переключается
+    на message_stats вместо message_daily."""
+    return db.period_start_day(period)
 
 
 def _parse_stat_args(tokens: list[str]) -> tuple[str, Optional[int]]:
@@ -31300,7 +32070,7 @@ async def stat_period_text(chat_id: int, period: str, limit: int) -> str:
         rows, total = await db.list_top_messages(chat_id, limit=limit)
     else:
         rows, total = await db.list_top_messages_period(chat_id, cutoff, limit=limit)
-    title = STAT_PERIOD_TITLES[period]
+    title = _stat_period_title(period, cutoff)
     if not rows:
         return f"💬 <b>Статистика за {title}</b>\n\nПока нет сообщений за этот период."
     lines = await _stat_rank_lines(chat_id, rows)
@@ -31326,7 +32096,7 @@ async def stat_period_page(chat_id: int, period: str, page: int) -> tuple[str, O
             page = 0
             rows, total = await db.list_top_messages_period(chat_id, cutoff, limit=STAT_PAGE_SIZE)
 
-    title = STAT_PERIOD_TITLES[period]
+    title = _stat_period_title(period, cutoff)
     if not rows:
         return f"💬 <b>Статистика за {title}</b>\n\nПока нет сообщений за этот период.", None
 
@@ -31427,7 +32197,7 @@ async def _render_chat_chart(chat_id: int, days: int, title: str = "Статис
     if not rows:
         return None
     try:
-        return await asyncio.to_thread(render_activity_chart, rows, days, title)
+        return await asyncio.to_thread(render_activity_chart, rows, days, title, today)
     except Exception:
         logger.exception("Не удалось построить график активности чата")
         return None
@@ -31872,6 +32642,91 @@ async def _drop_left_members(chat_id: int, rows: list[dict]) -> list[dict]:
     return alive
 
 
+# Плановая сверка ростера. Интервал крупный, а первый заход — вскоре после
+# старта: чинить старые «хвосты» надо один раз, дальше ростер держат в форме
+# события выхода.
+ROSTER_SWEEP_INTERVAL = 6 * 3600      # раз в 6 часов
+ROSTER_SWEEP_STARTUP_DELAY = 120      # дать боту подняться и разгрести старт
+ROSTER_SWEEP_CHAT_LIMIT = 300         # сколько человек проверяем за заход в одном чате
+ROSTER_SWEEP_PAUSE = 0.05             # пауза между запросами — не упираться в лимиты Telegram
+
+
+async def _sweep_chat_roster(chat_id: int) -> int:
+    """Сверяет голову ростера чата с Telegram и убирает тех, кого там нет.
+    Возвращает число вычищенных. Ошибку доступа к самому чату считает поводом
+    ОСТАНОВИТЬСЯ, а не чистить дальше (см. roster_sweep_loop)."""
+    # Первым делом спрашиваем про самого бота. По ответу на конкретного
+    # участника «этого человека в чате нет» и «этого ЧАТА для бота нет» не
+    # различить: удалённая группа и оставшийся от миграции в супергруппу
+    # старый chat_id отвечают тем же TelegramBadRequest, что и «user not
+    # found», — и сверка вычистила бы весь ростер такого чата до нуля.
+    # Лишнего запроса это не стоит: bot.id разбирается из токена.
+    try:
+        me = await bot.get_chat_member(chat_id, bot.id)
+    except Exception as exc:
+        log_suppressed("roster_sweep_loop", exc)
+        return 0
+    if me.status in ("left", "kicked"):
+        return 0
+
+    removed = 0
+    for row in await db.list_stale_roster_members(chat_id, ROSTER_SWEEP_CHAT_LIMIT):
+        user_id = int(row["user_id"])
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramForbiddenError:
+            # Это про бота, а не про участника: его выгнали из чата или он
+            # потерял права. Чистить на этом основании весь ростер нельзя.
+            logger.warning("roster_sweep: нет доступа к чату %s — сверка прервана", chat_id)
+            break
+        except TelegramBadRequest:
+            # А это уже про участника: «user not found» — такого в чате нет.
+            await db.delete_current_user(chat_id, user_id)
+            removed += 1
+        except Exception as exc:
+            # Сеть, лимит, 5xx — не повод считать человека вышедшим.
+            log_suppressed("roster_sweep_loop", exc)
+        else:
+            if member.status in ("left", "kicked"):
+                await db.delete_current_user(chat_id, user_id)
+                removed += 1
+        await asyncio.sleep(ROSTER_SWEEP_PAUSE)
+    return removed
+
+
+async def roster_sweep_loop() -> None:
+    """Держит ростер current_users в соответствии с реальным составом чатов.
+
+    Ростер — источник правды для ВСЕХ списков и топов (см. db.in_chat_sql), и
+    сам по себе он чистится только в handle_member_left, то есть лишь когда
+    бот получил событие выхода. Два дырявых места:
+      * событие не дошло — бот был выключен, апдейт потерялся;
+      * человек ушёл ДО появления таблицы current_users: при миграции в неё
+        скопом попали все known_users (backfill_current_users_from_known_users),
+        включая давно ушедших, и сами оттуда они не денутся никогда.
+    Именно эти «призраки» и висели во всех выборках: сообщений у них ноль,
+    поэтому в «не в норме» и «неактив» они шли первыми.
+
+    Разовые сверки на показе списка («неактив», «молчуны», роли) лечат только
+    тех, кто попал в конкретный список. Здесь — планово и по всему ростеру,
+    начиная с самых давних (db.list_stale_roster_members).
+    """
+    await asyncio.sleep(ROSTER_SWEEP_STARTUP_DELAY)
+    while True:
+        try:
+            for chat in await db.list_current_chats():
+                chat_id = int(chat["chat_id"])
+                removed = await _sweep_chat_roster(chat_id)
+                if removed:
+                    logger.info("roster_sweep: из ростера чата %s убрано %s вышедших",
+                                chat_id, removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой в цикле сверки ростера")
+        await asyncio.sleep(ROSTER_SWEEP_INTERVAL)
+
+
 async def _inactive_silent_text(rows: list[dict], title: str, date_field: str) -> str:
     if not rows:
         return f"{title}\n\nТаких не нашлось 🎉"
@@ -31962,12 +32817,104 @@ async def get_chat_norm(chat_id: int) -> Optional[int]:
 
 
 def _current_week_start():
-    """Начало текущей недели — СУББОТА (UTC): от неё отсчитывается недельная
-    норма (и чистка /clearUsers). Раньше неделя шла с понедельника — владелец
-    попросил считать с субботы. weekday(): Пн=0…Сб=5, поэтому откатываемся к
-    ближайшей прошедшей субботе через (weekday - 5) % 7."""
-    today = datetime.utcnow().date()
-    return today - timedelta(days=(today.weekday() - 5) % 7)
+    """Начало текущей недели (UTC): от неё отсчитывается недельная норма,
+    чистка /clearUsers, «вне нормы» и топы за неделю.
+
+    День недели — настройка (по умолчанию суббота, как просил владелец), и
+    живёт правило в db.week_start_day: оттуда же его берут профиль и
+    веб-панель. Пока оно было записано и здесь, и внутри
+    db.get_activity_breakdown (там — жёстко с понедельника), профиль и топ за
+    одну и ту же неделю показывали разные числа."""
+    return db.week_start_day()
+
+
+# ----------------------------------------------------------------------------
+# «начало недели {день}» — с какого дня считается неделя.
+#
+# Раньше суббота была вписана в код константой. Настройка общая для бота, как
+# часовой пояс: у него один рабочий чат, а неделя обязана быть одна и та же и
+# в норме, и в топах, и в профиле.
+# ----------------------------------------------------------------------------
+_WEEKDAY_WORDS = {
+    "понедельник": 0, "понедельника": 0, "пн": 0,
+    "вторник": 1, "вторника": 1, "вт": 1,
+    "среда": 2, "среды": 2, "среду": 2, "ср": 2,
+    "четверг": 3, "четверга": 3, "чт": 3,
+    "пятница": 4, "пятницы": 4, "пятницу": 4, "пт": 4,
+    "суббота": 5, "субботы": 5, "субботу": 5, "сб": 5,
+    "воскресенье": 6, "воскресенья": 6, "вс": 6,
+}
+WEEKDAY_NAMES = ("понедельника", "вторника", "среды", "четверга",
+                 "пятницы", "субботы", "воскресенья")
+
+
+def weekday_name(weekday: int) -> str:
+    return WEEKDAY_NAMES[weekday % 7]
+
+
+def parse_weekday(text: str) -> Optional[int]:
+    return _WEEKDAY_WORDS.get(ru_text.yo(text.strip().casefold()))
+
+
+def _is_week_start_command(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    words = ru_text.yo(text.strip().casefold()).split()
+    return len(words) >= 2 and words[0] == "начало" and words[1] == "недели"
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup", "private"}),
+    F.text.func(_is_week_start_command),
+)
+async def cmd_week_start(message: Message):
+    """«начало недели» — показать, «начало недели понедельник» — задать."""
+    current = db.week_start_weekday()
+    words = message.text.strip().split()
+
+    if len(words) < 3:
+        await message.reply(
+            f"📅 Неделя считается с <b>{weekday_name(current)}</b> — текущая началась "
+            f"{fmt_date(_current_week_start())}.\n"
+            "От неё считаются недельная норма, «вне нормы», «стата/топ неделя», "
+            "«Участники сообщения неделя» и строка «Актив» в профиле.\n"
+            "Задать другой день: <code>начало недели понедельник</code>."
+        )
+        return
+
+    if not has_level(message.from_user.id, required_level("week_start_set")):
+        if get_level(message.from_user.id) > 0:
+            await message.reply(
+                f"⛔ Менять начало недели может только "
+                f"«{level_name(required_level('week_start_set'))}» и выше."
+            )
+        return
+
+    weekday = parse_weekday(" ".join(words[2:]))
+    if weekday is None:
+        await message.reply(
+            "Не понял день. Напишите его словом: <code>начало недели суббота</code> "
+            "(подойдут и «пн», «вт», «ср», «чт», «пт», «сб», «вс»)."
+        )
+        return
+    if weekday == current:
+        await message.reply(f"📅 Неделя и так считается с {weekday_name(current)}.")
+        return
+
+    await db.save_setting("week_start_weekday", weekday)
+    settings["week_start_weekday"] = weekday
+    await db.fetch_settings()   # обновляет кэш границ в db (см. _remember_week_start)
+    await db.add_log("week_start_set", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=weekday_name(weekday))
+    await message.reply(
+        f"📅 Неделя теперь считается с <b>{weekday_name(weekday)}</b> — текущая началась "
+        f"{fmt_date(_current_week_start())}.\n"
+        "Норма, «вне нормы», топы за неделю и «Актив» в профиле пересчитаются сразу: "
+        "числа изменятся, потому что изменилась граница, а не статистика.\n"
+        "⚠️ Это касается и <code>/clearUsers</code>: чистка считает норму от новой "
+        "границы, и посреди недели под неё попадут не те же люди, что попали бы час "
+        "назад. Проверьте «вне нормы» перед чисткой."
+    )
 
 
 @router.message(
@@ -32037,7 +32984,11 @@ async def cmd_norm_check(message: Message):
     for i, row in enumerate(rows, start=1):
         name = mention_id(row["user_id"], full_name=row.get("full_name"), username=row.get("username"))
         lines.append(f"{i}. {name} — {int(row['message_count'])}/{norm}")
-    await message.reply("\n".join(lines))
+
+    # Список бывает на две сотни человек и в лимит Telegram не влезает —
+    # тогда команда молча не отвечала вовсе. Режем так же, как «Участники
+    # сообщения»: голова списка и сколько осталось.
+    await message.reply(clip_member_list(lines, len(rows)))
 
 
 # ----------------------------------------------------------------------------
@@ -32053,6 +33004,39 @@ async def cmd_norm_check(message: Message):
 # ----------------------------------------------------------------------------
 CLEANUP_BAN_DELAY = 0.1  # пауза между банами — не упираться в лимиты Telegram
 CLEANUP_PREVIEW_LIMIT = 20
+CLEANUP_NEWCOMER_DAYS_DEFAULT = 7   # столько дней новичок не под чисткой
+CLEANUP_NEWCOMER_DAYS_MAX = 365
+
+
+def cleanup_newcomer_days() -> int:
+    """Сколько дней после входа в чат человек защищён от чистки (настройка,
+    см. панель → «Чистка /clearUsers»). NULL в базе = дефолт."""
+    raw = settings.get("cleanup_newcomer_days")
+    if raw is None:
+        return CLEANUP_NEWCOMER_DAYS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return CLEANUP_NEWCOMER_DAYS_DEFAULT
+    return max(0, min(value, CLEANUP_NEWCOMER_DAYS_MAX))
+
+
+def _cleanup_join_cutoff():
+    """Раньше какого момента надо было войти в чат, чтобы попасть под чистку.
+
+    Защит две, и обе обязаны действовать одновременно:
+      * вступил ДО начала текущей недели — иначе человека судят по норме за
+        неделю, которая для него началась в среду. Набрать её нельзя;
+      * пробыл в чате дольше «защиты новичков» (настройка, по умолчанию
+        неделя) — иначе вступивший в пятницу попадает под субботнюю чистку,
+        формально прожив в чате сутки.
+
+    Значит, под чистку идёт только тот, кто вошёл раньше ОБЕИХ границ, — то
+    есть раньше более ранней из них.
+    """
+    week_start = datetime.combine(_current_week_start(), datetime.min.time())
+    by_days = datetime.utcnow() - timedelta(days=cleanup_newcomer_days())
+    return min(week_start, by_days)
 
 
 def _is_clear_users_command(text: Optional[str]) -> bool:
@@ -32063,11 +33047,31 @@ def _is_clear_users_command(text: Optional[str]) -> bool:
 
 
 async def _cleanup_candidates(chat_id: int, norm: int) -> list[dict]:
-    """Кто под чистку: ниже нормы за текущую неделю, в чате дольше недели, не в
-    ресте — и НЕ наш админ/владелец (их не баним, даже если молчали)."""
+    """Кто под чистку: ниже нормы за текущую неделю, вошёл в чат раньше обеих
+    границ защиты новичков (см. _cleanup_join_cutoff), не в ресте — и НЕ наш
+    админ/владелец (их не баним, даже если молчали)."""
     week_start = _current_week_start()
-    rows = await db.list_below_norm_joined_before(chat_id, week_start, norm, limit=1000)
+    rows = await db.list_below_norm_joined_before(
+        chat_id, week_start, norm, limit=1000, joined_before=_cleanup_join_cutoff()
+    )
     return [r for r in rows if not is_admin(r["user_id"])]
+
+
+async def _cleanup_protected_newcomers(chat_id: int, norm: int, candidates: list[dict]) -> int:
+    """Сколько человек ниже нормы спасла защита новичков.
+
+    Показываем это число в подтверждении: «новички не в счёт» — обещание, а
+    админ перед необратимым массовым баном должен видеть, что оно работает,
+    и на скольких людей повлияло.
+
+    Обе выборки берут по 1000 строк. Список под бан от этого не страдает
+    (его лимит тот же), а вот счётчик спасённых в чате, где ниже нормы
+    больше тысячи человек, окажется занижен — верить ему в таком масштабе
+    нельзя."""
+    below = await db.list_below_norm(chat_id, _current_week_start(), norm, limit=1000)
+    under_ban = {r["user_id"] for r in candidates}
+    return sum(1 for r in below
+               if r["user_id"] not in under_ban and not is_admin(r["user_id"]))
 
 
 @router.message(
@@ -32107,10 +33111,16 @@ async def cmd_clear_users(message: Message):
         InlineKeyboardButton(text=f"🧹 Забанить {len(candidates)}", callback_data=f"clearusers_go:{message.chat.id}"),
         InlineKeyboardButton(text="Отмена", callback_data="clearusers_cancel"),
     ]])
+    spared = await _cleanup_protected_newcomers(message.chat.id, norm, candidates)
+    spared_line = (
+        f"🌱 Новичков защищено: <b>{spared}</b> — вступили на этой неделе "
+        f"или в чате меньше {cleanup_newcomer_days()} дн.\n" if spared else ""
+    )
     await message.reply(
         f"🧹 <b>Чистка по норме</b> — {norm} сообщ./неделю, с {fmt_date(week_start)}.\n"
         f"Будет <b>перманентно забанено: {len(candidates)}</b> "
         "(админы, рестующие и новички не в счёт).\n"
+        f"{spared_line}"
         f"{DIVIDER}\n" + "\n".join(preview) + "\n\n"
         "⚠️ Действие необратимо. Подтвердите.",
         reply_markup=keyboard,
@@ -32208,10 +33218,8 @@ PARTICIPANTS_USAGE = (
 
 
 def _participants_period_start(period: str):
-    today = datetime.utcnow().date()
-    if period == "month":
-        return today.replace(day=1)
-    return _current_week_start()
+    # Те же календарные границы, что у профиля и топов, см. db.period_start_day.
+    return db.period_start_day(period)
 
 
 def _resolve_participants_period(text: str):
@@ -32302,14 +33310,9 @@ async def cmd_participants(message: Message):
         suffix = " (Рест)" if is_resting else ""
         lines.append(f"{i}. {prefix}{name} — {int(row['message_count'])}{suffix}")
 
-    text = "\n".join(lines)
-    # Telegram режет сообщения на 4096 символах — в очень больших чатах список
-    # может не влезть, тогда показываем первых 50 и говорим, сколько ещё есть.
-    if len(text) > 4000:
-        lines = lines[:2] + lines[2:52] + [f"…и ещё {len(rows) - 50} участников"]
-        text = "\n".join(lines)
-
-    await message.reply(text)
+    # Тот же приём, что и у «не в норме»: список из базы растёт вместе с чатом
+    # и однажды перестаёт влезать в лимит Telegram.
+    await message.reply(clip_member_list(lines, len(rows)))
 
 
 # ----------------------------------------------------------------------------
@@ -32766,8 +33769,9 @@ async def cmd_who_added(message: Message):
 # ачивки, браки, приход-уход, репутация. Можно позвать руками («итоги»),
 # можно включить автопост раз в неделю («+итоги»).
 
-WEEKLY_DIGEST_DAYS = 7
 WEEKLY_DIGEST_CHECK_INTERVAL = 3600  # как часто проверяем, не пора ли постить
+# Числа «7 дней» тут больше нет: неделя календарная и её длину задаёт начало
+# недели (db.week_start_day), а не константа в этом файле.
 
 
 def _digest_key(chat_id: int) -> str:
@@ -32778,19 +33782,46 @@ def _digest_last_key(chat_id: int) -> str:
     return f"digestlast:{chat_id}"
 
 
-async def build_weekly_digest(chat_id: int, days: int = WEEKLY_DIGEST_DAYS) -> Optional[str]:
-    """Собирает текст сводки. None — если за период вообще ничего не было."""
-    total_messages = await db.count_messages_since(chat_id, days)
-    top_active = await db.get_top_active_since(chat_id, days, limit=5)
-    newcomers = await db.get_new_members_since(chat_id, days)
-    marriages = await db.get_marriages_since(chat_id, days)
-    achievements = await db.get_achievements_since(chat_id, days)
-    gainers = await db.get_reputation_gainers_since(chat_id, days, limit=5)
+def _digest_window(since_day=None, until_day=None):
+    """Границы сводки: [since_day, until_day) по дням и то же самое моментами.
+
+    По умолчанию — ТЕКУЩАЯ неделя, с настроенного дня (см. db.period_start_day):
+    «итоги недели» обязаны считать ту же неделю, что норма, топы и профиль.
+    Раньше здесь было скользящее окно в 7 суток, и «неделя» в сводке начиналась
+    где придётся.
+    """
+    since_day = since_day or _current_week_start()
+    since = datetime.combine(since_day, datetime.min.time())
+    until = datetime.combine(until_day, datetime.min.time()) if until_day else None
+    return since_day, until_day, since, until
+
+
+async def build_weekly_digest(chat_id: int, since_day=None, until_day=None) -> Optional[str]:
+    """Собирает текст сводки за [since_day, until_day). None — если за период
+    вообще ничего не было.
+
+    until_day задаёт автопост: он подводит итог ЗАВЕРШИВШЕЙСЯ недели, и
+    сегодняшние сообщения новой недели в него попадать не должны. Ручные
+    «итоги» верхней границы не имеют — это сводка недели, которая идёт.
+    """
+    since_day, until_day, since, until = _digest_window(since_day, until_day)
+
+    total_messages = await db.count_messages_since(chat_id, since_day, until_day)
+    top_active = await db.get_top_active_since(chat_id, since_day, limit=5, until_day=until_day)
+    newcomers = await db.get_new_members_since(chat_id, since, until=until)
+    marriages = await db.get_marriages_since(chat_id, since, until=until)
+    achievements = await db.get_achievements_since(chat_id, since, until=until)
+    gainers = await db.get_reputation_gainers_since(chat_id, since, limit=5, until=until)
 
     if not total_messages and not newcomers and not marriages and not achievements:
         return None
 
-    period = "неделю" if days == 7 else f"{days} дн."
+    # Дата в заголовке — не украшение: неделя календарная, и в первый её день
+    # сводка законно почти пустая. Без дат это читается как «бот сломался».
+    if until_day is None:
+        period = f"неделю (с {fmt_date(since_day)})"
+    else:
+        period = f"неделю {fmt_date(since_day)} — {fmt_date(until_day - timedelta(days=1))}"
     lines = [f"📊 <b>Итоги за {period}</b>"]
 
     if total_messages:
@@ -32854,7 +33885,10 @@ async def cmd_weekly_digest(message: Message):
         return
     text = await build_weekly_digest(message.chat.id)
     if text is None:
-        await message.reply("За неделю в чате ничего заметного не произошло.")
+        await message.reply(
+            f"С начала недели ({fmt_date(_current_week_start())}) в чате "
+            "ничего заметного не произошло."
+        )
         return
     await message.answer(text)
 
@@ -33006,43 +34040,64 @@ async def stock_market_loop() -> None:
             logger.exception("Сбой в цикле биржи")
 
 
+async def post_due_weekly_digests() -> list[int]:
+    """Рассылает итоги тем чатам, кому за начавшуюся неделю их ещё не слали.
+    Возвращает список чатов, куда отправили (нужно тестам и логам).
+
+    Вынесено из цикла: у самого цикла проверять нечего, кроме sleep, а вот
+    решение «пора или нет» — самое ломкое место расписания."""
+    week_start = db.week_start_day()
+    marker = week_start.isoformat()
+    sent: list[int] = []
+
+    for row in await db.list_data_by_prefix("digest:"):
+        if row.get("data_value") != "1":
+            continue
+        try:
+            chat_id = int(row["data_key"].split(":", 1)[1])
+        except (ValueError, IndexError):
+            continue
+
+        last_row = await db.get_data(_digest_last_key(chat_id))
+        # Старое значение — момент отправки (ISO datetime), новое — дата
+        # начала недели. Не совпадёт, и после обновления бота каждый чат
+        # получит сводку один лишний раз; дальше метка уже в новом формате.
+        if last_row and last_row.get("data_value") == marker:
+            continue
+
+        text = await build_weekly_digest(
+            chat_id, since_day=week_start - timedelta(days=7), until_day=week_start
+        )
+        # Метку ставим и когда сводка пустая: иначе бот пробовал бы собрать её
+        # каждый час до конца недели.
+        await db.set_data(_digest_last_key(chat_id), marker)
+        if text is None:
+            continue
+        try:
+            await bot.send_message(chat_id, text)
+            sent.append(chat_id)
+        except Exception:
+            logger.warning("Не удалось отправить итоги в чат %s", chat_id, exc_info=True)
+    return sent
+
+
 async def weekly_digest_loop() -> None:
     """Раз в час проверяет, каким чатам пора отправить недельные итоги.
 
-    Расписание держим в bot_data: для каждого чата запоминаем дату последней
-    отправки. Так пропуск (бот лежал) не копит очередь — просто отправим,
-    когда снова поднимемся.
+    Постим НА ГРАНИЦЕ НЕДЕЛИ и подводим итог недели завершившейся: неделя у
+    бота календарная (по умолчанию с субботы, см. db.week_start_day), и сводка
+    обязана считать ту же неделю, что норма, топы и профиль. Раньше правило
+    было «прошло 7 суток с прошлой отправки» — день недели уплывал от того,
+    когда включили автопост или когда бот лежал.
+
+    В bot_data держим дату начала недели, за которую уже отправили. Пропуск
+    (бот лежал всю субботу) не теряет сводку и не копит очередь: отправим на
+    первой же проверке после подъёма, один раз.
     """
     while True:
         try:
             await asyncio.sleep(WEEKLY_DIGEST_CHECK_INTERVAL)
-            rows = await db.list_data_by_prefix("digest:")
-            for row in rows:
-                if row.get("data_value") != "1":
-                    continue
-                try:
-                    chat_id = int(row["data_key"].split(":", 1)[1])
-                except (ValueError, IndexError):
-                    continue
-
-                last_row = await db.get_data(_digest_last_key(chat_id))
-                last_value = last_row.get("data_value") if last_row else None
-                if last_value:
-                    try:
-                        last_sent = datetime.fromisoformat(last_value)
-                        if (datetime.utcnow() - last_sent).days < WEEKLY_DIGEST_DAYS:
-                            continue
-                    except ValueError:
-                        pass
-
-                text = await build_weekly_digest(chat_id)
-                await db.set_data(_digest_last_key(chat_id), datetime.utcnow().isoformat())
-                if text is None:
-                    continue
-                try:
-                    await bot.send_message(chat_id, text)
-                except Exception:
-                    logger.warning("Не удалось отправить итоги в чат %s", chat_id, exc_info=True)
+            await post_due_weekly_digests()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -33374,16 +34429,10 @@ async def cmd_stock_usage(message: Message):
 CHAT_EVENTS_TICK = 600  # как часто цикл заглядывает в каждый чат, сек
 
 
-def _events_state_key(chat_id: int) -> str:
-    return f"chat_event:{chat_id}"
-
-
-def _events_off_key(chat_id: int) -> str:
-    return f"chat_events_off:{chat_id}"
-
-
-async def events_enabled(chat_id: int) -> bool:
-    return (await db.get_data(_events_off_key(chat_id))) is None
+# Ключ и читатель события общие с сайтом: от ивента зависит, можно ли
+# сажать тыкву, и запирать её экран фермы обязан ровно тогда же.
+# Ключ общий с сайтом по той же причине, что и у заморозки; чтение — своё.
+_events_state_key = farm_actions.events_state_key
 
 
 async def get_active_event(chat_id: int) -> Optional[dict]:
@@ -33405,6 +34454,14 @@ async def get_active_event(chat_id: int) -> Optional[dict]:
         except ValueError:
             return None
     return state
+
+
+def _events_off_key(chat_id: int) -> str:
+    return f"chat_events_off:{chat_id}"
+
+
+async def events_enabled(chat_id: int) -> bool:
+    return (await db.get_data(_events_off_key(chat_id))) is None
 
 
 async def event_multiplier(chat_id: int, tag: str) -> float:
@@ -33825,6 +34882,116 @@ SHOP_RESTOCK_CHECK_INTERVAL = 300
 _SHOP_RESTOCK_LAST_KEY_PREFIX = "shop_restock_last:"
 
 
+def _shop_restock_notify_key(chat_id: int) -> str:
+    return f"restocknotify:{chat_id}"
+
+
+async def is_shop_restock_notify_enabled(chat_id: int) -> bool:
+    """Слать ли админам в личку сводку завоза. По умолчанию — да.
+
+    Отсутствие ключа означает ВКЛЮЧЕНО (как у «+стата»), а не выключено:
+    иначе настройку пришлось бы включать руками, а завоз должен приходить сам,
+    и выключается он по желанию.
+    """
+    row = await db.get_data(_shop_restock_notify_key(chat_id))
+    return not (row is not None and row.get("data_value") == "0")
+
+
+async def _send_shop_restock_report(chat_id: int, text: str) -> None:
+    """Сводка завоза уходит админам В ЛИЧКУ, а не в общий чат.
+
+    Каждый адресат — в своём try: у одного закрыта личка, у другого бот не
+    начат, и падение на первом лишило бы сводки всех остальных.
+    """
+    if not await is_shop_restock_notify_enabled(chat_id):
+        return
+    for admin_id in _admins_at_or_above(LEVEL_MODERATOR):
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as exc:
+            log_suppressed("shop_restock_report", exc)
+
+
+async def run_shop_restock(now: datetime) -> None:
+    """Один проход завоза — ровно по рабочему чату бота.
+
+    Раньше проход шёл по db.list_shop_chat_ids(), то есть по КАЖДОМУ чату, где
+    когда-либо открывали магазин, — а объявление слал в один и тот же чат.
+    Сколько чатов накопилось в таблице (чужая группа, старая группа, личка
+    админа), столько раз люди и видели «магазин обновился». Работает бот в
+    одном чате — и завоз идёт ровно в нём.
+    """
+    chat_id = settings.get("complaint_chat_id")
+    if not chat_id:
+        return
+    today_str = now.date().isoformat()
+    last_key = _SHOP_RESTOCK_LAST_KEY_PREFIX + str(chat_id)
+    last_row = await db.get_data(last_key)
+    if last_row and last_row.get("data_value") == today_str:
+        return
+
+    rows = await db.list_shop_items_for_restock(
+        chat_id, exclude_keys=sorted(black_market.POOL_KEYS)
+    )
+    lines = ["🔄 <b>Магазин обновился!</b>", DIVIDER]
+    restocked_any = False
+    for row in rows:
+        max_amount = int(row["restock_max"] or 0)
+        if max_amount <= 0:
+            continue
+        added = random.randint(0, max_amount)
+        if added <= 0:
+            continue
+        await db.restock_shop_item(chat_id, row["item_key"], added)
+        item = await db.get_shop_item(chat_id, row["item_key"])
+        if item:
+            lines.append(f"{item['emoji']} {html.escape(item['name'])} +{added}")
+            restocked_any = True
+
+    # Заодно крутим лавку — ради объявления. Сама по себе она обновится и без
+    # цикла, при первом обращении (см. ensure_black_market_rotation).
+    if await ensure_black_market_rotation(chat_id):
+        lines.append("🏴 Чёрный рынок обновил ассортимент — «лавка»")
+        restocked_any = True
+
+    # Метку дня ставим независимо от уведомлений: она про «завоз сегодня уже
+    # был», а не про то, кому о нём написали.
+    await db.set_data(last_key, today_str)
+    if restocked_any:
+        await _send_shop_restock_report(chat_id, "\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and ru_text.yo(t.strip().casefold()) in ("+завоз", "-завоз")),
+)
+async def cmd_shop_restock_notify_toggle(message: Message):
+    min_level = required_level("shop_restock_notify")
+    if not has_level(message.from_user.id, min_level):
+        await message.reply(
+            f"⛔ Включать/выключать сводку о завозе может «{level_name(min_level)}» и выше."
+        )
+        return
+    # Ключ — по рабочему чату, а не по тому, откуда написали: завоз читает
+    # настройку именно для него (см. run_shop_restock). Иначе «-завоз»,
+    # отправленный из чата заявок, отвечал бы «выключено» и не менял ничего.
+    shop_chat = _shop_chat_id()
+    if not shop_chat:
+        await message.reply("⚠️ Сначала привяжите основной чат командой «жалобы сюда».")
+        return
+    enable = message.text.strip().casefold() == "+завоз"
+    key = _shop_restock_notify_key(shop_chat)
+    if enable:
+        # Включено — это ОТСУТСТВИЕ ключа (см. is_shop_restock_notify_enabled).
+        await db.delete_data(key)
+        await message.reply("🚚 Сводка о ежедневном завозе снова приходит админам в личку.")
+    else:
+        await db.set_data(key, "0", updated_by=message.from_user.id)
+        await message.reply("🚚 Сводка о ежедневном завозе выключена. Сам завоз идёт как шёл.")
+    await db.add_log("shop_restock_notify", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details=str(enable))
+
+
 async def shop_restock_loop() -> None:
     while True:
         try:
@@ -33832,48 +34999,7 @@ async def shop_restock_loop() -> None:
             now = local_now()
             if now.hour != SHOP_RESTOCK_HOUR_LOCAL:
                 continue
-            today_str = now.date().isoformat()
-            chat_ids = await db.list_shop_chat_ids()
-            for chat_id in chat_ids:
-                last_key = _SHOP_RESTOCK_LAST_KEY_PREFIX + str(chat_id)
-                last_row = await db.get_data(last_key)
-                if last_row and last_row.get("data_value") == today_str:
-                    continue
-
-                rows = await db.list_shop_items_for_restock(
-                    chat_id, exclude_keys=sorted(black_market.POOL_KEYS)
-                )
-                lines = ["🔄 <b>Магазин обновился!</b>", DIVIDER]
-                restocked_any = False
-                for row in rows:
-                    max_amount = int(row["restock_max"] or 0)
-                    if max_amount <= 0:
-                        continue
-                    added = random.randint(0, max_amount)
-                    if added <= 0:
-                        continue
-                    await db.restock_shop_item(chat_id, row["item_key"], added)
-                    item = await db.get_shop_item(chat_id, row["item_key"])
-                    if item:
-                        lines.append(f"{item['emoji']} {html.escape(item['name'])} +{added}")
-                        restocked_any = True
-
-                # Заодно крутим лавку — ради объявления. Сама по себе она
-                # обновится и без цикла, при первом обращении (см.
-                # ensure_black_market_rotation).
-                if await ensure_black_market_rotation(chat_id):
-                    lines.append("🏴 Чёрный рынок обновил ассортимент — «лавка»")
-                    restocked_any = True
-
-                await db.set_data(last_key, today_str)
-                notify_chat = settings.get("complaint_chat_id")
-                if restocked_any and notify_chat:
-                    try:
-                        await bot.send_message(notify_chat, "\n".join(lines))
-                    except Exception:
-                        logger.warning(
-                            "shop_restock_loop: не удалось отправить в чат %s", notify_chat, exc_info=True
-                        )
+            await run_shop_restock(now)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -33889,8 +35015,13 @@ BIRTHDAY_CHECK_INTERVAL = 3600  # проверяем раз в час, шлём 
 
 
 async def birthday_congrats_loop() -> None:
-    """Раз в сутки проверяет, у кого сегодня день рождения (по UTC-дате),
-    и поздравляет в каждом чате, где бот видел этого пользователя.
+    """Раз в сутки проверяет, у кого сегодня день рождения, и поздравляет в
+    каждом чате, где бот видел этого пользователя.
+
+    Дата — по НАСТРОЕННОЙ ЗОНЕ: день рождения человек празднует по своему
+    календарю, а не по Гринвичу. По UTC в чате на МСК поздравление приходило
+    только с трёх ночи, а 31-го числа вечером бот успевал поздравить уже
+    «завтрашних» именинников.
 
     Защита от повторной отправки при рестарте бота в тот же день — метка
     последней отправки хранится в bot_data (db.set_data/get_data), как и
@@ -33898,8 +35029,8 @@ async def birthday_congrats_loop() -> None:
     while True:
         try:
             await asyncio.sleep(BIRTHDAY_CHECK_INTERVAL)
-            now = datetime.utcnow()
-            today_key = f"birthday_sent:{now.date().isoformat()}"
+            now = local_today()
+            today_key = f"birthday_sent:{now.isoformat()}"
 
             rows = await db.list_birthdays_for_day(now.day, now.month)
             if not rows:
@@ -34183,76 +35314,10 @@ async def cmd_reputation_reset(message: Message):
 
 # ---------- Ачивки: разовые достижения за активность и события ----------
 
-ACHIEVEMENTS: dict = {
-    # за награды чата («наградить»)
-    "rewarded_first": {"emoji": "🎗", "title": "Отмечен",      "desc": "получить первую награду чата"},
-    "rewarded_5":     {"emoji": "🏅", "title": "Заслуженный",  "desc": "получить 5 наград чата"},
-    "rewarded_high":  {"emoji": "🌟", "title": "Орденоносец",  "desc": "получить награду 7 степени или выше"},
-    # за количество сообщений
-    "msg_1":      {"emoji": "👶", "title": "Первое слово",     "desc": "написать первое сообщение в чате"},
-    "msg_100":    {"emoji": "💬", "title": "Разговорился",     "desc": "100 сообщений"},
-    "msg_1000":   {"emoji": "🗣", "title": "Голос чата",       "desc": "1 000 сообщений"},
-    "msg_10000":  {"emoji": "📢", "title": "Живая легенда",    "desc": "10 000 сообщений"},
-    "msg_50000":  {"emoji": "🏛", "title": "Памятник",         "desc": "50 000 сообщений"},
-    # за стрик
-    "streak_7":   {"emoji": "🔥", "title": "Неделя подряд",   "desc": "писать 7 дней подряд"},
-    "streak_30":  {"emoji": "🔥", "title": "Месяц подряд",    "desc": "писать 30 дней подряд"},
-    "streak_100": {"emoji": "🔥", "title": "Сотня подряд",    "desc": "писать 100 дней подряд"},
-    # за стаж
-    "days_30":    {"emoji": "📅", "title": "Месяц с нами",     "desc": "30 дней в чате"},
-    "days_365":   {"emoji": "🎂", "title": "Годовщина",        "desc": "год в чате"},
-    # за время суток
-    "night_owl":  {"emoji": "🦉", "title": "Сова",             "desc": "написать между 3 и 5 утра"},
-    "early_bird": {"emoji": "🐓", "title": "Жаворонок",        "desc": "написать между 5 и 7 утра"},
-    # за события
-    "duel_win":   {"emoji": "🔫", "title": "Дуэлянт",          "desc": "победить в дуэли"},
-    "married":    {"emoji": "💍", "title": "Окольцован",       "desc": "вступить в брак"},
-    "role_taken": {"emoji": "🎭", "title": "В образе",         "desc": "занять роль в чате"},
-    "clan_member":{"emoji": "🛡", "title": "Не один",          "desc": "вступить в клан"},
-    "popular":    {"emoji": "🌟", "title": "Популярный",       "desc": "собрать 5 подписчиков"},
-    "investor":   {"emoji": "📈", "title": "Инвестор", "desc": "заработать 1000 i¢ на бирже"},
-    "lootbox_master": {"emoji": "🎰", "title": "Азартный", "desc": "открыть 100 лутбоксов"},
-    "coins_10000":     {"emoji": "💵", "title": "Богач", "desc": "накопить 10 000 i¢ в кошельке"},
-    "coins_100000":    {"emoji": "🏦", "title": "Магнат", "desc": "накопить 100 000 i¢ в кошельке"},
-    "casino_jackpot":  {"emoji": "🎰", "title": "Джекпот", "desc": "выиграть в казино 5 000 i¢ и более за раз"},
-    "casino_100_games":{"emoji": "🃏", "title": "Завсегдатай казино", "desc": "сыграть в казино 100 раз"},
-    "robber_20":       {"emoji": "🥷", "title": "Гроза карманов", "desc": "20 успешных ограблений"},
-    "clan_founder":    {"emoji": "🏰", "title": "Основатель клана", "desc": "создать клан"},
-    "club_founder":    {"emoji": "🎪", "title": "Основатель кружка", "desc": "создать кружок"},
-    "bookmarks_10":    {"emoji": "🔖", "title": "Архивариус", "desc": "создать 10 закладок"},
-    "quotes_10":       {"emoji": "💬", "title": "Мастер цитат", "desc": "создать 10 стикеров-цитат"},
-    "duel_master":     {"emoji": "⚔️", "title": "Дуэльный мастер", "desc": "10 побед в дуэлях"},
-    "matchmaker_50":   {"emoji": "💘", "title": "Купидон", "desc": "зашипперить 50 пар"},
-    "prof_level10":    {"emoji": "💼", "title": "Карьерист", "desc": "достичь 10 уровня в профессии"},
-    "family_5kids":    {"emoji": "👨‍👩‍👧", "title": "Многодетный", "desc": "завести 5 детей в паре"},
-    "pets_5":          {"emoji": "🐾", "title": "Повелитель зверей", "desc": "завести 5 питомцев"},
-    "house_built":     {"emoji": "🏠", "title": "Архитектор", "desc": "построить дом с партнёром"},
-    "race_win":        {"emoji": "🏇", "title": "Жокей", "desc": "выиграть в гонках"},
-    "race_master":     {"emoji": "🏆", "title": "Чемпион ипподрома", "desc": "выиграть в гонках 10 раз"},
-    "generous_20":      {"emoji": "🎁", "title": "Щедрая душа", "desc": "подарить 20 предметов"},
-    # За эти четыре, кроме записи в списке, падает ещё и ПРЕДМЕТ — см.
-    # shop_effects.ITEM_BY_ACHIEVEMENT. Предмет либо пассивно поднимает доход
-    # от того же занятия, либо раз в сутки платит.
-    # Коллекции: за полный сбор (см. collections_meta.py).
-    "collection_tycoon":  {"emoji": "🏢", "title": "Промышленник", "desc": "владеть всеми видами бизнеса"},
-    "collection_empire":  {"emoji": "👑", "title": "Империя", "desc": "все бизнесы на 3 уровне"},
-    "collection_zoo":     {"emoji": "🐾", "title": "Зоопарк", "desc": "завести всех питомцев"},
-    "collection_junk":    {"emoji": "🗑", "title": "Барахольщик", "desc": "собрать весь хлам из магазина"},
-    "collection_dynasty": {"emoji": "🏆", "title": "Династия", "desc": "три сезона подряд в призах"},
-    # Сезонные: выдаются только за место в месячном зачёте (см. seasons.py).
-    "season_1":        {"emoji": "🥇", "title": "Чемпион сезона", "desc": "занять 1 место в месячном зачёте"},
-    "season_2":        {"emoji": "🥈", "title": "Призёр сезона", "desc": "занять 2 место в месячном зачёте"},
-    "season_3":        {"emoji": "🥉", "title": "Бронза сезона", "desc": "занять 3 место в месячном зачёте"},
-    "work_20":         {"emoji": "🤖", "title": "Работяга", "desc": "отработать 20 смен"},
-    "farm_100":        {"emoji": "🚜", "title": "Фермер", "desc": "собрать ферму 100 раз"},
-    # Огородные — отдельно от «Фермера»: тот про старую команду «ферма», а эти
-    # про грядки, и путать их нельзя. Обе выдают предмет, расширяющий огород.
-    "farm_harvest_100": {"emoji": "🧺", "title": "Сто сборов", "desc": "собрать урожай с грядок 100 раз"},
-    "farm_plant_100":  {"emoji": "🌱", "title": "Сто посадок", "desc": "посадить 100 грядок"},
-    "fish_100":        {"emoji": "🎣", "title": "Рыбак", "desc": "поймать 100 уловов"},
-    "treasure_10":     {"emoji": "🗺", "title": "Кладоискатель", "desc": "найти 10 кладов"},
-    "sidejob_50":      {"emoji": "🧰", "title": "Мастер на все руки", "desc": "взять 50 подработок"},
-}
+# Реестр достижений — общий с сайтом (achievements_meta): экран кабинета
+# показывает их все, и разъехавшийся текст человек прочтёт как другое
+# достижение.
+ACHIEVEMENTS = achievements_meta.ACHIEVEMENTS
 # Бонус монет, который выдаётся ОДИН РАЗ вместе с соответствующей ачивкой
 # стрика (grant_achievement идемпотентен — повторно не начислит).
 STREAK_BONUS_COINS = {"streak_7": 100, "streak_30": 500, "streak_100": 2000}
@@ -34389,9 +35454,16 @@ async def check_message_achievements(chat_id: int, user_id: int, when: datetime)
         if code:
             await grant_achievement(chat_id, user_id, code)
 
-        # ночные/утренние — час считаем по времени сообщения (UTC, как и вся
-        # остальная статистика бота)
-        hour = when.hour
+        # Ночные/утренние — час по НАСТРОЕННОЙ ЗОНЕ, а не по UTC. «Написать
+        # между 3 и 5 утра» человек понимает по своим часам: в чате на МСК
+        # «Сова» падала тем, кто писал в 6–7 утра, а настоящие полуночники её
+        # не получали никогда. Сообщения по-прежнему хранятся в UTC — сдвигаем
+        # только момент проверки (см. to_local).
+        #
+        # Стрика и стажа это не касается: они считаются по message_daily, а её
+        # сутки размечены UTC при записи (см. блок «Границы суток» выше).
+        # Читать чужую историю по другой разметке — молча смешать две.
+        hour = to_local(when).hour
         if 3 <= hour < 5:
             await grant_achievement(chat_id, user_id, "night_owl")
         elif 5 <= hour < 7:
@@ -34807,11 +35879,12 @@ async def cmd_title(message: Message):
 
     # word == "+звание"
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("Использование: <code>+звание Текст</code> (до 30 символов).")
+        await message.reply(f"Использование: <code>+звание Текст</code> (до {card_actions.TITLE_MAX} символов).")
         return
     value = parts[1].strip()
-    if len(value) > 30:
-        await message.reply("⚠️ Слишком длинное звание (максимум 30 символов).")
+    if len(value) > card_actions.TITLE_MAX:
+        await message.reply(
+            f"⚠️ Слишком длинное звание (максимум {card_actions.TITLE_MAX} символов).")
         return
     await db.set_title(message.chat.id, message.from_user.id, value)
     await message.reply(f"✅ Ваше звание: <b>{html.escape(value)}</b>")
@@ -34842,11 +35915,12 @@ async def cmd_motto(message: Message):
 
     # word == "+девиз"
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("Использование: <code>+девиз Текст</code> (до 100 символов).")
+        await message.reply(f"Использование: <code>+девиз Текст</code> (до {card_actions.MOTTO_MAX} символов).")
         return
     value = parts[1].strip()
-    if len(value) > 100:
-        await message.reply("⚠️ Слишком длинный девиз (максимум 100 символов).")
+    if len(value) > card_actions.MOTTO_MAX:
+        await message.reply(
+            f"⚠️ Слишком длинный девиз (максимум {card_actions.MOTTO_MAX} символов).")
         return
     await db.set_motto(message.chat.id, message.from_user.id, value)
     await message.reply(f"✅ Ваш девиз: «{html.escape(value)}»")
@@ -34893,8 +35967,10 @@ async def cmd_citizens_list(message: Message):
 GENDER_LABEL = {"м": "мужской", "ж": "женский", "др": "другой"}
 GENDER_EMOJI = {"м": "♂️", "ж": "♀️", "др": "⚧️"}
 GENDER_ALIASES = {"м": "м", "муж": "м", "мужской": "м", "ж": "ж", "жен": "ж", "женский": "ж", "др": "др", "другой": "др"}
-ABOUT_MAX_LEN = 1000
-CITY_MAX_LEN = 64
+# Пределы длины общие с сайтом (card_actions): разъедься они — и текст,
+# который в чате не принимают, спокойно проходил бы из кабинета.
+ABOUT_MAX_LEN = card_actions.ABOUT_MAX
+CITY_MAX_LEN = card_actions.CITY_MAX
 
 
 def _is_gender_set_command(text: str | None) -> bool:
@@ -35531,21 +36607,9 @@ async def cmd_restore_marriage(message: Message):
     await message.reply(await _restore_marriage(message.chat.id, message.from_user.id))
 
 
-@router.message(
-    F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == ".отн"),
-)
-async def cmd_couple(message: Message):
-    marriage = await db.get_marriage(message.chat.id, message.from_user.id)
-    if not marriage:
-        await message.reply(
-            "Вы пока ни с кем не в браке. Ответьте на сообщение человека словом <b>Брак</b>, "
-            "чтобы сделать предложение."
-        )
-        return
-    partner_name = await display_name_by_id(message.chat.id, marriage["partner_id"])
-    married_at: datetime = marriage["married_at"]
-    await message.reply(f"💍 Вы в браке с {partner_name} с {fmt_date(married_at)}")
+# «.отн» обслуживает relationships_v2: его роутер подключён раньше основного,
+# а точку он срезает сам. Здесь когда-то стоял свой обработчик, показывавший
+# строку о браке, — он не срабатывал НИ РАЗУ: до него сообщение не доходило.
 
 
 MARRIAGES_PAGE_SIZE = 10
@@ -36059,7 +37123,7 @@ async def cmd_marriage_extend(message: Message):
         return
 
     cost = conf["renew_price"] * days
-    if cost and not has_infinite_money(user_id):
+    if cost and not await has_infinite_money(user_id):
         if await is_account_frozen(chat_id, user_id):
             await message.reply("🧊 Ваш счёт заморожен — продление недоступно.")
             return
@@ -36192,102 +37256,15 @@ async def marriage_expiry_loop(interval_seconds: int = MARRIAGE_EXPIRY_CHECK_INT
 
 
 # ============================================================================
-# Отношения («Отношения» — как в Iris | Чат-менеджер). Отдельный, более лёгкий
-# модуль, предшествующий браку: пара копит очки близости РП-действиями и
-# поднимается по уровням. Никак не связан с логикой marriages/propose_marriage
-# выше — обе системы работают независимо, /профиль может показать оба статуса.
+# Цель команды по ответу или упоминанию.
+#
+# Единственное, что уцелело от удалённого модуля отношений v1, — и уцелело
+# потому, что к отношениям давно не привязано: этой функцией пользуются
+# команды кланов («+зам», «кик из клана»).
 # ============================================================================
-
-# Уровни близости: (имя, порог очков). Финальный уровень НЕ включает брак —
-# брак остаётся отдельной командой («Брак») и доступен независимо, как сейчас.
-# Дефолт — сид/фолбэк (см. комментарий у _RP_ACTIONS_DEFAULT выше по коду).
-_RELATIONSHIP_LEVELS_DEFAULT: list[tuple[str, int]] = [
-    ("Симпатия", 0),
-    ("Дружеские отношения", 1500),
-    ("Влюблённость", 4000),
-    ("Отношения", 8000),
-    ("Крепкие отношения", 15000),
-]
-
-# Живой кэш — заполняется в load_caches() из db.list_relationship_levels().
-RELATIONSHIP_LEVELS: list[tuple[str, int]] = list(_RELATIONSHIP_LEVELS_DEFAULT)
-
-
-def relationship_level_index(points: int) -> int:
-    """Индекс текущего уровня (0-based) по накопленным очкам."""
-    index = 0
-    for i, (_, threshold) in enumerate(RELATIONSHIP_LEVELS):
-        if points >= threshold:
-            index = i
-    return index
-
-
-def relationship_level_name(level_index: int) -> str:
-    if 0 <= level_index < len(RELATIONSHIP_LEVELS):
-        return RELATIONSHIP_LEVELS[level_index][0]
-    return RELATIONSHIP_LEVELS[-1][0]
-
-
-def relationship_next_level_info(points: int) -> Optional[tuple[str, int]]:
-    """(имя следующего уровня, сколько очков до него) либо None, если уровень уже максимальный."""
-    for name, threshold in RELATIONSHIP_LEVELS:
-        if points < threshold:
-            return name, threshold - points
-    return None
-
-
-# Очки близости за РП-действия. Действия из RP_ACTIONS (обнять/поцеловать/
-# погладить/укусить/ударить) работают как и раньше на ком угодно (см.
-# handle_rp_action выше по коду), но начисляют очки, только если цель —
-# текущий партнёр по отношениям. Ниже — отдельные действия, доступные ТОЛЬКО
-# с текущим партнёром (иначе бот откажет).
-_REL_ACTION_POINTS_DEFAULT: dict[str, int] = {
-    "обнять": 20,
-    "погладить": 15,
-    "укусить": 10,
-    "поцеловать": 35,
-    "ударить": -15,
-    "комплимент": 25,
-    "подарок": 50,
-    "свидание": 70,
-}
-
-# Ключи из _REL_ACTION_POINTS_DEFAULT, которые считаются «партнёрскими» —
-# нужно только для сида db.seed_relationship_actions_if_empty (какой
-# partner_only проставить каждому действию при первой миграции); дальше
-# источник истины — колонка partner_only в таблице relationship_actions.
-_REL_PARTNER_ONLY_KEYS_DEFAULT: set[str] = {"комплимент", "подарок", "свидание"}
-
-# Действия, доступные только с текущим партнёром (не работают на случайных
-# людях вообще, в отличие от «общих» обнять/поцеловать/погладить/укусить/
-# ударить, унаследованных из старого RP_ACTIONS).
-_REL_ONLY_PARTNER_ACTIONS_DEFAULT: dict[str, list[str]] = {
-    "комплимент": [
-        "😊 {actor} делает {target} комплимент — не смущайся, это правда!",
-        "💬 {actor} говорит {target} что-то очень приятное",
-        "✨ {actor} восхищается {target} вслух",
-    ],
-    "подарок": [
-        "🎁 {actor} дарит {target} подарок",
-        "🎁 {actor} преподносит {target} сюрприз-подарок",
-        "🎀 {actor} вручает {target} красиво упакованный подарок",
-    ],
-    "свидание": [
-        "🌆 {actor} приглашает {target} на свидание",
-        "🕯 {actor} и {target} проводят романтический вечер вместе",
-        "🌹 {actor} устраивает для {target} свидание мечты",
-    ],
-}
-
-# Живые кэши — заполняются в load_caches() из db.list_relationship_actions()
-# и db.list_relationship_action_phrases().
-REL_ACTION_POINTS: dict[str, int] = dict(_REL_ACTION_POINTS_DEFAULT)
-REL_ONLY_PARTNER_ACTIONS: dict[str, list[str]] = dict(_REL_ONLY_PARTNER_ACTIONS_DEFAULT)
-
-
-async def resolve_relationship_target(message: Message):
-    """Определяет цель команды модуля «Отношения»: ответ на сообщение или
-    ссылка-упоминание в самом тексте (кликабельное упоминание/@username).
+async def resolve_reply_or_mention_target(message: Message):
+    """Цель команды: ответ на сообщение или ссылка-упоминание в самом тексте
+    (кликабельное упоминание/@username).
     Возвращает Telegram User (или похожий на него объект с id/full_name/
     username/is_bot) либо None, если цель не найдена."""
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -36311,25 +37288,6 @@ async def resolve_relationship_target(message: Message):
                 is_bot=False,
             )
     return None
-
-
-def relationship_status_lines(chat_id_hint: str, rel: dict, partner_name: str) -> list[str]:
-    level_index = rel["level"]
-    level_name = relationship_level_name(level_index)
-    started_at: datetime = rel["started_at"]
-    lines = [
-        f"💞 Партнёр: {partner_name}",
-        f"🏵 Уровень: <b>{level_name}</b>",
-        f"✨ Очки близости: <b>{rel['points']}</b>",
-    ]
-    nxt = relationship_next_level_info(rel["points"])
-    if nxt:
-        next_name, remaining = nxt
-        lines.append(f"📈 До уровня «{next_name}»: {remaining} очк.")
-    else:
-        lines.append("📈 Достигнут максимальный уровень близости")
-    lines.append(f"📅 Отношения начались: {fmt_date(started_at)}")
-    return lines
 
 
 # ============================================================================
@@ -36996,18 +37954,59 @@ def _call_mention(target: dict) -> str:
     return f'<a href="tg://user?id={user_id}">{emoji}</a>'
 
 
+def _call_pin_key(chat_id: int) -> str:
+    return f"callpin:{chat_id}"
+
+
+async def _pin_call_message(chat_id: int, message_id: int) -> None:
+    """Закрепляет сообщение созыва и снимает закреп с ПРОШЛОГО созыва.
+
+    Закрепляется первое сообщение — то, в котором сам текст созыва; остальные
+    это продолжение списка упоминаний, и закреплять их незачем.
+
+    Снимаем прошлый закреп, потому что созывы идут регулярно: без этого шапка
+    чата за неделю обрастает десятком одинаковых закрепов, и найти в ней
+    что-то нужное становится нельзя. Порядок — сначала закрепить новый, потом
+    снять старый: наоборот чат на секунду остался бы вовсе без закрепа.
+
+    Тихо: уведомление о закрепе не нужно, созыв и так только что всех
+    протегал. Нет прав на закрепление — молча продолжаем, ронять из-за этого
+    сам созыв было бы хуже.
+    """
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id, message_id=message_id, disable_notification=True
+        )
+    except Exception as exc:
+        log_suppressed("_pin_call_message", exc)
+        return
+
+    прошлый = await db.get_data(_call_pin_key(chat_id))
+    старый_id = (прошлый or {}).get("data_value")
+    if старый_id and str(старый_id) != str(message_id):
+        try:
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=int(старый_id))
+        except Exception as exc:
+            log_suppressed("_pin_call_message", exc)
+    await db.set_data(_call_pin_key(chat_id), str(message_id))
+
+
 async def _run_call(chat_id: int, targets: list[dict], header_text: Optional[str]):
+    закреплено = False
     try:
         for i in range(0, len(targets), CALL_BATCH_SIZE):
             batch = targets[i : i + CALL_BATCH_SIZE]
             line = " ".join(_call_mention(t) for t in batch)
             text = f"{html.escape(header_text)}\n{line}" if header_text else line
             try:
-                await bot.send_message(chat_id, text)
+                отправлено = await bot.send_message(chat_id, text)
             except TelegramForbiddenError:
                 break
             except TelegramBadRequest:
-                pass
+                отправлено = None
+            if отправлено is not None and not закреплено:
+                закреплено = True
+                await _pin_call_message(chat_id, отправлено.message_id)
             await asyncio.sleep(CALL_BATCH_DELAY)
         try:
             await bot.send_message(chat_id, "📣 Созыв окончен.")
@@ -38397,7 +39396,7 @@ async def cmd_clan_deputy_add(message: Message):
     if membership is None or membership["role"] != "leader":
         await message.reply("⛔ Назначать замов может только лидер клана.")
         return
-    target = await resolve_relationship_target(message)
+    target = await resolve_reply_or_mention_target(message)
     if target is None:
         await message.reply("Укажите цель: ответом на сообщение участника клана или его @username.")
         return
@@ -38421,7 +39420,7 @@ async def cmd_clan_deputy_remove(message: Message):
     if membership is None or membership["role"] != "leader":
         await message.reply("⛔ Снимать замов может только лидер клана.")
         return
-    target = await resolve_relationship_target(message)
+    target = await resolve_reply_or_mention_target(message)
     if target is None:
         await message.reply("Укажите цель: ответом на сообщение участника клана или его @username.")
         return
@@ -38442,7 +39441,7 @@ async def cmd_clan_kick(message: Message):
     if membership is None or membership["role"] not in ("leader", "deputy"):
         await message.reply("⛔ Исключать из клана может только лидер или зам.")
         return
-    target = await resolve_relationship_target(message)
+    target = await resolve_reply_or_mention_target(message)
     if target is None:
         await message.reply("Укажите цель: ответом на сообщение участника клана или его @username.")
         return
@@ -38472,7 +39471,7 @@ async def cmd_clan_transfer(message: Message):
     if membership is None or membership["role"] != "leader":
         await message.reply("⛔ Передать клан может только его лидер.")
         return
-    target = await resolve_relationship_target(message)
+    target = await resolve_reply_or_mention_target(message)
     if target is None:
         await message.reply("Укажите цель: ответом на сообщение участника клана или его @username.")
         return
@@ -39930,9 +40929,6 @@ async def main():
     await db.ensure_propose_phrases_table()
     await db.ensure_propose_requests_table()
     await db.ensure_propose_cooldowns_table()
-    await db.ensure_relationship_levels_table()
-    await db.ensure_relationship_actions_table()
-    await db.ensure_relationship_action_phrases_table()
     await db.ensure_call_emoji_pool_table()
     await db.ensure_duels_table()
     await db.ensure_duel_stats_table()
@@ -39986,8 +40982,12 @@ async def main():
     await db.ensure_voodoo_table()            # именные сувениры-куклы
     await db.ensure_farm_plots_table()        # огород: грядки и помощь соседям
     await db.ensure_farm_animals_table()      # хлев: скот и его продукт
+    await db.ensure_farm_animals_quantity_column()   # поголовье по видам
     await db.ensure_seasons_table()           # месячный зачёт
     await db.ensure_timezone_column()
+    await db.ensure_week_start_column()       # с какого дня считается неделя
+    await db.ensure_cleanup_newcomer_column() # защита новичков от /clearUsers
+    await db.ensure_current_users_joined_column()  # момент входа в чат
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)
     await db.ensure_rel2_tables()
     await db.ensure_rel2_house_tables()
@@ -40013,9 +41013,6 @@ async def main():
     await db.seed_propose_actions_if_empty(_PROPOSE_ACTION_KEYS_DEFAULT)
     await db.seed_propose_action_synonyms_if_empty(_PROPOSE_ACTION_SYNONYMS_DEFAULT)
     await db.seed_propose_phrases_if_empty(_PROPOSE_PHRASES_DEFAULT)
-    await db.seed_relationship_levels_if_empty(_RELATIONSHIP_LEVELS_DEFAULT)
-    await db.seed_relationship_actions_if_empty(_REL_ACTION_POINTS_DEFAULT, _REL_PARTNER_ONLY_KEYS_DEFAULT)
-    await db.seed_relationship_action_phrases_if_empty(_REL_ONLY_PARTNER_ACTIONS_DEFAULT)
     await db.seed_call_emoji_pool_if_empty(_CALL_EMOJI_POOL_DEFAULT)
     await db.seed_titles_if_empty()
     await db.seed_titles_missing()
@@ -40078,6 +41075,7 @@ async def main():
     asyncio.create_task(relationships_v2.pregnancy_announce_loop(bot))
     asyncio.create_task(rest_tag_expiry_loop())
     asyncio.create_task(cmd_cleanup_loop())
+    asyncio.create_task(roster_sweep_loop())
     # шрифты для цитат подтягиваются с сети при первом обращении — греем их
     # заранее и в фоне, чтобы первый «.стикер» не ждал загрузки, а неудача
     # (сервер без интернета) не мешала боту стартовать

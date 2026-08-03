@@ -22,6 +22,7 @@ os.environ.setdefault("BOT_TOKEN", "123456:TESTTOKENTESTTOKENTESTTOKENTESTTOKEN"
 os.environ.setdefault("OWNER_IDS", "1")
 
 import black_market as BM  # noqa: E402
+import steal_actions  # noqa: E402
 import bot as bot_module  # noqa: E402
 import robbery  # noqa: E402
 
@@ -327,6 +328,17 @@ class _Кража:
         monkeypatch.setattr(bot_module.db, "add_inventory_item", add_inventory_item)
         monkeypatch.setattr(bot_module.db, "add_log", add_log)
         monkeypatch.setattr(bot_module.db, "get_shop_item", get_shop_item)
+        # Само дело переехало в steal_actions, общий с сайтом модуль: правила
+        # у чата и кабинета обязаны быть одни. Поэтому подменяем ЕГО швы —
+        # откат, отметку и событие чата, — а не одноимённые в боте.
+        # Инвентарь, списания и кубик подменять отдельно не нужно: db и random
+        # — те же самые модули, что видит бот.
+        async def нет_события(chat_id):
+            return None
+
+        monkeypatch.setattr(steal_actions, "mark_used", mark_used)
+        monkeypatch.setattr(steal_actions, "cooldown_left", cooldown_left)
+        monkeypatch.setattr(steal_actions.farm_actions, "active_event", нет_события)
         monkeypatch.setattr(bot_module, "_steal_mark_used", mark_used)
         monkeypatch.setattr(bot_module, "_steal_cooldown_left", cooldown_left)
         monkeypatch.setattr(bot_module, "event_flag", event_flag)

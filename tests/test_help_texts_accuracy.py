@@ -167,9 +167,11 @@ def test_справка_называет_кулдаун_медвежатника
     справке остался «крадёт один предмет» — по такому описанию человек
     покупает предмет, а потом обнаруживает, что применить его нельзя ещё
     десять часов. Число берём из кода, чтобы они не разъехались снова."""
-    bot = _source("bot.py")
-    match = re.search(r"STEAL_COOLDOWN\s*=\s*timedelta\(hours=(\d+)\)", bot)
-    assert match, "не нашёлся STEAL_COOLDOWN"
+    # Число переехало в steal_actions — общий с сайтом модуль. Ищем там, где
+    # оно объявлено, а не там, где его берут: у бота теперь ссылка.
+    match = re.search(r"COOLDOWN\s*=\s*timedelta\(hours=(\d+)\)",
+                      _source("steal_actions.py"))
+    assert match, "не нашёлся откат медвежатника"
     hours = match.group(1)
 
     строки = [l for l in _help_text().splitlines() if "Медвежатник" in l]

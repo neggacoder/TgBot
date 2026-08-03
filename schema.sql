@@ -87,34 +87,13 @@ CREATE TABLE IF NOT EXISTS marriages (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ----------------------------------------------------------------------------
--- 7. Отношения и очки близости
+-- 7-8. Отношения v1 — УДАЛЕНЫ.
+--
+-- Таблицы relationships и relationship_requests обслуживали старый модуль
+-- отношений. Его команды давно взял на себя rel2 (см. relationships_v2.py),
+-- а сам он висел мёртвым слоем и был удалён. В уже работающих базах таблицы
+-- остаются: в них история старых пар, и дропать её молча незачем.
 -- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS relationships (
-    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-    chat_id         BIGINT NOT NULL,
-    user1_id        BIGINT NOT NULL,
-    user2_id        BIGINT NOT NULL,
-    points          BIGINT NOT NULL DEFAULT 0,
-    level           TINYINT UNSIGNED NOT NULL DEFAULT 0,
-    started_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_action_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uniq_relationship_pair (chat_id, user1_id, user2_id),
-    INDEX idx_relationship_user1 (chat_id, user1_id),
-    INDEX idx_relationship_user2 (chat_id, user2_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- ----------------------------------------------------------------------------
--- 8. Запросы на отношения
--- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS relationship_requests (
-    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-    chat_id       BIGINT NOT NULL,
-    from_user_id  BIGINT NOT NULL,
-    to_user_id    BIGINT NOT NULL,
-    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_relreq_to (chat_id, to_user_id, created_at DESC),
-    INDEX idx_relreq_from (chat_id, from_user_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ----------------------------------------------------------------------------
 -- 9. Локальные никнеймы

@@ -24,6 +24,7 @@ os.environ.setdefault("BOT_TOKEN", "123456:TESTTOKENTESTTOKENTESTTOKENTESTTOKEN"
 os.environ.setdefault("OWNER_IDS", "1")
 
 import bot as bot_module  # noqa: E402
+import farm_actions  # noqa: E402
 
 
 def _sync(fn):
@@ -357,6 +358,11 @@ class _Message:
 def мир(monkeypatch):
     world = _World()
     monkeypatch.setattr(bot_module, "db", world)
+    # Правила огорода живут в farm_actions (ими же пользуется сайт), и база у
+    # него своя ссылка — заглушку надо ставить обеим, иначе половина команды
+    # пойдёт в настоящий пул.
+    monkeypatch.setattr(farm_actions, "db", world)
+    monkeypatch.setattr(farm_actions, "item_perk", lambda *a, **k: _zero())
     monkeypatch.setattr(bot_module, "is_account_frozen",
                         lambda *a, **k: _false())
     monkeypatch.setattr(bot_module, "spend_coins", _spend_for(world))

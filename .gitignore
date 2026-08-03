@@ -6,3 +6,7 @@ $null
 *__pycache__/
 *venv/
 *.pytest_cache/
+**.png
+**.gif
+**.jpg
+

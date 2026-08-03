@@ -193,3 +193,70 @@ def test_кнопки_видны_только_с_правами():
     клавиатура = bot_module.private_menu_kb(ADMIN_ID)
     тексты = [b.text for row in клавиатура.keyboard for b in row]
     assert bot_module.BTN_RAID_ON in тексты or not bot_module.is_admin(ADMIN_ID)
+
+
+# ---------------------------------------------------------------------------
+# Как антирейд ЗАПУСКАЮТ
+#
+# Реестр команд обещает фразу «рейд начался / рейд окончен», а обработчики
+# сверялись с текстом КНОПКИ — вместе с эмодзи. Получалось худшее из
+# возможного: набранное руками в личке «рейд начался» уезжало админам ЗАЯВКОЙ
+# НА ВСТУПЛЕНИЕ, а в самом чате — где админ и находится, когда рейд идёт, —
+# не делало вообще ничего. Молча, в самый неподходящий момент.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("текст", [
+    "🚨 РЕЙД НАЧАЛСЯ",      # кнопка из меню лички
+    "рейд начался",
+    "Рейд Начался",         # регистр не важен
+    "  рейд начался  ",
+])
+def test_антирейд_включается_и_кнопкой_и_фразой(текст):
+    assert bot_module._is_raid_on_phrase(текст)
+    assert not bot_module._is_raid_off_phrase(текст)
+
+
+@pytest.mark.parametrize("текст", ["✅ РЕЙД ОКОНЧЕН", "рейд окончен", "РЕЙД ОКОНЧЕН"])
+def test_антирейд_выключается_и_кнопкой_и_фразой(текст):
+    assert bot_module._is_raid_off_phrase(текст)
+    assert not bot_module._is_raid_on_phrase(текст)
+
+
+@pytest.mark.parametrize("текст", ["рейд", "рейды начались", "начался рейд", "", None])
+def test_похожие_фразы_антирейд_не_включают(текст):
+    """Ошибиться здесь дорого в обе стороны: лишний запуск закрывает чат и
+    банит новичков."""
+    assert not bot_module._is_raid_on_phrase(текст)
+    assert not bot_module._is_raid_off_phrase(текст)
+
+
+def test_набранная_фраза_не_уедет_заявкой():
+    """is_private_passthrough решает, отправить ли написанное админам как
+    заявку. Пока фразы там не было, «рейд начался» из лички уходило именно
+    туда — вместе с профилем написавшего.
+
+    Проверяем ВСЕ формы разом, а не перечисленные руками: два списка легко
+    разъезжаются, и добавленная в один форма снова начнёт уезжать заявкой."""
+    for фраза in bot_module.RAID_ON_PHRASES | bot_module.RAID_OFF_PHRASES:
+        assert bot_module.is_private_passthrough(фраза), фраза
+    assert bot_module.is_private_passthrough(bot_module.BTN_RAID_ON)
+    assert bot_module.is_private_passthrough(bot_module.BTN_RAID_OFF)
+
+
+def test_антирейд_работает_и_в_чате_и_в_личке():
+    """Фильтр обработчика обязан пускать оба места: кнопки живут в личке, но
+    рейд случается в чате, и туда админ пишет первым делом."""
+    import inspect
+    for fn in (bot_module.cmd_raid_start, bot_module.cmd_raid_stop):
+        флаги = inspect.getsource(fn)
+        assert "private" in флаги and "supergroup" in флаги, fn.__name__
+
+
+def test_из_лички_фраза_доходит_до_своего_обработчика():
+    """Заявочный обработчик стоит в файле раньше антирейда и ловит в личке всё.
+    Он обязан ПРОПУСТИТЬ фразу дальше (SkipHandler), а не забрать себе."""
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    msg = _Сообщение("рейд начался")
+    with pytest.raises(SkipHandler):
+        asyncio.run(bot_module.handle_user_message(msg))
+    assert msg.ответы == [], "антирейд не должен получить ответ вместо действия"

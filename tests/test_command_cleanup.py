@@ -899,3 +899,159 @@ def test_без_реплая_и_без_аргумента_подсказка_р�
     assert _чк == []
     assert "ответом" in msg.ответы[0]
     assert ".рулетка" in msg.ответы[0], "пример нужен: без него способ не очевиден"
+
+
+# ---------------------------------------------------------------------------
+# Групповая запись «+чк рп»
+#
+# РП-действий 34, у каждого второго есть повелительная форма («обними» к
+# «обнять»), плюс 21 себяшка — и всё это правится в панели. Поштучно такое в
+# список не занесёшь, а занёсший «обнять» получал чистку ровно на «обнять»:
+# «обними» оставалось в чате. Отсюда и жалоба «рп-команды не подчиняются чк».
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def группа_рп(пустой_список):
+    """Список глобальный (см. пустой_список), поэтому включаем группу только
+    на время теста — с восстановлением, как и всё остальное в этом файле."""
+    bot_module.cleanup_extra_phrases[:] = [bot_module.CLEANUP_GROUP_RP]
+    bot_module.rebuild_cleanup_extra_forms()
+    return bot_module.cleanup_extra_phrases
+
+
+@pytest.mark.parametrize("text", [
+    "обнять",                 # цель — из ответа на сообщение
+    "обнять @vasya",
+    "обнять 12345",
+    "обними",                 # повелительная форма: та самая, что не ловилась
+    "обними его",
+    "взять за руку @vasya",   # многословное действие
+    "[пукнуть",               # себяшка
+    "[пукнуть громко",        # хвост себяшки обработчик игнорирует и отвечает
+])
+def test_рп_команды_доезжают_до_очереди(monkeypatch, группа_рп, text):
+    assert _прогнать_через_очистку(monkeypatch, text), f"{text!r} не попало в очередь"
+
+
+@pytest.mark.parametrize("text", [
+    "обнять снова тест",      # обработчик такое пропускает (SkipHandler)
+    "обнять его сегодня",
+    "привет, обними меня",
+    "погода сегодня хорошая",
+])
+def test_живая_речь_под_группу_не_попадает(monkeypatch, группа_рп, text):
+    """Правило группы: убирается то, на что бот ОТВЕТИЛ. Здесь он молчит —
+    значит, это просто разговор, и трогать его нельзя.
+
+    Тем и отличается от ручной записи: «+чк обнять» ловит по началу сообщения
+    и «обнять снова тест» уберёт. Группа — уже нет, и это намеренно."""
+    assert not _прогнать_через_очистку(monkeypatch, text)
+
+
+def test_без_группы_рп_остаётся_в_чате(monkeypatch, пустой_список):
+    """Обратная сторона: пока «рп» не добавили, ничего РП не чистится."""
+    assert not _прогнать_через_очистку(monkeypatch, "обними @vasya")
+    assert not _прогнать_через_очистку(monkeypatch, "[пукнуть")
+
+
+def test_действие_добавленное_в_панели_под_группу_попадает(monkeypatch, группа_рп):
+    """Ради этого группа и проверяется условием обработчика, а не словами из
+    списка: новое действие из панели должно чиститься само, без похода в «чк»."""
+    assert not _прогнать_через_очистку(monkeypatch, "боднуть @vasya"), "такого действия ещё нет"
+
+    async def list_rp_actions(active_only=True):
+        return {**bot_module.RP_ACTIONS, "боднуть": ["{actor} бодает {target}"]}
+
+    async def list_rp_action_synonyms():
+        return {**bot_module.RP_ACTION_SYNONYMS, "боднй": "боднуть"}
+
+    monkeypatch.setattr(bot_module.db, "list_rp_actions", list_rp_actions, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_rp_action_synonyms", list_rp_action_synonyms,
+                        raising=False)
+    было = dict(bot_module.RP_ACTIONS), dict(bot_module.RP_ACTION_SYNONYMS)
+    try:
+        asyncio.run(bot_module.refresh_rp_caches())
+        assert _прогнать_через_очистку(monkeypatch, "боднуть @vasya")
+    finally:
+        # RP_ACTIONS живут в модуле — monkeypatch их не откатит.
+        bot_module.RP_ACTIONS.clear(); bot_module.RP_ACTIONS.update(было[0])
+        bot_module.RP_ACTION_SYNONYMS.clear(); bot_module.RP_ACTION_SYNONYMS.update(было[1])
+        asyncio.run(bot_module.refresh_rp_caches())
+
+
+def test_подпись_к_фото_под_группу_не_попадает(monkeypatch, группа_рп):
+    """Обработчики РП стоят на F.text: на фото с подписью «обнять» бот не
+    отвечает ничем. Удалить за ним чужую картинку — это уже не чистка команд,
+    а удаление сообщений участников."""
+    from datetime import datetime as _dt
+
+    from aiogram.types import Chat, Message, User
+
+    очередь: list[tuple] = []
+    ЧАТ_ЖАЛОБ = -1009999999999
+
+    async def add_cleanup_entry(chat_id, message_id, delete_at, root_message_id=None):
+        очередь.append((chat_id, message_id))
+
+    async def handler(event, data):
+        return None
+
+    monkeypatch.setattr(bot_module.db, "add_cleanup_entry", add_cleanup_entry, raising=False)
+    monkeypatch.setitem(bot_module.settings, "complaint_chat_id", ЧАТ_ЖАЛОБ)
+    monkeypatch.setitem(bot_module.settings, "command_cleanup_minutes", "15")
+
+    фото = Message(
+        message_id=43, date=_dt.now(), chat=Chat(id=ЧАТ_ЖАЛОБ, type="supergroup"),
+        from_user=User(id=555, is_bot=False, first_name="Тестер"), caption="обнять",
+    )
+    asyncio.run(bot_module.CommandCleanupMiddleware()(handler, фото, {}))
+
+    assert очередь == []
+
+
+def test_плюс_чк_рп_объясняет_что_это_группа(_чк):
+    msg = _ЗаписьВЧат("+чк рп")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == ["рп"]
+    ответ = msg.ответы[0]
+    assert "группа" in ответ.casefold(), "иначе выглядит как обычная запись из одного слова"
+    assert "себяшки" in ответ.casefold()
+
+
+def test_плюс_чк_на_одиночное_действие_подсказывает_про_группу(_чк):
+    """Добавивший «обнять» должен узнать про «обними» сразу, а не через неделю
+    по неубранным сообщениям."""
+    msg = _ЗаписьВЧат("+чк обнять")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == ["обнять"]
+    assert "+чк рп" in msg.ответы[0]
+
+
+def test_плюс_чк_реплаем_на_рп_понимает_действие(_чк):
+    """Раньше «+чк» ответом на РП-сообщение отвечал «не похоже на команду» —
+    при том что бот на это сообщение как раз ответил."""
+    msg = _ЗаписьСОтветом("+чк", "обними @vasya")
+    asyncio.run(bot_module.cmd_cleanup_add(msg))
+
+    assert _чк == ["обними"], "форма берётся та, что написана в чате"
+
+
+def test_чк_рассказывает_про_группу_в_списке(группа_рп):
+    текст = bot_module._cleanup_status_text()
+    assert "ГРУППА" in текст, "строка «рп» в списке выглядит как обычная запись"
+
+
+def test_минус_чк_рп_выключает_группу(_чк):
+    """Флаг группы живёт в модуле, и если его не сбросить при удалении записи,
+    чистка продолжит убирать РП уже после «-чк рп». Невыключаемая чистка хуже
+    той, ради которой всё затевалось."""
+    asyncio.run(bot_module.cmd_cleanup_add(_ЗаписьВЧат("+чк рп")))
+    assert bot_module.matches_cleanup_rp_group("обними @vasya")
+
+    asyncio.run(bot_module.cmd_cleanup_del(_ЗаписьВЧат("-чк рп")))
+
+    assert _чк == []
+    assert not bot_module.matches_cleanup_rp_group("обними @vasya")
+    assert not bot_module.matches_cleanup_rp_group("[пукнуть")

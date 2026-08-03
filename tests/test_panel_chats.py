@@ -29,7 +29,13 @@ def panel_client(monkeypatch):
             {"chat_id": CHAT_B, "members": 7, "last_seen": "2026-07-23 09:00:00"},
         ]
 
+    async def fetch_settings():
+        # Рабочий чат: панель показывает только его. Раньше отдавались все, где
+        # бот когда-либо состоял, и админ выбирал чат, данных по которому нет.
+        return {"complaint_chat_id": CHAT_A, "notify_chat_id": -100333}
+
     monkeypatch.setattr(db, "list_current_chats", list_current_chats)
+    monkeypatch.setattr(db, "fetch_settings", fetch_settings, raising=False)
 
     panel.app.dependency_overrides[panel.auth.require_user] = lambda: PanelUser(
         id=1, username="tester", role="owner"
@@ -47,10 +53,19 @@ def test_api_chats_reads_current_users_not_known_users(panel_client):
     assert res.status_code == 200, res.text
     chats = res.json()["chats"]
 
-    assert [c["chat_id"] for c in chats] == [CHAT_A, CHAT_B]
-    assert [c["members"] for c in chats] == [42, 7]
-    assert [c["last_seen"] for c in chats] == ["2026-07-24 10:00:00", "2026-07-23 09:00:00"]
+    assert [c["chat_id"] for c in chats] == [CHAT_A]
+    assert [c["members"] for c in chats] == [42]
+    assert [c["last_seen"] for c in chats] == ["2026-07-24 10:00:00"]
     assert all(c["title"] == f"{c['chat_id']} (недоступен)" for c in chats)
+
+
+def test_api_chats_отдаёт_только_рабочий_чат(panel_client):
+    """Панель одночатовая: бот работает только в рабочем чате, а остальные
+    строки в current_users — остаток от прежнего использования. Пока они
+    показывались, админ выбирал чат и смотрел данные, которых нет."""
+    chats = panel_client.get("/api/chats").json()["chats"]
+    assert len(chats) == 1
+    assert CHAT_B not in [c["chat_id"] for c in chats]
 
 
 def test_api_chats_does_not_use_list_known_chats(panel_client, monkeypatch):

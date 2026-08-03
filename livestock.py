@@ -19,9 +19,16 @@
    вернулся к горе шерсти, и заходить каждый день стало бы незачем. Потолок
    — примерно двое суток производства.
 
-3. Одно животное каждого вида. Пять коров — это просто «×5 к молоку», то есть
-   никакого решения; а вот «на что копить дальше» — решение. По той же
-   причине один бизнес каждого типа (см. BUSINESS_MAX_OWNED).
+3. Животных одного вида теперь можно держать несколько — до MAX_PER_KIND.
+   Раньше было строго по одному, и рассуждение звучало так: «пять коров — это
+   просто ×5 к молоку, то есть никакого решения, а вот на что копить дальше —
+   решение». Владелец решил иначе: хлев должен масштабироваться. Потолок на
+   вид всё же остаётся — он держит цену продукта осмысленной и не даёт
+   превратить хлев в бесконечный станок.
+
+   Всё, что зависит от количества, считается через total_cap()/produced():
+   и потолок накопления, и скорость — иначе три коровы давали бы столько же
+   молока, сколько одна, и покупка выглядела бы обманом.
 """
 
 from __future__ import annotations
@@ -80,6 +87,10 @@ BY_ITEM: dict[str, Animal] = {a.item_key: a for a in ANIMALS}
 # не было бесплатным, но и не наказывало за смену планов.
 SELL_BACK_PERCENT = 50
 
+# Сколько животных одного вида можно держать. Не «сколько угодно»: продукт
+# идёт в крафты и в продажу, и бесконечный хлев обесценил бы и то, и другое.
+MAX_PER_KIND = 10
+
 # Названия для команды: «ферма купить корова». Русское слово, а не ключ, —
 # ключи человек видит только в инвентаре.
 BY_WORD: dict[str, Animal] = {}
@@ -108,9 +119,19 @@ SHOP_ITEMS: list[tuple[str, str, int, str, str]] = [
 ]
 
 
+def total_cap(animal: Animal, quantity: int = 1) -> int:
+    """Потолок накопления на всё поголовье этого вида."""
+    return animal.cap * max(1, int(quantity))
+
+
 def produced(animal: Animal, last_collect_at: Optional[datetime],
-             now: datetime) -> int:
+             now: datetime, quantity: int = 1) -> int:
     """Сколько продукта накопилось к этому моменту. Никогда больше потолка.
+
+    quantity — сколько таких животных в хлеву: и выработка, и потолок растут
+    вместе с поголовьем. Считаем «сколько дало бы одно» и умножаем на число
+    голов — так потолок остаётся ровно двумя сутками производства независимо
+    от размера стада.
 
     Ленивый счёт, без фоновой задачи: в базе лежит только «когда забирали в
     прошлый раз». Бот может простоять сутки — при первом обращении досчитает,
@@ -121,15 +142,20 @@ def produced(animal: Animal, last_collect_at: Optional[datetime],
     hours = (now - last_collect_at).total_seconds() / 3600
     if hours <= 0:
         return 0
-    return min(animal.cap, int(hours / animal.cycle_hours) * animal.per_cycle)
+    за_голову = min(animal.cap, int(hours / animal.cycle_hours) * animal.per_cycle)
+    return за_голову * max(1, int(quantity))
 
 
 def next_unit_in(animal: Animal, last_collect_at: Optional[datetime],
-                 now: datetime) -> Optional[timedelta]:
-    """Через сколько появится следующая порция. None — потолок уже достигнут."""
+                 now: datetime, quantity: int = 1) -> Optional[timedelta]:
+    """Через сколько появится следующая порция. None — потолок уже достигнут.
+
+    Потолок и здесь на всё поголовье (см. total_cap): иначе у стада из трёх
+    коров бот писал бы «полный хлев» втрое раньше, чем он на самом деле
+    полон."""
     if last_collect_at is None:
         return timedelta(hours=animal.cycle_hours)
-    if produced(animal, last_collect_at, now) >= animal.cap:
+    if produced(animal, last_collect_at, now, quantity) >= total_cap(animal, quantity):
         return None
     hours = max(0.0, (now - last_collect_at).total_seconds() / 3600)
     циклов = int(hours / animal.cycle_hours) + 1

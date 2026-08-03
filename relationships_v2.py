@@ -125,6 +125,30 @@ def _first_word_is(text: Optional[str], word: str) -> bool:
     return bool(parts) and parts[0].casefold() == word
 
 
+def _first_word_in(text: Optional[str], words) -> bool:
+    """То же, но для команд с несколькими названиями («рб» / «ребёнок»).
+
+    Точку понимает вся семья «отн», а не только сама «отн». Раньше её
+    срезала одна эта команда, а соседние — «+отн», «-отн», «рб …», «дом …» —
+    сверялись с текстом буквально: предложение подавалось «.отн запрос», а
+    принять его «.+отн» уже было нельзя. Справка при этом сама предлагала
+    короткий алиас «.рб».
+    """
+    if not text:
+        return False
+    parts = _strip_dot_prefix(text).split()
+    return bool(parts) and parts[0].casefold() in words
+
+
+def _dot_free_text(message) -> str:
+    """Текст команды без ведущей точки — для разбора аргументов.
+
+    Разбирать message.text напрямую нельзя: у «.дом купить cottage» первым
+    словом окажется «.дом», и подкоманда съедет.
+    """
+    return _strip_dot_prefix(message.text or "")
+
+
 # ============================================================================
 # 🔥 ИСКРЫ — формула, вехи уровней, начисление/списание
 # ============================================================================
@@ -884,10 +908,10 @@ async def house_maintenance_loop(bot, interval_seconds: int = 3600) -> None:
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() == "дом"),
+    F.text.func(lambda t: _first_word_is(t, "дом")),
 )
 async def cmd_house_word(message: Message) -> None:
-    parts = message.text.strip().split()
+    parts = _dot_free_text(message).split()
     sub = parts[1].casefold() if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""
     arg_rest = " ".join(parts[2:]) if len(parts) > 2 else ""
@@ -1725,8 +1749,8 @@ async def cmd_child_propose(message: Message, name_hint: str) -> None:
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="👶 Принять", callback_data=f"child_accept:{actor.id}:{target.id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"child_decline:{actor.id}:{target.id}"),
+            InlineKeyboardButton(text="🟢 Да", callback_data=f"child_accept:{actor.id}:{target.id}"),
+            InlineKeyboardButton(text="🔴 Нет", callback_data=f"child_decline:{actor.id}:{target.id}"),
         ]]
     )
     await message.reply(
@@ -2904,9 +2928,20 @@ async def _display_name(chat_id: int, user, bot) -> str:
 
 
 async def resolve_rel2_target(message: Message):
-    """Цель команды: ответ на сообщение или кликабельная ссылка-упоминание в
-    самом тексте (text_mention/@username). Возвращает Telegram User-подобный
-    объект (id/full_name/username/is_bot) либо None."""
+    """Цель команды: ответ на сообщение или упоминание в тексте
+    (text_mention/@username). Возвращает Telegram User-подобный объект
+    (id/full_name/username/is_bot) либо None.
+
+    @ник ищется В РЕЕСТРЕ БОТА, а не у Telegram, и это не оптимизация: Bot API
+    не умеет превращать юзернейм обычного человека в user_id — getChat по нему
+    отвечает ошибкой. Раньше здесь стоял именно getChat, и «отн запрос @ник»
+    не срабатывал НИКОГДА: бот отвечал «ответьте на сообщение человека», хотя
+    ник указан прямо в команде. Остальные команды бота (муты, награды,
+    подарки) давно ищут цель в known_users — теперь и эта.
+
+    Сначала свой чат, потом глобально: юзернеймы в Telegram уникальны, но в
+    своём чате запись свежее.
+    """
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
 
@@ -2914,20 +2949,25 @@ async def resolve_rel2_target(message: Message):
         if entity.type == "text_mention" and entity.user:
             return entity.user
         if entity.type == "mention":
-            username = message.text[entity.offset : entity.offset + entity.length].lstrip("@")
-            try:
-                chat = await message.bot.get_chat(username)
-            except Exception:
-                continue
-            if chat.type != "private":
-                continue
-            return SimpleNamespace(
-                id=chat.id,
-                full_name=chat.full_name or chat.first_name or username,
-                username=chat.username,
-                is_bot=False,
-            )
+            username = (message.text or "")[entity.offset: entity.offset + entity.length].lstrip("@")
+            known = (await db.get_known_user_by_username_in_chat(message.chat.id, username)
+                     or await db.get_known_user_by_username(username))
+            if known:
+                return SimpleNamespace(
+                    id=int(known["user_id"]),
+                    full_name=known.get("full_name") or username,
+                    username=known.get("username") or username,
+                    is_bot=False,
+                )
     return None
+
+
+def _has_mention(message: Message) -> bool:
+    """Был ли в команде @ник или кликабельное упоминание.
+
+    Нужно, чтобы не советовать «ответьте на сообщение» тому, кто ник как раз
+    указал: у него другая беда — бот этого участника ещё не видел."""
+    return any(e.type in ("mention", "text_mention") for e in (message.entities or []))
 
 
 # ============================================================================
@@ -2940,10 +2980,10 @@ async def resolve_rel2_target(message: Message):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().split()[0].casefold() in ("ребенок", "ребёнок", "рб")),
+    F.text.func(lambda t: _first_word_in(t, ("ребенок", "ребёнок", "рб"))),
 )
 async def cmd_child_word(message: Message) -> None:
-    parts = message.text.strip().split()
+    parts = _dot_free_text(message).split()
     sub = parts[1].casefold() if len(parts) > 1 else ""
     a1 = parts[2] if len(parts) > 2 else ""
     a2 = " ".join(parts[3:]) if len(parts) > 3 else ""
@@ -3011,25 +3051,31 @@ async def cmd_child_word(message: Message) -> None:
 async def cmd_rel2_word(message: Message):
     parts = _strip_dot_prefix(message.text).split(maxsplit=1)
     sub = parts[1].strip().casefold() if len(parts) > 1 else ""
+    # ПЕРВОЕ СЛОВО хвоста. В sub лежит всё, что после «отн», поэтому ветка,
+    # сверяющаяся с sub целиком, ломается от первого же аргумента: «отн обнять
+    # @vasya» (привычка из дружеских РП-действий) вместо жеста выдавал
+    # простыню со списком команд. Ветки со своими аргументами разбирают parts[1]
+    # сами и на это слово не смотрят.
+    первое = sub.split()[0] if sub else ""
 
     if sub == "я" or sub.startswith("я "):
         # Хвост после «я» (например «отн я Ник») игнорируем — карточка всегда о
         # своей паре («Твоя половинка»).
         await cmd_rel2_me(message)
         return
-    if sub in ("вернуть", "верни"):
+    if первое in ("вернуть", "верни"):
         await message.reply(await _restore_rel2(message.chat.id, message.from_user.id, message.bot))
         return
-    if sub in ("список",):
+    if первое in ("список",):
         await cmd_rel2_list(message)
         return
-    if sub in ("бонус",):
+    if первое in ("бонус",):
         await cmd_rel2_bonus(message)
         return
-    if sub in ("история",):
+    if первое in ("история",):
         await cmd_rel2_history(message)
         return
-    if sub in ("действия", "действие"):
+    if первое in ("действия", "действие"):
         await cmd_rel2_actions_catalog(message)
         return
     if sub == "сделать" or sub.startswith("сделать "):
@@ -3042,8 +3088,10 @@ async def cmd_rel2_word(message: Message):
             return
         await cmd_rel2_do_action(message, query)
         return
-    if sub in SIMPLE_RP_ALIAS_MAP:
-        await cmd_rel2_simple_action(message, SIMPLE_RP_ALIAS_MAP[sub])
+    if первое in SIMPLE_RP_ALIAS_MAP:
+        # Жест всегда направлен на партнёра, поэтому хвост («отн обнять
+        # @vasya») просто игнорируем: цель у пары одна, и указывать её незачем.
+        await cmd_rel2_simple_action(message, SIMPLE_RP_ALIAS_MAP[первое])
         return
     # «отн особые» — новое, нейтральное имя. «отн премиум» оставлено рабочим,
     # чтобы у тех, кто привык к старой команде, ничего не сломалось.
@@ -3055,13 +3103,13 @@ async def cmd_rel2_word(message: Message):
         else:
             await cmd_rel2_premium_action(message, query)
         return
-    if sub == "презик":
+    if первое == "презик":
         await cmd_rel2_toggle_contraception(message)
         return
-    if sub in ("секс", "кекс","пошалить"):
+    if первое in ("секс", "кекс", "пошалить"):
         await cmd_rel2_conceive(message)
         return
-    if sub in ("беременность", "беременна", "берем"):
+    if первое in ("беременность", "беременна", "берем"):
         await cmd_rel2_pregnancy_status(message)
         return
     if sub == "пт" or sub.startswith("пт "):
@@ -3072,9 +3120,15 @@ async def cmd_rel2_word(message: Message):
         name_hint = parts[1][len("родить"):].strip() if len(parts) > 1 else ""
         await cmd_child_propose(message, name_hint)
         return
-    if sub in ("запрос", "расторгнуть", ""):
+    if sub == "" or первое in ("запрос", "расторгнуть"):
         # «отн запрос @user», «отн запрос» ответом, либо голое «отн» ответом —
         # все ведут в один обработчик предложения/разрыва (см. ниже).
+        #
+        # Сверяем ПЕРВОЕ СЛОВО хвоста, а не хвост целиком. В sub лежит всё
+        # после «отн», то есть у «отн запрос @vasya» это «запрос @vasya», —
+        # и сравнение с голым «запрос» не совпадало никогда. Человек в ответ
+        # получал простыню со списком команд, где та же форма «отн запрос
+        # [@user/ответом]» и была написана.
         await _handle_rel2_propose_or_break(message)
         return
 
@@ -3097,15 +3151,27 @@ async def cmd_rel2_word(message: Message):
     )
 
 
+# Кнопки «да/нет» в модуле отношений — 🟢 и 🔴.
+#
+# Своего цвета у inline-кнопок Telegram нет: клавиатура рисуется одинаково
+# серой, и раскрасить её нечем. Цвет даёт кружок в подписи — так это сделано
+# и у ботов, на которые ссылался владелец. Поэтому пары кнопок здесь одинаковы
+# по виду: зелёный кружок слева, красный справа, слова короткие.
 async def _handle_rel2_propose_or_break(message: Message) -> None:
     actor = message.from_user
     target = await resolve_rel2_target(message)
 
     if target is None:
-        await message.reply(
-            "💞 Чтобы предложить отношения, ответьте на сообщение человека командой "
-            "<b>отн запрос</b> или отправьте её с кликабельной ссылкой на него."
-        )
+        if _has_mention(message):
+            await message.reply(
+                "💞 Не нашёл этого участника — бот его ещё не видел в этом чате. "
+                "Ответьте командой <b>отн запрос</b> на любое его сообщение."
+            )
+        else:
+            await message.reply(
+                "💞 Чтобы предложить отношения, ответьте на сообщение человека командой "
+                "<b>отн запрос</b> или укажите его @ник."
+            )
         return
     if target.id == actor.id:
         await message.reply("Нельзя предложить отношения самому себе 🙂")
@@ -3136,8 +3202,8 @@ async def _handle_rel2_propose_or_break(message: Message) -> None:
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="💞 Принять", callback_data=f"rel2_accept:{actor.id}:{target.id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rel2_decline:{actor.id}:{target.id}"),
+            InlineKeyboardButton(text="🟢 Да", callback_data=f"rel2_accept:{actor.id}:{target.id}"),
+            InlineKeyboardButton(text="🔴 Нет", callback_data=f"rel2_decline:{actor.id}:{target.id}"),
         ]]
     )
     await message.reply(
@@ -3231,7 +3297,7 @@ async def rel2_decline_button(callback: CallbackQuery):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "+отн"),
+    F.text.func(lambda t: _strip_dot_prefix(t or "").casefold() == "+отн"),
 )
 async def cmd_rel2_accept_word(message: Message):
     actor = message.from_user
@@ -3249,8 +3315,8 @@ async def _do_rel2_break(message: Message, pair: dict) -> None:
     # Подтверждение перед расторжением (можно случайно ответить партнёру «отн»).
     partner_name = await _display_name_by_id(message.chat.id, pair["partner_id"], message.bot)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="💔 Да, расторгнуть", callback_data=f"rel2_break_yes:{message.from_user.id}"),
-        InlineKeyboardButton(text="Отмена", callback_data=f"rel2_break_no:{message.from_user.id}"),
+        InlineKeyboardButton(text="🟢 Да", callback_data=f"rel2_break_yes:{message.from_user.id}"),
+        InlineKeyboardButton(text="🔴 Нет", callback_data=f"rel2_break_no:{message.from_user.id}"),
     ]])
     await message.reply(
         f"💔 Точно расторгнуть отношения с {partner_name}? Вернуть можно в течение 72 часов.",
@@ -3347,7 +3413,7 @@ async def cb_rel2_undo(callback: CallbackQuery):
 
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and t.strip().casefold() == "-отн"),
+    F.text.func(lambda t: _strip_dot_prefix(t or "").casefold() == "-отн"),
 )
 async def cmd_rel2_break_word(message: Message):
     pair = await db.get_rel2_pair(message.chat.id, message.from_user.id)

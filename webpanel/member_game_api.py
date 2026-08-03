@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+import chats
 import db
 import game_actions
 
@@ -33,7 +34,6 @@ require_member_in_chat = None
 
 
 class PetActionBody(BaseModel):
-    chat_id: int
     key: Optional[str] = None
     name: Optional[str] = None
     confirm: bool = False
@@ -94,7 +94,10 @@ _ACTION_COMMANDS = {
 
 
 @router.get("/api/member/game/pets")
-async def api_member_pets(chat_id: int, user: PanelUser = Depends(auth.require_member)):
+async def api_member_pets(user: PanelUser = Depends(auth.require_member)):
+    chat_id = await chats.work_chat_id()
+    if chat_id is None:
+        raise HTTPException(400, "Рабочий чат ещё не привязан")
     await require_member_in_chat(user, chat_id)
     await permissions.ensure(user, _LIST_COMMAND)
     # own=True: это экран «мои питомцы», а не просмотр чужого профиля — тех же
@@ -105,8 +108,15 @@ async def api_member_pets(chat_id: int, user: PanelUser = Depends(auth.require_m
     # питомцев списком: вкладке нужен ключ на каждую кнопку, а без ключа
     # действие уходит «кому-нибудь» и у любого, у кого питомцев больше
     # одного, отбивается советом набрать команду в чате.
+    # Текст остаётся для тех, кто читает его как в чате, а рядом едут те же
+    # числа данными: страница рисует карточки, а не показывает стену текста
+    # с полосками из ▰▱ (см. game_actions.my_pets_cards).
+    карточки = await game_actions.my_pets_cards(chat_id, user.tg_user_id)
     return {"ok": result.ok, "text": result.text,
-            "pets": await game_actions.my_pets_list(chat_id, user.tg_user_id)}
+            "pets": await game_actions.my_pets_list(chat_id, user.tg_user_id),
+            "cards": карточки["pets"], "food": карточки["food"],
+            "food_emoji": карточки["food_emoji"],
+            "food_price": карточки.get("food_price")}
 
 
 # Слово ласки для care_pet/care_all — то же самое, что разбирает регулярка
@@ -198,6 +208,10 @@ async def api_member_pet_action(
     user: PanelUser = Depends(auth.require_member),
 ):
     auth.verify_csrf(request)
+    chat_id = await chats.work_chat_id()
+    if chat_id is None:
+        raise HTTPException(400, "Рабочий чат ещё не привязан")
+
     # Отключённые проверяем ДО «такого действия нет»: адрес существует, и
     # отвечать на него «не знаю такого» значило бы врать тому, кто помнит
     # это действие по чату.
@@ -215,13 +229,13 @@ async def api_member_pet_action(
         # действием. Явный 400 честнее.
         raise HTTPException(
             400, f"Укажите verb — один из: {', '.join(_CARE_VERBS)}.")
-    await require_member_in_chat(user, body.chat_id)
+    await require_member_in_chat(user, chat_id)
     # Сначала «а вы вообще в этом чате», потом «а хватает ли уровня»: иначе
     # постороннему сообщали бы, какого права ему не хватает в чужом чате.
     # Ключ берём прямым индексированием: действие без ключа команды — дыра, и
     # тест не даёт такому появиться (см. test_у_каждого_действия_есть_право).
     await permissions.ensure(user, _ACTION_COMMANDS[action])
-    result = await _ACTIONS[action](body, body.chat_id, user.tg_user_id)
+    result = await _ACTIONS[action](body, chat_id, user.tg_user_id)
     # Защита на будущее: контракт «результат действия — всегда ActionResult»
     # сегодня выполняют все действия таблицы, но держится он в game_actions.py,
     # а не здесь — забытый там None молча уронил бы _announce на
@@ -233,7 +247,7 @@ async def api_member_pet_action(
     # Журнал ПЕРЕД объявлениями: действие уже случилось, и след о нём не
     # должен зависеть от того, дошло ли поздравление до чата. Сейчас неудачу
     # отправки ловит _announce, но порядок держит запись даже без ловушки.
-    await db.add_log("member_game", chat_id=body.chat_id,
+    await db.add_log("member_game", chat_id=chat_id,
                      actor_id=user.tg_user_id, details=f"pets/{action}")
-    await _announce(body.chat_id, result)
+    await _announce(chat_id, result)
     return {"ok": result.ok, "text": result.text}

@@ -27,6 +27,18 @@ os.environ.setdefault("OWNER_IDS", "1")
 import bot as bot_module  # noqa: E402
 import shop_effects as SE  # noqa: E402
 
+# Проверка «+бесконечность» стала асинхронной: список читается из базы на
+# каждый вопрос, иначе рубильник с сайта для бота не существует до
+# перезапуска (см. owner_flags). Синхронная заглушка отдавала bool, а его
+# нельзя await'ить.
+async def _не_бесконечность(user_id):
+    return False
+
+
+async def _бесконечность(user_id):
+    return True
+
+
 CHAT_ID = -1001234567890
 ME = 555
 
@@ -197,7 +209,7 @@ def world(monkeypatch):
     ]:
         monkeypatch.setattr(bot_module.db, name, fn, raising=False)
     monkeypatch.setattr(bot_module, "is_account_frozen", _returns(False), raising=False)
-    monkeypatch.setattr(bot_module, "has_infinite_money", lambda uid: False, raising=False)
+    monkeypatch.setattr(bot_module, "has_infinite_money", _не_бесконечность, raising=False)
     return state
 
 

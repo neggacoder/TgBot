@@ -64,7 +64,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import admin_holds
+import chats as chats_mod
 import db
+import owner_flags
 import relationships_v2
 import rest_rules
 import rp_photos
@@ -694,6 +696,50 @@ async def api_link_telegram(
     return {"ok": True, "tg_full_name": row.get("tg_full_name")}
 
 
+# ---------------------------------------------------------------------------
+# Бесконечные деньги («+бесконечность») — рубильник владельца.
+#
+# Он же существует командой в чате, и это ровно тот случай, ради которого
+# заведён owner_flags: список читается из базы на каждый вопрос, а не из
+# множества в памяти бота. Иначе кнопка здесь выглядела бы сработавшей, а бот
+# продолжал бы списывать монеты до перезапуска.
+#
+# Привязка телеграма обязательна и это не формальность: бот знает человека по
+# телеграм-идентификатору, а у аккаунта панели его может не быть вовсе.
+# Записать нечего — значит рубильник бы молчал.
+# ---------------------------------------------------------------------------
+class InfiniteMoneyBody(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/owner/infinite-money")
+async def api_infinite_money(user: PanelUser = Depends(auth.require_owner)):
+    return {
+        "linked": user.tg_user_id is not None,
+        "enabled": await owner_flags.has_infinite_money(user.tg_user_id),
+        # Кому ещё включено — владелец должен видеть, что рубильник не только
+        # его: список общий, и выключить чужой отсюда нельзя.
+        "others": sorted(u for u in await owner_flags.infinite_money_users()
+                         if u != user.tg_user_id),
+    }
+
+
+@app.post("/api/owner/infinite-money")
+async def api_infinite_money_set(
+    body: InfiniteMoneyBody, request: Request,
+    user: PanelUser = Depends(auth.require_owner),
+):
+    auth.verify_csrf(request)
+    if user.tg_user_id is None:
+        raise HTTPException(400, "Сначала привяжите телеграм — бот узнаёт вас по нему.")
+    await owner_flags.set_infinite_money(user.tg_user_id, body.enabled)
+    # Тот же журнал, что у команды в чате: в аудите оба входа выглядят
+    # одинаково, и по нему видно, откуда переключали.
+    await db.add_log("infinite_money_toggle", actor_id=user.tg_user_id,
+                     details=f"{body.enabled} (панель)")
+    return {"ok": True, "enabled": body.enabled}
+
+
 @app.get("/api/users")
 async def api_users(user: PanelUser = Depends(auth.require_owner)):
     return {"users": await db.list_panel_users()}
@@ -766,7 +812,20 @@ async def api_logins(user: PanelUser = Depends(auth.require_owner)):
 
 @app.get("/api/chats")
 async def api_chats(user: PanelUser = Depends(auth.require_user)):
-    chats = await db.list_current_chats()
+    """Чаты панели. Он один — рабочий.
+
+    Раньше отдавались все чаты, где бот когда-либо состоял, и в каждом разделе
+    висел выбор чата. Выбор был обманом: бот работает только в рабочем чате, а
+    остальные строки — остаток от прежнего использования. Админ выбирал чат и
+    смотрел данные, которых не существует.
+    """
+    рабочий = await chats_mod.work_chat_id()
+    chats = [r for r in await db.list_current_chats()
+             if рабочий is not None and r["chat_id"] == рабочий]
+    if рабочий is not None and not chats:
+        # Бот в рабочем чате есть, а строки в current_users ещё нет (свежая
+        # привязка) — чат всё равно надо показать, иначе панель пуста.
+        chats = [{"chat_id": рабочий, "members": 0}]
     out = []
     for row in chats:
         chat_id = row["chat_id"]
@@ -1893,8 +1952,22 @@ async def _member_display(chat_id: int, user_id: int) -> str:
 
 
 async def _require_member_in_chat(user: PanelUser, chat_id: int) -> None:
+    """Кабинет работает ТОЛЬКО в рабочем чате.
+
+    Раньше здесь стояло одно «бот видел вас в этом чате», и этого хватало:
+    любой чат из истории открывал игровые экраны, а деньги и данные уходили
+    под чужой chat_id. Заметить это можно было только по расхождению цифр в
+    чате и на сайте.
+
+    Какой чат рабочий, знает chats.py — здесь только проверка.
+    """
     if not user.tg_user_id:
         raise HTTPException(400, "Аккаунт не привязан к Telegram")
+    рабочий = await chats_mod.work_chat_id()
+    if рабочий is None:
+        raise HTTPException(400, "Рабочий чат ещё не привязан — скажите «жалобы сюда» в чате")
+    if chat_id != рабочий:
+        raise HTTPException(403, "Кабинет работает только в основном чате")
     if not await db.get_known_user(chat_id, user.tg_user_id):
         raise HTTPException(403, "Бот не видел вас в этом чате")
 
@@ -1910,7 +1983,17 @@ class MemberProposeBody(BaseModel):
 
 @app.get("/api/member/chats")
 async def api_member_chats(user: PanelUser = Depends(auth.require_member)):
-    ids = await db.list_user_chats(user.tg_user_id) if user.tg_user_id else []
+    """Чаты, где работает кабинет. Их ровно один — рабочий.
+
+    Раньше отдавались все чаты, где бота когда-либо видели вместе с человеком,
+    и вкладки предлагали выбрать любой. Выбор был бессмысленным (кабинет
+    пускает только рабочий) и вредным: человек выбирал чат, где бот давно не
+    работает, и получал отказ вместо экрана.
+    """
+    рабочий = await chats_mod.work_chat_id()
+    if рабочий is None:
+        return {"chats": []}
+    ids = [рабочий] if await db.get_known_user(рабочий, user.tg_user_id) else []
     out = []
     for chat_id in ids:
         title = str(chat_id)
@@ -2019,42 +2102,14 @@ async def api_member_farm_bonus(
 # на уровне модуля). Выполнить действие = начислить искры и поставить кулдаун,
 # ровно как «отн сделать <название/номер>» в боте.
 # ---------------------------------------------------------------------------
+
 RP_ACTION_COOLDOWN_SCOPE = "rp_action"
 
-RP_ACTIONS = [
-    {"level": 1,  "key": "compliment",     "name": "Сделать комплимент",       "reward": 15,    "cooldown_minutes": 5},
-    {"level": 2,  "key": "breakfast",      "name": "Сделать завтрак",          "reward": 35,    "cooldown_minutes": 8},
-    {"level": 3,  "key": "flowers",        "name": "Подарить цветы",           "reward": 60,    "cooldown_minutes": 11},
-    {"level": 4,  "key": "movie",          "name": "Посмотреть фильм",         "reward": 80,    "cooldown_minutes": 15},
-    {"level": 5,  "key": "massage",        "name": "Сделать массаж",           "reward": 120,   "cooldown_minutes": 20},
-    {"level": 6,  "key": "dinner",         "name": "Романтический ужин",       "reward": 170,   "cooldown_minutes": 30},
-    {"level": 7,  "key": "gift",           "name": "Сделать подарок",          "reward": 230,   "cooldown_minutes": 38},
-    {"level": 8,  "key": "trip",           "name": "Туристическая поездка",    "reward": 300,   "cooldown_minutes": 45},
-    {"level": 9,  "key": "astronomy",      "name": "Вечер астрономии",         "reward": 400,   "cooldown_minutes": 60},
-    {"level": 10, "key": "memories",       "name": "Приятные воспоминания",    "reward": 500,   "cooldown_minutes": 80},
-    {"level": 11, "key": "photoshoot",     "name": "Совместная фотосессия",    "reward": 700,   "cooldown_minutes": 90},
-    {"level": 12, "key": "tradition",      "name": "Создать традицию",         "reward": 900,   "cooldown_minutes": 100},
-    {"level": 13, "key": "project",        "name": "Совместный проект",        "reward": 1100,  "cooldown_minutes": 110},
-    {"level": 14, "key": "genealogy",      "name": "Исследовать родословную",  "reward": 1400,  "cooldown_minutes": 120},
-    {"level": 15, "key": "future",         "name": "Спланировать будущее",     "reward": 1700,  "cooldown_minutes": 130},
-    {"level": 16, "key": "wish",           "name": "Исполнить желание",        "reward": 2100,  "cooldown_minutes": 140},
-    {"level": 17, "key": "anniversary",    "name": "Годовщина отношений",      "reward": 2500,  "cooldown_minutes": 150},
-    {"level": 18, "key": "home",           "name": "Обустроить жилище",        "reward": 3000,  "cooldown_minutes": 160},
-    {"level": 19, "key": "spirit",         "name": "Духовное единение",        "reward": 3500,  "cooldown_minutes": 170},
-    {"level": 20, "key": "retreat",        "name": "Уединенный отдых",         "reward": 4000,  "cooldown_minutes": 180},
-    {"level": 21, "key": "vow",            "name": "Написать клятву",          "reward": 4800,  "cooldown_minutes": 200},
-    {"level": 22, "key": "talisman",       "name": "Создать талисман",         "reward": 5600,  "cooldown_minutes": 220},
-    {"level": 23, "key": "song",           "name": "Написать песню",           "reward": 6500,  "cooldown_minutes": 240},
-    {"level": 24, "key": "garden",         "name": "Вырастить сад",            "reward": 7500,  "cooldown_minutes": 260},
-    {"level": 25, "key": "dance",          "name": "Танцевальный вечер",       "reward": 8500,  "cooldown_minutes": 280},
-    {"level": 26, "key": "family_council", "name": "Семейный совет",           "reward": 10000, "cooldown_minutes": 300},
-    {"level": 27, "key": "star",           "name": "Назвать звезду",           "reward": 11500, "cooldown_minutes": 320},
-    {"level": 28, "key": "book",           "name": "Написать книгу",           "reward": 13000, "cooldown_minutes": 340},
-    {"level": 29, "key": "celebration",    "name": "Организовать праздник",    "reward": 15000, "cooldown_minutes": 360},
-    {"level": 30, "key": "eternal_love",   "name": "Вечная любовь",            "reward": 18000, "cooldown_minutes": 400},
-]
-
-RP_ACTIONS_BY_KEY = {a["key"]: a for a in RP_ACTIONS}
+# Второй, урезанный список тех же действий когда-то лежал прямо здесь и молча
+# затирал каталог выше: числа в нём совпадали, а «verb» и «phrases» — те, что
+# и делают объявление в чате человеческим («сделал(а) комплимент» вместо
+# «сделать комплимент», плюс фраза-цитата), — терялись. Каталог должен быть
+# один, и он выше по файлу.
 
 
 def _rp_action_reward(action: dict, premium: bool) -> int:
@@ -2808,8 +2863,15 @@ async def api_member_restore(
 
 @app.get("/api/member/chat-members")
 async def api_member_chat_members(
-    chat_id: int, q: str = "", user: PanelUser = Depends(auth.require_member)
+    q: str = "", user: PanelUser = Depends(auth.require_member)
 ):
+    # Чат один, и знает его сервер. Раньше он приходил параметром из браузера:
+    # заслон это пропускал, потому что смотрел только в member_*_api.py, а этот
+    # эндпоинт живёт здесь. Дыры не было (чужой чат всё равно давал 403), но
+    # параметр, которым можно ошибиться, — лишний.
+    chat_id = await chats_mod.work_chat_id()
+    if chat_id is None:
+        raise HTTPException(400, "Рабочий чат ещё не привязан")
     await _require_member_in_chat(user, chat_id)
     rows, _total = await db.list_known_users(chat_id, limit=500, offset=0)
     needle = q.casefold().strip()
@@ -4043,14 +4105,19 @@ async def api_stats(chat_id: int, days: int = 7, user: PanelUser = Depends(auth.
     role_map = await roles.load()
     days = max(1, min(days, 365))
 
-    top_active = role_map.annotate(await db.get_top_active_since(chat_id, days, limit=10))
-    newcomers = role_map.annotate(await db.get_new_members_since(chat_id, days, limit=20))
-
+    # Границы — датами, а не числом дней: в db.* «since» теперь везде момент,
+    # а не «сколько суток назад». Заодно счётчик сообщений считает ровно тот же
+    # отрезок, что и график рядом, — раньше он захватывал лишний день.
     today = _stats_today()
     since_day = today - timedelta(days=days - 1)
+    since = datetime.combine(since_day, datetime.min.time())
+
+    top_active = role_map.annotate(await db.get_top_active_since(chat_id, since_day, limit=10))
+    newcomers = role_map.annotate(await db.get_new_members_since(chat_id, since, limit=20))
+
     daily = _daily_series(await db.list_daily_counts_for_chat(chat_id, since_day), since_day, today)
     hourly = _hourly_series(await db.list_hourly_last_24h_for_chat(chat_id))
-    total = await db.count_messages_since(chat_id, days)
+    total = await db.count_messages_since(chat_id, since_day)
 
     peak_day = max(daily, key=lambda d: d["count"]) if daily else {"day": None, "count": 0}
     peak_hour = max(hourly, key=lambda h: h["count"]) if hourly else {"hour": None, "count": 0}
@@ -4386,5 +4453,77 @@ from .member_game_api import router as member_game_router  # noqa: E402
 member_game_api.get_bot = get_bot
 member_game_api.require_member_in_chat = _require_member_in_chat
 app.include_router(member_game_router)
+
+from . import member_farm_api  # noqa: E402
+from .member_farm_api import router as member_farm_router  # noqa: E402
+member_farm_api.get_bot = get_bot
+member_farm_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_farm_router)
+
+from . import member_casino_api  # noqa: E402
+from .member_casino_api import router as member_casino_router  # noqa: E402
+member_casino_api.get_bot = get_bot
+member_casino_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_casino_router)
+
+from . import member_business_api  # noqa: E402
+from .member_business_api import router as member_business_router  # noqa: E402
+member_business_api.get_bot = get_bot
+member_business_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_business_router)
+
+from . import member_activity_api  # noqa: E402
+from .member_activity_api import router as member_activity_router  # noqa: E402
+member_activity_api.get_bot = get_bot
+member_activity_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_activity_router)
+
+from . import member_profile_api  # noqa: E402
+from .member_profile_api import router as member_profile_router  # noqa: E402
+member_profile_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_profile_router)
+
+from . import member_shop_api  # noqa: E402
+from .member_shop_api import router as member_shop_router  # noqa: E402
+member_shop_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_shop_router)
+
+from . import member_stock_api  # noqa: E402
+from .member_stock_api import router as member_stock_router  # noqa: E402
+member_stock_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_stock_router)
+
+from . import member_bank_api  # noqa: E402
+from .member_bank_api import router as member_bank_router  # noqa: E402
+member_bank_api.get_bot = get_bot
+member_bank_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_bank_router)
+
+from . import member_steal_api  # noqa: E402
+from .member_steal_api import router as member_steal_router  # noqa: E402
+member_steal_api.get_bot = get_bot
+member_steal_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_steal_router)
+
+from . import member_card_api  # noqa: E402
+from .member_card_api import router as member_card_router  # noqa: E402
+member_card_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_card_router)
+
+from . import member_lootbox_api  # noqa: E402
+from .member_lootbox_api import router as member_lootbox_router  # noqa: E402
+member_lootbox_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_lootbox_router)
+
+from . import member_market_api  # noqa: E402
+from .member_market_api import router as member_market_router  # noqa: E402
+member_market_api.get_bot = get_bot
+member_market_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_market_router)
+
+from . import member_gallery_api  # noqa: E402
+from .member_gallery_api import router as member_gallery_router  # noqa: E402
+member_gallery_api.require_member_in_chat = _require_member_in_chat
+app.include_router(member_gallery_router)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

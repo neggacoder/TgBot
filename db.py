@@ -37,6 +37,32 @@ async def init_pool() -> None:
         autocommit=True,
         minsize=1,
         maxsize=10,
+        # Сессия базы — строго UTC, и это не косметика.
+        #
+        # Питон пишет время через datetime.utcnow(), а MySQL — через NOW(),
+        # CURRENT_TIMESTAMP и ON UPDATE CURRENT_TIMESTAMP, то есть в часовом
+        # поясе СЕССИИ. Пока он не задан, зона берётся из настроек сервера, и
+        # на сервере, скажем, по Москве получается так: колонка created_at
+        # заполнена по МСК, а код сравнивает её с utcnow() — и всякий срок,
+        # кулдаун и «сколько прошло» уезжают на три часа. Молча: на UTC-сервере
+        # всё сходится, при переезде ломается.
+        #
+        # Пришпиливаем зону здесь, а не правим полторы сотни запросов:
+        # NOW() == UTC_TIMESTAMP() == то, что пишет питон. Панель поднимает
+        # тот же пул (webpanel/app.py зовёт init_pool), так что зона у обоих
+        # процессов одна.
+        #
+        # Что происходит со СТАРЫМИ строками, если сервер стоял не на UTC:
+        #   * колонки TIMESTAMP хранятся как момент (epoch) и переводятся при
+        #     чтении — их показ, наоборот, чинится: раньше значение приезжало
+        #     в зоне сервера, а to_local() сдвигал его ещё раз;
+        #   * колонки DATETIME хранятся как есть, поэтому исторические строки,
+        #     заполненные CURRENT_TIMESTAMP до этой правки, теперь читаются
+        #     как UTC и разъезжаются на смещение сервера. Разово и только у
+        #     старых записей; новые пишутся уже верно.
+        # Если сервер и так на UTC (обычный случай), не меняется ничего.
+        # Проверить: SELECT @@global.time_zone, NOW(), UTC_TIMESTAMP();
+        init_command="SET time_zone = '+00:00'",
     )
 
 
@@ -119,6 +145,11 @@ async def fetch_settings() -> dict:
     if row is None:
         await _execute("INSERT IGNORE INTO settings (id) VALUES (1)")
         row = await _fetchone("SELECT * FROM settings WHERE id = 1")
+    # Начало недели нужно и синхронному коду (границы периодов, см.
+    # week_start_day ниже), поэтому запоминаем его здесь: fetch_settings —
+    # единственная дорога к строке настроек, и её проходят оба процесса, и
+    # бот, и веб-панель. Отдельный загрузчик пришлось бы не забыть вызвать.
+    _remember_week_start(row)
     return row
 
 
@@ -154,6 +185,12 @@ _ALLOWED_SETTING_FIELDS = {
     # Часовой пояс ПОКАЗА времени (внутри всё по-прежнему в UTC), колонка
     # добавляется миграцией ensure_timezone_column()
     "timezone",
+    # С какого дня недели считаются «неделя» и недельная норма; колонка
+    # добавляется миграцией ensure_week_start_column()
+    "week_start_weekday",
+    # Сколько дней новичок защищён от чистки /clearUsers; колонка добавляется
+    # миграцией ensure_cleanup_newcomer_column()
+    "cleanup_newcomer_days",
 }
 
 
@@ -234,6 +271,29 @@ async def ensure_timezone_column() -> None:
     (см. fmt_dt/to_local в bot.py).
     """
     await _add_column_if_missing("settings", "timezone", "VARCHAR(64) NULL")
+
+
+async def ensure_cleanup_newcomer_column() -> None:
+    """Колонка settings.cleanup_newcomer_days — сколько дней после входа в чат
+    человек не попадает под чистку «/clearUsers».
+
+    NULL = дефолт CLEANUP_NEWCOMER_DAYS_DEFAULT. Ноль — «отсчёта в днях нет»,
+    но защита вступивших на текущей неделе остаётся всегда: чистка судит по
+    недельной норме, а неделю, которая для тебя началась в среду, набрать
+    нельзя (см. _cleanup_join_cutoff в bot.py).
+    """
+    await _add_column_if_missing("settings", "cleanup_newcomer_days", "INT NULL")
+
+
+async def ensure_week_start_column() -> None:
+    """Колонка settings.week_start_weekday — с какого дня начинается неделя
+    (0 = понедельник … 6 = воскресенье, см. weekday()).
+
+    NULL = дефолт WEEK_START_DEFAULT (суббота — так попросил считать
+    владелец). Хранение в колонке, а не константой в коде: день недели —
+    настройка чата, и менять её правкой исходников неправильно.
+    """
+    await _add_column_if_missing("settings", "week_start_weekday", "TINYINT NULL")
 
 
 async def ensure_command_cleanup_column() -> None:
@@ -663,7 +723,10 @@ async def mark_request_decided(anchor_message_id: int, status: str, decided_by: 
     await _execute(
         "UPDATE request_messages SET status = %s, decided_by = %s, decided_at = %s "
         "WHERE message_id = %s",
-        (status, decided_by, datetime.now(), anchor_message_id),
+        # utcnow, а не now: весь остальной бот пишет время в UTC, а now()
+        # берёт зону операционной системы — на не-UTC сервере отметка о
+        # решении по заявке уезжала бы относительно всех соседних.
+        (status, decided_by, datetime.utcnow(), anchor_message_id),
     )
 
 
@@ -935,123 +998,6 @@ async def cleanup_dissolutions(hours: int = 72) -> int:
     )
 
 
-# ----------------------------------------------------------------------------
-# Отношения (привязаны к чату) — лёгкая механика близости, отдельно от браков.
-# ----------------------------------------------------------------------------
-async def get_relationship(chat_id: int, user_id: int) -> Optional[dict]:
-    row = await _fetchone(
-        "SELECT user1_id, user2_id, points, level, started_at, last_action_at "
-        "FROM relationships WHERE chat_id = %s AND (user1_id = %s OR user2_id = %s) LIMIT 1",
-        (chat_id, user_id, user_id),
-    )
-    if row is None:
-        return None
-    partner_id = row["user2_id"] if row["user1_id"] == user_id else row["user1_id"]
-    return {
-        "partner_id": partner_id,
-        "points": row["points"],
-        "level": row["level"],
-        "started_at": row["started_at"],
-        "last_action_at": row["last_action_at"],
-    }
-
-
-async def list_relationships(chat_id: int, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
-    """Топ пар чата по очкам близости (для «отн топ») + общее количество."""
-    count_row = await _fetchone(
-        "SELECT COUNT(*) AS total FROM relationships WHERE chat_id = %s", (chat_id,)
-    )
-    rows = await _fetchall(
-        "SELECT user1_id, user2_id, points, level, started_at FROM relationships "
-        "WHERE chat_id = %s ORDER BY points DESC, id ASC LIMIT %s OFFSET %s",
-        (chat_id, limit, offset),
-    )
-    return rows, int(count_row["total"] if count_row else 0)
-
-
-async def create_relationship(chat_id: int, user_a: int, user_b: int) -> bool:
-    """Создаёт отношения атомарно; возвращает False, если один уже занят."""
-    u1, u2 = sorted((user_a, user_b))
-    pool = _require_pool()
-    lock_name = f"relationship:{chat_id}"
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT GET_LOCK(%s, 5) AS acquired", (lock_name,))
-            lock = await cur.fetchone()
-            if not lock or lock["acquired"] != 1:
-                return False
-            try:
-                await cur.execute(
-                    "SELECT 1 FROM relationships "
-                    "WHERE chat_id = %s AND (user1_id IN (%s, %s) OR user2_id IN (%s, %s)) LIMIT 1",
-                    (chat_id, u1, u2, u1, u2),
-                )
-                if await cur.fetchone():
-                    return False
-                await cur.execute(
-                    "INSERT INTO relationships (chat_id, user1_id, user2_id) VALUES (%s, %s, %s)",
-                    (chat_id, u1, u2),
-                )
-                return True
-            finally:
-                await cur.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
-
-
-async def delete_relationship(chat_id: int, user_id: int) -> bool:
-    rowcount = await _execute(
-        "DELETE FROM relationships WHERE chat_id = %s AND (user1_id = %s OR user2_id = %s)",
-        (chat_id, user_id, user_id),
-    )
-    return rowcount > 0
-
-
-async def set_relationship_progress(chat_id: int, user_a: int, user_b: int, points: int, level: int) -> None:
-    """Обновляет очки/уровень пары (уровень уже посчитан в bot.py по RELATIONSHIP_LEVELS)."""
-    u1, u2 = sorted((user_a, user_b))
-    points = max(points, 0)
-    await _execute(
-        "UPDATE relationships SET points = %s, level = %s, last_action_at = CURRENT_TIMESTAMP "
-        "WHERE chat_id = %s AND user1_id = %s AND user2_id = %s",
-        (points, level, chat_id, u1, u2),
-    )
-
-
-# ----------------------------------------------------------------------------
-# Предложения отношений («отн {ссылка}» / ответом, принимаются «+отн»)
-# ----------------------------------------------------------------------------
-async def create_relationship_request(chat_id: int, from_user_id: int, to_user_id: int) -> None:
-    """Новое предложение перезаписывает предыдущее от того же отправителя в чате."""
-    await _execute(
-        "DELETE FROM relationship_requests WHERE chat_id = %s AND from_user_id = %s",
-        (chat_id, from_user_id),
-    )
-    await _execute(
-        "INSERT INTO relationship_requests (chat_id, from_user_id, to_user_id) VALUES (%s, %s, %s)",
-        (chat_id, from_user_id, to_user_id),
-    )
-
-
-async def get_latest_relationship_request(chat_id: int, to_user_id: int) -> Optional[dict]:
-    return await _fetchone(
-        "SELECT from_user_id, to_user_id, created_at FROM relationship_requests "
-        "WHERE chat_id = %s AND to_user_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
-        (chat_id, to_user_id),
-    )
-
-
-async def delete_relationship_request(chat_id: int, from_user_id: int, to_user_id: int) -> None:
-    await _execute(
-        "DELETE FROM relationship_requests WHERE chat_id = %s AND from_user_id = %s AND to_user_id = %s",
-        (chat_id, from_user_id, to_user_id),
-    )
-
-
-async def clear_relationship_requests_for(chat_id: int, user_id: int) -> None:
-    """Убирает все предложения, где участвует user_id (после принятия/начала отношений)."""
-    await _execute(
-        "DELETE FROM relationship_requests WHERE chat_id = %s AND (from_user_id = %s OR to_user_id = %s)",
-        (chat_id, user_id, user_id),
-    )
 
 
 # ----------------------------------------------------------------------------
@@ -1863,14 +1809,44 @@ async def ensure_current_users_table() -> None:
     )
 
 
+async def ensure_current_users_joined_column() -> None:
+    """Колонка current_users.joined_at — когда человек вошёл в чат В ЭТОТ РАЗ.
+
+    Отличается от known_users.first_seen_at, который помнит самое первое
+    появление и НЕ обновляется при возвращении (в этом весь смысл разделения
+    таблиц). Для защиты новичков от чистки нужен именно текущий вход: тот,
+    кто ушёл год назад и вернулся вчера, — новичок, а по first_seen_at он
+    старожил, не набравший норму.
+
+    Строкам, созданным до этой колонки, проставляем known_users.first_seen_at:
+    точного момента входа для них уже не восстановить, но это ровно то
+    значение, по которому чистка судила о них и раньше. Без такой засыпки
+    колонка стояла бы пустой у всего чата, и защита новичков заработала бы
+    только для тех, кто войдёт после обновления, — то есть недели через две.
+    Тем, кого нет в known_users, остаётся NULL: там работает прежний запасной
+    путь (см. list_below_norm_joined_before).
+    """
+    await _add_column_if_missing("current_users", "joined_at", "DATETIME NULL")
+    await _execute(
+        "UPDATE current_users cu "
+        "JOIN known_users ku ON ku.chat_id = cu.chat_id AND ku.user_id = cu.user_id "
+        "SET cu.joined_at = ku.first_seen_at "
+        "WHERE cu.joined_at IS NULL"
+    )
+
+
 async def upsert_current_user(chat_id: int, user_id: int, full_name: str, username: Optional[str]) -> None:
     # last_seen_at — явно UTC_TIMESTAMP() в самом запросе, не полагаемся на
     # ON UPDATE CURRENT_TIMESTAMP колонки (тот в часовом поясе сессии MySQL,
     # а весь остальной код сравнивает время в UTC) — тот же приём, что и в
     # upsert_known_user (db.py:1435-1452).
+    # joined_at ставится только при вставке строки — то есть при входе в чат, —
+    # и НЕ обновляется в ON DUPLICATE KEY UPDATE: иначе каждое сообщение
+    # делало бы человека новичком заново, и защита от чистки не кончалась бы
+    # никогда.
     await _execute(
-        "INSERT INTO current_users (chat_id, user_id, full_name, username) "
-        "VALUES (%s, %s, %s, %s) "
+        "INSERT INTO current_users (chat_id, user_id, full_name, username, joined_at) "
+        "VALUES (%s, %s, %s, %s, UTC_TIMESTAMP()) "
         "ON DUPLICATE KEY UPDATE full_name = VALUES(full_name), username = VALUES(username), "
         "last_seen_at = UTC_TIMESTAMP()",
         (chat_id, user_id, full_name[:255], username),
@@ -1922,6 +1898,21 @@ async def list_current_users_with_counts(chat_id: int, limit: int = 500) -> list
     )
 
 
+async def list_stale_roster_members(chat_id: int, limit: int = 300) -> list[dict]:
+    """Кого проверять при плановой сверке ростера — начиная с самых давних.
+
+    last_seen_at в current_users обновляется на каждом сообщении и при входе,
+    поэтому «давно не видели» — лучший доступный признак «возможно, уже вышел,
+    а событие выхода до бота не дошло». Сортировка по возрастанию ставит таких
+    в начало: за один заход проверяется голова списка, а не весь чат целиком
+    (см. roster_sweep_loop в bot.py — там же про цену запросов к Telegram)."""
+    return await _fetchall(
+        "SELECT user_id, full_name, username FROM current_users "
+        "WHERE chat_id = %s ORDER BY last_seen_at ASC LIMIT %s",
+        (chat_id, limit),
+    )
+
+
 async def backfill_current_users_from_known_users() -> int:
     """Одноразовая миграция при деплое: бот не может запросить у Telegram
     полный список участников обычной группы, поэтому единственный доступный
@@ -1939,6 +1930,24 @@ async def backfill_current_users_from_known_users() -> int:
     )
     row = await _fetchone("SELECT COUNT(*) AS cnt FROM current_users")
     return int(row["cnt"] if row else 0)
+
+
+def in_chat_sql(chat_col: str, user_col: str) -> str:
+    """Условие «этот человек сейчас состоит в чате» для WHERE любого списка.
+
+    Все таблицы истории (known_users, message_stats, message_daily, кошельки,
+    статистика рыбалки и т.п.) хранят строки вечно — они и должны, иначе
+    вернувшийся терял бы стаж и накопления. Но списки и топы показывают
+    СОСТАВ ЧАТА, а он живёт в current_users (см. блок выше). Без этого
+    условия во всех топах и выборках висели вышедшие.
+
+    Именно EXISTS, а не JOIN: вставляется в запросы, где уже есть свои
+    LEFT JOIN и GROUP BY, ничего в них не меняя, и не добавляет параметров —
+    подставляются только имена колонок вызывающего запроса. Алиас cu_f
+    отдельный, потому что cu в этих запросах бывает занят.
+    """
+    return (f"EXISTS (SELECT 1 FROM current_users cu_f "
+            f"WHERE cu_f.chat_id = {chat_col} AND cu_f.user_id = {user_col})")
 
 
 async def get_known_user(chat_id: int, user_id: int) -> Optional[dict]:
@@ -2031,21 +2040,28 @@ async def get_inviter(chat_id: int, user_id: int) -> Optional[int]:
 async def list_oldtimers(chat_id: int, limit: int = 10) -> list[dict]:
     """Самые старые (по первому появлению в чате) известные боту участники.
     last_message_at (из message_stats) — чтобы отметить недавно активных
-    участников значком 🔥 (см. cmd_oldtimers в bot.py)."""
+    участников значком 🔥 (см. cmd_oldtimers в bot.py).
+
+    Только те, кто сейчас в чате (in_chat_sql): «олды» — это про нынешний
+    состав, а не про историю, и вышедшие годами держали бы первые места."""
     return await _fetchall(
         "SELECT ku.user_id, ku.full_name, ku.username, ku.first_seen_at, ms.last_message_at "
         "FROM known_users ku "
         "LEFT JOIN message_stats ms ON ms.chat_id = ku.chat_id AND ms.user_id = ku.user_id "
-        "WHERE ku.chat_id = %s ORDER BY ku.first_seen_at ASC LIMIT %s",
+        f"WHERE ku.chat_id = %s AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
+        "ORDER BY ku.first_seen_at ASC LIMIT %s",
         (chat_id, limit),
     )
 
 
 async def list_newcomers(chat_id: int, limit: int = 10) -> list[dict]:
-    """Недавно появившиеся (по первому появлению в чате) известные боту участники."""
+    """Недавно появившиеся (по первому появлению в чате) известные боту
+    участники — только те, кто ещё в чате (зашёл и сразу вышел в «новичках»
+    не нужен)."""
     return await _fetchall(
-        "SELECT user_id, full_name, username, first_seen_at FROM known_users "
-        "WHERE chat_id = %s ORDER BY first_seen_at DESC LIMIT %s",
+        "SELECT user_id, full_name, username, first_seen_at FROM known_users ku "
+        f"WHERE chat_id = %s AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
+        "ORDER BY first_seen_at DESC LIMIT %s",
         (chat_id, limit),
     )
 
@@ -2061,6 +2077,10 @@ async def list_new_members_without_role_since(
     Проверка живёт в SQL, а не в коде вызывающего: список бывает на сотни
     строк, и вытаскивать роли отдельным запросом на каждого — это сотни
     запросов в тот момент, когда чат горит.
+
+    Единственный список, где вышедшие НЕ отсеиваются (ср. in_chat_sql):
+    рейдера, успевшего уйти самому, админ всё равно должен видеть — бан
+    работает и по тому, кого в чате уже нет.
     """
     holders = (
         "SELECT holder_user_id AS user_id FROM chat_roles "
@@ -2080,10 +2100,12 @@ async def list_new_members_without_role_since(
 
 async def list_new_members_since(chat_id: int, since: datetime, limit: int = 200) -> list[dict]:
     """Известные боту участники, впервые появившиеся в чате не раньше `since`
-    (используется командой «нью {период}», например «нью 2д»)."""
+    (используется командой «нью {период}», например «нью 2д») — и не успевшие
+    выйти: спрашивают «кто у нас новенький», а не «кто заглядывал»."""
     return await _fetchall(
-        "SELECT user_id, full_name, username, first_seen_at FROM known_users "
-        "WHERE chat_id = %s AND first_seen_at >= %s ORDER BY first_seen_at DESC LIMIT %s",
+        "SELECT user_id, full_name, username, first_seen_at FROM known_users ku "
+        f"WHERE chat_id = %s AND first_seen_at >= %s AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
+        "ORDER BY first_seen_at DESC LIMIT %s",
         (chat_id, since, limit),
     )
 
@@ -2184,13 +2206,104 @@ async def get_message_stats(chat_id: int, user_id: int) -> Optional[dict]:
     )
 
 
+# ----------------------------------------------------------------------------
+# ГРАНИЦЫ ПЕРИОДОВ «день / неделя / месяц» — одно определение на весь бот.
+#
+# Неделя начинается в СУББОТУ: так попросил считать владелец (раньше было с
+# понедельника). Живёт правило здесь, потому что спрашивают его все трое —
+# бот (норма, «вне нормы», /clearUsers, «Участники сообщения», топы за период),
+# веб-панель и сам db.
+#
+# Пока оно было записано ДВАЖДЫ — в bot._current_week_start (суббота) и прямо
+# внутри get_activity_breakdown (понедельник) — профиль показывал «за неделю
+# 25», а топ за ту же неделю у того же человека 125: у профиля неделя
+# начиналась на два дня позже, и суббота с воскресеньем в неё не попадали.
+# Второй раз это правило писать нельзя ни при каких обстоятельствах.
+#
+# Всё считается в UTC, и это не оплошность: message_daily.day пишется от
+# datetime.utcnow() (см. increment_daily_count). Часовой пояс показа сюда
+# протекать не должен — иначе сутки в счётчиках и сутки в границах разъедутся.
+#
+# Сам день недели — НАСТРОЙКА (settings.week_start_weekday), а не константа:
+# менять его правкой исходников неправильно. В коде остался только дефолт на
+# случай, когда настройку ещё не трогали.
+# ----------------------------------------------------------------------------
+WEEK_START_DEFAULT = 5  # weekday(): Пн=0 … Сб=5, Вс=6
+
+# Кэш настройки: границы периодов спрашивает и синхронный код (матчинг
+# «стата неделя», нормы), которому некуда вставить await. Наполняется в
+# fetch_settings — то есть в обоих процессах, и в боте, и в панели.
+_week_start_weekday: int = WEEK_START_DEFAULT
+_week_start_loaded = False
+
+
+def _remember_week_start(row: Optional[dict]) -> None:
+    global _week_start_weekday, _week_start_loaded
+    value = (row or {}).get("week_start_weekday")
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = WEEK_START_DEFAULT       # NULL в колонке или мусор — дефолт
+    _week_start_weekday = value % 7
+    _week_start_loaded = True
+
+
+def week_start_weekday() -> int:
+    """Настроенный день начала недели (0 = понедельник … 6 = воскресенье)."""
+    return _week_start_weekday
+
+
+async def ensure_week_start_loaded() -> int:
+    """Подтягивает настройку, если в этом процессе её ещё не читали.
+
+    Нужно веб-панели: она живёт отдельным процессом и на страницу профиля
+    может прийти, ни разу не позвав fetch_settings, — и посчитала бы неделю
+    от дефолта, разойдясь с ботом ровно так, как разошлись профиль и топ.
+    """
+    if not _week_start_loaded:
+        await fetch_settings()
+    return _week_start_weekday
+
+
+def week_start_day(today=None, weekday: Optional[int] = None):
+    """Начало текущей недели — ближайший прошедший настроенный день
+    (включительно). today и weekday передают тесты: без них границу не
+    проверить, не подменяя время и настройку."""
+    today = today or datetime.utcnow().date()
+    start = _week_start_weekday if weekday is None else weekday % 7
+    return today - timedelta(days=(today.weekday() - start) % 7)
+
+
+def period_start_day(period: str, today=None):
+    """С какого дня считается период: «day» — сегодня, «week» — с настроенного
+    дня недели, «month» — с 1-го числа.
+
+    None — «за всё время», и это рабочее значение, а не отказ: по нему
+    вызывающий переключается с посуточной message_daily на общий счётчик
+    message_stats (см. list_top_messages_period против list_top_messages).
+    """
+    today = today or datetime.utcnow().date()
+    if period == "day":
+        return today
+    if period == "week":
+        return week_start_day(today)
+    if period == "month":
+        return today.replace(day=1)
+    return None
+
+
 async def get_activity_breakdown(chat_id: int, user_id: int) -> dict:
     """Сообщения пользователя в этом чате за сегодня / текущую неделю / текущий
     месяц (из посуточных счётчиков message_daily) — для строки профиля
     «Актив (д|н|м|весь)», как у Iris. «Весь» берётся отдельно из
-    message_stats.message_count (общий счётчик, не зависит от message_daily)."""
+    message_stats.message_count (общий счётчик, не зависит от message_daily).
+
+    Границы недели и месяца — общие для всего бота (см. period_start_day
+    выше). Здесь они когда-то считались отдельно, с понедельника, и профиль
+    расходился с топом за ту же неделю."""
+    await ensure_week_start_loaded()     # панель может прийти сюда первой
     today = datetime.utcnow().date()
-    week_start = today - timedelta(days=today.weekday())
+    week_start = week_start_day(today)
     month_start = today.replace(day=1)
     row = await _fetchone(
         "SELECT "
@@ -2204,23 +2317,34 @@ async def get_activity_breakdown(chat_id: int, user_id: int) -> dict:
 
 
 async def get_message_rank(chat_id: int, user_id: int) -> Optional[int]:
-    """Место пользователя в топе чата по количеству сообщений (1 = самый активный)."""
+    """Место пользователя в топе чата по количеству сообщений (1 = самый
+    активный). Вышедшие не считаются — иначе место в профиле («вы 8-й») не
+    сходилось бы с самим топом, который их уже не показывает."""
     row = await _fetchone(
-        "SELECT COUNT(*) + 1 AS user_rank FROM message_stats "
+        "SELECT COUNT(*) + 1 AS user_rank FROM message_stats ms "
         "WHERE chat_id = %s AND message_count > ("
         "    SELECT message_count FROM message_stats WHERE chat_id = %s AND user_id = %s"
-        ")",
+        f") AND {in_chat_sql('ms.chat_id', 'ms.user_id')}",
         (chat_id, chat_id, user_id),
     )
     return row["user_rank"] if row else None
 
 
 async def list_top_messages(chat_id: int, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
+    """Топ по сообщениям за всё время + сколько всего участников в нём.
+
+    Условие «сейчас в чате» стоит в ОБОИХ запросах, и это не формальность:
+    отфильтруй только строки — и в заголовке останется старое число, а
+    листание упрётся в пустые страницы в конце.
+    """
     count_row = await _fetchone(
-        "SELECT COUNT(*) AS total FROM message_stats WHERE chat_id = %s", (chat_id,)
+        "SELECT COUNT(*) AS total FROM message_stats ms WHERE chat_id = %s "
+        f"AND {in_chat_sql('ms.chat_id', 'ms.user_id')}",
+        (chat_id,),
     )
     rows = await _fetchall(
-        "SELECT user_id, message_count FROM message_stats WHERE chat_id = %s "
+        "SELECT user_id, message_count FROM message_stats ms WHERE chat_id = %s "
+        f"AND {in_chat_sql('ms.chat_id', 'ms.user_id')} "
         "ORDER BY message_count DESC LIMIT %s OFFSET %s",
         (chat_id, limit, offset),
     )
@@ -2380,14 +2504,19 @@ async def list_hourly_last_24h_for_chat(chat_id: int) -> list[dict]:
 
 async def list_top_messages_period(chat_id: int, since_day, limit: int = 10, offset: int = 0) -> tuple[list[dict], int]:
     """Топ по сообщениям за период since_day..сегодня. since_day=None → вся история
-    (используется message_stats напрямую вместо message_daily, см. list_top_messages)."""
+    (используется message_stats напрямую вместо message_daily, см. list_top_messages).
+    Вышедшие отсеиваются и в строках, и в счётчике — как в list_top_messages."""
     count_row = await _fetchone(
-        "SELECT COUNT(DISTINCT user_id) AS total FROM message_daily WHERE chat_id = %s AND day >= %s",
+        "SELECT COUNT(DISTINCT user_id) AS total FROM message_daily md "
+        "WHERE chat_id = %s AND day >= %s "
+        f"AND {in_chat_sql('md.chat_id', 'md.user_id')}",
         (chat_id, since_day),
     )
     rows = await _fetchall(
-        "SELECT user_id, SUM(message_count) AS message_count FROM message_daily "
-        "WHERE chat_id = %s AND day >= %s GROUP BY user_id "
+        "SELECT user_id, SUM(message_count) AS message_count FROM message_daily md "
+        "WHERE chat_id = %s AND day >= %s "
+        f"AND {in_chat_sql('md.chat_id', 'md.user_id')} "
+        "GROUP BY user_id "
         "ORDER BY message_count DESC LIMIT %s OFFSET %s",
         (chat_id, since_day, limit, offset),
     )
@@ -2417,13 +2546,18 @@ async def list_below_norm(chat_id: int, since_day, norm: int, limit: int = 200) 
     начало текущей недели) меньше заданной нормы. Те, у кого сейчас активный
     одобренный рест, не включаются — как и в list_inactive, на время реста
     участник не обязан набирать норму. Отсортировано по возрастанию (кто
-    дальше всех от нормы — в начале списка)."""
+    дальше всех от нормы — в начале списка).
+
+    Считаются только те, кто сейчас в чате: у вышедшего сообщений за неделю
+    ноль по определению, и такие возглавляли список, вытесняя тех, к кому
+    вопросы есть на самом деле."""
     return await _fetchall(
         "SELECT ku.user_id, ku.full_name, ku.username, "
         "COALESCE(SUM(md.message_count), 0) AS message_count "
         "FROM known_users ku "
         "LEFT JOIN message_daily md ON md.chat_id = ku.chat_id AND md.user_id = ku.user_id AND md.day >= %s "
         "WHERE ku.chat_id = %s "
+        f"AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM rest_requests r WHERE r.chat_id = ku.chat_id AND r.user_id = ku.user_id "
         "  AND r.status = 'approved' AND r.expires_at > UTC_TIMESTAMP()"
@@ -2436,15 +2570,33 @@ async def list_below_norm(chat_id: int, since_day, norm: int, limit: int = 200) 
     )
 
 
-async def list_below_norm_joined_before(chat_id: int, since_day, norm: int, limit: int = 1000) -> list[dict]:
+async def list_below_norm_joined_before(
+    chat_id: int, since_day, norm: int, limit: int = 1000, joined_before=None
+) -> list[dict]:
+    """Как list_below_norm, но только те, кто пришёл в чат раньше joined_before
+    (по умолчанию — раньше начала недели) — выборка под чистку «/clearUsers».
+
+    Момент прихода берём из current_users.joined_at, то есть по ТЕКУЩЕМУ
+    входу в чат, и только если его нет (строка старше колонки) — по
+    known_users/message_stats. Иначе вернувшийся после долгого перерыва
+    считался бы старожилом: known_users.first_seen_at при возвращении не
+    обновляется намеренно, это память о стаже, а не о входе.
+
+    Вышедшие отсеиваются, как и везде: банить того, кто ушёл сам, незачем,
+    а в списке он шёл первым — сообщений-то ноль.
+    """
+    joined_before = joined_before if joined_before is not None else since_day
     return await _fetchall(
         "SELECT ku.user_id, ku.full_name, ku.username, "
         "COALESCE(SUM(md.message_count), 0) AS message_count "
         "FROM known_users ku "
+        "LEFT JOIN current_users cu ON cu.chat_id = ku.chat_id AND cu.user_id = ku.user_id "
         "LEFT JOIN message_daily md ON md.chat_id = ku.chat_id AND md.user_id = ku.user_id AND md.day >= %s "
         "LEFT JOIN message_stats ms ON ms.chat_id = ku.chat_id AND ms.user_id = ku.user_id "
         "WHERE ku.chat_id = %s "
-        "AND LEAST(ku.first_seen_at, COALESCE(ms.first_seen_at, ku.first_seen_at)) < %s "
+        f"AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
+        "AND COALESCE(cu.joined_at, "
+        "             LEAST(ku.first_seen_at, COALESCE(ms.first_seen_at, ku.first_seen_at))) < %s "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM rest_requests r WHERE r.chat_id = ku.chat_id AND r.user_id = ku.user_id "
         "  AND r.status = 'approved' AND r.expires_at > UTC_TIMESTAMP()"
@@ -2453,7 +2605,7 @@ async def list_below_norm_joined_before(chat_id: int, since_day, norm: int, limi
         "HAVING COALESCE(SUM(md.message_count), 0) < %s "
         "ORDER BY message_count ASC "
         "LIMIT %s",
-        (since_day, chat_id, since_day, norm, limit),
+        (since_day, chat_id, joined_before, norm, limit),
     )
 
 
@@ -2465,7 +2617,10 @@ async def list_by_message_count(chat_id: int, since_day, comparison: str, number
     comparison ДОЛЖЕН быть провалидирован вызывающим кодом против жёсткого
     списка ('>','<','=') ДО вызова — сюда он подставляется прямо в SQL-текст
     (плейсхолдер для оператора сравнения синтаксически невозможен), поэтому
-    непроверенное значение сюда попадать не должно."""
+    непроверенное значение сюда попадать не должно.
+
+    Как и «не в норме», показывает только нынешний состав чата — вышедшие
+    с их нулём иначе занимали бы весь список «меньше N»."""
     if comparison not in (">", "<", "="):
         raise ValueError(f"unsupported comparison operator: {comparison!r}")
     return await _fetchall(
@@ -2474,6 +2629,7 @@ async def list_by_message_count(chat_id: int, since_day, comparison: str, number
         "FROM known_users ku "
         "LEFT JOIN message_daily md ON md.chat_id = ku.chat_id AND md.user_id = ku.user_id AND md.day >= %s "
         "WHERE ku.chat_id = %s "
+        f"AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
         "GROUP BY ku.user_id, ku.full_name, ku.username "
         f"HAVING COALESCE(SUM(md.message_count), 0) {comparison} %s "
         "ORDER BY message_count DESC "
@@ -2636,7 +2792,9 @@ async def list_reward_top(chat_id: int, limit: int = 10) -> list[dict]:
     иначе десять первых степеней обходили бы один орден высшей."""
     return await _fetchall(
         "SELECT user_id, SUM(degree) AS weight, COUNT(*) AS total, MAX(degree) AS best "
-        "FROM rewards WHERE chat_id = %s GROUP BY user_id "
+        "FROM rewards r WHERE chat_id = %s "
+        f"AND {in_chat_sql('r.chat_id', 'r.user_id')} "
+        "GROUP BY user_id "
         "ORDER BY weight DESC, best DESC LIMIT %s",
         (chat_id, limit),
     )
@@ -3300,16 +3458,22 @@ async def get_unreg(chat_id: int, user_id: int) -> Optional[dict]:
 
 
 async def list_callable_users(chat_id: int, limit: int = 1000) -> list[dict]:
-    """Известные боту участники чата (см. ограничение Bot API в README),
-    за вычетом тех, кто сейчас в анреге или в активном ресте — то есть
-    кандидаты на упоминание в созыве. emoji — персональный позывной, если
-    задан."""
+    """Кандидаты на упоминание в созыве: участники чата за вычетом тех, кто
+    сейчас в анреге или в активном ресте. emoji — персональный позывной,
+    если задан.
+
+    Именно участники ЧАТА (in_chat_sql), а не все, кого бот когда-либо видел:
+    known_users не чистится при выходе, и созыв тегал всех, кто хоть раз
+    писал в чат за всю его историю. Со стороны это «созывается слишком много
+    людей» — и половина из них давно ушла.
+    """
     return await _fetchall(
         "SELECT ku.user_id, ku.full_name, ku.username, cs.emoji "
         "FROM known_users ku "
         "LEFT JOIN call_unregs cu ON cu.chat_id = ku.chat_id AND cu.user_id = ku.user_id "
         "LEFT JOIN call_signs cs ON cs.chat_id = ku.chat_id AND cs.user_id = ku.user_id "
         "WHERE ku.chat_id = %s AND cu.user_id IS NULL "
+        f"AND {in_chat_sql('ku.chat_id', 'ku.user_id')} "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM rest_requests r WHERE r.chat_id = ku.chat_id AND r.user_id = ku.user_id "
         "  AND r.status = 'approved' AND r.expires_at > UTC_TIMESTAMP()"
@@ -4347,207 +4511,13 @@ async def check_and_touch_propose_cooldown(
     return None
 
 
-# ----------------------------------------------------------------------------
-# Модуль «Отношения»: пороги уровней близости (RELATIONSHIP_LEVELS в bot.py),
-# очки за действия (REL_ACTION_POINTS) и партнёрские действия с их фразами
-# (REL_ONLY_PARTNER_ACTIONS). Как и rp_actions/self_actions выше — теперь
-# живут в БД и редактируются через сайт, bot.py читает их в load_caches().
-#
-# relationship_actions хранит ОБА вида действий из REL_ACTION_POINTS:
-#   - partner_only=FALSE — «общие» действия (обнять/поцеловать/...), они уже
-#     есть в RP_ACTIONS/rp_actions, здесь только их points_delta;
-#   - partner_only=TRUE  — доступны только с партнёром, их тексты фраз лежат
-#     в relationship_action_phrases (аналог REL_ONLY_PARTNER_ACTIONS).
-# ----------------------------------------------------------------------------
-async def ensure_relationship_levels_table() -> None:
-    await _execute(
-        "CREATE TABLE IF NOT EXISTS relationship_levels ("
-        "level_index INT NOT NULL PRIMARY KEY, "
-        "name VARCHAR(64) NOT NULL, "
-        "points_threshold INT NOT NULL"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-    )
-
-
-async def ensure_relationship_actions_table() -> None:
-    await _execute(
-        "CREATE TABLE IF NOT EXISTS relationship_actions ("
-        "action_key VARCHAR(64) NOT NULL PRIMARY KEY, "
-        "points_delta INT NOT NULL, "
-        "partner_only BOOL NOT NULL DEFAULT FALSE"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-    )
-
-
-async def ensure_relationship_action_phrases_table() -> None:
-    await _execute(
-        "CREATE TABLE IF NOT EXISTS relationship_action_phrases ("
-        "id INT AUTO_INCREMENT PRIMARY KEY, "
-        "action_key VARCHAR(64) NOT NULL, "
-        "phrase VARCHAR(512) NOT NULL, "
-        "sort_order INT NOT NULL DEFAULT 0, "
-        "INDEX idx_rel_action_phrases_key (action_key, sort_order)"
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-    )
-
-
-async def seed_relationship_levels_if_empty(defaults: list[tuple[str, int]]) -> int:
-    row = await _fetchone("SELECT COUNT(*) AS cnt FROM relationship_levels")
-    if row and row["cnt"]:
-        return 0
-    for i, (name, threshold) in enumerate(defaults):
-        await _execute(
-            "INSERT INTO relationship_levels (level_index, name, points_threshold) VALUES (%s, %s, %s)",
-            (i, name, threshold),
-        )
-    return len(defaults)
-
-
-async def seed_relationship_actions_if_empty(
-    points_defaults: dict[str, int], partner_only_keys: set[str]
-) -> int:
-    row = await _fetchone("SELECT COUNT(*) AS cnt FROM relationship_actions")
-    if row and row["cnt"]:
-        return 0
-    for action_key, points in points_defaults.items():
-        await _execute(
-            "INSERT INTO relationship_actions (action_key, points_delta, partner_only) VALUES (%s, %s, %s)",
-            (action_key, points, action_key in partner_only_keys),
-        )
-    return len(points_defaults)
-
-
-async def seed_relationship_action_phrases_if_empty(defaults: dict[str, list[str]]) -> int:
-    row = await _fetchone("SELECT COUNT(*) AS cnt FROM relationship_action_phrases")
-    if row and row["cnt"]:
-        return 0
-    count = 0
-    for action_key, phrases in defaults.items():
-        for i, phrase in enumerate(phrases):
-            await _execute(
-                "INSERT INTO relationship_action_phrases (action_key, phrase, sort_order) VALUES (%s, %s, %s)",
-                (action_key, phrase, i),
-            )
-            count += 1
-    return count
-
-
-async def list_relationship_levels() -> list[tuple[str, int]]:
-    """[(имя, порог), ...] по возрастанию level_index — формат для
-    RELATIONSHIP_LEVELS в bot.py (порядок важен: relationship_level_index
-    и relationship_next_level_info идут по списку от младшего уровня к
-    старшему)."""
-    rows = await _fetchall(
-        "SELECT name, points_threshold FROM relationship_levels ORDER BY level_index"
-    )
-    return [(r["name"], int(r["points_threshold"])) for r in rows]
-
-
-async def list_relationship_levels_rows() -> list[dict]:
-    return await _fetchall(
-        "SELECT level_index, name, points_threshold FROM relationship_levels ORDER BY level_index"
-    )
-
-
-async def upsert_relationship_level(level_index: int, name: str, points_threshold: int) -> None:
-    await _execute(
-        "INSERT INTO relationship_levels (level_index, name, points_threshold) VALUES (%s, %s, %s) "
-        "ON DUPLICATE KEY UPDATE name = VALUES(name), points_threshold = VALUES(points_threshold)",
-        (level_index, name, points_threshold),
-    )
-
-
-async def delete_relationship_level(level_index: int) -> bool:
-    rowcount = await _execute(
-        "DELETE FROM relationship_levels WHERE level_index = %s", (level_index,)
-    )
-    return rowcount > 0
-
-
-async def list_relationship_actions() -> dict[str, int]:
-    """{action_key: points_delta} — формат для REL_ACTION_POINTS в bot.py."""
-    rows = await _fetchall("SELECT action_key, points_delta FROM relationship_actions")
-    return {r["action_key"]: int(r["points_delta"]) for r in rows}
-
-
-async def list_relationship_actions_rows() -> list[dict]:
-    return await _fetchall(
-        "SELECT action_key, points_delta, partner_only FROM relationship_actions ORDER BY action_key"
-    )
-
-
-async def upsert_relationship_action(action_key: str, points_delta: int, partner_only: bool) -> None:
-    await _execute(
-        "INSERT INTO relationship_actions (action_key, points_delta, partner_only) VALUES (%s, %s, %s) "
-        "ON DUPLICATE KEY UPDATE points_delta = VALUES(points_delta), partner_only = VALUES(partner_only)",
-        (action_key, points_delta, partner_only),
-    )
-
-
-async def delete_relationship_action(action_key: str) -> bool:
-    rowcount = await _execute(
-        "DELETE FROM relationship_actions WHERE action_key = %s", (action_key,)
-    )
-    # Фразы партнёрского действия (если были) без соответствующей строки в
-    # relationship_actions больше не нужны — подчищаем, чтобы не оставалось
-    # "осиротевших" фраз без начисления очков за действие.
-    await _execute("DELETE FROM relationship_action_phrases WHERE action_key = %s", (action_key,))
-    return rowcount > 0
-
-
-async def list_relationship_action_phrases() -> dict[str, list[str]]:
-    """{action_key: [фраза, ...]} — формат для REL_ONLY_PARTNER_ACTIONS в bot.py."""
-    rows = await _fetchall(
-        "SELECT action_key, phrase FROM relationship_action_phrases ORDER BY action_key, sort_order, id"
-    )
-    result: dict[str, list[str]] = {}
-    for r in rows:
-        result.setdefault(r["action_key"], []).append(r["phrase"])
-    return result
-
-
-async def list_relationship_action_phrases_rows() -> list[dict]:
-    return await _fetchall(
-        "SELECT id, action_key, phrase, sort_order FROM relationship_action_phrases "
-        "ORDER BY action_key, sort_order, id"
-    )
-
-
-async def add_relationship_action_phrase(
-    action_key: str, phrase: str, sort_order: Optional[int] = None
-) -> int:
-    if sort_order is None:
-        row = await _fetchone(
-            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order "
-            "FROM relationship_action_phrases WHERE action_key = %s",
-            (action_key,),
-        )
-        sort_order = row["next_order"] if row else 0
-    return await _execute(
-        "INSERT INTO relationship_action_phrases (action_key, phrase, sort_order) VALUES (%s, %s, %s)",
-        (action_key, phrase, sort_order),
-    )
-
-
-async def update_relationship_action_phrase(phrase_id: int, phrase: str) -> bool:
-    rowcount = await _execute(
-        "UPDATE relationship_action_phrases SET phrase = %s WHERE id = %s", (phrase, phrase_id)
-    )
-    return rowcount > 0
-
-
-async def delete_relationship_action_phrase(phrase_id: int) -> bool:
-    rowcount = await _execute("DELETE FROM relationship_action_phrases WHERE id = %s", (phrase_id,))
-    return rowcount > 0
-
-
 # ============================================================================
-# Плагин «Отношения 2.0» (rel2_*) — расширенная система по образцу Iris
-# (см. relationships_v2.py). Отдельные таблицы rel2_* — НЕ пересекаются со
-# старыми relationships/relationship_requests (тот модуль остаётся рабочим,
-# пока rel2 не заменит его в bot.py, см. комментарий в начале relationships_v2.py).
+# Плагин «Отношения 2.0» (rel2_*) — единственная система отношений в боте
+# (см. relationships_v2.py). Модуль v1 — таблицы relationships/
+# relationship_requests, уровни близости и очки за действия — удалён целиком:
+# его команды давно обслуживал rel2, а сам он висел мёртвым слоем.
 #
-# Ключевое отличие от старого модуля: здесь «искры» — это одновременно и
+# Ключевое отличие от удалённого v1: здесь «искры» — это одновременно и
 # валюта (тратится/сгорает), и мера уровня (уровень = функция ТЕКУЩЕГО
 # баланса искр, а не накопленных очков) — см. rel2_levels ниже.
 # ============================================================================
@@ -7057,8 +7027,9 @@ async def refresh_net(chat_id: int, user_id: int, now: datetime) -> int:
 async def list_fishing_top(chat_id: int, limit: int = 10) -> list[dict]:
     return await _fetchall(
         "SELECT user_id, best_catch, best_catch_name, total_catches, "
-        "       best_weight, best_weight_species FROM fishing_stats "
+        "       best_weight, best_weight_species FROM fishing_stats fs "
         "WHERE chat_id = %s AND best_catch > 0 "
+        f"AND {in_chat_sql('fs.chat_id', 'fs.user_id')} "
         "ORDER BY best_catch DESC, total_catches DESC LIMIT %s",
         (chat_id, limit),
     )
@@ -7068,7 +7039,8 @@ async def list_fishing_weight_top(chat_id: int, limit: int = 10) -> list[dict]:
     """Рекорды по весу — «кто вытащил самую тяжёлую»."""
     return await _fetchall(
         "SELECT user_id, best_weight, best_weight_species, total_catches "
-        "FROM fishing_stats WHERE chat_id = %s AND best_weight > 0 "
+        "FROM fishing_stats fs WHERE chat_id = %s AND best_weight > 0 "
+        f"AND {in_chat_sql('fs.chat_id', 'fs.user_id')} "
         "ORDER BY best_weight DESC, total_catches DESC LIMIT %s",
         (chat_id, limit),
     )
@@ -7915,6 +7887,17 @@ async def increment_casino_games(chat_id: int, user_id: int) -> int:
     return int(row["games_played"]) if row else 0
 
 
+async def get_casino_games(chat_id: int, user_id: int) -> int:
+    """Сколько игр сыграно — БЕЗ прибавления. Экрану казино счётчик нужен как
+    показание («до сотни игр осталось столько-то»), а не как отметка о ходе:
+    показ через increment_casino_games накручивал бы ачивку за открытие
+    вкладки."""
+    row = await _fetchone(
+        "SELECT games_played FROM casino_game_stats WHERE chat_id = %s AND user_id = %s",
+        (chat_id, user_id),
+    )
+    return int(row["games_played"]) if row else 0
+
 
 async def ensure_racing_stats_table() -> None:
     await _execute(
@@ -8093,14 +8076,21 @@ async def list_coins_top(
     участников его не считал, а в чате, где у всех отняли последнее, бот
     сообщал «Пока ни у кого нет i¢» — то есть врал. Спека требует обратного:
     в топе должники показываются как есть, внизу списка.
+
+    Вышедшие из чата не показываются (и не считаются в общем числе) — как и
+    в остальных топах, см. in_chat_sql. Кошелёк при этом остаётся нетронутым:
+    вернётся — вернутся и монеты, и место в топе.
     """
     count_row = await _fetchone(
-        "SELECT COUNT(*) AS total FROM economy_wallets WHERE chat_id = %s AND coins <> 0",
+        "SELECT COUNT(*) AS total FROM economy_wallets w "
+        "WHERE chat_id = %s AND coins <> 0 "
+        f"AND {in_chat_sql('w.chat_id', 'w.user_id')}",
         (chat_id,),
     )
     rows = await _fetchall(
-        "SELECT user_id, coins, star_level, total_farms FROM economy_wallets "
+        "SELECT user_id, coins, star_level, total_farms FROM economy_wallets w "
         "WHERE chat_id = %s AND coins <> 0 "
+        f"AND {in_chat_sql('w.chat_id', 'w.user_id')} "
         "ORDER BY coins DESC LIMIT %s OFFSET %s",
         (chat_id, limit, offset),
     )
@@ -8294,8 +8284,19 @@ async def count_voodoo_dolls_of(chat_id: int, target_id: int) -> int:
 # ----------------------------------------------------------------------------
 # ОГОРОД: грядки (правила и числа — farming.py)
 # ----------------------------------------------------------------------------
+async def ensure_farm_animals_quantity_column() -> None:
+    """Колонка farm_animals.quantity — сколько таких животных в хлеву.
+
+    Раньше вид держали строго по одному, и количества не требовалось. Теперь
+    поголовье растёт (см. livestock.MAX_PER_KIND), а строка на вид осталась
+    одна: last_collect_at у них общий, и продукт считается на всё стадо разом.
+    DEFAULT 1 — у всех, кто уже что-то купил, ровно по одной голове.
+    """
+    await _add_column_if_missing("farm_animals", "quantity", "INT NOT NULL DEFAULT 1")
+
+
 async def ensure_farm_animals_table() -> None:
-    """Хлев: одно животное каждого вида на человека.
+    """Хлев: животные по видам, в строке — сколько их.
 
     last_collect_at — единственное, что нужно для подсчёта продукта: сколько
     накопилось, выводится из прошедшего времени (см. livestock.produced).
@@ -8307,6 +8308,7 @@ async def ensure_farm_animals_table() -> None:
         "chat_id BIGINT NOT NULL, "
         "user_id BIGINT NOT NULL, "
         "animal_key VARCHAR(32) NOT NULL, "
+        "quantity INT NOT NULL DEFAULT 1, "
         "bought_at DATETIME NOT NULL, "
         "last_collect_at DATETIME NOT NULL, "
         "PRIMARY KEY (chat_id, user_id, animal_key)"
@@ -8316,46 +8318,79 @@ async def ensure_farm_animals_table() -> None:
 
 async def list_farm_animals(chat_id: int, user_id: int) -> list[dict]:
     return await _fetchall(
-        "SELECT animal_key, bought_at, last_collect_at FROM farm_animals "
+        "SELECT animal_key, quantity, bought_at, last_collect_at FROM farm_animals "
         "WHERE chat_id = %s AND user_id = %s ORDER BY bought_at",
         (chat_id, user_id),
     )
 
 
-async def add_farm_animal(chat_id: int, user_id: int, animal_key: str,
-                          now: datetime) -> bool:
-    """False — такое животное уже есть. Проверка и вставка одним запросом:
-    двумя командами подряд можно было бы купить корову дважды.
-
-    Ответ берём из rowcount самой вставки (INSERT IGNORE: 1 — вставили, 0 —
-    уже было), а НЕ из сравнения записанной даты с переданной. Сравнение и
-    было багом: bought_at — это DATETIME, MySQL режет микросекунды, а
-    datetime.utcnow() их приносит. Равенство не выполнялось никогда, поэтому
-    ПЕРВАЯ же покупка отвечала «животное уже куплено» — и возвращала деньги
-    за корову, которая при этом преспокойно стояла в хлеву.
-    """
-    return await _execute(
-        "INSERT IGNORE INTO farm_animals "
-        "(chat_id, user_id, animal_key, bought_at, last_collect_at) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (chat_id, user_id, animal_key, now, now),
-    ) > 0
-
-
-async def remove_farm_animal(chat_id: int, user_id: int, animal_key: str) -> bool:
-    """False — животного и не было (значит и денег за него возвращать не за что)."""
+async def get_farm_animal_quantity(chat_id: int, user_id: int, animal_key: str) -> int:
     row = await _fetchone(
-        "SELECT animal_key FROM farm_animals "
+        "SELECT quantity FROM farm_animals "
         "WHERE chat_id = %s AND user_id = %s AND animal_key = %s",
         (chat_id, user_id, animal_key),
     )
-    if not row:
-        return False
+    return int(row["quantity"]) if row else 0
+
+
+async def add_farm_animals(chat_id: int, user_id: int, animal_key: str,
+                           now: datetime, quantity: int = 1,
+                           max_per_kind: int = 1) -> int:
+    """Добавляет голов в хлев. Возвращает, сколько ДЕЙСТВИТЕЛЬНО добавили.
+
+    Потолок держит сама база (LEAST при обновлении), а не проверка в коде:
+    две команды подряд иначе покупали бы по одной голове сверх лимита каждая.
+    Вызывающий сравнивает ответ с тем, сколько просил, и возвращает деньги за
+    разницу — поэтому число здесь честное, а не «получилось/не получилось».
+
+    last_collect_at сбрасывается на now: продукт за прошлый период вызывающий
+    забирает ДО покупки, иначе новые головы задним числом надоили бы за время,
+    когда их ещё не было.
+    """
+    quantity = max(0, int(quantity))
+    if quantity <= 0:
+        return 0
+    было = await get_farm_animal_quantity(chat_id, user_id, animal_key)
     await _execute(
-        "DELETE FROM farm_animals WHERE chat_id = %s AND user_id = %s AND animal_key = %s",
+        "INSERT INTO farm_animals "
+        "(chat_id, user_id, animal_key, quantity, bought_at, last_collect_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE quantity = LEAST(quantity + VALUES(quantity), %s), "
+        "last_collect_at = VALUES(last_collect_at)",
+        (chat_id, user_id, animal_key, min(quantity, max_per_kind), now, now,
+         max_per_kind),
+    )
+    стало = await get_farm_animal_quantity(chat_id, user_id, animal_key)
+    return max(0, стало - было)
+
+
+async def remove_farm_animals(chat_id: int, user_id: int, animal_key: str,
+                              quantity: int = 1) -> int:
+    """Убирает голов из хлева. Возвращает, сколько убрали (0 — животного нет).
+
+    Больше, чем есть, не убираем — считает сама база, одним UPDATE: между
+    проверкой и удалением в коде помещается вторая команда, и продать одну
+    корову дважды было бы можно.
+    """
+    quantity = max(0, int(quantity))
+    if quantity <= 0:
+        return 0
+    было = await get_farm_animal_quantity(chat_id, user_id, animal_key)
+    убрать = min(было, quantity)
+    if убрать <= 0:
+        return 0
+    await _execute(
+        "UPDATE farm_animals SET quantity = quantity - %s "
+        "WHERE chat_id = %s AND user_id = %s AND animal_key = %s AND quantity >= %s",
+        (убрать, chat_id, user_id, animal_key, убрать),
+    )
+    await _execute(
+        "DELETE FROM farm_animals "
+        "WHERE chat_id = %s AND user_id = %s AND animal_key = %s AND quantity <= 0",
         (chat_id, user_id, animal_key),
     )
-    return True
+    стало = await get_farm_animal_quantity(chat_id, user_id, animal_key)
+    return max(0, было - стало)
 
 
 async def touch_farm_animals(chat_id: int, user_id: int, keys: list[str],
@@ -9538,66 +9573,94 @@ async def list_current_chats() -> list[dict]:
 # Отдельных таблиц не нужно — всё считается по уже накопленным данным.
 # ---------------------------------------------------------------------------
 
-async def get_top_active_since(chat_id: int, days: int, limit: int = 5) -> list[dict]:
-    """Топ по числу сообщений за последние N дней."""
+async def get_top_active_since(chat_id: int, since_day, limit: int = 5,
+                               until_day=None) -> list[dict]:
+    """Топ по числу сообщений с указанного дня (включительно) по until_day
+    (НЕ включая) или по сегодня, если верхней границы нет.
+
+    Границу принимаем датой, а не числом дней: «неделя» у этого бота
+    календарная и начинается в настроенный день (см. period_start_day), а
+    «последние N суток» сходились с ней ровно по одному дню в неделю."""
+    until_sql = "AND md.day < %s " if until_day is not None else ""
+    params = ([chat_id, since_day] + ([until_day] if until_day is not None else [])
+              + [limit])
     return await _fetchall(
         "SELECT md.user_id, SUM(md.message_count) AS total, ku.full_name, ku.username "
         "FROM message_daily md "
         "JOIN known_users ku ON ku.chat_id = md.chat_id AND ku.user_id = md.user_id "
-        "WHERE md.chat_id = %s AND md.day >= DATE_SUB(CURDATE(), INTERVAL %s DAY) "
+        "WHERE md.chat_id = %s AND md.day >= %s "
+        + until_sql
+        + f"AND {in_chat_sql('md.chat_id', 'md.user_id')} "
         "GROUP BY md.user_id, ku.full_name, ku.username "
         "ORDER BY total DESC LIMIT %s",
-        (chat_id, days, limit),
+        tuple(params),
     )
 
 
-async def count_messages_since(chat_id: int, days: int) -> int:
+async def count_messages_since(chat_id: int, since_day, until_day=None) -> int:
+    """Сколько всего сообщений в чате с since_day (включительно) и до
+    until_day (не включая), если верхняя граница задана."""
+    until_sql = "AND day < %s" if until_day is not None else ""
+    params = [chat_id, since_day] + ([until_day] if until_day is not None else [])
     row = await _fetchone(
         "SELECT COALESCE(SUM(message_count), 0) AS total FROM message_daily "
-        "WHERE chat_id = %s AND day >= DATE_SUB(CURDATE(), INTERVAL %s DAY)",
-        (chat_id, days),
+        "WHERE chat_id = %s AND day >= %s " + until_sql,
+        tuple(params),
     )
     return int(row["total"]) if row else 0
 
 
-async def get_new_members_since(chat_id: int, days: int, limit: int = 20) -> list[dict]:
+async def get_new_members_since(chat_id: int, since, limit: int = 20, until=None) -> list[dict]:
+    until_sql = "AND first_seen_at < %s " if until is not None else ""
+    params = ([chat_id, since] + ([until] if until is not None else []) + [limit])
     return await _fetchall(
         "SELECT user_id, full_name, username FROM known_users "
-        "WHERE chat_id = %s AND first_seen_at >= DATE_SUB(NOW(), INTERVAL %s DAY) "
-        "ORDER BY first_seen_at DESC LIMIT %s",
-        (chat_id, days, limit),
+        "WHERE chat_id = %s AND first_seen_at >= %s "
+        + until_sql
+        + "ORDER BY first_seen_at DESC LIMIT %s",
+        tuple(params),
     )
 
 
-async def get_marriages_since(chat_id: int, days: int, limit: int = 10) -> list[dict]:
+async def get_marriages_since(chat_id: int, since, limit: int = 10, until=None) -> list[dict]:
+    until_sql = "AND married_at < %s " if until is not None else ""
+    params = ([chat_id, since] + ([until] if until is not None else []) + [limit])
     return await _fetchall(
         "SELECT user1_id, user2_id, married_at FROM marriages "
-        "WHERE chat_id = %s AND married_at >= DATE_SUB(NOW(), INTERVAL %s DAY) "
-        "ORDER BY married_at DESC LIMIT %s",
-        (chat_id, days, limit),
+        "WHERE chat_id = %s AND married_at >= %s "
+        + until_sql
+        + "ORDER BY married_at DESC LIMIT %s",
+        tuple(params),
     )
 
 
-async def get_achievements_since(chat_id: int, days: int, limit: int = 15) -> list[dict]:
+async def get_achievements_since(chat_id: int, since, limit: int = 15, until=None) -> list[dict]:
+    until_sql = "AND earned_at < %s " if until is not None else ""
+    params = ([chat_id, since] + ([until] if until is not None else []) + [limit])
     return await _fetchall(
         "SELECT user_id, code, earned_at FROM achievements "
-        "WHERE chat_id = %s AND earned_at >= DATE_SUB(NOW(), INTERVAL %s DAY) "
-        "ORDER BY earned_at DESC LIMIT %s",
-        (chat_id, days, limit),
+        "WHERE chat_id = %s AND earned_at >= %s "
+        + until_sql
+        + "ORDER BY earned_at DESC LIMIT %s",
+        tuple(params),
     )
 
 
-async def get_reputation_gainers_since(chat_id: int, days: int, limit: int = 5) -> list[dict]:
+async def get_reputation_gainers_since(chat_id: int, since, limit: int = 5,
+                                       until=None) -> list[dict]:
     """Кому за период больше всего накинули репутации (минусы вычитаются)."""
+    until_sql = "AND rl.created_at < %s " if until is not None else ""
+    params = ([chat_id, since] + ([until] if until is not None else []) + [limit])
     return await _fetchall(
         "SELECT rl.target_id AS user_id, SUM(rl.amount) AS gained, "
         "ku.full_name, ku.username "
         "FROM reputation_log rl "
         "JOIN known_users ku ON ku.chat_id = rl.chat_id AND ku.user_id = rl.target_id "
-        "WHERE rl.chat_id = %s AND rl.created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) "
-        "GROUP BY rl.target_id, ku.full_name, ku.username "
+        "WHERE rl.chat_id = %s AND rl.created_at >= %s "
+        + until_sql
+        + "GROUP BY rl.target_id, ku.full_name, ku.username "
         "HAVING gained <> 0 ORDER BY gained DESC LIMIT %s",
-        (chat_id, days, limit),
+        tuple(params),
     )
 
 
@@ -9664,7 +9727,9 @@ async def get_reputation_top(chat_id: int, limit: int = 10, worst: bool = False)
         "SELECT r.user_id, r.points, ku.full_name, ku.username "
         "FROM reputation r "
         "JOIN known_users ku ON ku.chat_id = r.chat_id AND ku.user_id = r.user_id "
-        f"WHERE r.chat_id = %s AND r.points <> 0 ORDER BY r.points {order} LIMIT %s",
+        "WHERE r.chat_id = %s AND r.points <> 0 "
+        f"AND {in_chat_sql('r.chat_id', 'r.user_id')} "
+        f"ORDER BY r.points {order} LIMIT %s",
         (chat_id, limit),
     )
 
@@ -9776,6 +9841,7 @@ async def get_achievements_top(chat_id: int, limit: int = 10) -> list[dict]:
         "FROM achievements a "
         "JOIN known_users ku ON ku.chat_id = a.chat_id AND ku.user_id = a.user_id "
         "WHERE a.chat_id = %s "
+        f"AND {in_chat_sql('a.chat_id', 'a.user_id')} "
         "GROUP BY a.user_id, ku.full_name, ku.username "
         "ORDER BY total DESC, ku.full_name LIMIT %s",
         (chat_id, limit),
@@ -9829,20 +9895,30 @@ async def count_subscriptions_of(chat_id: int, subscriber_id: int) -> int:
 
 
 async def get_subscribers(chat_id: int, target_id: int, limit: int = 200) -> list[dict]:
-    """Кто подписан на человека (только те, кто ещё в чате)."""
+    """Кто подписан на человека — те, кто ещё в чате: их зовёт «созвать своих».
+
+    «Ещё в чате» тут раньше было только в этой строке документации: соединение
+    шло с known_users, откуда никто не удаляется, и созыв звал давно ушедших.
+    Подписки вышедшего чистит handle_member_left, но лишь когда бот получил
+    событие выхода, — на пропущенное событие проверки не было.
+    """
     return await _fetchall(
         "SELECT s.subscriber_id AS user_id, ku.full_name, ku.username "
         "FROM subscriptions s "
         "JOIN known_users ku ON ku.chat_id = s.chat_id AND ku.user_id = s.subscriber_id "
         "WHERE s.chat_id = %s AND s.target_id = %s "
+        f"AND {in_chat_sql('s.chat_id', 's.subscriber_id')} "
         "ORDER BY s.created_at LIMIT %s",
         (chat_id, target_id, limit),
     )
 
 async def count_subscribers(chat_id: int, target_id: int) -> int:
-    """Сколько человек подписано на target_id — для строки в профиле."""
+    """Сколько человек подписано на target_id — для строки в профиле.
+    Считаются те же, кого позовёт «созвать своих» (см. get_subscribers):
+    иначе в профиле 20 подписчиков, а созыв зовёт двенадцать."""
     row = await _fetchone(
-        "SELECT COUNT(*) AS total FROM subscriptions WHERE chat_id = %s AND target_id = %s",
+        "SELECT COUNT(*) AS total FROM subscriptions s WHERE chat_id = %s AND target_id = %s "
+        f"AND {in_chat_sql('s.chat_id', 's.subscriber_id')}",
         (chat_id, target_id),
     )
     return int(row["total"]) if row else 0
@@ -9866,6 +9942,7 @@ async def get_top_subscribed(chat_id: int, limit: int = 10) -> list[dict]:
         "FROM subscriptions s "
         "JOIN known_users ku ON ku.chat_id = s.chat_id AND ku.user_id = s.target_id "
         "WHERE s.chat_id = %s "
+        f"AND {in_chat_sql('s.chat_id', 's.target_id')} "
         "GROUP BY s.target_id, ku.full_name, ku.username "
         "ORDER BY subs DESC, ku.full_name LIMIT %s",
         (chat_id, limit),
@@ -10054,8 +10131,10 @@ async def list_chat_investments(chat_id: int, limit: int = 15) -> list[dict]:
 async def list_chat_investment_top(chat_id: int, limit: int = 10) -> list[dict]:
     """Топ вкладчиков чата — сумма всех вложений на человека."""
     return await _fetchall(
-        "SELECT user_id, SUM(amount) AS total_amount FROM chat_coin_investments "
-        "WHERE chat_id = %s GROUP BY user_id ORDER BY total_amount DESC LIMIT %s",
+        "SELECT user_id, SUM(amount) AS total_amount FROM chat_coin_investments ci "
+        "WHERE chat_id = %s "
+        f"AND {in_chat_sql('ci.chat_id', 'ci.user_id')} "
+        "GROUP BY user_id ORDER BY total_amount DESC LIMIT %s",
         (chat_id, limit),
     )
 
@@ -10719,7 +10798,8 @@ async def set_profession_level(chat_id: int, user_id: int, level: int) -> None:
 async def list_profession_top(chat_id: int, limit: int = 10) -> list[dict]:
     return await _fetchall(
         "SELECT user_id, profession_key, prof_level, prof_xp, total_earned "
-        "FROM profession_stats WHERE chat_id = %s AND profession_key IS NOT NULL "
+        "FROM profession_stats ps WHERE chat_id = %s AND profession_key IS NOT NULL "
+        f"AND {in_chat_sql('ps.chat_id', 'ps.user_id')} "
         "ORDER BY prof_level DESC, prof_xp DESC LIMIT %s",
         (chat_id, limit),
     )
@@ -11387,6 +11467,7 @@ async def list_recent_active_users(chat_id: int, limit: int = 300) -> list[dict]
         "SELECT DISTINCT ku.user_id, ku.full_name, ku.username FROM message_daily md "
         "JOIN known_users ku ON ku.chat_id = md.chat_id AND ku.user_id = md.user_id "
         "WHERE md.chat_id = %s AND md.day IN (%s, %s) AND md.message_count > 0 "
+        f"AND {in_chat_sql('md.chat_id', 'md.user_id')} "
         "LIMIT %s",
         (chat_id, today, yesterday, limit),
     )
@@ -11531,8 +11612,9 @@ async def get_lootbox_stats(chat_id: int, user_id: int) -> dict:
 
 async def list_lootbox_top(chat_id: int, limit: int = 10) -> list[dict]:
     return await _fetchall(
-        "SELECT user_id, opened_count, rare_count FROM lootbox_stats "
+        "SELECT user_id, opened_count, rare_count FROM lootbox_stats l "
         "WHERE chat_id = %s AND opened_count > 0 "
+        f"AND {in_chat_sql('l.chat_id', 'l.user_id')} "
         "ORDER BY opened_count DESC LIMIT %s",
         (chat_id, limit),
     )
@@ -11883,8 +11965,10 @@ async def apply_robbery_fail(chat_id: int, robber_id: int, loss_amount: int) -> 
 
 async def list_robbery_top(chat_id: int, limit: int = 10) -> list[dict]:
     return await _fetchall(
-        "SELECT user_id, stolen_total, successes, attempts FROM robbery_stats "
-        "WHERE chat_id = %s AND stolen_total > 0 ORDER BY stolen_total DESC LIMIT %s",
+        "SELECT user_id, stolen_total, successes, attempts FROM robbery_stats rs "
+        "WHERE chat_id = %s AND stolen_total > 0 "
+        f"AND {in_chat_sql('rs.chat_id', 'rs.user_id')} "
+        "ORDER BY stolen_total DESC LIMIT %s",
         (chat_id, limit),
     )
 

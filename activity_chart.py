@@ -21,7 +21,7 @@ ACTIVITY_CHART_DAYS дней (по умолчанию 57 — как на реф�
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import matplotlib
@@ -62,12 +62,19 @@ def _nice_y_step(max_value: int) -> int:
     return _Y_STEP_CANDIDATES[-1]
 
 
-def _daily_series(rows: list[dict], days: int) -> tuple[list[date], list[int]]:
+def _daily_series(rows: list[dict], days: int,
+                  today: date | None = None) -> tuple[list[date], list[int]]:
     """Достраивает непрерывный ряд по дням за последние `days` дней (включая
     сегодня) — дни без сообщений получают 0. Без этого столбцы графика были
     бы расставлены только по «активным» дням, а не по равномерной шкале дат,
-    как на референсе."""
-    today = date.today()
+    как на референсе.
+
+    Сегодня — по UTC, потому что rows приходят из message_daily, а её сутки
+    размечены UTC при записи. Раньше тут стоял date.today() — зона
+    ОПЕРАЦИОННОЙ СИСТЕМЫ: на сервере восточнее UTC последний столбец графика
+    оказывался завтрашним днём, а сегодняшние сообщения в ряд не попадали
+    вовсе."""
+    today = today or datetime.utcnow().date()
     counts_by_day = {row["day"]: row["message_count"] for row in rows}
     series_days = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
     series_counts = [int(counts_by_day.get(d, 0)) for d in series_days]
@@ -75,7 +82,8 @@ def _daily_series(rows: list[dict], days: int) -> tuple[list[date], list[int]]:
 
 
 def render_activity_chart(
-    rows: list[dict], days: int = ACTIVITY_CHART_DAYS, title: str = "Статистика активности"
+    rows: list[dict], days: int = ACTIVITY_CHART_DAYS, title: str = "Статистика активности",
+    today: date | None = None,
 ) -> BytesIO:
     """rows — результат db.list_daily_counts_for_user(...) (или
     db.list_daily_counts_for_chat(...) — формат строк одинаковый):
@@ -87,7 +95,7 @@ def render_activity_chart(
 
     Возвращает PNG-картинку в памяти (BytesIO, позиция уже сброшена на
     начало — готова для BufferedInputFile/send_photo)."""
-    series_days, series_counts = _daily_series(rows, days)
+    series_days, series_counts = _daily_series(rows, days, today)
 
     fig, ax = plt.subplots(figsize=(7.4, 3.6), dpi=130)
     fig.patch.set_facecolor("white")

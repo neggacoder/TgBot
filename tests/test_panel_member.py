@@ -15,6 +15,11 @@ from webpanel.auth import PanelUser
 
 panel = importlib.import_module("webpanel.app")
 
+# Чат, который тесты панели используют как рабочий. Раньше он был просто
+# числом в каждом запросе; теперь кабинет сверяет его с настройками, и число
+# должно быть одно на весь файл.
+ЧАТ = -100
+
 
 @pytest.fixture
 def client(monkeypatch):
@@ -29,6 +34,14 @@ def client(monkeypatch):
     # вход по коду теперь считает попытки перебора (см. api_member_login)
     monkeypatch.setattr(db, "add_panel_login_attempt", _noop, raising=False)
     monkeypatch.setattr(db, "count_failed_logins_by_ip", _no_fails, raising=False)
+
+    # Кабинет теперь работает только в РАБОЧЕМ чате, а какой он — читается из
+    # настроек (см. chats.py). Заглушка обязана их отдать: иначе каждый тест
+    # получает «рабочий чат ещё не привязан» вместо проверяемого поведения.
+    async def _настройки():
+        return {"complaint_chat_id": ЧАТ, "notify_chat_id": -100222}
+
+    monkeypatch.setattr(db, "fetch_settings", _настройки, raising=False)
     c = TestClient(panel.app)
     yield c
     panel.app.dependency_overrides.clear()
@@ -587,10 +600,13 @@ def test_фарм_действие_пишет_в_чат(client, monkeypatch):
     monkeypatch.setattr(panel, "get_bot", lambda: FakeBot())
     res = client.post("/api/member/rp-action", json={"chat_id": -100, "key": "flowers"})
     assert res.status_code == 200, res.text
-    # название действия попадает в текст в нижнем регистре («… подарить цветы
-    # своей половинке …») — сверяем без учёта регистра, а не по точной строке
+    # В объявлении — ГЛАГОЛ из каталога («подарил(а) цветы»), а не название
+    # действия в инфинитиве. Раньше тут проверялось второе, и это была не
+    # придирка к формулировке: рядом с рабочим каталогом лежал его урезанный
+    # дубль без «verb» и «phrases», он молча затирал полный — и панель писала
+    # в чат «подарить цветы».
     assert sent["chat"] == -100
-    assert "подарить цветы" in sent["text"].casefold(), sent["text"]
+    assert "подарил(а) цветы" in sent["text"], sent["text"]
 
 
 # --- кланы участника -------------------------------------------------------
