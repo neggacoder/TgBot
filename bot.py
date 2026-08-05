@@ -26222,7 +26222,7 @@ SHOP_TOGGLE_RE = ru_text.rx(r"(?i)^!?магазин\s+(вкл|выкл)\s+(\S+)$
 SHOP_BUY_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+купить|купить)\s+(\S+)(?:\s+(\S+))?$")
 # Потолок на одну команду: опечатка в количестве («купить fishka 100000»)
 # иначе разом выносит весь кошелёк.
-SHOP_BUY_MAX_QTY = 100
+SHOP_BUY_MAX_QTY = 10000
 SHOP_GIFT_RE = ru_text.rx(r"(?i)^(?:!?магазин\s+подарить|подарить)\s+(\S+)\s*(.*)$")
 # Потолок тот же, что у покупки: дарить пачками разрешено, выносить склад
 # одной командой — нет.
@@ -30611,17 +30611,19 @@ async def cmd_reward(message: Message):
             )
         return
 
-    # Кулдаун на пару «кто → кому». Награда теперь приносит монеты и
-    # репутацию, а выдаётся вручную — без ограничения двое договорившихся
-    # награждали бы друг друга по кругу.
-    last_at = await db.last_reward_between(message.chat.id, message.from_user.id, target.id)
-    if last_at and (datetime.utcnow() - last_at) < REWARD_SAME_TARGET_COOLDOWN:
-        remaining_cd = REWARD_SAME_TARGET_COOLDOWN - (datetime.utcnow() - last_at)
-        await message.reply(
-            f"⏳ Вы уже награждали этого человека. Следующая награда от вас — "
-            f"через {format_duration_ru(remaining_cd)}."
-        )
-        return
+    # Кулдаун на пару «кто → кому» — только для рядовых участников. Он
+    # заведён против «двое участников награждают друг друга по кругу», а не
+    # против администрации: модератор и выше (включая владельца) выдают
+    # награды без ограничения по частоте.
+    if not is_admin(message.from_user.id):
+        last_at = await db.last_reward_between(message.chat.id, message.from_user.id, target.id)
+        if last_at and (datetime.utcnow() - last_at) < REWARD_SAME_TARGET_COOLDOWN:
+            remaining_cd = REWARD_SAME_TARGET_COOLDOWN - (datetime.utcnow() - last_at)
+            await message.reply(
+                f"⏳ Вы уже награждали этого человека. Следующая награда от вас — "
+                f"через {format_duration_ru(remaining_cd)}."
+            )
+            return
 
     reward_id = await db.add_reward(message.chat.id, target.id, degree, reason, message.from_user.id)
     await db.add_log(
@@ -37991,7 +37993,7 @@ async def _pin_call_message(chat_id: int, message_id: int) -> None:
     await db.set_data(_call_pin_key(chat_id), str(message_id))
 
 
-async def _run_call(chat_id: int, targets: list[dict], header_text: Optional[str]):
+async def _run_call(chat_id: int, targets: list[dict], header_text: Optional[str], pin_on_photo: bool = False):
     закреплено = False
     try:
         for i in range(0, len(targets), CALL_BATCH_SIZE):
@@ -38004,7 +38006,7 @@ async def _run_call(chat_id: int, targets: list[dict], header_text: Optional[str
                 break
             except TelegramBadRequest:
                 отправлено = None
-            if отправлено is not None and not закреплено:
+            if отправлено is not None and not закреплено and pin_on_photo:
                 закреплено = True
                 await _pin_call_message(chat_id, отправлено.message_id)
             await asyncio.sleep(CALL_BATCH_DELAY)
@@ -38024,8 +38026,8 @@ async def _run_call(chat_id: int, targets: list[dict], header_text: Optional[str
 CALL_CONFIRM_THRESHOLD = 30  # созывы больше этого размера требуют подтверждения кнопкой
 
 
-async def _launch_call(chat_id: int, targets: list[dict], header_text: Optional[str], actor_id: int, only_admins: bool) -> None:
-    task = asyncio.create_task(_run_call(chat_id, targets, header_text))
+async def _launch_call(chat_id: int, targets: list[dict], header_text: Optional[str], actor_id: int, only_admins: bool, pin_on_photo: bool = False) -> None:
+    task = asyncio.create_task(_run_call(chat_id, targets, header_text, pin_on_photo))
     active_calls[chat_id] = task
     await db.add_log(
         "call_start" if not only_admins else "call_admins_start",
@@ -38041,7 +38043,9 @@ async def _start_call(message: Message, command_key: str, only_admins: bool):
     if message.chat.id in active_calls:
         await message.reply("В этом чате уже идёт созыв. Остановить его: «стоп».")
         return
-
+    # Закреп сообщения созыва — только если К СООБЩЕНИЮ С КОМАНДОЙ было
+    # прикреплено фото. Иначе созыв (даже большой) не занимает шапку чата.
+    pin_on_photo = bool(message.photo)
     header_text = call_commands.call_header(call_command_text(message))
 
     targets = await _call_targets(message.chat.id, only_admins)
@@ -38067,6 +38071,7 @@ async def _start_call(message: Message, command_key: str, only_admins: bool):
             "targets": targets,
             "header_text": header_text,
             "only_admins": only_admins,
+            "pin_on_photo": pin_on_photo,
         }
         kb = confirm_kb(
             yes_data=f"call_yes:{message.from_user.id}",
@@ -38084,7 +38089,7 @@ async def _start_call(message: Message, command_key: str, only_admins: bool):
         return
 
     await message.reply(f"📣 Начинаю созыв: {len(targets)} чел.{note}")
-    await _launch_call(message.chat.id, targets, header_text, message.from_user.id, only_admins)
+    await _launch_call(message.chat.id, targets, header_text, message.from_user.id, only_admins, pin_on_photo)
 
 
 @router.callback_query(F.data.startswith("call_yes:"))
@@ -38120,7 +38125,10 @@ async def confirm_call(callback: CallbackQuery):
         await callback.message.edit_text(f"📣 Начинаю созыв: {len(targets)} чел.")
     except TelegramBadRequest:
         pass
-    await _launch_call(chat_id, targets, payload["header_text"], initiator_id, payload["only_admins"])
+    await _launch_call(
+        chat_id, targets, payload["header_text"], initiator_id, payload["only_admins"],
+        payload.get("pin_on_photo", False),
+    )
     await callback.answer()
 
 
