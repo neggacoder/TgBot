@@ -214,11 +214,11 @@ async def ensure_rest_settings_columns() -> None:
     админ (ДД.ММ.ГГГГ), — она же показывается ему обратно.
     """
     await _add_column_if_missing("settings", "rest_rules_template", "TEXT NULL")
-    await _add_column_if_missing("settings", "rest_max_days", "INT NULL")
-    await _add_column_if_missing("settings", "rest_cooldown_days", "INT NULL")
-    await _add_column_if_missing("settings", "rest_min_member_days", "INT NULL")
+    await _add_column_if_missing("settings", "rest_max_days", "BIGINT NULL")
+    await _add_column_if_missing("settings", "rest_cooldown_days", "BIGINT NULL")
+    await _add_column_if_missing("settings", "rest_min_member_days", "BIGINT NULL")
     await _add_column_if_missing("settings", "rest_cleanup_date", "VARCHAR(10) NULL")
-    await _add_column_if_missing("settings", "rest_cleanup_block_days", "INT NULL")
+    await _add_column_if_missing("settings", "rest_cleanup_block_days", "BIGINT NULL")
 
 
 async def ensure_word_filter_table() -> None:
@@ -227,7 +227,7 @@ async def ensure_word_filter_table() -> None:
     у этого бота один рабочий чат."""
     await _execute(
         "CREATE TABLE IF NOT EXISTS word_filter ("
-        "id INT AUTO_INCREMENT PRIMARY KEY, "
+        "id BIGINT AUTO_INCREMENT PRIMARY KEY, "
         "word VARCHAR(128) NOT NULL, "
         "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
         "UNIQUE KEY uniq_word (word)"
@@ -261,7 +261,7 @@ async def ensure_fake_warn_column() -> None:
     всего). 0 — копить их отдельно, тогда человек в своём списке видит только
     настоящие варны, а модератор смотрит обманные командой «&варны».
     """
-    await _add_column_if_missing("settings", "fake_warns_in_list", "TINYINT NULL")
+    await _add_column_if_missing("settings", "fake_warns_in_list", "BIGINT NULL")
 
 async def ensure_timezone_column() -> None:
     """Колонка settings.timezone — часовой пояс ПОКАЗА времени.
@@ -282,7 +282,7 @@ async def ensure_cleanup_newcomer_column() -> None:
     недельной норме, а неделю, которая для тебя началась в среду, набрать
     нельзя (см. _cleanup_join_cutoff в bot.py).
     """
-    await _add_column_if_missing("settings", "cleanup_newcomer_days", "INT NULL")
+    await _add_column_if_missing("settings", "cleanup_newcomer_days", "BIGINT NULL")
 
 
 async def ensure_week_start_column() -> None:
@@ -7399,9 +7399,9 @@ async def ensure_stock_market_tables() -> None:
         "chat_id BIGINT NOT NULL, "
         "user_id BIGINT NOT NULL, "
         "shares DECIMAL(20,6) NOT NULL DEFAULT 0, "
-        "invested BIGINT NOT NULL DEFAULT 0, "
+        "invested INT NOT NULL DEFAULT 0, "
         "pending_dividends DECIMAL(14,2) NOT NULL DEFAULT 0, "
-        "total_profit BIGINT NOT NULL DEFAULT 0, "
+        "total_profit INT NOT NULL DEFAULT 0, "
         "last_accrual_date DATE NULL, "
         "last_dividend_at DATETIME NULL, "
         "PRIMARY KEY (chat_id, user_id)"

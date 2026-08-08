@@ -12845,7 +12845,8 @@ async def confirm_nuke(callback: CallbackQuery):
                 can_delete_messages=False,
                 can_manage_video_chats=False,
                 can_restrict_members=False,
-                can_promote_members=False,
+                
+can_promote_members=False,
                 can_change_info=False,
                 can_invite_users=False,
                 can_pin_messages=False,
@@ -12861,7 +12862,9 @@ async def confirm_nuke(callback: CallbackQuery):
     for row in known_users:
         user_id = row["user_id"]
         if user_id == me.id or user_id in OWNER_IDS:
-            continue
+
+
+          continue
         try:
             await bot.ban_chat_member(chat_id, user_id)
             banned += 1
@@ -24592,7 +24595,7 @@ async def cmd_casino_dice(message: Message):
         return
     m = CASINO_DICE_RE.match(message.text.strip())
     bet, guess = await resolve_casino_amount(message, m.group(1)), int(m.group(2))
-    if bet is None or bet <= 0:
+    if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
 
@@ -24649,7 +24652,7 @@ async def cmd_casino_coin(message: Message):
     m = CASINO_COIN_RE.match(message.text.strip())
     guess = "орёл" if m.group(1).casefold() in ("орёл", "орел") else "решка"
     bet = await resolve_casino_amount(message, m.group(2))
-    if bet is None or bet <= 0 :
+    if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
 
@@ -24704,7 +24707,7 @@ async def cmd_casino_poker(message: Message):
         return
     bet = await resolve_casino_amount(
         message, CASINO_POKER_RE.match(message.text.strip()).group(1))
-    if bet is None or bet <= 0:
+    if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
 

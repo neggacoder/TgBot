@@ -16,7 +16,7 @@ load_dotenv()
 
 
 def main() -> None:
-    host = os.getenv("PANEL_HOST", "127.0.0.1")
+    host = os.getenv("PANEL_HOST", "0.0.0.0")
     port = int(os.getenv("PANEL_PORT", "8080"))
     uvicorn.run(
         "webpanel.app:app",

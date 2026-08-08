@@ -51,7 +51,7 @@ ALIASES: dict[str, str] = {
     "эпический": "epic", "эпические": "epic", "epic": "epic", "4": "epic",
     "легендарный": "legendary", "легендарные": "legendary", "legendary": "legendary", "5": "legendary",
 }
-MAX_PER_COMMAND = 20      # предохранитель: не купить и не открыть сотню за раз
+MAX_PER_COMMAND = 100      # предохранитель: не купить и не открыть сотню за раз
 RARE_POOL_SHARE = 0.25    # доля самых дорогих позиций каталога — «редкий» пул
 MASTER_OPENED = 100       # с какого числа открытых даётся достижение
 

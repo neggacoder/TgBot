@@ -68,7 +68,7 @@ URL_PREFIX = "/rp"
 
 # Адрес, по которому панель доступна ИЗ ИНТЕРНЕТА: по нему Telegram пойдёт за
 # превью. Дефолт — тот же адрес, что бот показывает в команде «сайт».
-DEFAULT_PUBLIC_URL = "https://nurasyl-aspire-a315-59.tail0a2432.ts.net/"
+DEFAULT_PUBLIC_URL = "http://localhost:8080"
 
 
 def public_base_url() -> str:

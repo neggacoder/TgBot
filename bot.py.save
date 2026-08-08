@@ -24592,7 +24592,7 @@ async def cmd_casino_dice(message: Message):
         return
     m = CASINO_DICE_RE.match(message.text.strip())
     bet, guess = await resolve_casino_amount(message, m.group(1)), int(m.group(2))
-    if bet is None or bet <= 0:
+    if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
 
@@ -24649,7 +24649,7 @@ async def cmd_casino_coin(message: Message):
     m = CASINO_COIN_RE.match(message.text.strip())
     guess = "орёл" if m.group(1).casefold() in ("орёл", "орел") else "решка"
     bet = await resolve_casino_amount(message, m.group(2))
-    if bet is None or bet <= 0 :
+    if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
 
@@ -24704,7 +24704,7 @@ async def cmd_casino_poker(message: Message):
         return
     bet = await resolve_casino_amount(
         message, CASINO_POKER_RE.match(message.text.strip()).group(1))
-    if bet is None or bet <= 0:
+    if bet is None or bet <= 0 or bet > CASINO_MAX_BET:
         await message.reply(f"Ставка должна быть от 1 до {CASINO_MAX_BET} i¢.")
         return
 
