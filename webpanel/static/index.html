@@ -127,18 +127,7 @@
     <label><span>Логин</span><input type="text" id="auth-user" autocomplete="username" required></label>
     <label><span>Пароль</span><input type="password" id="auth-pass" autocomplete="current-password" required></label>
     <button class="primary block" type="submit">Войти</button>
-    <button type="button" class="link-btn" id="member-toggle">Я участник — войти по коду</button>
-  </form>
-
-  <!-- Вход участника по одноразовому коду от бота (команда «сайт» в личке) -->
-  <form class="auth-card hidden" id="member-form">
-    <div class="auth-logo"><svg class="ic"><use href="#ic-user"/></svg></div>
-    <h1>Вход участника</h1>
-    <p class="hint">Напишите боту в личку слово «сайт» — он пришлёт код. Введите его здесь.</p>
-    <div id="member-msg"></div>
-    <label><span>Код</span><input type="text" id="member-code" autocomplete="one-time-code" placeholder="Например, K7P2M9QF" required></label>
-    <button class="primary block" type="submit">Войти</button>
-    <button type="button" class="link-btn" id="member-back">← Вход для персонала</button>
+    <p class="hint">Участники создают логин и пароль командой <code>аккаунт</code> в личке боту и входят здесь же.</p>
   </form>
 </div>
 
@@ -183,6 +172,7 @@
     <button type="button" class="member-tab" data-mtab="bank"><svg class="ic"><use href="#ic-coins"/></svg>Банк</button>
     <button type="button" class="member-tab" data-mtab="pets"><svg class="ic"><use href="#ic-paw"/></svg>Питомцы</button>
     <button type="button" class="member-tab" data-mtab="caps"><svg class="ic"><use href="#ic-message"/></svg>Возможности</button>
+    <button type="button" class="member-tab" data-mtab="suggest"><svg class="ic"><use href="#ic-message"/></svg>Предложения</button>
   </nav>
   <main class="member-content" id="member-content">
     <div id="member-toast" class="toast-area"></div>
@@ -201,6 +191,7 @@
     <div class="member-panel hidden" data-panel="bank"><div id="member-bank" class="bank"></div></div>
     <div class="member-panel hidden" data-panel="pets"><div id="member-pets"></div></div>
     <div class="member-panel hidden" data-panel="caps"><div id="member-caps"></div></div>
+    <div class="member-panel hidden" data-panel="suggest"><div id="member-suggest"></div></div>
   </main>
 </div>
 
@@ -814,8 +805,9 @@
         <h3><svg class="ic"><use href="#ic-user"/></svg>Мой Telegram</h3>
         <div id="tg-link-unlinked">
           <p class="hint">Привяжите аккаунт к своему Telegram, чтобы открыть экран участника
-            (браки, кланы, питомцы — как видят остальные). Напишите боту в личку слово
-            «сайт», получите код и введите его здесь.</p>
+            (браки, кланы, питомцы — как видят остальные). Напишите боту в личку
+            «код панели» и введите код здесь. Если у вас уже есть отдельный аккаунт
+            участника, он автоматически объединится с этим аккаунтом администратора.</p>
           <div class="row">
             <label><span>Код из бота</span><input type="text" id="tg-link-code" autocomplete="one-time-code" placeholder="Например, K7P2M9QF"></label>
             <div class="grow-0"><button class="primary" id="tg-link-save"><svg class="ic"><use href="#ic-check"/></svg>Привязать</button></div>

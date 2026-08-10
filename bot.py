@@ -270,16 +270,6 @@ async def _enforce_word_filter(event: "Message") -> bool:
         "word_filter_deleted", chat_id=event.chat.id,
         actor_id=event.from_user.id, details=hit,
     )
-    try:
-        if not event.from_user.is_bot and await _enforce_auto_delete(event):
-            return
-    except Exception:
-        logger.exception("Ошибка автоудаления")
-    try:
-        if not event.from_user.is_bot and await _enforce_word_filter(event):
-            return
-    except Exception:
-        logger.exception("Ошибка фильтра слов")
     return True
 
 async def _enforce_auto_delete(event: "Message") -> bool:
@@ -469,14 +459,11 @@ class ChatScopeMiddleware(BaseMiddleware):
 
 
 class MessageGuardMiddleware(BaseMiddleware):
-    """Фильтр мата и медленный режим — то, что решает, дойдёт ли сообщение до
-    обработчиков вообще.
+    """Медленный режим основного набора команд.
 
-    Осталась на основном роутере, где и была (раньше называлась
-    MessageCounterMiddleware и делала заодно счётчики — те уехали в
-    MessageStatsMiddleware выше). На команды relationships_v2 она, как и
-    прежде, не распространяется: перенос модерации на все сообщения — это
-    смена правил чата, а не починка статистики.
+    Фильтр слов вынесен отдельно на диспетчер: он обязан видеть сообщения до
+    любого роутера, тогда как расширять медленный режим на relationships_v2
+    без отдельной настройки нельзя.
     """
 
     async def __call__(self, handler, event, data):
@@ -486,15 +473,28 @@ class MessageGuardMiddleware(BaseMiddleware):
             and event.from_user is not None
         ):
             try:
-                if not event.from_user.is_bot and await _enforce_word_filter(event):
-                    return
-            except Exception:
-                logger.exception("Ошибка фильтра слов")
-            try:
                 if not event.from_user.is_bot and await _enforce_slowmode(event):
                     return
             except Exception:
                 logger.exception("Ошибка медленного режима")
+        return await handler(event, data)
+
+
+class WordFilterMiddleware(BaseMiddleware):
+    """Глобальный фильтр слов до всех роутеров, включая relationships_v2."""
+
+    async def __call__(self, handler, event, data):
+        if (
+            isinstance(event, Message)
+            and event.chat.type in ("group", "supergroup")
+            and event.from_user is not None
+            and not event.from_user.is_bot
+        ):
+            try:
+                if await _enforce_word_filter(event):
+                    return None
+            except Exception:
+                logger.exception("Ошибка фильтра слов")
         return await handler(event, data)
 
 
@@ -569,6 +569,7 @@ dp.message.outer_middleware(ChatScopeMiddleware())
 dp.callback_query.outer_middleware(ChatScopeMiddleware())
 dp.message.outer_middleware(MessageStatsMiddleware())
 dp.message.outer_middleware(CommandCleanupMiddleware())
+dp.message.outer_middleware(WordFilterMiddleware())
 router.message.outer_middleware(MessageGuardMiddleware())
 
 
@@ -4033,10 +4034,10 @@ async def _show_main_menu(message: Message, state: FSMContext) -> None:
 
 
 # ----------------------------------------------------------------------------
-# «сайт» / «/site» в личке — выдать одноразовый код для входа на веб-панель
-# как УЧАСТНИК (read-only). Код кладём в panel_link_codes, панель гасит его при
-# входе и заводит/находит member-аккаунт, привязанный к этому Telegram id.
-# Доступно всем: это вход для обычных участников, не админов.
+# «сайт» / «/site» в личке — вход участника на сайт по постоянному аккаунту.
+# Одноразовый код больше НЕ является способом входа участника: он остался
+# только для привязки Telegram к уже существующему аккаунту персонала и
+# выдаётся отдельной командой «код панели».
 # ----------------------------------------------------------------------------
 PANEL_LINK_CODE_TTL_MIN = 10
 _PANEL_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих 0/O/1/I
@@ -4084,6 +4085,29 @@ def _gen_panel_link_code() -> str:
     F.text.func(lambda t: bool(t) and t.strip().casefold().split("@")[0] in ("сайт", "/site")),
 )
 async def cmd_site_code(message: Message):
+    existing = await db.get_panel_user_by_tg(message.from_user.id)
+    if existing:
+        await message.answer(
+            "🌐 <b>Вход на сайт</b>\n\n"
+            f"Сайт: {PANEL_SITE_URL}\n"
+            f"Логин: <code>{html.escape(existing['username'])}</code>\n\n"
+            "Входите через обычную форму по логину и паролю. Если забыли пароль "
+            "участника — снова отправьте команду «аккаунт» и задайте новый."
+        )
+        return
+    await message.answer(
+        "🌐 <b>Вход на сайт</b>\n\n"
+        "У вас ещё нет постоянного аккаунта. Отправьте команду «аккаунт», "
+        "придумайте логин и пароль, затем входите через обычную форму:\n"
+        f"{PANEL_SITE_URL}"
+    )
+
+
+@router.message(
+    F.chat.type == "private",
+    F.text.func(lambda t: bool(t) and t.strip().casefold() == "код панели"),
+)
+async def cmd_panel_link_code(message: Message):
     code = _gen_panel_link_code()
     expires_at = datetime.utcnow() + timedelta(minutes=PANEL_LINK_CODE_TTL_MIN)
     await db.create_panel_link_code(
@@ -4091,19 +4115,16 @@ async def cmd_site_code(message: Message):
         message.from_user.full_name or str(message.from_user.id), expires_at,
     )
     await message.answer(
-        "🔑 <b>Код для сайта</b>\n\n"
+        "🔗 <b>Код привязки Telegram</b>\n\n"
         f"<code>{code}</code>\n\n"
-        f"🌐 Сайт: {PANEL_SITE_URL}\n"
-        f"Если у вас ЕЩЁ НЕТ аккаунта персонала — этот код для входа участника "
-        "устарел, используйте команду «аккаунт», чтобы задать логин/пароль.\n"
-        "Если вы уже вошли на сайте как персонал (admin/owner) — введите этот код "
-        "в разделе привязки Telegram в панели, чтобы привязать свой аккаунт к тг. "
+        "Войдите на сайт как администратор или владелец и введите код в разделе "
+        "«Мой Telegram». Это не код входа участника. "
         f"Код одноразовый и действует {PANEL_LINK_CODE_TTL_MIN} минут.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 # Приложению код не нужен — Telegram сам подтверждает, кто вы.
                 [InlineKeyboardButton(text="🎮 Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL))],
-                [InlineKeyboardButton(text="🌐 Сайт в браузере", url=PANEL_SITE_URL)],
+                [InlineKeyboardButton(text="🌐 Открыть панель", url=PANEL_SITE_URL)],
             ]
         ),
     )
@@ -12354,6 +12375,110 @@ async def resolve_command_target(
         return target, remaining
 
     return None, text
+
+
+async def _human_pet_name(chat_id: int, user_id: int) -> str:
+    row = await db.get_known_user(chat_id, user_id)
+    shown = await db.get_nickname(chat_id, user_id) or (row or {}).get("full_name") or str(user_id)
+    return f'<a href="tg://user?id={user_id}">{html.escape(shown)}</a>'
+
+
+@router.message(F.text.regexp(r"(?i)^пет(?:\s|$)"))
+async def cmd_human_pet_request(message: Message):
+    """«пет @user» или «пет» ответом — запрос стать хозяином человека."""
+    target, _ = await resolve_command_target(message, trigger_words=1, allow_bare_id=False)
+    if target is None and message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        target = SimpleNamespace(id=u.id, full_name=u.full_name, username=u.username, is_bot=u.is_bot)
+    if target is None or target.id is None:
+        await message.reply("Ответьте на сообщение человека словом <b>пет</b> или напишите <b>пет @username</b>.")
+        return
+    if target.id == message.from_user.id:
+        await message.reply("Самого себя сделать питомцем нельзя 🙂")
+        return
+    if getattr(target, "is_bot", False):
+        await message.reply("Бота сделать питомцем нельзя.")
+        return
+    if not await db.create_human_pet_request(message.chat.id, message.from_user.id, target.id):
+        await message.reply("У кого-то из вас уже есть активная связь или ожидающий запрос.")
+        return
+    owner_link = await _human_pet_name(message.chat.id, message.from_user.id)
+    pet_link = await _human_pet_name(message.chat.id, target.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data=f"hpet_yes:{message.chat.id}:{message.from_user.id}:{target.id}"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"hpet_no:{message.chat.id}:{message.from_user.id}:{target.id}"),
+    ]])
+    await message.answer(
+        f"🐾 {pet_link}, {owner_link} предлагает стать его/её питомцем. Согласны?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("hpet_yes:"))
+async def human_pet_accept(callback: CallbackQuery):
+    try:
+        _, chat_raw, owner_raw, pet_raw = callback.data.split(":")
+        chat_id, owner_id, pet_id = int(chat_raw), int(owner_raw), int(pet_raw)
+    except (ValueError, AttributeError):
+        await callback.answer("Запрос повреждён.", show_alert=True)
+        return
+    if callback.from_user.id != pet_id:
+        await callback.answer("Этот запрос адресован не вам.", show_alert=True)
+        return
+    if not await db.accept_human_pet_request(chat_id, owner_id, pet_id):
+        await callback.answer("Запрос уже обработан или устарел.", show_alert=True)
+        return
+    owner_link = await _human_pet_name(chat_id, owner_id)
+    pet_link = await _human_pet_name(chat_id, pet_id)
+    await callback.message.edit_text(f"🐾 Готово! Теперь питомец {owner_link} — {pet_link}.")
+    await callback.answer("Принято")
+
+
+@router.callback_query(F.data.startswith("hpet_no:"))
+async def human_pet_decline(callback: CallbackQuery):
+    try:
+        _, chat_raw, owner_raw, pet_raw = callback.data.split(":")
+        chat_id, owner_id, pet_id = int(chat_raw), int(owner_raw), int(pet_raw)
+    except (ValueError, AttributeError):
+        await callback.answer("Запрос повреждён.", show_alert=True)
+        return
+    if callback.from_user.id != pet_id:
+        await callback.answer("Этот запрос адресован не вам.", show_alert=True)
+        return
+    if not await db.decline_human_pet_request(chat_id, owner_id, pet_id):
+        await callback.answer("Запрос уже обработан или устарел.", show_alert=True)
+        return
+    await callback.message.edit_text("Запрос отклонён.")
+    await callback.answer("Отклонено")
+
+
+@router.message(F.text.regexp(r"(?is)^(?:предложение|идея)(?:\s+(.+))?$"))
+async def cmd_improvement_suggestion(message: Message):
+    match = re.match(r"(?is)^(?:предложение|идея)(?:\s+(.+))?$", message.text or "")
+    suggestion = (match.group(1) if match else "").strip()
+    if not suggestion:
+        await message.reply("Напишите идею после команды, например: <b>идея добавить ежедневные задания</b>.")
+        return
+    if len(suggestion) > 2000:
+        await message.reply("Предложение слишком длинное — максимум 2000 символов.")
+        return
+    notify_chat_id = settings.get("notify_chat_id")
+    if not notify_chat_id:
+        await message.reply("Чат уведомлений пока не настроен.")
+        return
+    author = await _human_pet_name(message.chat.id, message.from_user.id)
+    try:
+        await bot.send_message(
+            notify_chat_id,
+            f"💡 <b>Предложение по улучшению</b>\n\nОт: {author}\n"
+            f"Из чата: <code>{message.chat.id}</code>\n\n{html.escape(suggestion)}",
+            message_thread_id=settings.get("notify_topic_id"),
+        )
+    except Exception:
+        logger.exception("Не удалось отправить предложение в notifications_chat_id")
+        await message.reply("Не удалось отправить предложение. Попробуйте позже.")
+        return
+    await message.reply("✅ Предложение отправлено. Спасибо!")
 
 
 async def _require_moderation_target(
@@ -31228,6 +31353,7 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     nickname = await db.get_nickname(chat_id, target.id)
     marriage = await db.get_marriage(chat_id, target.id)
     relationship = await db.get_rel2_pair(chat_id, target.id)
+    human_pet = await db.get_human_pet_link(chat_id, target.id)
     mute = await db.get_mute(chat_id, target.id)
     reward_count = await db.count_rewards(chat_id, target.id)
     warn_count = await db.count_warns(chat_id, target.id)
@@ -31359,6 +31485,15 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
         extra.append(f"✏️ Ник: <b>{html.escape(nickname)}</b>")
     if role:
         extra.append(f"🎭 Роль: <b>{html.escape(role['name'])}</b>")
+    if human_pet:
+        other_id = int(human_pet["pet_id"] if int(human_pet["owner_id"]) == target.id else human_pet["owner_id"])
+        other = await db.get_known_user(chat_id, other_id)
+        other_name = await db.get_nickname(chat_id, other_id) or (other or {}).get("full_name") or str(other_id)
+        other_link = f'<a href="tg://user?id={other_id}">{html.escape(other_name)}</a>'
+        if int(human_pet["owner_id"]) == target.id:
+            extra.append(f"🐾 Питомец: {other_link}")
+        else:
+            extra.append(f"🦮 Хозяин: {other_link}")
     if anketa_shown and card and card.get("gender"):
         extra.append(f"{GENDER_EMOJI[card['gender']]} Пол: <b>{GENDER_LABEL[card['gender']]}</b>")
     if anketa_shown and card and card.get("city"):
@@ -40912,9 +41047,8 @@ async def role_reservation_expiry_loop():
         await asyncio.sleep(3600)
 
 
-async def main():
+async def _run_bot():
     logger.info("Бот запускается...")
-    await db.init_pool()
     await db.ensure_timers_table()
     await db.ensure_theme_columns()
     await db.ensure_limits_columns()
@@ -40923,6 +41057,7 @@ async def main():
     await db.ensure_warn_columns()
     await db.ensure_rewards_tables()
     await db.ensure_profile_cards_table()
+    await db.ensure_human_pets_table()
     await db.ensure_user_birthdays_table()
     await db.ensure_rest_table()
     await db.ensure_admin_holds_table()
@@ -40999,6 +41134,9 @@ async def main():
     await db.ensure_timezone_column()
     await db.ensure_week_start_column()       # с какого дня считается неделя
     await db.ensure_cleanup_newcomer_column() # защита новичков от /clearUsers
+    # Сначала создаём таблицу, затем применяем к ней миграции колонок.
+    # На чистой БД обратный порядок падал с MySQL 1146.
+    await db.ensure_current_users_table()
     await db.ensure_current_users_joined_column()  # момент входа в чат
     # relationships_v2 — «Отношения 2.0» (искры/дом/питомцы/дети/дуэли)
     await db.ensure_rel2_tables()
@@ -41011,7 +41149,6 @@ async def main():
     await db.ensure_rel2_gesture_tables()
     await db.ensure_relationship_undo_table()
     await db.ensure_marriage_module_tables()
-    await db.ensure_current_users_table()
     await db.ensure_stock_market_tables()
     await db.ensure_bank_tables()
     await db.ensure_bank_blacklist_table()
@@ -41092,13 +41229,20 @@ async def main():
     # заранее и в фоне, чтобы первый «.стикер» не ждал загрузки, а неудача
     # (сервер без интернета) не мешала боту стартовать
     asyncio.create_task(asyncio.to_thread(quote_assets.prefetch))
+    await bot.delete_webhook(drop_pending_updates=True)
+    # allowed_updates обязателен: chat_member Telegram по умолчанию НЕ
+    # присылает, а без него в супергруппах теряются выходы участников —
+    # роли ушедших остаются занятыми навсегда.
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+async def main():
+    await db.init_pool()
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        # allowed_updates обязателен: chat_member Telegram по умолчанию НЕ
-        # присылает, а без него в супергруппах теряются выходы участников —
-        # роли ушедших остаются занятыми навсегда.
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await _run_bot()
     finally:
+        # Закрываем пул и при ошибке в миграциях/загрузке кэшей, а не только
+        # после успешного достижения start_polling().
         await db.close_pool()
 
 

@@ -39,12 +39,23 @@ def client(monkeypatch):
         state["users"][user_id]["tg_full_name"] = tg_full_name
         return True
 
+    async def merge_panel_member_into_staff(staff_user_id, member_user_id, tg_user_id, tg_full_name):
+        member = state["users"].get(member_user_id)
+        staff = state["users"].get(staff_user_id)
+        if not member or member.get("role") != "member" or not staff:
+            return False
+        state["users"].pop(member_user_id)
+        staff["tg_user_id"] = tg_user_id
+        staff["tg_full_name"] = tg_full_name
+        return True
+
     async def add_log(kind, **kwargs):
         state["logs"].append(kind)
 
     monkeypatch.setattr(db, "consume_panel_link_code", consume_panel_link_code)
     monkeypatch.setattr(db, "get_panel_user_by_tg", get_panel_user_by_tg)
     monkeypatch.setattr(db, "set_panel_user_tg_link", set_panel_user_tg_link)
+    monkeypatch.setattr(db, "merge_panel_member_into_staff", merge_panel_member_into_staff)
     monkeypatch.setattr(db, "add_log", add_log)
     monkeypatch.setattr(panel.auth, "verify_csrf", lambda request: None)
 
@@ -97,6 +108,25 @@ def test_tg_уже_занят_другим_аккаунтом(client):
     }
     res = client.post("/api/link-telegram", json={"code": "ABC12345"})
     assert res.status_code == 409
+
+
+def test_аккаунт_участника_объединяется_с_аккаунтом_админа(client):
+    _login_as(client, user_id=1, role="admin", tg_user_id=None)
+    client.state["users"][2] = {
+        "id": 2, "username": "member-login", "role": "member", "tg_user_id": 999,
+    }
+    client.state["codes"]["ABC12345"] = {
+        "code": "ABC12345", "tg_user_id": 999, "tg_username": "someone",
+        "tg_full_name": "Один человек",
+    }
+
+    res = client.post("/api/link-telegram", json={"code": "ABC12345"})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["merged"] is True
+    assert 2 not in client.state["users"]
+    assert client.state["users"][1]["tg_user_id"] == 999
+    assert "panel_accounts_merged" in client.state["logs"]
 
 
 def test_гонка_дубликат_tg_user_id_даёт_чистый_409(client, monkeypatch):

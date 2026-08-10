@@ -48,7 +48,7 @@ COLLECTIONS: tuple[Collection, ...] = (
     ),
     Collection(
         "zoo", "Зоопарк", "🐾",
-        "Завести всех питомцев",
+        "Завести всех питомцев, доступных для покупки",
         "🐾 Зоопарк", "collection_zoo",
     ),
     Collection(

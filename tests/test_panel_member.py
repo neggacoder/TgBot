@@ -1,13 +1,18 @@
-"""Аккаунт-участник в панели: вход по коду от бота, read-only обзор
-возможностей, и — самое важное — что участник НЕ может лезть в админ-эндпоинты.
+"""Постоянный аккаунт участника: общий вход по логину/паролю, отдельный
+интерфейс и — самое важное — запрет административных эндпоинтов.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import json
+from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 import db
 from webpanel import auth
@@ -26,14 +31,13 @@ def client(monkeypatch):
     async def _noop(*args, **kwargs):
         return None
 
-    async def _no_fails(*args, **kwargs):
+    async def _zero(*args, **kwargs):
         return 0
 
     monkeypatch.setattr(db, "add_log", _noop, raising=False)
     monkeypatch.setattr(db, "touch_panel_login", _noop, raising=False)
-    # вход по коду теперь считает попытки перебора (см. api_member_login)
     monkeypatch.setattr(db, "add_panel_login_attempt", _noop, raising=False)
-    monkeypatch.setattr(db, "count_failed_logins_by_ip", _no_fails, raising=False)
+    monkeypatch.setattr(db, "count_failed_logins", _zero, raising=False)
 
     # Кабинет теперь работает только в РАБОЧЕМ чате, а какой он — читается из
     # настроек (см. chats.py). Заглушка обязана их отдать: иначе каждый тест
@@ -47,93 +51,85 @@ def client(monkeypatch):
     panel.app.dependency_overrides.clear()
 
 
-# --- вход по коду ----------------------------------------------------------
+# --- общий вход по логину и паролю ----------------------------------------
 
-def test_вход_по_валидному_коду_заводит_участника(client, monkeypatch):
-    created = {}
+def test_участник_входит_через_обычную_форму(client, monkeypatch):
+    password_hash = auth.hash_password("надёжный-пароль-участника")
 
-    async def consume(code):
-        assert code == "GOODCODE"  # панель приводит к верхнему регистру
-        return {"tg_user_id": 555, "tg_username": "user", "tg_full_name": "Тестер"}
+    async def get_user(username):
+        assert username == "tester"
+        return {"id": 42, "username": username, "password_hash": password_hash,
+                "role": "member", "tg_user_id": 555, "tg_full_name": "Тестер",
+                "disabled": False}
 
-    async def get_member(tg):
-        return None
+    monkeypatch.setattr(db, "get_panel_user", get_user)
+    request = Request({"type": "http", "method": "POST", "path": "/api/login",
+                       "headers": [], "client": ("127.0.0.1", 12345)})
+    res = asyncio.run(panel.api_login(panel.LoginBody(
+        username="tester", password="надёжный-пароль-участника"), request))
 
-    async def create_member(tg, username, full_name):
-        created.update(tg=tg, username=username, full_name=full_name)
-        return 42
-
-    monkeypatch.setattr(db, "consume_panel_link_code", consume)
-    monkeypatch.setattr(db, "get_panel_member_by_tg", get_member)
-    monkeypatch.setattr(db, "create_panel_member", create_member)
-
-    res = client.post("/api/member/login", json={"code": "goodcode"})
-    assert res.status_code == 200, res.text
-    body = res.json()
-    assert body["role"] == "member" and body["name"] == "Тестер"
-    assert auth.SESSION_COOKIE in res.cookies  # сессия выдана
-    assert created["tg"] == 555 and created["username"] == "tg555"
+    assert res.status_code == 200
+    assert json.loads(res.body)["role"] == "member"
+    assert auth.SESSION_COOKIE in res.headers.get("set-cookie", "")
 
 
-def test_вход_по_неверному_коду_отклонён(client, monkeypatch):
-    async def consume(code):
-        return None  # нет / истёк / уже использован
+def test_неверный_пароль_участника_отклонён(client, monkeypatch):
+    password_hash = auth.hash_password("правильный-пароль-участника")
+    async def get_user(_username):
+        return {"id": 42, "username": "tester", "password_hash": password_hash,
+                "role": "member", "disabled": False}
 
-    monkeypatch.setattr(db, "consume_panel_link_code", consume)
-    res = client.post("/api/member/login", json={"code": "nope"})
-    assert res.status_code == 401
-
-
-def test_пустой_код_400(client):
-    assert client.post("/api/member/login", json={"code": "   "}).status_code == 400
-
-
-def test_перебор_кода_упирается_в_порог(client, monkeypatch):
-    """Код входа — 8 символов; без ограничения попыток его перебирали бы
-    бесконечно, а это единственная дверь в аккаунт участника."""
-    async def many_fails(username, ip, minutes):
-        assert username == panel.MEMBER_LOGIN_MARKER
-        return auth.LOGIN_FAIL_LIMIT
-
-    async def consume(code):  # до кода дойти не должно
-        raise AssertionError("после порога код проверять уже нельзя")
-
-    monkeypatch.setattr(db, "count_failed_logins_by_ip", many_fails)
-    monkeypatch.setattr(db, "consume_panel_link_code", consume)
-    assert client.post("/api/member/login", json={"code": "ABCD2345"}).status_code == 429
+    monkeypatch.setattr(db, "get_panel_user", get_user)
+    request = Request({"type": "http", "method": "POST", "path": "/api/login",
+                       "headers": [], "client": ("127.0.0.1", 12345)})
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(panel.api_login(
+            panel.LoginBody(username="tester", password="неверный"), request))
+    assert exc.value.status_code == 401
+    assert exc.value.detail == "Неверный логин или пароль"
 
 
-def test_неверный_код_записывается_в_счётчик(client, monkeypatch):
-    """Иначе порог никогда не наберётся и ограничение бесполезно."""
-    logged = []
+def test_старого_входа_участника_по_коду_больше_нет():
+    assert "/api/member/login" not in {
+        route.path for route in panel.app.routes if hasattr(route, "path")
+    }
 
-    async def consume(code):
-        return None
 
-    async def attempt(username, ip, success):
-        logged.append((username, success))
+def test_на_странице_одна_форма_логина_для_всех():
+    static = Path(panel.STATIC_DIR)
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
 
-    monkeypatch.setattr(db, "consume_panel_link_code", consume)
-    monkeypatch.setattr(db, "add_panel_login_attempt", attempt)
-    assert client.post("/api/member/login", json={"code": "BADCODE1"}).status_code == 401
-    assert logged == [(panel.MEMBER_LOGIN_MARKER, False)]
+    assert 'id="auth-form"' in html
+    assert 'id="member-form"' not in html
+    assert "/api/member/login" not in js
+    assert "командой <code>аккаунт</code>" in html
 
 
 # --- безопасность: участник не персонал -----------------------------------
 
-def test_участник_не_может_в_админ_эндпоинт(client, monkeypatch):
+def test_участник_не_может_в_админ_эндпоинт(monkeypatch):
     """С member-сессией require_user обязан давать 403 — иначе участник получил
     бы доступ ко всем админ-эндпоинтам, висящим на require_user."""
+    password_hash = auth.hash_password("пароль-участника-123")
+
     async def get_user_by_id(uid):
         return {
             "id": uid, "username": "tg555", "role": "member",
             "tg_user_id": 555, "tg_full_name": "Тестер", "disabled": False,
+            "password_hash": password_hash,
         }
 
     monkeypatch.setattr(db, "get_panel_user_by_id", get_user_by_id)
-    client.cookies.set(auth.SESSION_COOKIE, auth.issue_session(7))
-    res = client.get("/api/settings")  # админский эндпоинт
-    assert res.status_code == 403, res.text
+    token = auth.issue_session(7, password_hash)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/api/settings",
+        "headers": [(b"cookie", f"{auth.SESSION_COOKIE}={token}".encode())],
+        "client": ("127.0.0.1", 12345),
+    })
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(auth.require_user(request))
+    assert exc.value.status_code == 403
 
 
 # --- read-only обзор возможностей ------------------------------------------

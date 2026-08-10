@@ -90,9 +90,10 @@ const MEDIA_KINDS = [
 
 const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2300}-\u{23FF}\u{FE0F}\u{FE0E}\u{200D}\u{20E3}]/gu;
 
-// Кабинет не показывает эмодзи вовсе: имена титулов, товаров и серверные
-// строки приходят с ними, а рисуем мы своё. Заодно вырезаем чатовые теги
-// <tg-emoji> из РП-фраз.
+// Для части экранов имена и серверные строки приходят с декоративными
+// эмодзи, которые там заменяются собственными иконками. Товары и питомцы —
+// исключение: их emoji является частью каталога в БД и выводится как есть.
+// Заодно вырезаем чатовые теги <tg-emoji> из РП-фраз.
 function безЭмодзи(s) {
   return String(s ?? "")
     .replace(/<\/?tg-emoji[^>]*>/g, "")
@@ -279,6 +280,22 @@ function toggleTheme() {
   applyTheme(next);
 }
 
+// Текущий экран живёт в URL, поэтому перезагрузка и история браузера
+// возвращают человека туда же. panel различает одинаковые имена вкладок
+// админки и кабинета участника (например, stock).
+function navFromUrl() {
+  const params = new URLSearchParams(location.search);
+  return { panel: params.get("panel"), tab: params.get("tab") };
+}
+
+function writeNavUrl(panel, tab, push = true) {
+  const url = new URL(location.href);
+  url.searchParams.delete("token");
+  url.searchParams.set("panel", panel);
+  url.searchParams.set("tab", tab);
+  history[push ? "pushState" : "replaceState"]({ panel, tab }, "", url);
+}
+
 // Тему ставим до первой отрисовки — иначе панель мигнёт чужим цветом.
 applyTheme(localStorage.getItem(THEME_KEY));
 
@@ -330,31 +347,9 @@ $("#logout").addEventListener("click", async () => {
 
 $("#theme-toggle").addEventListener("click", toggleTheme);
 
-// --- вход и экран участника (read-only) -----------------------------------
-
-$("#member-toggle").addEventListener("click", () => {
-  $("#auth-form").classList.add("hidden");
-  $("#member-form").classList.remove("hidden");
-  $("#member-code").focus();
-});
-
-$("#member-back").addEventListener("click", () => {
-  $("#member-form").classList.add("hidden");
-  $("#auth-form").classList.remove("hidden");
-});
-
-$("#member-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const code = $("#member-code").value.trim();
-  if (!code) return;
-  try {
-    await api("/api/member/login", { method: "POST", body: { code } });
-    location.href = "/";
-  } catch (err) {
-    say("#member-msg", err.message, "err");
-  }
-});
-
+// --- экран участника ------------------------------------------------------
+// Вход у участников и персонала общий — /api/login по логину и паролю.
+// После проверки роли boot() открывает отдельный интерфейс участника.
 $("#member-logout").addEventListener("click", async () => {
   await api("/api/logout", { method: "POST" });
   location.href = "/";
@@ -368,7 +363,7 @@ $("#member-theme").addEventListener("click", toggleTheme);
 // именно его.
 const _членство = { rel: null, family: null, clans: null };
 
-const _memberLoaded = { prof: false, tops: false, shop: false, pets: false, rel: false, family: false, clans: false, caps: false, farm: false, casino: false, biz: false, fish: false, work: false, stock: false, bank: false };
+const _memberLoaded = { prof: false, tops: false, shop: false, pets: false, rel: false, family: false, clans: false, caps: false, suggest: false, farm: false, casino: false, biz: false, fish: false, work: false, stock: false, bank: false };
 
 function showMember() {
   $("#auth").classList.add("hidden");
@@ -383,11 +378,15 @@ function showMember() {
   _memberLoaded.fish = _memberLoaded.work = false;
   _memberLoaded.prof = _memberLoaded.tops = false;
   _memberLoaded.shop = _memberLoaded.pets = false;
-  switchMemberTab("prof");
+  const nav = navFromUrl();
+  const requested = nav.panel === "member" ? nav.tab : null;
+  const exists = $$(".member-tab").some((b) => b.dataset.mtab === requested);
+  switchMemberTab(exists ? requested : "prof", false);
 }
 
 $("#member-back-to-panel").addEventListener("click", () => {
   $("#member").classList.add("hidden");
+  writeNavUrl("admin", "send");
   showApp();
 });
 
@@ -419,11 +418,13 @@ if (_burger) {
   });
 }
 
-function switchMemberTab(name) {
+function switchMemberTab(name, push = true) {
+  const выбранная = $$(".member-tab").find((b) => b.dataset.mtab === name);
+  if (!выбранная) return;
+  writeNavUrl("member", name, push);
   $$(".member-tab").forEach((b) => b.classList.toggle("active", b.dataset.mtab === name));
   // Название текущего раздела на кнопке: свёрнутый список иначе не говорит,
   // где ты находишься.
-  const выбранная = $$(".member-tab").find((b) => b.dataset.mtab === name);
   const подпись = $("#member-burger-label");
   if (подпись && выбранная) подпись.textContent = выбранная.textContent.trim();
   setBurger(false);
@@ -434,6 +435,7 @@ function switchMemberTab(name) {
   else if (name === "family" && !_memberLoaded.family) { _memberLoaded.family = true; loadMemberFamily(); }
   else if (name === "clans" && !_memberLoaded.clans) { _memberLoaded.clans = true; loadMemberClans(); }
   else if (name === "caps" && !_memberLoaded.caps) { _memberLoaded.caps = true; loadMemberCapabilities(); }
+  else if (name === "suggest" && !_memberLoaded.suggest) { _memberLoaded.suggest = true; loadMemberSuggestion(); }
   else if (name === "farm" && !_memberLoaded.farm) { _memberLoaded.farm = true; loadMemberFarm(); }
   else if (name === "casino" && !_memberLoaded.casino) { _memberLoaded.casino = true; loadMemberCasino(); }
   else if (name === "biz" && !_memberLoaded.biz) { _memberLoaded.biz = true; loadMemberBiz(); }
@@ -770,6 +772,38 @@ async function loadMemberCapabilities() {
     });
   } catch (err) {
     el.innerHTML = `<div class="empty">${icon("alert")}<span>${escapeHtml(err.message)}</span></div>`;
+  }
+}
+
+function loadMemberSuggestion() {
+  const el = $("#member-suggest");
+  el.innerHTML = `<section class="member-block"><h2>${icon("message")}Предложить улучшение</h2>
+    <div class="card">
+      <p class="muted">Расскажите, что стоит добавить, изменить или исправить. Сообщение попадёт администраторам.</p>
+      <label><span>Ваше предложение</span>
+        <textarea id="member-suggestion-text" maxlength="2000" rows="7"
+          placeholder="Например: добавить новое событие для всего чата…"></textarea>
+      </label>
+      <div id="member-suggestion-msg"></div>
+      <div class="form-foot"><button class="primary" id="member-suggestion-send">${icon("send")}Отправить</button></div>
+    </div></section>`;
+  $("#member-suggestion-send").addEventListener("click", sendMemberSuggestion);
+}
+
+async function sendMemberSuggestion() {
+  const input = $("#member-suggestion-text");
+  const text = input.value.trim();
+  if (!text) { say("#member-suggestion-msg", "Напишите предложение", "err"); return; }
+  const btn = $("#member-suggestion-send");
+  btn.disabled = true;
+  try {
+    await api("/api/member/suggestion", { method: "POST", body: { text } });
+    input.value = "";
+    say("#member-suggestion-msg", "Предложение отправлено. Спасибо!");
+  } catch (err) {
+    say("#member-suggestion-msg", err.message, "err");
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -1218,6 +1252,11 @@ function showApp() {
   renderTgLink();
   loadRoles();
   loadChats();
+  const nav = navFromUrl();
+  const requested = nav.panel === "admin" ? nav.tab : null;
+  const button = $$(".nav-btn").find((b) =>
+    b.dataset.view === requested && !b.classList.contains("hidden"));
+  switchAdminView(button ? requested : "send", false);
 }
 
 // --- привязка персонала к Telegram (доступ к экрану участника) ------------
@@ -1254,17 +1293,18 @@ $("#tg-link-save").addEventListener("click", async () => {
   const code = $("#tg-link-code").value.trim();
   if (!code) return;
   try {
-    await api("/api/link-telegram", { method: "POST", body: { code } });
+    const result = await api("/api/link-telegram", { method: "POST", body: { code } });
     $("#tg-link-code").value = "";
     await refreshMe();
     renderTgLink();
-    say("#global-msg", "Telegram привязан");
+    say("#global-msg", result.merged ? "Аккаунты объединены, Telegram привязан" : "Telegram привязан");
   } catch (err) {
     say("#global-msg", err.message, "err");
   }
 });
 
 $("#tg-link-open-member").addEventListener("click", () => {
+  writeNavUrl("member", "prof");
   showMember();
 });
 
@@ -1309,14 +1349,16 @@ if (навБургер()) {
   });
 }
 
-$$(".nav-btn").forEach((btn) => {
-  btn.addEventListener("click", () => {
+function switchAdminView(view, push = true) {
+  const btn = $$(".nav-btn").find((b) =>
+    b.dataset.view === view && !b.classList.contains("hidden"));
+  if (!btn) return;
+  writeNavUrl("admin", view, push);
     $$(".nav-btn").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     const метка = $("#nav-burger-label");
     if (метка) метка.textContent = подписьРаздела(btn);
     закрытьНавМеню();
-    const view = btn.dataset.view;
     $$(".view").forEach((v) => v.classList.add("hidden"));
     $(`#view-${view}`).classList.remove("hidden");
     if (view === "settings") loadSettings();
@@ -1334,12 +1376,27 @@ $$(".nav-btn").forEach((btn) => {
     // Лента живёт только на своей вкладке: иначе SSE-соединение и опрос БД
     // продолжались бы всё время, пока панель просто открыта.
     if (view === "send") loadFeed(); else closeFeedStream();
-  });
+}
+
+$$(".nav-btn").forEach((btn) => {
+  btn.addEventListener("click", () => switchAdminView(btn.dataset.view));
 });
 
 // Вкладки экрана участника — привязываем один раз (кнопки статичны в разметке).
 $$(".member-tab").forEach((btn) =>
   btn.addEventListener("click", () => switchMemberTab(btn.dataset.mtab)));
+
+window.addEventListener("popstate", () => {
+  if (!me) return;
+  const nav = navFromUrl();
+  if (me.role === "member") {
+    showMember();
+  } else if (nav.panel === "member" && me.tg_user_id) {
+    showMember();
+  } else {
+    showApp();
+  }
+});
 
 // ===== Дерево команд (админ) ===============================================
 let _cmdTree = null;  // кэш ответа для клиентского поиска/локального обновления
@@ -3058,14 +3115,7 @@ function pickMember(member, chatId) {
 
   if (chatId) чат() = chatId;
   // переключаемся на вкладку модерации, если пришли из списка участников
-  closeFeedStream();   // вкладку «Написать» покидаем — лента больше не нужна
-  $$(".nav-btn").forEach((b) => b.classList.toggle("active", b.dataset.view === "moderation"));
-  $$(".view").forEach((v) => v.classList.add("hidden"));
-  $("#view-moderation").classList.remove("hidden");
-  const метка = $("#nav-burger-label");
-  const кнопка = $$(".nav-btn").find((b) => b.dataset.view === "moderation");
-  if (метка && кнопка) метка.textContent = подписьРаздела(кнопка);
-  закрытьНавМеню();
+  switchAdminView("moderation");
 
   renderPicked();
 }
@@ -4316,19 +4366,15 @@ function plotHtml(p) {
       data-ready="${escapeHtml(p.ready_at)}" data-planted="${escapeHtml(p.planted_at)}"
       style="--grown:${ready ? 100 : p.progress}">
     <span class="plot-ring"></span>${значок}
-    <span class="plot-plant">${gicon("crop", p.crop, "xl")}</span>
+    <span class="plot-plant game-emoji xl">${escapeHtml(p.emoji || "🌱")}</span>
     <span class="plot-label">${escapeHtml(подпись)}</span>
     <span class="plot-crop">${escapeHtml(p.name)}</span>
   </button>`;
 }
 
-// Продукт хлева по виду животного: набор конечный, ключи продуктов у панели
-// свои (иконки), сервер шлёт только название.
-const ANIMAL_PRODUCT = { kurica: "yayca", utka: "pero", svinya: "myaso", ovca: "sherst", korova: "moloko" };
-
 function barnHtml(a) {
   const есть = a.quantity > 0;
-  const продукт = gicon("product", ANIMAL_PRODUCT[a.key] || "", "");
+  const продукт = `<span class="game-emoji">${escapeHtml(a.item_emoji || "📦")}</span>`;
   const строка = есть
     ? (a.ready > 0
         ? `${продукт} <b>${a.ready} ${escapeHtml(a.item_name.toLowerCase())}</b> готово`
@@ -4342,7 +4388,7 @@ function barnHtml(a) {
     : `<button type="button" class="btn" data-act="barn_buy" data-animal="${a.key}">Купить · ${a.price} i¢</button>`;
   return `<div class="barn-card${есть ? " has" : ""}">
     <div class="barn-head">
-      <span class="barn-emoji">${gicon("animal", a.key, "lg")}</span>
+      <span class="barn-emoji game-emoji lg">${escapeHtml(a.emoji || "🐾")}</span>
       <span class="barn-name">${escapeHtml(a.name)}</span>
       <span class="barn-qty">${есть ? `×${a.quantity}` : ""}</span>
     </div>
@@ -4542,7 +4588,7 @@ function openCropSheet(slot) {
       : c.affordable < 1 ? "не хватает монет"
       : `${срок} · ${c.yield_min}–${c.yield_max} шт${c.perish_hours ? ` · сгниёт через ${c.perish_hours} ч` : ""}`;
     return `<button type="button" class="crop-row" data-act="sow" data-crop="${c.key}" ${мало ? "disabled" : ""}>
-      <span class="crop-emoji">${gicon("crop", c.key, "lg")}</span>
+      <span class="crop-emoji game-emoji lg">${escapeHtml(c.emoji || "🌱")}</span>
       <span><span class="crop-name">${escapeHtml(c.name)}</span>
         <span class="crop-meta">${escapeHtml(пометка)}</span></span>
       <span class="crop-price">${c.price} i¢<small>хватит на ${хватит}</small></span>
@@ -5295,11 +5341,11 @@ function bizCardHtml(b, gear) {
     const цена = (b.gear_prices || {})[g.key] || 0;
     return `<button type="button" class="${стоит ? "on" : ""}" ${стоит ? "disabled" : ""}
       data-bact="equip" data-key="${b.key}" data-gear="${g.key}"
-      title="${escapeHtml(g.hint)}">${gicon("bizup", g.key)} ${escapeHtml(g.name)}${стоит ? "" : ` · ${цена} i¢`}</button>`;
+      title="${escapeHtml(g.hint)}"><span class="game-emoji">${escapeHtml(g.emoji || "🔧")}</span> ${escapeHtml(g.name)}${стоит ? "" : ` · ${цена} i¢`}</button>`;
   }).join("");
   return `<div class="biz-card ${b.broken ? "broken" : ""}">
     <div class="biz-head">
-      <span class="biz-name">${gicon("biz", b.key, "lg")} ${escapeHtml(безЭмодзи(b.name))}</span>
+      <span class="biz-name">${escapeHtml(b.name)}</span>
       <span class="biz-level">${b.level}/${b.max_level} ур.</span>
       <span class="biz-income">${b.income.toLocaleString("ru")} i¢/час</span>
     </div>
@@ -5332,7 +5378,7 @@ function renderBiz() {
   const карточки = s.mine.map((b) => bizCardHtml(b, s.gear)).join("");
   const витрина = s.catalog.map((c) => `
     <div class="biz-offer ${c.owned ? "owned" : ""}">
-      <span><span class="name">${gicon("biz", c.key)} ${escapeHtml(безЭмодзи(c.name))}</span>
+      <span><span class="name">${escapeHtml(c.name)}</span>
         <span class="meta">${c.income.toLocaleString("ru")} i¢/час · копилка ${c.cap.toLocaleString("ru")}</span></span>
       ${c.owned
         ? `<span class="meta">уже ваш</span>`
@@ -5481,7 +5527,7 @@ function fishCardHtml(f) {
   // принимается взглядом.
   const класс = f.hours >= 48 ? "rot" : f.hours >= 24 ? "stale" : "";
   return `<div class="fish-card ${класс} ${f.pinned ? "pinned" : ""}">
-    <div class="fish-card-head">${gicon("fish", f.key, "lg")}
+    <div class="fish-card-head"><span class="game-emoji lg">${escapeHtml(f.emoji || "🐟")}</span>
       <span class="rarity ${f.rarity}">${escapeHtml(f.rarity_label)}</span></div>
     <div class="fish-name">${escapeHtml(f.name)}${f.pinned ? ` ${icon("pin")}` : ""}</div>
     <div class="fish-meta">${escapeHtml(f.weight)} · ${escapeHtml(f.freshness)}</div>
@@ -5544,7 +5590,7 @@ function renderWork() {
     body.innerHTML = `<div class="empty">${icon("empty")}<span>Профессии пока нет.
       Устроиться можно в чате: <code>!работа устроиться {профессия}</code>.</span></div>
       <div class="prof-list mt-3">${s.catalog.map((p) => `
-        <div class="prof-card"><div class="name">${gicon("prof", (p.name || "").toLowerCase())} ${escapeHtml(p.name)}</div>
+        <div class="prof-card"><div class="name"><span class="game-emoji">${escapeHtml(p.emoji || "💼")}</span> ${escapeHtml(p.name)}</div>
           <div class="meta">${p.income[0].toLocaleString("ru")}–${p.income[1].toLocaleString("ru")} i¢ · ${icon("spark")}${p.energy}
           ${p.req_days ? ` · от ${p.req_days} дн.` : ""}</div></div>`).join("")}</div>`;
     return;
@@ -5561,7 +5607,7 @@ function renderWork() {
 
   body.innerHTML = `
     <div class="work-head">
-      <div><div class="work-prof">${gicon("prof", (s.name || "").toLowerCase(), "lg")} ${escapeHtml(s.name)}</div>
+      <div><div class="work-prof"><span class="game-emoji lg">${escapeHtml(s.emoji || "💼")}</span> ${escapeHtml(s.name)}</div>
         <div class="work-level">${s.level}/${s.max_level} уровень · ${s.income[0].toLocaleString("ru")}–${s.income[1].toLocaleString("ru")} i¢ за смену</div>
         <div class="xp-bar"><i style="width:${доля}%"></i></div>
         <div class="work-level">${s.xp} / ${s.xp_next} XP</div></div>
@@ -5722,7 +5768,7 @@ function renderProfile() {
 
   const занятия = [];
   if (p.work.name) {
-    занятия.push(`<div class="tile"><div class="v">${gicon("prof", (p.work.name || "").toLowerCase())} ${escapeHtml(p.work.name)}</div>
+    занятия.push(`<div class="tile"><div class="v"><span class="game-emoji">${escapeHtml(p.work.emoji || "💼")}</span> ${escapeHtml(p.work.name)}</div>
       <div class="k">${p.work.level} ур. · ${p.work.shifts} смен${p.work.streak ? ` · серия ${p.work.streak}` : ""}</div></div>`);
   }
   if (p.fishing.catches) {
@@ -6055,7 +6101,7 @@ function goodHtml(g) {
   const остаток = g.stock === null || g.stock === undefined
     ? "" : `<div class="good-stock">на полке: ${g.stock}</div>`;
   return `<div class="good ${g.sale ? "sale" : ""} ${g.affordable ? "" : "dear"}">
-    <div class="good-head"><span class="good-emoji">${shopIcon(g.key, "lg")}</span>
+    <div class="good-head"><span class="good-emoji">${escapeHtml(g.emoji || "🎁")}</span>
       <span class="good-name">${escapeHtml(g.name)}</span></div>
     ${g.description ? `<div class="good-desc">${escapeHtml(g.description)}</div>` : ""}
     <div class="good-price"><b>${g.price.toLocaleString("ru")} i¢</b>
@@ -6069,7 +6115,7 @@ function goodHtml(g) {
 
 function invHtml(i) {
   return `<div class="inv-card ${i.reward ? "reward" : ""}">
-    <div class="good-head"><span class="good-emoji">${shopIcon(i.key, "lg")}</span>
+    <div class="good-head"><span class="good-emoji">${escapeHtml(i.emoji || "🎁")}</span>
       <span class="good-name">${escapeHtml(i.name)}</span>
       <span class="inv-qty">×${i.quantity}</span></div>
     ${i.sellable
@@ -6142,7 +6188,7 @@ function renderMarket() {
 
     ${чужие.length ? `<div class="market-list">${чужие.map((g) => `
       <div class="market-row">
-        <div class="market-name">${shopIcon(g.key)} <b>${escapeHtml(безЭмодзи(g.name))}</b>
+        <div class="market-name"><span class="good-emoji">${escapeHtml(g.emoji || "🧺")}</span> <b>${escapeHtml(безЭмодзи(g.name))}</b>
           <code class="steal-item-key">${escapeHtml(g.key)}</code>
           <span class="muted">${g.price.toLocaleString("ru")} i¢${g.sold ? ` · продано ${g.sold}` : ""}</span></div>
         <div class="market-acts">
@@ -6368,7 +6414,7 @@ function stealLootHtml() {
   }
   return `<div class="steal-loot">${добыча.map((и) => `
     <button type="button" class="btn ghost small steal-item" data-key="${escapeHtml(и.key)}">
-      <span class="steal-item-name">${shopIcon(и.key)} ${escapeHtml(безЭмодзи(и.name))}${
+      <span class="steal-item-name"><span class="good-emoji">${escapeHtml(и.emoji || "🎁")}</span> ${escapeHtml(безЭмодзи(и.name))}${
         и.quantity > 1 ? ` ×${и.quantity}` : ""}</span>
       <code class="steal-item-key">${escapeHtml(и.key)}</code>
     </button>`).join("")}</div>`;
@@ -6544,7 +6590,7 @@ function petCardHtml(p) {
     </div>`).join("");
   return `<div class="${классы.join(" ")}">
     <div class="pet-head">
-      <span class="pet-emoji">${petIcon(p.key, "xl")}</span>
+      <span class="pet-emoji">${escapeHtml(p.emoji || "🐾")}</span>
       <span class="grow">
         <span class="pet-name">${escapeHtml(p.name)}</span>
         <span class="pet-key">${escapeHtml(p.key)}${

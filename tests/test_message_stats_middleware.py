@@ -137,13 +137,13 @@ def test_админа_фильтр_не_касается_и_считает_ка�
     assert посчитано == [USER_ID]
 
 
-def test_фильтр_и_медленный_режим_остались_на_роутере():
-    """Их сознательно НЕ переносили: распространить модерацию на команды rel2 —
-    это смена правил чата, а не починка статистики."""
+def test_фильтр_глобальный_а_медленный_режим_остался_на_роутере():
+    """Слова фильтруются до rel2, но медленный режим туда не расширяется."""
     на_диспетчере = [type(m).__name__ for m in bot_module.dp.message.outer_middleware]
     на_роутере = [type(m).__name__ for m in bot_module.router.message.outer_middleware]
 
     assert "MessageStatsMiddleware" in на_диспетчере
+    assert "WordFilterMiddleware" in на_диспетчере
     assert "MessageGuardMiddleware" in на_роутере
     assert "MessageGuardMiddleware" not in на_диспетчере
 

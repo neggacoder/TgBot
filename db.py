@@ -1063,6 +1063,72 @@ async def ensure_profile_cards_table() -> None:
     await _execute("ALTER TABLE profile_cards MODIFY gender VARCHAR(8) DEFAULT NULL")
 
 
+async def ensure_human_pets_table() -> None:
+    """Добровольные связи «хозяин — человек-питомец» внутри одного чата."""
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS human_pets ("
+        "chat_id BIGINT NOT NULL, owner_id BIGINT NOT NULL, pet_id BIGINT NOT NULL, "
+        "status ENUM('pending','active') NOT NULL DEFAULT 'pending', "
+        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, "
+        "PRIMARY KEY (chat_id, owner_id, pet_id), "
+        "KEY idx_human_pets_owner (chat_id, owner_id, status), "
+        "KEY idx_human_pets_pet (chat_id, pet_id, status)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def get_human_pet_link(chat_id: int, user_id: int, active_only: bool = True) -> Optional[dict]:
+    status_sql = " AND status = 'active'" if active_only else ""
+    return await _fetchone(
+        "SELECT owner_id, pet_id, status, created_at FROM human_pets "
+        "WHERE chat_id = %s AND (owner_id = %s OR pet_id = %s)" + status_sql +
+        " ORDER BY updated_at DESC LIMIT 1",
+        (chat_id, user_id, user_id),
+    )
+
+
+async def create_human_pet_request(chat_id: int, owner_id: int, pet_id: int) -> bool:
+    """Создать запрос. False означает, что один из участников уже занят."""
+    if await get_human_pet_link(chat_id, owner_id, active_only=False):
+        return False
+    if await get_human_pet_link(chat_id, pet_id, active_only=False):
+        return False
+    await _execute(
+        "INSERT INTO human_pets (chat_id, owner_id, pet_id, status) VALUES (%s, %s, %s, 'pending')",
+        (chat_id, owner_id, pet_id),
+    )
+    return True
+
+
+async def accept_human_pet_request(chat_id: int, owner_id: int, pet_id: int) -> bool:
+    """Принять только ещё существующий запрос; повторное нажатие безопасно."""
+    result = await _execute(
+        "UPDATE human_pets SET status = 'active' WHERE chat_id = %s AND owner_id = %s "
+        "AND pet_id = %s AND status = 'pending'",
+        (chat_id, owner_id, pet_id),
+    )
+    if not result:
+        return False
+    # После согласия удаляем все прочие входящие/исходящие ожидания обоих
+    # людей: активная связь в анкете всегда одна и не двусмысленная.
+    await _execute(
+        "DELETE FROM human_pets WHERE chat_id = %s AND status = 'pending' AND "
+        "(owner_id IN (%s, %s) OR pet_id IN (%s, %s))",
+        (chat_id, owner_id, pet_id, owner_id, pet_id),
+    )
+    return True
+
+
+async def decline_human_pet_request(chat_id: int, owner_id: int, pet_id: int) -> bool:
+    result = await _execute(
+        "DELETE FROM human_pets WHERE chat_id = %s AND owner_id = %s AND pet_id = %s "
+        "AND status = 'pending'",
+        (chat_id, owner_id, pet_id),
+    )
+    return bool(result)
+
+
 async def get_profile_card(chat_id: int, user_id: int) -> Optional[dict]:
     return await _fetchone(
         "SELECT title, motto, is_citizen, gender, city, about_text, anketa_visible, "
@@ -1826,6 +1892,9 @@ async def ensure_current_users_joined_column() -> None:
     Тем, кого нет в known_users, остаётся NULL: там работает прежний запасной
     путь (см. list_below_norm_joined_before).
     """
+    # Миграция должна быть безопасна и при прямом вызове из другого процесса
+    # (например, веб-панели), а не зависеть от порядка вызовов в bot.main().
+    await ensure_current_users_table()
     await _add_column_if_missing("current_users", "joined_at", "DATETIME NULL")
     await _execute(
         "UPDATE current_users cu "
@@ -9305,10 +9374,9 @@ async def ensure_panel_tables() -> None:
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
 
-    # Аккаунты-участники: роль 'member', вход по одноразовому коду от бота (без
-    # пароля), привязка к Telegram id. ALTER ... MODIFY идемпотентен — можно при
-    # каждом старте. Расширяем роль-энум, делаем пароль необязательным (у
-    # участников его нет) и добавляем поля привязки.
+    # Аккаунты-участники: роль 'member', постоянный логин/пароль и привязка к
+    # Telegram id. NULL остаётся допустимым для строки, автоматически созданной
+    # Mini App до выполнения команды «аккаунт». ALTER ... MODIFY идемпотентен.
     await _execute(
         "ALTER TABLE panel_users MODIFY role ENUM('owner','admin','member') "
         "NOT NULL DEFAULT 'admin'"
@@ -9332,7 +9400,7 @@ async def ensure_panel_tables() -> None:
             "GROUP BY tg_user_id HAVING COUNT(*) > 1' и вручную устраните дубли, затем "
             "перезапустите панель."
         )
-    # Одноразовые коды входа участника: бот кладёт код с TTL, панель его гасит.
+    # Одноразовые коды нужны только для привязки Telegram к аккаунту персонала.
     await _execute(
         "CREATE TABLE IF NOT EXISTS panel_link_codes ("
         "code VARCHAR(16) PRIMARY KEY, "
@@ -9351,8 +9419,8 @@ async def create_panel_link_code(
     code: str, tg_user_id: int, tg_username: Optional[str],
     tg_full_name: Optional[str], expires_at,
 ) -> None:
-    """Кладёт одноразовый код входа участника. На пользователя держим один
-    активный код — прежние его коды удаляем, чтобы не копились."""
+    """Кладёт одноразовый код привязки Telegram к аккаунту персонала.
+    На пользователя держим один активный код, старые удаляем."""
     await _execute("DELETE FROM panel_link_codes WHERE tg_user_id = %s", (tg_user_id,))
     await _execute(
         "INSERT INTO panel_link_codes (code, tg_user_id, tg_username, tg_full_name, expires_at) "
@@ -9481,6 +9549,48 @@ async def set_panel_user_tg_link(user_id: int, tg_user_id: int, tg_full_name: Op
         "UPDATE panel_users SET tg_user_id = %s, tg_full_name = %s WHERE id = %s",
         (tg_user_id, tg_full_name, user_id),
     ))
+
+
+async def merge_panel_member_into_staff(
+    staff_user_id: int, member_user_id: int, tg_user_id: int, tg_full_name: Optional[str]
+) -> bool:
+    """Объединить member и staff одного человека в один аккаунт персонала.
+
+    Игровые данные не переносятся: они везде принадлежат Telegram user_id, а
+    не id строки panel_users. Транзакция сначала освобождает UNIQUE tg_user_id,
+    затем привязывает его к staff и удаляет лишнюю учётную запись участника.
+    """
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.begin()
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT id, role, tg_user_id FROM panel_users WHERE id IN (%s, %s) FOR UPDATE",
+                    (staff_user_id, member_user_id),
+                )
+                rows = {int(row["id"]): row for row in await cur.fetchall()}
+                staff = rows.get(staff_user_id)
+                member = rows.get(member_user_id)
+                if not staff or staff["role"] not in ("owner", "admin"):
+                    await conn.rollback()
+                    return False
+                if not member or member["role"] != "member" or int(member.get("tg_user_id") or 0) != tg_user_id:
+                    await conn.rollback()
+                    return False
+                await cur.execute("DELETE FROM panel_users WHERE id = %s", (member_user_id,))
+                await cur.execute(
+                    "UPDATE panel_users SET tg_user_id = %s, tg_full_name = %s WHERE id = %s",
+                    (tg_user_id, tg_full_name, staff_user_id),
+                )
+                if cur.rowcount != 1:
+                    await conn.rollback()
+                    return False
+            await conn.commit()
+            return True
+        except Exception:
+            await conn.rollback()
+            raise
 
 
 async def set_panel_user_disabled(user_id: int, disabled: bool) -> bool:

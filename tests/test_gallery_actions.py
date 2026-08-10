@@ -134,6 +134,18 @@ async def test_прогресс_считает_по_каталогу_чата(м
 
 
 @_sync
+async def test_награда_за_зоопарк_не_входит_в_сам_зоопарк(мир):
+    import pets
+
+    мир.питомцы = [p.key for p in pets.PETS if not p.by_achievement]
+    каталог = {p.key: p for p in pets.PETS}
+    прогресс = await g.collection_progress(ЧАТ, ЧЕЛОВЕК, pet_specs=каталог)
+
+    assert прогресс["zoo"][0] == прогресс["zoo"][1]
+    assert "edinorog" not in {p.key for p in pets.PETS if not p.by_achievement}
+
+
+@_sync
 async def test_хлам_считается_по_инвентарю(мир):
     мир.инвентарь = ["junk_a", "junk_c", "не_хлам"]
     прогресс = await g.collection_progress(ЧАТ, ЧЕЛОВЕК)

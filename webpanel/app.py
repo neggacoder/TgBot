@@ -109,6 +109,7 @@ async def on_startup() -> None:
     # её могли поднять раньше бота — тогда запрос ушёл бы в колонку expires_at,
     # которой ещё нет. Миграция идемпотентна.
     await db.ensure_marriage_module_tables()
+    await db.ensure_human_pets_table()
     # Свои сроки автоочистки команд правит только панель — а создаёт таблицу
     # бот. Если панель подняли первой, первая же правка упала бы на
     # несуществующей таблице. Миграция идемпотентна.
@@ -616,58 +617,6 @@ async def api_me(request: Request):
     return result
 
 
-class MemberLoginBody(BaseModel):
-    code: str
-
-
-# Метка входа участника в таблице panel_logins: логина у него нет, а порог
-# перебора считать по чему-то надо. Со скобками — чтобы не столкнуться с
-# настоящим логином (validate_username их не пропускает).
-MEMBER_LOGIN_MARKER = "(код участника)"
-
-
-@app.post("/api/member/login")
-async def api_member_login(body: MemberLoginBody, request: Request):
-    """Вход участника по одноразовому коду от бота (см. команду «сайт»). Код
-    гасится, аккаунт-участник заводится/находится по Telegram id, выдаётся
-    обычная сессия — дальше участник ходит по member-эндпоинтам (read-only).
-
-    Попытки ограничены так же, как обычный вход: код короткий (8 символов) и
-    живёт 10 минут, но без ограничения его перебирали бы сколько угодно раз в
-    секунду — а это единственная дверь в аккаунт участника."""
-    ip = auth.client_ip(request)
-    fails = await db.count_failed_logins_by_ip(
-        MEMBER_LOGIN_MARKER, ip, auth.LOGIN_FAIL_WINDOW_MINUTES
-    )
-    if fails >= auth.LOGIN_FAIL_LIMIT:
-        raise HTTPException(429, "Слишком много попыток. Подождите 15 минут.")
-
-    code = (body.code or "").strip().upper()
-    if not code:
-        raise HTTPException(400, "Введите код")
-    link = await db.consume_panel_link_code(code)
-    if not link:
-        await db.add_panel_login_attempt(MEMBER_LOGIN_MARKER, ip, False)
-        raise HTTPException(
-            401, "Код неверный или истёк. Запросите новый: напишите боту в личку «сайт»."
-        )
-    await db.add_panel_login_attempt(MEMBER_LOGIN_MARKER, ip, True)
-    tg_id = int(link["tg_user_id"])
-    full_name = link.get("tg_full_name")
-    member = await db.get_panel_member_by_tg(tg_id)
-    if member is None:
-        member_id = await db.create_panel_member(tg_id, f"tg{tg_id}", full_name)
-    else:
-        member_id = member["id"]
-        if full_name and member.get("tg_full_name") != full_name:
-            await db.update_panel_member_name(member_id, full_name)
-    await db.touch_panel_login(member_id)
-
-    response = JSONResponse({"ok": True, "role": auth.ROLE_MEMBER, "name": full_name or f"tg{tg_id}"})
-    _set_session_cookies(response, member_id)
-    return response
-
-
 class LinkTelegramBody(BaseModel):
     code: str
 
@@ -686,7 +635,21 @@ async def api_link_telegram(
 
     existing = await db.get_panel_user_by_tg(row["tg_user_id"])
     if existing and existing["id"] != user.id:
-        raise HTTPException(409, "Этот Telegram уже привязан к другому аккаунту.")
+        if user.role not in auth.STAFF_ROLES or existing["role"] != "member":
+            raise HTTPException(409, "Этот Telegram уже привязан к другому аккаунту.")
+        try:
+            merged = await db.merge_panel_member_into_staff(
+                user.id, existing["id"], row["tg_user_id"], row.get("tg_full_name")
+            )
+        except aiomysql.IntegrityError:
+            raise HTTPException(409, "Этот Telegram уже привязан к другому аккаунту.")
+        if not merged:
+            raise HTTPException(409, "Не удалось объединить аккаунты. Получите новый код и повторите.")
+        await db.add_log(
+            "panel_accounts_merged", actor_id=user.id,
+            details=f"member={existing['id']}; tg={row['tg_user_id']}",
+        )
+        return {"ok": True, "merged": True, "tg_full_name": row.get("tg_full_name")}
 
     try:
         await db.set_panel_user_tg_link(user.id, row["tg_user_id"], row.get("tg_full_name"))
@@ -2604,6 +2567,43 @@ async def api_member_info(chat_id: int, user: PanelUser = Depends(auth.require_m
     """Своя карточка участника (сообщения/активность/роль/награды) в этом чате."""
     await _require_member_in_chat(user, chat_id)
     return await _user_info(chat_id, user.tg_user_id)
+
+
+class MemberSuggestionBody(BaseModel):
+    text: str
+
+
+@app.post("/api/member/suggestion")
+async def api_member_suggestion(
+    body: MemberSuggestionBody, request: Request, user: PanelUser = Depends(auth.require_member)
+):
+    """Предложение участника уходит в настроенный чат уведомлений."""
+    auth.verify_csrf(request)
+    suggestion = (body.text or "").strip()
+    if not suggestion:
+        raise HTTPException(400, "Напишите, что стоит улучшить или добавить")
+    if len(suggestion) > 2000:
+        raise HTTPException(400, "Максимальная длина — 2000 символов")
+    chat_id = await chats_mod.work_chat_id()
+    if chat_id is None:
+        raise HTTPException(400, "Рабочий чат ещё не привязан")
+    await _require_member_in_chat(user, chat_id)
+    settings = await db.fetch_settings() or {}
+    notify_chat_id = settings.get("notify_chat_id")
+    if not notify_chat_id:
+        raise HTTPException(503, "Чат уведомлений пока не настроен")
+    author = await _member_display_link(chat_id, user.tg_user_id)
+    try:
+        await get_bot().send_message(
+            notify_chat_id,
+            f"💡 <b>Предложение по улучшению</b>\n\nОт: {author}\n"
+            f"Из сайта · чат: <code>{chat_id}</code>\n\n{html.escape(suggestion)}",
+            message_thread_id=settings.get("notify_topic_id"),
+        )
+    except Exception as exc:
+        logger.exception("Не удалось отправить предложение с сайта")
+        raise HTTPException(502, "Telegram не принял сообщение. Попробуйте позже") from exc
+    return {"ok": True}
 
 
 # --- участник: ник, топ, свои варны/награды, действия отн (жесты) -----------

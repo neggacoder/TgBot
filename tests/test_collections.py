@@ -170,7 +170,20 @@ def test_зоопарк_считается_по_каталогу_чата(world)
     был бы неполным, хотя игрок собрал всё доступное."""
     world["pets"] = [p.key for p in P.PETS]
     p = _progress(world)
-    assert p["zoo"] == (len(P.PETS), len(P.PETS))
+    доступные = [pet for pet in P.PETS if not pet.by_achievement]
+    assert p["zoo"] == (len(доступные), len(доступные))
+
+
+def test_зоопарк_не_требует_единорога_которого_сам_выдаёт(world):
+    """collection_zoo → edinorog, поэтому обратное требование невозможно."""
+    world["pets"] = [p.key for p in P.PETS if not p.by_achievement]
+
+    progress = _progress(world)
+    assert progress["zoo"][0] == progress["zoo"][1]
+
+    _check(world)
+    assert "collection_zoo" in world["granted"]
+    assert "collection_zoo" in world["achievements"]
 
 
 def test_династия_считает_призовые_сезоны(world):
