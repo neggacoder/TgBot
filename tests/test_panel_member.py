@@ -275,7 +275,8 @@ def test_своя_инфа_участника(client, monkeypatch):
         return {"message_count": 42, "first_seen_at": "2026-01-01T00:00:00", "last_message_at": "2026-07-01T12:00:00"}
 
     async def breakdown(chat_id, uid):
-        return {"today_count": 1, "week_count": 5, "month_count": 20}
+        return {"last_24h_count": 3, "today_count": 1, "week_count": 5,
+                "month_count": 20}
 
     async def rank(chat_id, uid):
         return 3
@@ -304,7 +305,7 @@ def test_своя_инфа_участника(client, monkeypatch):
     res = client.get("/api/member/info?chat_id=-100")
     assert res.status_code == 200, res.text
     d = res.json()
-    assert d["messages"] == 42 and d["rank"] == 3 and d["week"] == 5
+    assert d["messages"] == 42 and d["rank"] == 3 and d["week"] == 5 and d["last_24h"] == 3
     assert d["rewards"] == 2 and d["reputation"] == 7 and d["nickname"] == "Котик"
 
 

@@ -52,7 +52,8 @@ class _World:
         # Имена — РОВНО те, что у настоящей функции. Заглушка со своими
         # именами один раз уже «подтвердила» баг: профиль читал day/week/month
         # и показывал нули, а тест этого не видел.
-        return {"today_count": 12, "week_count": 25, "month_count": 400}
+        return {"last_24h_count": 18, "today_count": 12, "week_count": 25,
+                "month_count": 400}
 
     async def get_wallet(self, chat_id, user_id):
         return {"coins": 54321, "total_farms": 27}
@@ -252,12 +253,10 @@ async def test_неизвестный_топ_не_роняет_экран(мир
 
 @_sync
 async def test_активность_читается_настоящими_именами_столбцов(мир):
-    """Тот самый баг: профиль читал day/week/month, а база отдаёт
-    today_count/week_count/month_count — везде были нули, кроме «всего»,
-    которое приходит из другого места и потому работало."""
+    """Профиль читает реальные имена полей, которые возвращает база."""
     карточка = await profile_actions.profile(CHAT, USER)
-    assert карточка["activity"] == {"day": 12, "week": 25, "month": 400,
-                                    "all": 1234}
+    assert карточка["activity"] == {"last_24h": 18, "day": 12, "week": 25,
+                                    "month": 400}
 
 
 def test_имена_столбцов_совпадают_с_базой():
@@ -266,7 +265,7 @@ def test_имена_столбцов_совпадают_с_базой():
     import inspect
     исходник = inspect.getsource(db.get_activity_breakdown)
     столбцы = set(re.findall(r"AS (\w+_count)", исходник))
-    assert столбцы == {"today_count", "week_count", "month_count"}
+    assert столбцы == {"last_24h_count", "today_count", "week_count", "month_count"}
     читает = inspect.getsource(profile_actions.profile)
     for столбец in столбцы:
         assert f'"{столбец}"' in читает, f"профиль не читает {столбец}"

@@ -873,6 +873,7 @@ async def _user_info(chat_id: int, user_id: int) -> dict:
         "messages": int(stats["message_count"]) if stats else 0,
         "first_seen": str(stats["first_seen_at"]) if stats and stats.get("first_seen_at") else None,
         "last_active": str(stats["last_message_at"]) if stats and stats.get("last_message_at") else None,
+        "last_24h": breakdown.get("last_24h_count", 0),
         "today": breakdown.get("today_count", 0),
         "week": breakdown.get("week_count", 0),
         "month": breakdown.get("month_count", 0),

@@ -159,8 +159,9 @@ def test_окна_профиля_и_топа_совпадают_по_дате(mo
 
     asyncio.run(db_module.get_activity_breakdown(-100, 555))
     профиль_sql, профиль_params = запросы[0]
-    # (today, week_start, month_start, chat_id, user_id) — см. сам запрос
-    assert профиль_params[1] == db_module.week_start_day()
+    # Первые шесть параметров — скользящие 24 часа из message_hourly;
+    # дальше идут (today, week_start, month_start, chat_id, user_id).
+    assert профиль_params[7] == db_module.week_start_day()
 
     запросы.clear()
     cutoff = bot_module._period_cutoff_day("week")

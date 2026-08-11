@@ -265,6 +265,9 @@ ABILITY_PET_MOOD = "pet_mood"
 ABILITY_PET_HUNGER = "pet_hunger"
 ABILITY_PET_XP = "pet_xp"
 ABILITY_PET_WALK = "pet_walk"
+ABILITY_PET_FEED = "pet_feed"
+ABILITY_PET_CARE = "pet_care"
+ABILITY_PET_FIND = "pet_find"
 
 
 def _pet_is_active(row: dict, hunger: int, mood: int,
@@ -284,9 +287,10 @@ def _pet_family_bonus(rows: list[dict], specs: dict, ability: str,
                       pinned_key: Optional[str] = None) -> int:
     """Сила способности, которая действует на ВСЕХ питомцев хозяина сразу.
 
-    Таких четыре: «Компаньон» (настроение), «Хозяйственный» (сытость),
-    «Наставник» (опыт) и «Следопыт» (монеты с прогулки). Считаются они
-    одинаково, поэтому и код один: разойдись он на четыре копии, однажды
+    Таких семь: «Компаньон» (настроение), «Хозяйственный» (сытость),
+    «Наставник» (опыт), «Следопыт» (монеты с прогулки), а также усиленные
+    кормление, ласка и поиск находок. Считаются они одинаково, поэтому и код
+    один: разойдись он на семь копий, однажды
     одна из них забыла бы про эволюцию или про закреп.
 
     Рекурсии здесь нет намеренно: сам носитель проверяется по состоянию БЕЗ
@@ -314,19 +318,31 @@ class PetAura:
     """Что способности ваших питомцев дают ВСЕМ вашим питомцам сразу.
 
     Одной структурой, а не россыпью процентов по аргументам: таких способностей
-    уже четыре, и следующая иначе потребовала бы править сигнатуру кормёжки,
+    уже семь, и следующая иначе потребовала бы править сигнатуру кормёжки,
     ласки и прогулки разом — а забыть одну из трёх проще простого.
     """
     mood: int = 0      # «Компаньон» — настроение падает медленнее
     hunger: int = 0    # «Хозяйственный» — сытость падает медленнее
     xp: int = 0        # «Наставник» — опыт растёт быстрее
     walk: int = 0      # «Следопыт» — больше монет с прогулки
+    feed: int = 0      # «Заботливый» — корм лучше насыщает
+    care: int = 0      # «Ласковый» — ласка лучше поднимает настроение
+    find: int = 0      # «Искатель» — выше шанс находки на прогулке
 
     def xp_gain(self, base: int) -> int:
         return base + base * max(0, self.xp) // 100
 
     def walk_coins(self, base: int) -> int:
         return base + base * max(0, self.walk) // 100
+
+    def feed_gain(self, base: int) -> int:
+        return base + base * max(0, self.feed) // 100
+
+    def care_gain(self, base: int) -> int:
+        return base + base * max(0, self.care) // 100
+
+    def find_chance(self, base: int) -> int:
+        return min(100, base + base * max(0, self.find) // 100)
 
 
 def _pet_aura(rows: list[dict], specs: dict,
@@ -336,6 +352,9 @@ def _pet_aura(rows: list[dict], specs: dict,
         hunger=_pet_family_bonus(rows, specs, ABILITY_PET_HUNGER, pinned_key),
         xp=_pet_family_bonus(rows, specs, ABILITY_PET_XP, pinned_key),
         walk=_pet_family_bonus(rows, specs, ABILITY_PET_WALK, pinned_key),
+        feed=_pet_family_bonus(rows, specs, ABILITY_PET_FEED, pinned_key),
+        care=_pet_family_bonus(rows, specs, ABILITY_PET_CARE, pinned_key),
+        find=_pet_family_bonus(rows, specs, ABILITY_PET_FIND, pinned_key),
     )
 
 
@@ -518,7 +537,7 @@ async def _feed_pet(chat_id: int, user_id: int, spec, row: dict,
     # Поблажка «Компаньона» обязана участвовать здесь: настроение отсюда
     # БАНКУЕТСЯ, и посчитанное без неё стёрло бы её накопленный эффект.
     hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-    hunger = pets_catalog.gain(hunger, pets_catalog.FEED_GAIN)
+    hunger = pets_catalog.gain(hunger, aura.feed_gain(pets_catalog.FEED_GAIN))
     level_before = _pet_level(row)
     xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.XP_BONUS_FEED))
     try:
@@ -557,7 +576,7 @@ async def _care_pet(chat_id: int, user_id: int, spec, row: dict, verb: str,
     стирать её при каждой ласке."""
     aura = aura or PetAura()
     hunger, mood = _pet_now(row, aura.mood, aura.hunger)
-    mood = pets_catalog.gain(mood, _care_gain(verb))
+    mood = pets_catalog.gain(mood, aura.care_gain(_care_gain(verb)))
     level_before = _pet_level(row)
     xp = pets_catalog.xp_add(_pet_xp_now(row), aura.xp_gain(pets_catalog.XP_BONUS_CARE))
     await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp,
@@ -790,7 +809,7 @@ async def _walk_pet(chat_id: int, user_id: int, spec, row: dict, now: datetime,
     await db.set_pet_stats(chat_id, user_id, spec.key, hunger, mood, xp, now,
                            walk_at=now)
     finds = pets_catalog.walk_finds(spec.key)
-    if finds and random.randint(1, 100) <= pets_catalog.WALK_ITEM_CHANCE:
+    if finds and random.randint(1, 100) <= aura.find_chance(pets_catalog.WALK_ITEM_CHANCE):
         find = random.choice(finds)
         # Товар мог быть не засеян в этом чате — тогда в инвентаре он выглядел
         # бы голым ключом, поэтому засеваем каталог перед выдачей.

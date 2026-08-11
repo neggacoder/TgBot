@@ -2362,27 +2362,41 @@ def period_start_day(period: str, today=None):
 
 
 async def get_activity_breakdown(chat_id: int, user_id: int) -> dict:
-    """Сообщения пользователя в этом чате за сегодня / текущую неделю / текущий
-    месяц (из посуточных счётчиков message_daily) — для строки профиля
-    «Актив (д|н|м|весь)», как у Iris. «Весь» берётся отдельно из
-    message_stats.message_count (общий счётчик, не зависит от message_daily).
+    """Сообщения пользователя за последние 24 часа / сегодня / текущую неделю /
+    текущий месяц — для строки профиля «Актив (24ч|1д|1нед|1мес)».
+
+    Скользящие 24 часа берём из почасовых счётчиков ``message_hourly``;
+    остальные периоды — из посуточных ``message_daily``. Общий счётчик больше
+    не входит в эту строку: он уже отдельно показан как число сообщений в
+    профиле.
 
     Границы недели и месяца — общие для всего бота (см. period_start_day
     выше). Здесь они когда-то считались отдельно, с понедельника, и профиль
     расходился с топом за ту же неделю."""
     await ensure_week_start_loaded()     # панель может прийти сюда первой
-    today = datetime.utcnow().date()
+    now = datetime.utcnow()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    current_hour = now.hour
     week_start = week_start_day(today)
     month_start = today.replace(day=1)
     row = await _fetchone(
         "SELECT "
+        "(SELECT COALESCE(SUM(message_count), 0) FROM message_hourly "
+        " WHERE chat_id = %s AND user_id = %s AND ("
+        "   (day = %s AND hour > %s) OR (day = %s AND hour <= %s)"
+        " )) AS last_24h_count, "
         "COALESCE(SUM(CASE WHEN day = %s THEN message_count ELSE 0 END), 0) AS today_count, "
         "COALESCE(SUM(CASE WHEN day >= %s THEN message_count ELSE 0 END), 0) AS week_count, "
         "COALESCE(SUM(CASE WHEN day >= %s THEN message_count ELSE 0 END), 0) AS month_count "
         "FROM message_daily WHERE chat_id = %s AND user_id = %s",
-        (today, week_start, month_start, chat_id, user_id),
+        (chat_id, user_id, yesterday, current_hour, today, current_hour,
+         today, week_start, month_start, chat_id, user_id),
     )
-    return row or {"today_count": 0, "week_count": 0, "month_count": 0}
+    return row or {
+        "last_24h_count": 0, "today_count": 0, "week_count": 0,
+        "month_count": 0,
+    }
 
 
 async def get_message_rank(chat_id: int, user_id: int) -> Optional[int]:

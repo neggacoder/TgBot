@@ -28,6 +28,12 @@ def test_права_известны_боту():
     assert ключи <= реестр, f"нет в реестре бота: {sorted(ключи - реестр)}"
 
 
+def test_сайт_умеет_открепить_трофей():
+    assert api._FISH_COMMANDS["unpin"] == "fishing_net"
+    source = inspect.getsource(api.api_member_fishing_action)
+    assert 'fishing_actions.pin(chat_id, user_id, None)' in source
+
+
 def test_заморозка_закрывает_занятия_и_на_сайте():
     for fn in (api.api_member_fishing_action, api.api_member_work_action):
         assert "is_account_frozen" in inspect.getsource(fn)

@@ -45,7 +45,8 @@ ACHIEVEMENT_TEXTS = {
 
 _FISH_LIST = "fishing_net"
 _FISH_COMMANDS = {"cast": "fishing_run", "sell": "fishing_net",
-                  "release": "fishing_net", "pin": "fishing_net"}
+                  "release": "fishing_net", "pin": "fishing_net",
+                  "unpin": "fishing_net"}
 _WORK_LIST = "prof_profile"
 # Перерыв в чате идёт без отдельного права — берём то же, что у смены.
 _WORK_COMMANDS = {"shift": "prof_run", "rest": "prof_run"}
@@ -111,8 +112,12 @@ async def api_member_fishing_action(
         if body.fish_id is None:
             raise HTTPException(400, "Не выбрана рыба.")
         result = await fishing_actions.release(chat_id, user_id, body.fish_id)
-    else:
+    elif action == "pin":
+        if body.fish_id is None:
+            raise HTTPException(400, "Не выбрана рыба.")
         result = await fishing_actions.pin(chat_id, user_id, body.fish_id)
+    else:  # unpin
+        result = await fishing_actions.pin(chat_id, user_id, None)
 
     if not result.ok:
         # У заброса отказ бывает штатным («ещё не время»), и экран рисует по

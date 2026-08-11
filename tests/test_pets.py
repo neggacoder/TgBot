@@ -1495,14 +1495,17 @@ def test_каталог_показывает_что_питомец_за_ачив
 
 
 def test_способности_ауры_действуют_на_всех():
-    """Наставник, Хозяйственный и Следопыт — как Компаньон: работают на всех
-    питомцев хозяина, а не на себя."""
-    for key in ("pet_mood", "pet_hunger", "pet_xp", "pet_walk"):
+    """Все ауры работают на питомцев хозяина, а не только на носителя."""
+    for key in ("pet_mood", "pet_hunger", "pet_xp", "pet_walk", "pet_feed",
+                "pet_care", "pet_find"):
         assert key in P.ABILITY_BY_KEY, key
 
 
 def test_аура_считает_проценты():
-    aura = bot_module.PetAura(xp=50, walk=50)
+    aura = bot_module.PetAura(xp=50, walk=50, feed=50, care=50, find=50)
     assert aura.xp_gain(10) == 15
     assert aura.walk_coins(200) == 300
+    assert aura.feed_gain(20) == 30
+    assert aura.care_gain(20) == 30
+    assert aura.find_chance(20) == 30
     assert bot_module.PetAura().xp_gain(10) == 10

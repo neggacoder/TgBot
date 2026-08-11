@@ -199,6 +199,15 @@ async def test_закреплённый_трофей_не_продаётся(м�
 
 
 @_sync
+async def test_открепление_трофея_освобождает_рыбу(мир):
+    номер = await мир.add_to_net(CHAT, USER, ЩУКА.key, ЩУКА.max_grams, datetime.utcnow())
+    await fishing_actions.pin(CHAT, USER, номер)
+    итог = await fishing_actions.pin(CHAT, USER, None)
+    assert итог.ok and мир.card["pinned_fish"] is None
+    assert (await fishing_actions.sell(CHAT, USER, номер)).ok
+
+
+@_sync
 async def test_свежесть_снижает_цену(мир):
     старая = datetime.utcnow() - timedelta(hours=fishing.ROT_HOURS + 10)
     свежая = datetime.utcnow()

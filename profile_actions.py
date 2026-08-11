@@ -96,15 +96,14 @@ async def profile(chat_id: int, user_id: int) -> dict:
                          if stats.get("last_message_at") else None),
         "messages": сообщений,
         "rank": место,
-        # Имена столбцов — как их отдаёт db.get_activity_breakdown
-        # (today_count / week_count / month_count), а не как хотелось бы их
-        # назвать. Читал «day/week/month» — и профиль показывал нули везде,
-        # кроме «всего»: то приходит из message_stats и потому работало.
+        # Имена столбцов — как их отдаёт db.get_activity_breakdown, а не как
+        # хотелось бы их назвать. Так API профиля и Telegram-карточка остаются в
+        # одинаковых периодах: 24 часа, текущий день, неделя и месяц.
         "activity": {
+            "last_24h": int((актив or {}).get("last_24h_count") or 0),
             "day": int((актив or {}).get("today_count") or 0),
             "week": int((актив or {}).get("week_count") or 0),
             "month": int((актив or {}).get("month_count") or 0),
-            "all": сообщений,
         },
         "coins": монеты,
         "stars": звёзд,

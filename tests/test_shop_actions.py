@@ -36,6 +36,15 @@ class _World:
                        for KEY in (КЛЮЧ,)}
         self.инвентарь: dict[str, int] = {}
         self.pinned = None
+        self.досев: list[tuple] = []
+
+    async def seed_default_shop_items(self, chat_id):
+        self.досев.append(("default", chat_id))
+        return 0
+
+    async def seed_extra_shop_items(self, chat_id, items, is_active=True):
+        self.досев.append(("extra", chat_id, tuple(items), is_active))
+        return 0
 
     async def get_shop_item(self, chat_id, key):
         товар = self.товары.get(key)
@@ -235,3 +244,4 @@ async def test_состояние_описывает_витрину_и_инве�
     свой = итог["inventory"][0]
     assert свой["quantity"] == 1 and свой["sell_price"] == 400 and свой["sellable"]
     assert итог["sell_percent"] == shop_actions.SELL_PERCENT
+    assert мир.досев, "сайт обязан подготовить каталог так же, как бот"

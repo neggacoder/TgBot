@@ -5535,7 +5535,7 @@ function fishCardHtml(f) {
     <div class="row-btns">
       <button type="button" class="btn" data-aact="sell" data-id="${f.id}"
               ${f.pinned ? "disabled" : ""}>Продать</button>
-      <button type="button" class="btn ghost btn-ic" data-aact="pin" data-id="${f.id}"
+      <button type="button" class="btn ghost btn-ic" data-aact="${f.pinned ? "unpin" : "pin"}" data-id="${f.id}"
               title="${f.pinned ? "Открепить" : "Закрепить — не продастся и не выпустится"}">
         ${icon(f.pinned ? "undo" : "pin")}</button>
       <button type="button" class="btn ghost btn-ic" data-aact="release" data-id="${f.id}"
@@ -5669,6 +5669,7 @@ function activityReport(вид, act, r) {
       return части.join(" · ");
     }
     if (act === "release") return "Рыбу выпустили — место освободилось.";
+    if (act === "unpin") return "Трофей откреплён.";
     return "Готово.";
   }
   if (act === "rest") return "Отдохнули." + (r.burnout ? " Выгорание снято." : "");
@@ -5791,10 +5792,10 @@ function renderProfile() {
       <div class="tiles">${занятия.join("")}</div>` : ""}
     <h3 class="block-head">Активность</h3>
     <div class="tiles">
+      ${tile(p.activity.last_24h.toLocaleString("ru"), "за 24 часа")}
       ${tile(p.activity.day.toLocaleString("ru"), "за сегодня")}
       ${tile(p.activity.week.toLocaleString("ru"), "за неделю")}
       ${tile(p.activity.month.toLocaleString("ru"), "за месяц")}
-      ${tile(p.activity.all.toLocaleString("ru"), "всего")}
     </div>
     <div id="member-gallery-block"></div>
     <div id="member-card-block"></div>`;

@@ -27221,17 +27221,7 @@ async def cmd_prof_market(message: Message):
 
 
 async def shop_list_page(chat_id: int, page: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
-    await db.seed_default_shop_items(chat_id)
-    # Дозасев (не требует пустого магазина): так новые товары доезжают
-    # и в чаты, где магазин давно наполнен, — иначе они не появились бы
-    # никогда, ведь seed_default_shop_items у непустого магазина молчит.
-    await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
-    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
-    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
-    # Урожай заводим НЕАКТИВНЫМ: строка нужна ради названия в инвентаре и
-    # цены для «магазин продать», но купить его нельзя — иначе подсолнух
-    # брался бы за деньги, и выращивать стало бы незачем.
-    await db.seed_extra_shop_items(chat_id, farming.SHOP_ITEMS, is_active=False)
+    await shop_actions.ensure_catalog(chat_id)
     # Товары лавки прячем из витрины магазина — продаются они только там.
     # db.list_shop_items при этом не трогаем: веб-панель должна видеть
     # каталог чата целиком.
@@ -31469,8 +31459,9 @@ async def build_profile_card(chat_id: int, requester_id: int, target) -> tuple[s
     last_active = stats.get("last_message_at") if stats else None
     lines.append(f"Последний актив: {relative_time_ru(last_active)}")
     lines.append(
-        f"Актив (д|н|м|весь): {breakdown['today_count']} | {breakdown['week_count']} | "
-        f"{breakdown['month_count']} | {count}"
+        f"Актив (24ч|1д|1нед|1мес): {breakdown['last_24h_count']} | "
+        f"{breakdown['today_count']} | {breakdown['week_count']} | "
+        f"{breakdown['month_count']}"
     )
     streak_days = await db.list_active_days(chat_id, target.id)
     streak = compute_streak(streak_days)

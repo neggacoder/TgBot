@@ -25,7 +25,9 @@ import black_market
 import chat_events
 import db
 import farm_actions
+import farming
 import game_actions
+import pets as pets_catalog
 import robbery
 import shop_effects
 
@@ -33,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 BUY_MAX_QTY = 100          # столько же, сколько в чате
 SELL_PERCENT = 80          # за сколько магазин принимает предмет обратно
+
+
+async def ensure_catalog(chat_id: int) -> None:
+    """Досеять встроенный каталог перед показом витрины.
+
+    Бот и сайт работают с одной таблицей, но раньше только команда «магазин»
+    запускала дозасев. Из-за этого сайт видел пустой или устаревший набор, пока
+    кто-то не откроет магазин в Telegram. Правило живёт здесь, рядом с общим
+    состоянием магазина, чтобы оба интерфейса не расходились снова.
+    """
+    await db.seed_default_shop_items(chat_id)
+    await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+    await db.seed_extra_shop_items(chat_id, black_market.NEW_ITEMS)
+    await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+    await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
+    # Урожай в каталоге нужен для названий и продажи, но покупаться не должен.
+    await db.seed_extra_shop_items(chat_id, farming.SHOP_ITEMS, is_active=False)
 
 
 @dataclass
@@ -225,6 +244,7 @@ async def state(chat_id: int, user_id: int, *,
                 today: Optional[date] = None) -> dict:
     """Витрина, лавка и инвентарь — всё, что рисует экран."""
     today = today or datetime.utcnow().date()
+    await ensure_catalog(chat_id)
     wallet = await db.get_wallet(chat_id, user_id) or {}
     монеты = int(wallet.get("coins") or 0)
 
