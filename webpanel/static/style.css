@@ -252,11 +252,28 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 .sidebar-foot { margin-top: auto; padding-top: var(--gap-2); }
 
-/* Мобильное меню админки: на широком экране кнопки нет, а .nav-list
-   растворяется в flex-потоке сайдбара (display: contents) — desktop-вёрстка
-   не знает о его существовании. Сам вид кнопки — как у бургера кабинета. */
+/* Обе навигации разбиты на одинаковые сворачиваемые группы. Это оставляет
+   текущий раздел под рукой, но не превращает меню из десятка пунктов в
+   длинную прокрутку. */
 .nav-burger { display: none; }
-.nav-list { display: contents; }
+.nav-list { display: flex; flex: 1; min-height: 0; flex-direction: column; gap: var(--gap-1); }
+.nav-group, .member-nav-group {
+  border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.nav-group > summary, .member-nav-group > summary {
+  display: flex; align-items: center; min-height: 36px; padding: 0 var(--gap-2);
+  cursor: pointer; color: var(--muted); font-size: var(--text-xs); font-weight: 700;
+  letter-spacing: .03em; text-transform: uppercase; user-select: none;
+}
+.nav-group > summary::marker, .member-nav-group > summary::marker { content: ""; }
+.nav-group > summary::-webkit-details-marker, .member-nav-group > summary::-webkit-details-marker { display: none; }
+.nav-group > summary::after, .member-nav-group > summary::after {
+  content: "⌄"; margin-left: auto; font-size: var(--text-base); font-weight: 400;
+  transition: transform .15s ease;
+}
+.nav-group[open] > summary::after, .member-nav-group[open] > summary::after { transform: rotate(180deg); }
+.nav-group > div { display: flex; flex-direction: column; padding: 0 var(--gap-1) var(--gap-1); }
 
 .content {
   flex: 1; min-width: 0;
@@ -1168,12 +1185,12 @@ hr { border: 0; border-top: 1px solid var(--line); margin: var(--gap-4) 0; }
    горизонтальным скроллом (scrollbar спрятан), и с мышью их не находили
    вовсе. Два ряда показывают всё. */
 .member-tabs {
-  display: flex; flex-wrap: wrap; justify-content: center; gap: var(--gap-1);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--gap-1);
   max-width: 980px; margin: 0 auto; padding: var(--gap-3) var(--gap-4) 0;
-  overflow-x: auto;
 }
+.member-nav-group > div { display: flex; flex-direction: column; padding: 0 var(--gap-1) var(--gap-1); }
 .member-tab {
-  display: inline-flex; align-items: center; gap: var(--gap-1);
+  display: flex; align-items: center; gap: var(--gap-1); width: 100%;
   padding: var(--gap-1) var(--gap-3); border: 0; border-radius: var(--radius-sm);
   background: none; color: var(--muted); font: inherit; cursor: pointer; white-space: nowrap;
 }
@@ -3253,6 +3270,21 @@ img, svg, canvas { max-width: 100%; }
   display: grid; gap: var(--gap-2);
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
 }
+.shop-tabs {
+  display: flex; gap: var(--gap-1); margin: var(--gap-3) 0;
+  padding-bottom: var(--gap-1); overflow-x: auto; scrollbar-width: thin;
+}
+.shop-tab {
+  display: inline-flex; flex: 0 0 auto; align-items: center; gap: var(--gap-1);
+  min-height: 38px; padding: 0 var(--gap-3); border: 1px solid var(--line);
+  border-radius: 999px; background: var(--panel); color: var(--muted); font: inherit;
+  font-size: var(--text-sm); font-weight: 600; cursor: pointer;
+}
+.shop-tab .ic { width: 16px; height: 16px; }
+.shop-tab:hover { color: var(--text); background: var(--panel-2); }
+.shop-tab.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.shop-tab:focus-visible { outline: none; box-shadow: var(--ring); }
+.shop-pane { min-height: 180px; }
 .good, .inv-card, .pet-card {
   border: 1px solid var(--line); border-radius: var(--radius);
   background: var(--panel-2); padding: var(--pad-card);

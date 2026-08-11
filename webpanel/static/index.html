@@ -157,22 +157,30 @@
     <svg class="ic burger-chevron"><use href="#ic-chevron"/></svg>
   </button>
   <nav class="member-tabs" id="member-tabs">
-    <button type="button" class="member-tab active" data-mtab="prof"><svg class="ic"><use href="#ic-user"/></svg>Профиль</button>
-    <button type="button" class="member-tab" data-mtab="tops"><svg class="ic"><use href="#ic-trophy"/></svg>Топы</button>
-    <button type="button" class="member-tab" data-mtab="rel"><svg class="ic"><use href="#ic-heart"/></svg>Отношения</button>
-    <button type="button" class="member-tab" data-mtab="family"><svg class="ic"><use href="#ic-crown"/></svg>Семья</button>
-    <button type="button" class="member-tab" data-mtab="clans"><svg class="ic"><use href="#ic-shield"/></svg>Кланы</button>
-    <button type="button" class="member-tab" data-mtab="farm"><svg class="ic"><use href="#ic-sprout"/></svg>Ферма</button>
-    <button type="button" class="member-tab" data-mtab="casino"><svg class="ic"><use href="#ic-casino"/></svg>Казино</button>
-    <button type="button" class="member-tab" data-mtab="biz"><svg class="ic"><use href="#ic-building"/></svg>Бизнесы</button>
-    <button type="button" class="member-tab" data-mtab="fish"><svg class="ic"><use href="#ic-fish"/></svg>Рыбалка</button>
-    <button type="button" class="member-tab" data-mtab="work"><svg class="ic"><use href="#ic-work"/></svg>Работа</button>
-    <button type="button" class="member-tab" data-mtab="shop"><svg class="ic"><use href="#ic-cart"/></svg>Магазин</button>
-    <button type="button" class="member-tab" data-mtab="stock"><svg class="ic"><use href="#ic-chart"/></svg>Биржа</button>
-    <button type="button" class="member-tab" data-mtab="bank"><svg class="ic"><use href="#ic-coins"/></svg>Банк</button>
-    <button type="button" class="member-tab" data-mtab="pets"><svg class="ic"><use href="#ic-paw"/></svg>Питомцы</button>
-    <button type="button" class="member-tab" data-mtab="caps"><svg class="ic"><use href="#ic-message"/></svg>Возможности</button>
-    <button type="button" class="member-tab" data-mtab="suggest"><svg class="ic"><use href="#ic-message"/></svg>Предложения</button>
+    <details class="member-nav-group" open><summary>Главное</summary><div>
+      <button type="button" class="member-tab active" data-mtab="prof"><svg class="ic"><use href="#ic-user"/></svg>Профиль</button>
+      <button type="button" class="member-tab" data-mtab="tops"><svg class="ic"><use href="#ic-trophy"/></svg>Топы</button>
+      <button type="button" class="member-tab" data-mtab="caps"><svg class="ic"><use href="#ic-message"/></svg>Возможности</button>
+      <button type="button" class="member-tab" data-mtab="suggest"><svg class="ic"><use href="#ic-message"/></svg>Предложения</button>
+    </div></details>
+    <details class="member-nav-group"><summary>Сообщество</summary><div>
+      <button type="button" class="member-tab" data-mtab="rel"><svg class="ic"><use href="#ic-heart"/></svg>Отношения</button>
+      <button type="button" class="member-tab" data-mtab="family"><svg class="ic"><use href="#ic-crown"/></svg>Семья</button>
+      <button type="button" class="member-tab" data-mtab="clans"><svg class="ic"><use href="#ic-shield"/></svg>Кланы</button>
+    </div></details>
+    <details class="member-nav-group"><summary>Игры и занятия</summary><div>
+      <button type="button" class="member-tab" data-mtab="farm"><svg class="ic"><use href="#ic-sprout"/></svg>Ферма</button>
+      <button type="button" class="member-tab" data-mtab="casino"><svg class="ic"><use href="#ic-casino"/></svg>Казино</button>
+      <button type="button" class="member-tab" data-mtab="biz"><svg class="ic"><use href="#ic-building"/></svg>Бизнесы</button>
+      <button type="button" class="member-tab" data-mtab="fish"><svg class="ic"><use href="#ic-fish"/></svg>Рыбалка</button>
+      <button type="button" class="member-tab" data-mtab="work"><svg class="ic"><use href="#ic-work"/></svg>Работа</button>
+      <button type="button" class="member-tab" data-mtab="pets"><svg class="ic"><use href="#ic-paw"/></svg>Питомцы</button>
+    </div></details>
+    <details class="member-nav-group"><summary>Финансы</summary><div>
+      <button type="button" class="member-tab" data-mtab="shop"><svg class="ic"><use href="#ic-cart"/></svg>Магазин</button>
+      <button type="button" class="member-tab" data-mtab="stock"><svg class="ic"><use href="#ic-chart"/></svg>Биржа</button>
+      <button type="button" class="member-tab" data-mtab="bank"><svg class="ic"><use href="#ic-coins"/></svg>Банк</button>
+    </div></details>
   </nav>
   <main class="member-content" id="member-content">
     <div id="member-toast" class="toast-area"></div>
@@ -207,7 +215,7 @@
          обрезанными пунктами и БЕЗ «Выйти» и темы (низ прятался). Теперь —
          тот же бургер, что уже прижился в кабинете участника: подпись
          показывает текущий раздел, список раскрывается вниз. На широком
-         экране кнопки нет, а .nav-list растворяется (display: contents). -->
+         экране кнопки нет, а разделы собраны в короткие раскрывающиеся группы. -->
     <button type="button" class="nav-burger" id="nav-burger"
             aria-expanded="false" aria-controls="nav-list">
       <svg class="ic"><use href="#ic-menu"/></svg>
@@ -216,21 +224,27 @@
     </button>
 
     <div class="nav-list" id="nav-list">
-    <button class="nav-btn active" data-view="send"><svg class="ic"><use href="#ic-send"/></svg>Написать</button>
-    <button class="nav-btn" data-view="chats"><svg class="ic"><use href="#ic-chats"/></svg>Чаты и люди</button>
-    <button class="nav-btn" data-view="chatroles"><svg class="ic"><use href="#ic-mask"/></svg>Роли чата</button>
-    <button class="nav-btn" data-view="moderation"><svg class="ic"><use href="#ic-shield"/></svg>Модерация</button>
-    <button class="nav-btn" data-view="complaints"><svg class="ic"><use href="#ic-alert"/></svg>Жалобы
-      <span class="nav-count hidden" id="complaints-badge">0</span></button>
-    <button class="nav-btn owner-only hidden" data-view="tgadmins"><svg class="ic"><use href="#ic-crown"/></svg>Админы чата</button>
-    <button class="nav-btn" data-view="stats"><svg class="ic"><use href="#ic-chart"/></svg>Статистика</button>
-    <button class="nav-btn" data-view="stock"><svg class="ic"><use href="#ic-xp"/></svg>Биржа</button>
-    <button class="nav-btn" data-view="logs"><svg class="ic"><use href="#ic-file"/></svg>Журнал</button>
-    <button class="nav-btn" data-view="actions"><svg class="ic"><use href="#ic-wand"/></svg>Действия</button>
-    <button class="nav-btn" data-view="cmdtree"><svg class="ic"><use href="#ic-sliders"/></svg>Дерево команд</button>
-    <button class="nav-btn" data-view="chatsettings"><svg class="ic"><use href="#ic-sliders"/></svg>Настройки чата</button>
-    <button class="nav-btn" data-view="settings"><svg class="ic"><use href="#ic-settings"/></svg>Настройки</button>
-    <button class="nav-btn owner-only hidden" data-view="users"><svg class="ic"><use href="#ic-id"/></svg>Аккаунты</button>
+    <details class="nav-group" open><summary>Управление чатом</summary><div>
+      <button class="nav-btn active" data-view="send"><svg class="ic"><use href="#ic-send"/></svg>Написать</button>
+      <button class="nav-btn" data-view="chats"><svg class="ic"><use href="#ic-chats"/></svg>Чаты и люди</button>
+      <button class="nav-btn" data-view="chatroles"><svg class="ic"><use href="#ic-mask"/></svg>Роли чата</button>
+      <button class="nav-btn" data-view="moderation"><svg class="ic"><use href="#ic-shield"/></svg>Модерация</button>
+      <button class="nav-btn" data-view="complaints"><svg class="ic"><use href="#ic-alert"/></svg>Жалобы
+        <span class="nav-count hidden" id="complaints-badge">0</span></button>
+      <button class="nav-btn owner-only hidden" data-view="tgadmins"><svg class="ic"><use href="#ic-crown"/></svg>Админы чата</button>
+    </div></details>
+    <details class="nav-group"><summary>Аналитика</summary><div>
+      <button class="nav-btn" data-view="stats"><svg class="ic"><use href="#ic-chart"/></svg>Статистика</button>
+      <button class="nav-btn" data-view="stock"><svg class="ic"><use href="#ic-xp"/></svg>Биржа</button>
+      <button class="nav-btn" data-view="logs"><svg class="ic"><use href="#ic-file"/></svg>Журнал</button>
+    </div></details>
+    <details class="nav-group"><summary>Настройки</summary><div>
+      <button class="nav-btn" data-view="actions"><svg class="ic"><use href="#ic-wand"/></svg>Действия</button>
+      <button class="nav-btn" data-view="cmdtree"><svg class="ic"><use href="#ic-sliders"/></svg>Дерево команд</button>
+      <button class="nav-btn" data-view="chatsettings"><svg class="ic"><use href="#ic-sliders"/></svg>Настройки чата</button>
+      <button class="nav-btn" data-view="settings"><svg class="ic"><use href="#ic-settings"/></svg>Настройки</button>
+      <button class="nav-btn owner-only hidden" data-view="users"><svg class="ic"><use href="#ic-id"/></svg>Аккаунты</button>
+    </div></details>
 
     <div class="sidebar-foot">
       <button class="ghost block theme-btn" id="theme-toggle" title="Сменить тему (T)">

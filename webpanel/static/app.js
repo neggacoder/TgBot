@@ -423,6 +423,10 @@ function switchMemberTab(name, push = true) {
   if (!выбранная) return;
   writeNavUrl("member", name, push);
   $$(".member-tab").forEach((b) => b.classList.toggle("active", b.dataset.mtab === name));
+  // Вложенные группы держат меню коротким. При переходе по URL или ссылке
+  // раскрываем группу активного раздела, чтобы он не оказался спрятан.
+  const группа = выбранная.closest("details.member-nav-group");
+  if (группа) группа.open = true;
   // Название текущего раздела на кнопке: свёрнутый список иначе не говорит,
   // где ты находишься.
   const подпись = $("#member-burger-label");
@@ -1356,6 +1360,8 @@ function switchAdminView(view, push = true) {
   writeNavUrl("admin", view, push);
     $$(".nav-btn").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
+    const группа = btn.closest("details.nav-group");
+    if (группа) группа.open = true;
     const метка = $("#nav-burger-label");
     if (метка) метка.textContent = подписьРаздела(btn);
     закрытьНавМеню();
@@ -6133,29 +6139,44 @@ function invHtml(i) {
 function renderShop() {
   const s = _shop.state, body = $("#member-shop-body");
   if (!s || !body) return;
-  const лавка = s.black_market.length
-    ? `<h3 class="block-head">${icon("mask")}Лавка · завоз на сегодня</h3>
-       <div class="shop-goods">${s.black_market.map(goodHtml).join("")}</div>` : "";
+  const доступныеВкладки = new Set(["shop", "black_market", "inventory", "market"]);
+  if (!доступныеВкладки.has(_shop.tab)) _shop.tab = "shop";
+  const вкладка = _shop.tab;
+  const tabs = [
+    ["shop", "Витрина", "store"], ["black_market", "Лавка", "mask"],
+    ["inventory", "Инвентарь", "bag"], ["market", "Рынок", "basket"],
+  ];
+  const вкладки = `<div class="shop-tabs" role="tablist" aria-label="Разделы магазина">${tabs.map(([key, label, ico]) =>
+    `<button type="button" class="shop-tab ${вкладка === key ? "active" : ""}" role="tab"
+      aria-selected="${вкладка === key}" data-shop-tab="${key}">${icon(ico)}${label}</button>`).join("")}</div>`;
+  let содержание = "";
+  if (вкладка === "shop") {
+    содержание = `<h3 class="mb-2">${icon("store")}Витрина</h3>${s.items.length
+      ? `<div class="shop-goods">${s.items.map(goodHtml).join("")}</div>`
+      : `<div class="empty">${icon("empty")}<span>На витрине пока нет товаров.</span></div>`}`;
+  } else if (вкладка === "black_market") {
+    const лавка = s.black_market || [];
+    содержание = `<h3 class="mb-2">${icon("mask")}Лавка · завоз на сегодня</h3>${лавка.length
+      ? `<div class="shop-goods">${лавка.map(goodHtml).join("")}</div>`
+      : `<div class="empty">${icon("empty")}<span>Сегодня лавка без завоза.</span></div>`}`;
+  } else if (вкладка === "inventory") {
+    содержание = `<h3 class="mb-2">${icon("bag")}Инвентарь</h3>${s.inventory.length
+      ? `<div class="inv-list">${s.inventory.map(invHtml).join("")}</div>`
+      : `<div class="empty">${icon("empty")}<span>Инвентарь пуст.</span></div>`}
+      <div id="lootbox-block"></div>`;
+  } else {
+    содержание = `<div id="market-block"><div class="muted">Загрузка рынка…</div></div>
+      <div id="steal-block"></div>`;
+  }
   body.innerHTML = `
     <div class="biz-summary">
       <div><span class="total">${s.coins.toLocaleString("ru")} i¢</span>
         <span class="muted">в кошельке<small>магазин принимает предметы обратно за ${s.sell_percent}%</small></span></div>
     </div>
-    <h3 class="mb-2">${icon("store")}Витрина</h3>
-    ${s.items.length
-      ? `<div class="shop-goods">${s.items.map(goodHtml).join("")}</div>`
-      : `<div class="empty">${icon("empty")}<span>В магазине пусто.</span></div>`}
-    ${лавка}
-    <h3 class="block-head">${icon("bag")}Инвентарь</h3>
-    ${s.inventory.length
-      ? `<div class="inv-list">${s.inventory.map(invHtml).join("")}</div>`
-      : `<div class="empty">${icon("empty")}<span>Инвентарь пуст.</span></div>`}
-    <div id="market-block"></div>
-    <div id="lootbox-block"></div>
-    <div id="steal-block"></div>`;
-  loadMarket();
-  loadLootboxes();
-  loadStealState();
+    ${вкладки}
+    <div class="shop-pane" role="tabpanel">${содержание}</div>`;
+  if (вкладка === "inventory") loadLootboxes();
+  if (вкладка === "market") { loadMarket(); loadStealState(); }
 }
 
 // --- рынок участников -------------------------------------------------------
@@ -6523,6 +6544,12 @@ async function onShopClick(e) {
   // Медвежатник живёт на этом же экране, поэтому его нажатия разбираются
   // здесь же: второй слушатель на тот же узел означал бы два места, где
   // решают, что делать с одним и тем же кликом.
+  const tab = e.target.closest("[data-shop-tab]");
+  if (tab) {
+    _shop.tab = tab.dataset.shopTab;
+    renderShop();
+    return;
+  }
   if (e.target.closest("[data-market]")) return onMarketClick(e);
   if (e.target.closest("[data-loot]")) return onLootboxClick(e);
   if (e.target.closest("[data-steal]") || e.target.closest(".steal-pick")
