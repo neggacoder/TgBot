@@ -313,3 +313,22 @@ def test_покупка_с_сайта_такая_же_громкая():
     assert кусок.count("send_message") == 2, "сайт объявляет покупку не всем и не продавцу"
     вызов = файл[файл.index("async def api_member_market_action"):]
     assert "_объявить_покупку(" in вызов
+
+
+def test_заявка_с_сайта_получает_инлайн_кнопки():
+    """Именно кабинет раньше отправлял голый текст с командами решения."""
+    файл = (КОРЕНЬ / "webpanel" / "member_market_api.py").read_text(encoding="utf-8")
+    кусок = файл[файл.index("async def _объявить_заявку"):файл.index("async def api_member_market_action")]
+    assert "InlineKeyboardMarkup" in кусок
+    assert "market.decision_callback_data(True" in кусок
+    assert "market.decision_callback_data(False" in кусок
+    assert "reply_markup=keyboard" in кусок
+    assert "рынок принять" not in кусок and "рынок отклонить" not in кусок
+
+
+def test_магазин_берёт_количество_из_поля_на_карточке():
+    файл = (КОРЕНЬ / "webpanel" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'class="good-qty" data-shop-qty' in файл
+    assert 'querySelector("[data-shop-qty]")' in файл
+    shop_click = файл[файл.index("async function onShopClick"):файл.index("// --- питомцы")]
+    assert 'prompt("Сколько купить?' not in shop_click

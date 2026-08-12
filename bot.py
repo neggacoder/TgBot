@@ -9,6 +9,7 @@ import os
 import random
 import re
 import secrets
+import tempfile
 import time
 import urllib.request
 from collections import deque
@@ -68,6 +69,7 @@ import fake_warns
 import relationships_v2
 import rest_rules
 import word_filter
+import transcription
 import robbery
 import black_market
 import business_actions
@@ -82,6 +84,7 @@ import chat_settings
 import livestock
 import bank_actions
 import achievements_meta
+import collection_actions
 import gallery_actions
 import card_actions
 import lootbox_actions
@@ -102,6 +105,7 @@ from help_texts import build_help_sections
 import bosses as boss_catalog
 import collections_meta
 import seasons
+import site_access
 import businesses as business_catalog
 import crafting
 import pets as pets_catalog
@@ -1890,7 +1894,7 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "pet_food_grant":  {"phrase": "пет раздать [корм] — выдать всем владельцам питомцев по 10 корма (раз в неделю)", "category": "Разное", "level": LEVEL_ADMIN},
     "item_steal":      {"phrase": "медвежатник @кому {ключ предмета} — украсть один предмет (раз в 10 часов)", "category": "Экономика", "level": 0},
     "market":          {"phrase": "рынок / рынок купить {ключ} [кол-во] / рынок заявка {ключ} {цена} {название} / рынок мои / рынок снять {ключ} / рынок цена {ключ} {число} / рынок описание {ключ} {текст} — торговля между участниками", "category": "Экономика", "level": 0},
-    "market_manage":   {"phrase": "рынок заявки / рынок принять {номер} / рынок отклонить {номер} / рынок режим ручной|авто|отклонять / рынок комиссия {число} / рынок потолок {число} / рынок лимит {число}", "category": "Экономика", "level": LEVEL_ADMIN},
+    "market_manage":   {"phrase": "рынок режим ручной|авто|отклонять / рынок комиссия {число} / рынок потолок {число} / рынок лимит {число} — заявки решаются кнопками или в панели", "category": "Экономика", "level": LEVEL_ADMIN},
     "item_sabotage":   {"phrase": "саботаж @кому — сломать бизнес выбранного человека (предмет «Саботаж»)", "category": "Экономика", "level": 0},
     "item_kompromat":  {"phrase": "компромат @кому — поднять старую фразу человека картинкой-цитатой (предмет «Компромат»)", "category": "Экономика", "level": 0},
     "item_dossier":    {"phrase": "досье @кому — сводка по человеку: деньги, бизнесы, ограбления (предмет «Досье»)", "category": "Экономика", "level": 0},
@@ -1927,6 +1931,12 @@ COMMAND_REGISTRY: dict[str, dict] = {
     "income_set":      {"phrase": "доход / доход {источник} {процент} / доход лимит {число} — множители заработка и суточный лимит подработок", "category": "Настройка", "level": LEVEL_ADMIN},
     "farm_expand":     {"phrase": "ферма расширить [сколько] / купить грядку / расширить огород — грядки за монеты, цена растёт с каждой; «все» — сколько влезет", "category": "Экономика", "level": 0},
     "raid_mode":       {"phrase": "рейд начался / рейд окончен — антирейд: закрыть чат, сменить ссылку и забанить свежих новичков без роли (кнопки в личке бота)", "category": "Модерация", "level": LEVEL_ADMIN},
+    "transcription_toggle": {"phrase": "+транскриб / -транскриб — расшифровывать аудио и видео в чате жалоб", "category": "Настройка", "level": LEVEL_MODERATOR},
+    "transfer_history": {"phrase": "история переводов — последние отправленные и полученные i¢", "category": "Экономика", "level": 0},
+    "earning_history": {"phrase": "история заработков — последние начисления i¢", "category": "Экономика", "level": 0},
+    "human_pet":      {"phrase": "челопет (ответом или @username) — предложить человеку стать вашим питомцем", "category": "РП", "level": 0},
+    "svo":            {"phrase": "СВО отправить / СВО вернуть (ответом или @username) / СВО статус / СВО вкл / СВО выкл — шуточный список", "category": "РП", "level": 0},
+    "site_toggle":    {"phrase": "+сайт / -сайт — включить или выключить кабинет участников в этом чате", "category": "Настройка", "level": LEVEL_ADMIN},
 }
 
 
@@ -12379,21 +12389,137 @@ async def resolve_command_target(
     return None, text
 
 
+# ----------------------------------------------------------------------------
+# Шуточный список «СВО». Никаких ограничений, денег, модерации или настоящих
+# действий здесь нет: это обычная РП-запись, отдельная для каждого чата.
+# ----------------------------------------------------------------------------
+_SVO_ENABLED_PREFIX = "svo_enabled:"
+_SVO_SENT_PREFIX = "svo_sent:"
+SVO_RE = ru_text.rx(
+    r"(?i)^сво\s+(?:(?P<target_action>отправить|вернуть)(?:\s+.*)?|"
+    r"(?P<simple_action>выкл|вкл|статус))$"
+)
+
+
+def _svo_enabled_key(chat_id: int) -> str:
+    return f"{_SVO_ENABLED_PREFIX}{chat_id}"
+
+
+def _svo_sent_key(chat_id: int) -> str:
+    return f"{_SVO_SENT_PREFIX}{chat_id}"
+
+
+async def _svo_enabled(chat_id: int) -> bool:
+    row = await db.get_data(_svo_enabled_key(chat_id))
+    return not row or row.get("data_value") != "0"
+
+
+async def _svo_sent_users(chat_id: int) -> list[int]:
+    row = await db.get_data(_svo_sent_key(chat_id))
+    if not row or not row.get("data_value"):
+        return []
+    try:
+        raw = json.loads(row["data_value"])
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    users: list[int] = []
+    for value in raw:
+        try:
+            user_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if user_id > 0 and user_id not in users:
+            users.append(user_id)
+    return users
+
+
+async def _save_svo_sent_users(chat_id: int, user_ids: list[int], actor_id: int) -> None:
+    await db.set_data(_svo_sent_key(chat_id), json.dumps(user_ids), updated_by=actor_id)
+
+
+@router.message(F.text.func(lambda t: bool(t) and bool(SVO_RE.match(t.strip()))))
+async def cmd_svo(message: Message):
+    match = SVO_RE.match(message.text.strip())
+    action = (match.group("target_action") or match.group("simple_action")).casefold()
+
+    # После «СВО выкл» бот действительно не отвечает на эти команды. «вкл» —
+    # единственное исключение, иначе вернуть шутку было бы невозможно.
+    if action != "вкл" and not await _svo_enabled(message.chat.id):
+        return
+
+    if action == "выкл":
+        await db.set_data(_svo_enabled_key(message.chat.id), "0", updated_by=message.from_user.id)
+        await db.add_log("svo_toggle", chat_id=message.chat.id,
+                         actor_id=message.from_user.id, details="off")
+        await message.reply("СВО выключено")
+        return
+    if action == "вкл":
+        await db.delete_data(_svo_enabled_key(message.chat.id))
+        await db.add_log("svo_toggle", chat_id=message.chat.id,
+                         actor_id=message.from_user.id, details="on")
+        await message.reply("СВО включено")
+        return
+    if action == "статус":
+        users = await _svo_sent_users(message.chat.id)
+        lines = ["📋 <b>Список отправленных на СВО:</b>", ""]
+        if users:
+            for user_id in users:
+                lines.append(f"• {await display_name_by_id(message.chat.id, user_id)}")
+        else:
+            lines.append("Пусто.")
+        await message.reply("\n".join(lines))
+        return
+
+    target, _ = await resolve_command_target(message, trigger_words=2, allow_bare_id=False)
+    if target is None and message.reply_to_message and message.reply_to_message.from_user:
+        user = message.reply_to_message.from_user
+        target = SimpleNamespace(id=user.id, full_name=user.full_name,
+                                 username=user.username, is_bot=user.is_bot)
+    if target is None or target.id is None:
+        await message.reply(
+            "Ответьте на сообщение человека или укажите @username: "
+            f"<code>СВО {action} @username</code>."
+        )
+        return
+
+    users = await _svo_sent_users(message.chat.id)
+    if action == "отправить":
+        if target.id not in users:
+            users.append(target.id)
+            await _save_svo_sent_users(message.chat.id, users, message.from_user.id)
+        await db.add_log("svo_send", chat_id=message.chat.id,
+                         actor_id=message.from_user.id, target_id=target.id)
+        await message.reply(f"🪖 {await display_name(message.chat.id, target)} отправлен на СВО.")
+        return
+
+    if target.id in users:
+        users.remove(target.id)
+        await _save_svo_sent_users(message.chat.id, users, message.from_user.id)
+    await db.add_log("svo_return", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, target_id=target.id)
+    await message.reply(f"🏠 {await display_name(message.chat.id, target)} вернулся с СВО.")
+
+
 async def _human_pet_name(chat_id: int, user_id: int) -> str:
     row = await db.get_known_user(chat_id, user_id)
     shown = await db.get_nickname(chat_id, user_id) or (row or {}).get("full_name") or str(user_id)
     return f'<a href="tg://user?id={user_id}">{html.escape(shown)}</a>'
 
 
-@router.message(F.text.regexp(r"(?i)^пет(?:\s|$)"))
+@router.message(F.text.regexp(r"(?i)^челопет(?:\s|$)"))
 async def cmd_human_pet_request(message: Message):
-    """«пет @user» или «пет» ответом — запрос стать хозяином человека."""
+    """«челопет @user» или «челопет» ответом — запрос стать хозяином человека."""
     target, _ = await resolve_command_target(message, trigger_words=1, allow_bare_id=False)
     if target is None and message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         target = SimpleNamespace(id=u.id, full_name=u.full_name, username=u.username, is_bot=u.is_bot)
     if target is None or target.id is None:
-        await message.reply("Ответьте на сообщение человека словом <b>пет</b> или напишите <b>пет @username</b>.")
+        await message.reply(
+            "Ответьте на сообщение человека словом <b>челопет</b> "
+            "или напишите <b>челопет @username</b>."
+        )
         return
     if target.id == message.from_user.id:
         await message.reply("Самого себя сделать питомцем нельзя 🙂")
@@ -16772,6 +16898,7 @@ async def cmd_barn_buy(message: Message):
     await db.seed_extra_shop_items(chat_id, livestock.SHOP_ITEMS, is_active=False)
     await db.add_log("barn_buy", chat_id=chat_id, actor_id=user_id,
                      details=f"{animal.key}x{добавлено}")
+    await _check_collections(chat_id, user_id)
     стало = есть + добавлено
     хвост = ("\nНакопленное перед покупкой забрали:\n" + "\n".join(собрано)) if собрано else ""
     await message.reply(
@@ -17112,6 +17239,7 @@ async def _fishing_execute(chat_id: int, user_id: int) -> str:
     await db.add_to_net(chat_id, user_id, species.key, grams, now)
     await db.add_log("fishing", chat_id=chat_id, actor_id=user_id,
                      details=f"{species.key}:{grams}")
+    await _check_collections(chat_id, user_id)
     if int((updated or {}).get("total_catches") or 0) >= 100:
         await grant_achievement(chat_id, user_id, "fish_100")
 
@@ -17614,6 +17742,14 @@ EARN_HAT = "hat"
 EARN_FARM = "farm"
 EARN_FISHING = "fishing"
 EARN_TREASURE = "treasure"
+
+EARNING_HISTORY_LABELS = {
+    EARN_DAILY_BONUS: "🎁 Ежедневный бонус",
+    EARN_SIDE_JOB: "💼 Подработка",
+    EARN_FARM: "🌾 Ферма",
+    EARN_FISHING: "🎣 Рыбалка",
+    EARN_TREASURE: "⛏ Клад",
+}
 
 # Ежедневный бонус. Первый день — BASE, каждый следующий подряд добавляет STEP,
 # и так до MAX_DAYS; дальше сумма не растёт, иначе через полгода бонус обгонит
@@ -18807,6 +18943,9 @@ async def cb_business_site_deal(callback: CallbackQuery):
     покупатель = await display_name_by_id(chat_id, итог.user_id)
     await db.add_log("business_sell_user", chat_id=chat_id,
                      actor_id=итог.user_id, details=f"{итог.key}:{итог.spent}:site")
+    # Бизнес мог стать последней недостающей частью «Промышленника» у
+    # покупателя. Сделка предложена с сайта, но завершилась кнопкой здесь.
+    await _check_collections(chat_id, итог.user_id)
     цена = f"за <b>{итог.spent}</b> i¢" if итог.spent else "в дар"
     try:
         await callback.message.edit_text(
@@ -18864,6 +19003,7 @@ async def cmd_business_give(message: Message):
     await db.clear_business_upgrades(chat_id, user_id, item.key)
     await db.add_log("business_transfer", chat_id=chat_id, actor_id=user_id,
                      target_id=target.id, details=item.key)
+    await _check_collections(chat_id, target.id)
     target_name = await display_name_by_id(chat_id, target.id)
     lines = [f"🎁 {item.name} ({row['level']} ур.) передан {target_name}."]
     if net or tax:
@@ -19138,6 +19278,7 @@ async def cmd_business_equip(message: Message):
 
     await db.add_log("business_equip", chat_id=chat_id, actor_id=user_id,
                      details=f"{item.key}:{upgrade.key}:{price}")
+    await _check_collections(chat_id, user_id)
     await message.reply(
         f"{upgrade.emoji} <b>{upgrade.name}</b> установлена в «{item.name}» "
         f"за {price} i¢.\n{upgrade.description}."
@@ -20808,22 +20949,12 @@ async def _check_collections(chat_id: int, user_id: int, announce: bool = True) 
     """Выдаёт награды за собранные коллекции. Зовётся после действий, которые
     могут её достроить: покупка бизнеса и питомца, апгрейд, закрытие сезона."""
     try:
-        progress = await _collection_progress(chat_id, user_id)
+        awarded = await collection_actions.check_collections(
+            chat_id, user_id, today=local_today())
     except Exception as exc:
         log_suppressed("_check_collections", exc)
         return
-    for collection in collections_meta.COLLECTIONS:
-        done, total = progress.get(collection.key, (0, 0))
-        if not collections_meta.is_complete(done, total):
-            continue
-        # Титул без цены — купить коллекционный титул нельзя (см. cmd_title_buy).
-        await db.add_title_if_missing(collection.title_key, collection.title_name)
-        if not await db.grant_title(chat_id, user_id, collection.title_key):
-            continue                      # уже был — второй раз не объявляем
-        await grant_achievement(chat_id, user_id, collection.achievement_code,
-                                announce=False)
-        await db.add_log("collection_done", chat_id=chat_id, actor_id=user_id,
-                         details=collection.key)
+    for collection in awarded:
         if announce:
             who = await display_name_by_id(chat_id, user_id)
             try:
@@ -20975,6 +21106,57 @@ async def cmd_bcoin_history(message: Message):
 
 
 TRANSFER_CMD_RE = ru_text.rx(r"(?i)^(?:перевод|перевести)\b")
+TRANSFER_HISTORY_RE = ru_text.rx(r"(?i)^история\s+переводов$")
+EARNING_HISTORY_RE = ru_text.rx(r"(?i)^история\s+заработков$")
+
+
+async def _money_history_name(chat_id: int, user_id: int) -> str:
+    """Имя в истории: человек мог уже выйти, тогда остаётся безопасный ID."""
+    known = await db.get_known_user(chat_id, user_id)
+    if known:
+        return mention_id(user_id, full_name=known.get("full_name"), username=known.get("username"))
+    return f"<code>{user_id}</code>"
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(TRANSFER_HISTORY_RE.match(t.strip()))),
+)
+async def cmd_transfer_history(message: Message):
+    rows = await db.list_coin_transfers(message.chat.id, message.from_user.id, limit=15)
+    if not rows:
+        await message.reply("💸 <b>История переводов</b>\n\nПереводов пока нет.")
+        return
+    lines = ["💸 <b>История переводов</b>", DIVIDER]
+    for row in rows:
+        sent = int(row.get("actor_id") or 0) == message.from_user.id
+        other_id = int((row.get("target_id") if sent else row.get("actor_id")) or 0)
+        direction = "→" if sent else "←"
+        amount = max(0, int(row.get("details") or 0))
+        lines.append(
+            f"{direction} <b>{amount} i¢</b> {'для' if sent else 'от'} "
+            f"{await _money_history_name(message.chat.id, other_id)} · {fmt_dt(row['created_at'])}"
+        )
+    await message.reply("\n".join(lines))
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(EARNING_HISTORY_RE.match(t.strip()))),
+)
+async def cmd_earning_history(message: Message):
+    rows = await db.list_earning_history(message.chat.id, message.from_user.id, limit=15)
+    if not rows:
+        await message.reply(
+            "💰 <b>История заработков</b>\n\nНачислений пока нет. "
+            "История начинает записываться после обновления бота."
+        )
+        return
+    lines = ["💰 <b>История заработков</b>", DIVIDER]
+    for row in rows:
+        label = EARNING_HISTORY_LABELS.get(row["activity_key"], row["activity_key"])
+        lines.append(f"+<b>{int(row['amount'])} i¢</b> · {label} · {fmt_dt(row['created_at'])}")
+    await message.reply("\n".join(lines))
 
 
 @router.message(
@@ -21341,7 +21523,6 @@ async def cmd_steal_item(message: Message):
 MARKET_APPLY_RE = ru_text.rx(r"(?i)^!?рынок\s+заявка\s+(\S+)\s+(\S+)\s+(.+)$")
 MARKET_BUY_RE = ru_text.rx(r"(?i)^!?рынок\s+купить\s+(\S+)(?:\s+(\d+))?$")
 MARKET_WITHDRAW_RE = ru_text.rx(r"(?i)^!?рынок\s+снять\s+(\S+)$")
-MARKET_DECIDE_RE = ru_text.rx(r"(?i)^!?рынок\s+(принять|отклонить)\s+(\d+)$")
 MARKET_MODE_RE = ru_text.rx(r"(?i)^!?рынок\s+режим\s+(ручной|авто|отклонять)$")
 MARKET_CFG_RE = ru_text.rx(r"(?i)^!?рынок\s+(комиссия|потолок|лимит)\s+(\d+)$")
 # Свои товары: то же самое, что делают кнопки в личке, но текстом — кнопки
@@ -21386,9 +21567,8 @@ async def _market_notify_request(
     """Отправляет заявку в чат уведомлений (settings.notify_chat_id) — туда же,
     куда идут заявки на вступление и жалобы. False — чат не настроен.
 
-    Решение принимается кнопками, а не командой «рынок принять {номер}»:
-    команда ищет заявку по чату, в котором её написали, а нажимают её как раз
-    в ЧУЖОМ чате уведомлений. Поэтому id исходного чата едет в callback_data.
+    Решение принимается кнопками в чате уведомлений. Они нажимаются не там,
+    где заявку подали, поэтому id исходного чата едет в callback_data.
     """
     notify_chat_id = settings.get("notify_chat_id")
     if not notify_chat_id:
@@ -21396,9 +21576,9 @@ async def _market_notify_request(
     where = f" · чат: {html.escape(chat_title)}" if chat_title else ""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Принять",
-                             callback_data=f"mktok:{chat_id}:{good_id}"),
+                             callback_data=market.decision_callback_data(True, chat_id, good_id)),
         InlineKeyboardButton(text="🚫 Отклонить",
-                             callback_data=f"mktno:{chat_id}:{good_id}"),
+                             callback_data=market.decision_callback_data(False, chat_id, good_id)),
     ]])
     try:
         await bot.send_message(
@@ -21420,7 +21600,7 @@ async def _market_notify_request(
 
 async def _market_apply_decision(chat_id: int, good_id: int, approve: bool,
                                  admin_id: int) -> Optional[dict]:
-    """Общее решение по заявке для команды и для кнопки. None — заявки уже нет.
+    """Решение по заявке из инлайн-кнопки. None — заявки уже нет.
 
     Объявление о решении уходит в ИСХОДНЫЙ чат: продавец и покупатели живут
     там, а не в чате уведомлений.
@@ -21843,6 +22023,7 @@ async def cmd_craft(message: Message):
         return
     await db.add_inventory_item(chat_id, user_id, recipe.result)
     await db.add_log("craft", chat_id=chat_id, actor_id=user_id, details=recipe.key)
+    await _check_collections(chat_id, user_id)
     await message.reply(
         f"🔨 Собрано: {spec.emoji} <b>{spec.name}</b>!\n"
         f"{spec.description}\n"
@@ -22275,13 +22456,12 @@ async def cmd_market_apply(message: Message):
             f"(<code>{html.escape(key)}</code>) по {price} i¢."
         )
         return
-    # Чат уведомлений не настроен — разбираем на месте, как раньше, иначе
-    # заявка просто зависла бы и о ней никто не узнал.
+    # Чат уведомлений не настроен: текстовых команд решения больше нет,
+    # поэтому заявка ждёт в разделе «Подтверждения» админ-панели.
     await message.answer(
         f"📝 Заявка №{good_id} от {who}: продавать «{html.escape(name)}» "
         f"(<code>{html.escape(key)}</code>) по {price} i¢.\n"
-        f"Администрация: <code>рынок принять {good_id}</code> или "
-        f"<code>рынок отклонить {good_id}</code>."
+        "Ждёт решения администрации в панели."
     )
 
 
@@ -22423,31 +22603,8 @@ async def cmd_market_requests(message: Message):
             f"№{good['id']} — {who}: «{html.escape(good['name'])}» "
             f"(<code>{html.escape(good['item_key'])}</code>) по {good['price']} i¢"
         )
-    lines.append("\n<code>рынок принять {номер}</code> · <code>рынок отклонить {номер}</code>")
+    lines.append("\nРешите заявку кнопками под её карточкой или в разделе «Подтверждения» панели.")
     await message.answer("\n".join(lines))
-
-
-@router.message(
-    F.chat.type.in_({"group", "supergroup"}),
-    F.text.func(lambda t: bool(t) and bool(MARKET_DECIDE_RE.match(t.strip()))),
-)
-async def cmd_market_decide(message: Message):
-    if not has_level(message.from_user.id, required_level("market_manage")):
-        if get_level(message.from_user.id) > 0:
-            await message.reply(
-                f"⛔ Разбирать заявки может «{level_name(required_level('market_manage'))}» и выше."
-            )
-        return
-    m = MARKET_DECIDE_RE.match(message.text.strip())
-    approve = m.group(1).casefold() == "принять"
-    good_id = int(m.group(2))
-
-    # Та же функция, что и у кнопок в чате уведомлений: решение по заявке
-    # должно приводить к одному и тому же, откуда бы его ни приняли.
-    if await _market_apply_decision(
-        message.chat.id, good_id, approve, message.from_user.id
-    ) is None:
-        await message.reply(f"Заявки №{good_id} нет или она уже разобрана.")
 
 
 @router.message(
@@ -31187,6 +31344,137 @@ async def cmd_join_leave_toggle(message: Message):
         "join_leave_notify", chat_id=message.chat.id,
         actor_id=message.from_user.id, details=f"{what}={enable}",
     )
+
+
+# ----------------------------------------------------------------------------
+# Расшифровка медиа в служебном чате жалоб.
+#
+# Настройка намеренно привязана к самому complaint_chat_id: так она не может
+# случайно включиться в игровом чате и начать скачивать все голосовые. Модель
+# запускается в отдельном потоке (см. transcription.py), а семафор не даёт
+# нескольким тяжёлым распознаваниям одновременно съесть всю память/CPU.
+# ----------------------------------------------------------------------------
+_TRANSCRIPTION_KEY_PREFIX = "complaint_transcription:"
+_transcription_semaphore = asyncio.Semaphore(1)
+
+
+def _transcription_key(chat_id: int) -> str:
+    return f"{_TRANSCRIPTION_KEY_PREFIX}{chat_id}"
+
+
+def _is_complaint_chat(chat_id: int) -> bool:
+    """Совпадает ли чат с настроенным complaint_chat_id."""
+    configured_chat_id = settings.get("complaint_chat_id")
+    try:
+        return configured_chat_id is not None and int(configured_chat_id) == chat_id
+    except (TypeError, ValueError):
+        return False
+
+
+async def is_transcription_enabled(chat_id: int) -> bool:
+    row = await db.get_data(_transcription_key(chat_id))
+    return row is not None and row.get("data_value") == "1"
+
+
+def _transcription_media(message: Message) -> Optional[tuple[str, str]]:
+    """Возвращает file_id и безопасное расширение временного файла."""
+    if message.voice is not None:
+        return message.voice.file_id, ".ogg"
+    if message.audio is not None:
+        suffix = os.path.splitext(message.audio.file_name or "")[1].lower()
+        return message.audio.file_id, suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ".audio"
+    if message.video_note is not None:
+        return message.video_note.file_id, ".mp4"
+    if message.video is not None:
+        return message.video.file_id, ".mp4"
+    return None
+
+
+TRANSCRIPTION_TOGGLE_RE = ru_text.rx(r"^([+\-])\s*транскриб$", re.IGNORECASE)
+
+
+@router.message(
+    F.text.func(lambda t: bool(t) and bool(TRANSCRIPTION_TOGGLE_RE.match(t.strip()))),
+)
+async def cmd_transcription_toggle(message: Message):
+    min_level = required_level("transcription_toggle")
+    if not has_level(message.from_user.id, min_level):
+        await message.reply(
+            f"⛔ Включать расшифровку может «{level_name(min_level)}» и выше."
+        )
+        return
+    if not _is_complaint_chat(message.chat.id):
+        await message.reply("⚠️ Эту настройку можно менять только в чате жалоб.")
+        return
+
+    enable = TRANSCRIPTION_TOGGLE_RE.match(message.text.strip()).group(1) == "+"
+    key = _transcription_key(message.chat.id)
+    if enable:
+        await db.set_data(key, "1", updated_by=message.from_user.id)
+        await message.reply(
+            "📝 Расшифровка включена: голосовые, аудио, видео и кружки в этом чате "
+            "будут распознаваться через faster-whisper."
+        )
+    else:
+        await db.delete_data(key)
+        await message.reply("📝 Расшифровка выключена.")
+    await db.add_log(
+        "transcription_toggle", chat_id=message.chat.id,
+        actor_id=message.from_user.id, details=str(enable),
+    )
+
+
+SITE_TOGGLE_RE = ru_text.rx(r"^([+\-])\s*сайт$", re.IGNORECASE)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: bool(t) and bool(SITE_TOGGLE_RE.match(t.strip()))),
+)
+async def cmd_site_toggle(message: Message):
+    """Включает/выключает кабинет участников только для текущего чата."""
+    min_level = required_level("site_toggle")
+    if not has_level(message.from_user.id, min_level):
+        await message.reply(f"⛔ Менять доступ к сайту может «{level_name(min_level)}» и выше.")
+        return
+    enabled = SITE_TOGGLE_RE.match(message.text.strip()).group(1) == "+"
+    await site_access.set_enabled(message.chat.id, enabled, actor_id=message.from_user.id)
+    await db.add_log("site_toggle", chat_id=message.chat.id,
+                     actor_id=message.from_user.id, details="on" if enabled else "off")
+    await message.reply("🌐 Сайт включен." if enabled else "🌐 Сайт выключен.")
+
+
+@router.message(
+    F.chat.id.func(_is_complaint_chat),
+    F.voice | F.audio | F.video | F.video_note,
+)
+async def transcribe_notification_media(message: Message):
+    if not await is_transcription_enabled(message.chat.id):
+        return
+    media = _transcription_media(message)
+    if media is None:  # защита на случай расширения типов Telegram в aiogram
+        return
+    file_id, suffix = media
+    fd, path = tempfile.mkstemp(prefix="tgbot-transcription-", suffix=suffix)
+    os.close(fd)
+    try:
+        async with _transcription_semaphore:
+            await bot.download(file_id, destination=path)
+            result = await asyncio.to_thread(transcription.transcribe_file, path)
+        if not result.text:
+            await message.reply("📝 В записи не удалось распознать речь.")
+            return
+        language = f" <i>({html.escape(result.language)})</i>" if result.language else ""
+        text = f"📝 <b>Расшифровка</b>{language}\n\n{html.escape(result.text)}"
+        await message.reply(clip_html_message(text))
+    except Exception:
+        logger.exception("Не удалось расшифровать медиа в complaint_chat_id")
+        await message.reply("⚠️ Не удалось расшифровать запись. Попробуйте ещё раз позже.")
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 @router.message(
@@ -41109,6 +41397,7 @@ async def _run_bot():
         black_market.SIGNAL_STALE_DESCRIPTION,
     )
     await db.ensure_earning_activity_table()  # бонус / подработка / шапка
+    await db.ensure_earning_history_table()   # личная история начислений
     await db.ensure_businesses_table()        # бизнесы: пассивный доход
     await db.ensure_pets_table()              # личные питомцы
     await db.ensure_voodoo_table()            # именные сувениры-куклы

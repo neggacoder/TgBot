@@ -23,6 +23,7 @@ from pydantic import BaseModel
 import chats
 import db
 import farm_actions
+import market
 import market_actions
 
 from . import auth, permissions
@@ -101,20 +102,29 @@ async def _объявить_покупку(chat_id: int, user_id: int,
 
 async def _объявить_заявку(chat_id: int, user_id: int,
                            итог: market_actions.MarketResult) -> None:
-    """Заявка админам. Не ушла — не беда: она уже записана и видна по команде
-    «рынок заявки», а человеку мы про это скажем."""
+    """Заявка админам с теми же кнопками, что и у заявки из чата."""
     gate = await chats.gate_chat_id()
     if gate is None:
         return
     кто = await _имя(chat_id, user_id)
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Принять",
+            callback_data=market.decision_callback_data(True, chat_id, итог.good_id),
+        ),
+        InlineKeyboardButton(
+            text="🚫 Отклонить",
+            callback_data=market.decision_callback_data(False, chat_id, итог.good_id),
+        ),
+    ]])
     try:
         await get_bot().send_message(gate, (
             f"📝 <b>Заявка на рынок</b> <i>(из кабинета)</i>\n\n"
             f"👤 {кто}\n"
             f"🧺 {html.escape(итог.name)} (<code>{html.escape(итог.key)}</code>)\n"
-            f"№{итог.good_id}\n\n"
-            f"Разобрать: <code>рынок принять {итог.good_id}</code> · "
-            f"<code>рынок отклонить {итог.good_id}</code>"))
+            f"№{итог.good_id}"), reply_markup=keyboard)
     except Exception as exc:
         logger.warning("Рынок: заявка админам не ушла: %s", exc)
 

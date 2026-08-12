@@ -140,6 +140,24 @@ def test_учёт_суток_не_затирается_обычной_отмет
     assert "last_day = IF(VALUES(last_day) IS NULL, last_day, VALUES(last_day))" in отправлено["q"]
 
 
+def test_начисление_пишется_в_личную_историю(monkeypatch):
+    запросы = []
+
+    async def execute(query, params=()):
+        запросы.append((" ".join(query.split()), params))
+
+    monkeypatch.setattr(db_module, "_execute", execute)
+    now = datetime(2026, 8, 13, 10, 30)
+    asyncio.run(db_module.touch_earning_activity(
+        CHAT_ID, USER_ID, "fishing", now, earned=250,
+    ))
+
+    history = next((q for q, _ in запросы if "INSERT INTO earning_history" in q), "")
+    assert history
+    assert any(params[-2:] == (250, now) for query, params in запросы
+               if "INSERT INTO earning_history" in query)
+
+
 @pytest.fixture
 def лимит(monkeypatch):
     def настроить(предел, сделано):

@@ -45,6 +45,15 @@ DESC_MAX = 200
 BUY_MAX_QTY = 100              # потолок на одну команду, как SHOP_BUY_MAX_QTY
 
 
+def decision_callback_data(approve: bool, chat_id: int, good_id: int) -> str:
+    """Короткий callback для решения заявки рынка.
+
+    Его строят и бот, и кабинет участника: заявка может быть подана из
+    любого из этих мест, но обработчик кнопки в боте один.
+    """
+    return f"{'mktok' if approve else 'mktno'}:{chat_id}:{good_id}"
+
+
 @dataclass(frozen=True)
 class Settings:
     mode: str = DEFAULT_MODE

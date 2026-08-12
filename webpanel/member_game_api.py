@@ -17,6 +17,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import chats
+import casino_actions
+import collection_actions
 import db
 import game_actions
 
@@ -62,6 +64,26 @@ async def _announce(chat_id: int, result: game_actions.ActionResult) -> None:
             await get_bot().send_message(chat_id, item.text)
         except Exception as exc:
             logger.warning("Кабинет: объявление в чат %s не ушло: %s: %s",
+                           chat_id, type(exc).__name__, exc)
+
+
+async def _check_collections(chat_id: int, user_id: int) -> None:
+    """Питомец, купленный в кабинете, тоже может завершить «Зоопарк»."""
+    try:
+        awards = await collection_actions.check_collections(
+            chat_id, user_id, today=await casino_actions.local_today())
+    except Exception as exc:
+        logger.warning("Кабинет: не проверились коллекции: %s: %s",
+                       type(exc).__name__, exc)
+        return
+    for collection in awards:
+        try:
+            await get_bot().send_message(
+                chat_id,
+                await collection_actions.site_announcement(chat_id, user_id, collection),
+            )
+        except Exception as exc:
+            logger.warning("Кабинет: объявление о коллекции в чат %s не ушло: %s: %s",
                            chat_id, type(exc).__name__, exc)
 
 
@@ -231,5 +253,7 @@ async def api_member_pet_action(
     # отправки ловит _announce, но порядок держит запись даже без ловушки.
     await db.add_log("member_game", chat_id=chat_id,
                      actor_id=user.tg_user_id, details=f"pets/{action}")
+    if action == "buy" and result.ok:
+        await _check_collections(chat_id, user.tg_user_id)
     await _announce(chat_id, result)
     return {"ok": result.ok, "text": result.text}

@@ -84,6 +84,13 @@ class _World:
     async def set_anketa_visibility(self, chat_id, user_id, on):
         self.карточка["anketa_visible"] = bool(on)
 
+    async def set_gender(self, chat_id, user_id, value):
+        self.карточка["gender"] = value
+
+    async def clear_gender(self, chat_id, user_id):
+        self.очищено.append("gender")
+        self.карточка.pop("gender", None)
+
     # --- титулы ---
     async def list_titles(self):
         return [dict(t) for t in self.титулы]
@@ -189,6 +196,22 @@ async def test_состояние_отдаёт_пределы(мир):
     s = await card_actions.state(ЧАТ, ЧЕЛОВЕК)
     assert s["limits"]["title"] == card_actions.TITLE_MAX
     assert set(s["limits"]) == set(card_actions.ПОЛЯ)
+
+
+@pytest.mark.parametrize("код", card_actions.GENDER_OPTIONS)
+@_sync
+async def test_пол_из_общего_списка_сохраняется(мир, код):
+    итог = await card_actions.set_gender(ЧАТ, ЧЕЛОВЕК, код)
+    assert итог.ok and мир.карточка["gender"] == код
+
+
+@_sync
+async def test_пол_снимается_пустым_выбором_и_чужой_код_не_проходит(мир):
+    await card_actions.set_gender(ЧАТ, ЧЕЛОВЕК, "ж")
+    снят = await card_actions.set_gender(ЧАТ, ЧЕЛОВЕК, "")
+    неверный = await card_actions.set_gender(ЧАТ, ЧЕЛОВЕК, "неизвестно")
+    assert снят.ok and снят.cleared and "gender" in мир.очищено
+    assert not неверный.ok
 
 
 def test_пределы_общие_с_ботом():

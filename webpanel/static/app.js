@@ -5,6 +5,13 @@
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+// На /member/... в DOM нет админки, а на /admin/... — кабинета участника.
+// Общий скрипт обслуживает обе облегчённые оболочки, поэтому статичные
+// слушатели вешаем только если их элемент действительно отдан сервером.
+function on(sel, event, handler) {
+  const element = $(sel);
+  if (element) element.addEventListener(event, handler);
+}
 
 let me = null;      // {username, role}
 let chats = [];     // кэш списка чатов
@@ -280,10 +287,31 @@ function toggleTheme() {
   applyTheme(next);
 }
 
-// Текущий экран живёт в URL, поэтому перезагрузка и история браузера
-// возвращают человека туда же. panel различает одинаковые имена вкладок
-// админки и кабинета участника (например, stock).
+// Маршруты — настоящие адреса, а не состояние, спрятанное в ?panel=&tab=.
+// Сервер отдаёт одну оболочку для /member/... и /admin/..., а клиент лениво
+// рисует нужный экран. Так прямой ссылкой можно поделиться, F5 не сбрасывает
+// человека на главную, и после повторного входа остаётся именно тот раздел,
+// на котором протухла сессия.
+const MEMBER_TAB_TO_ROUTE = {
+  prof: "profile", tops: "tops", caps: "capabilities", suggest: "suggestions",
+  rel: "relationships", family: "family", clans: "clans", farm: "farm",
+  casino: "casino", biz: "businesses", fish: "fishing", work: "work",
+  pets: "pets", shop: "shop", stock: "stock", bank: "bank",
+};
+const MEMBER_ROUTE_TO_TAB = Object.fromEntries(
+  Object.entries(MEMBER_TAB_TO_ROUTE).map(([tab, route]) => [route, tab])
+);
+
 function navFromUrl() {
+  const parts = location.pathname.split("/").filter(Boolean);
+  if (parts[0] === "member") {
+    return { panel: "member", tab: MEMBER_ROUTE_TO_TAB[parts[1]] || null };
+  }
+  if (parts[0] === "admin") {
+    return { panel: "admin", tab: parts[1] || null };
+  }
+  // Старые ссылки с query-параметрами не ломаем: при первом переходе они
+  // автоматически станут каноническим адресом.
   const params = new URLSearchParams(location.search);
   return { panel: params.get("panel"), tab: params.get("tab") };
 }
@@ -291,9 +319,19 @@ function navFromUrl() {
 function writeNavUrl(panel, tab, push = true) {
   const url = new URL(location.href);
   url.searchParams.delete("token");
-  url.searchParams.set("panel", panel);
-  url.searchParams.set("tab", tab);
+  url.searchParams.delete("panel");
+  url.searchParams.delete("tab");
+  const route = panel === "member" ? MEMBER_TAB_TO_ROUTE[tab] : tab;
+  url.pathname = `/${panel}/${route || (panel === "member" ? "profile" : "send")}`;
   history[push ? "pushState" : "replaceState"]({ panel, tab }, "", url);
+}
+
+function postLoginUrl() {
+  const nav = navFromUrl();
+  if (nav.panel === "member" || nav.panel === "admin") {
+    return `${location.pathname}${location.search}${location.hash}`;
+  }
+  return "/";
 }
 
 // Тему ставим до первой отрисовки — иначе панель мигнёт чужим цветом.
@@ -305,7 +343,14 @@ async function boot() {
   const state = await api("/api/me");
   if (state.authenticated) {
     me = state;
-    if (me.role === "member") showMember(); else showApp();
+    const nav = navFromUrl();
+    // Сам URL выбирает оболочку. Роль ограничивает данные и действия через
+    // API, но не имеет права молча превратить /member/profile в /admin/send:
+    // иначе прямые ссылки и возврат после входа теряют весь смысл.
+    if (nav.panel === "member") showMember();
+    else if (nav.panel === "admin") showApp();
+    else if (me.role === "member") location.replace("/member/profile");
+    else showApp();
     return;
   }
   const setupToken = new URLSearchParams(location.search).get("token");
@@ -322,7 +367,7 @@ async function boot() {
   $("#auth").classList.remove("hidden");
 }
 
-$("#auth-form").addEventListener("submit", async (e) => {
+on("#auth-form", "submit", async (e) => {
   e.preventDefault();
   const username = $("#auth-user").value.trim();
   const password = $("#auth-pass").value;
@@ -334,28 +379,28 @@ $("#auth-form").addEventListener("submit", async (e) => {
     } else {
       await api("/api/login", { method: "POST", body: { username, password } });
     }
-    location.href = "/";
+    location.assign(postLoginUrl());
   } catch (err) {
     say("#auth-msg", err.message, "err");
   }
 });
 
-$("#logout").addEventListener("click", async () => {
+on("#logout", "click", async () => {
   await api("/api/logout", { method: "POST" });
   location.href = "/";
 });
 
-$("#theme-toggle").addEventListener("click", toggleTheme);
+on("#theme-toggle", "click", toggleTheme);
 
 // --- экран участника ------------------------------------------------------
 // Вход у участников и персонала общий — /api/login по логину и паролю.
 // После проверки роли boot() открывает отдельный интерфейс участника.
-$("#member-logout").addEventListener("click", async () => {
+on("#member-logout", "click", async () => {
   await api("/api/logout", { method: "POST" });
   location.href = "/";
 });
 
-$("#member-theme").addEventListener("click", toggleTheme);
+on("#member-theme", "click", toggleTheme);
 
 // Какие вкладки участника уже загружены (ленивая загрузка при первом открытии).
 // Рабочий чат для старых вкладок (отношения, семья, кланы). Раньше он
@@ -366,8 +411,12 @@ const _членство = { rel: null, family: null, clans: null };
 const _memberLoaded = { prof: false, tops: false, shop: false, pets: false, rel: false, family: false, clans: false, caps: false, suggest: false, farm: false, casino: false, biz: false, fish: false, work: false, stock: false, bank: false };
 
 function showMember() {
+  if (!$("#member")) {
+    location.replace("/member/profile");
+    return;
+  }
   $("#auth").classList.add("hidden");
-  $("#app").classList.add("hidden");
+  $("#app")?.classList.add("hidden");
   $("#member").classList.remove("hidden");
   // Кнопка возврата — только у персонала (admin/owner), заглянувшего сюда из
   // своей панели. Обычный участник (role === "member") сюда попадает
@@ -384,23 +433,25 @@ function showMember() {
   switchMemberTab(exists ? requested : "prof", false);
 }
 
-$("#member-back-to-panel").addEventListener("click", () => {
+on("#member-back-to-panel", "click", () => {
   $("#member").classList.add("hidden");
   writeNavUrl("admin", "send");
-  showApp();
+  if ($("#app")) showApp(); else location.assign("/admin/send");
 });
 
-// Бургер: на телефоне ряд вкладок свёрнут в одну кнопку. Открывается по
-// нажатию, закрывается выбором раздела, повторным нажатием, Escape и кликом
-// мимо — все четыре пути обязательны: любой пропущенный оставляет человека с
-// открытым списком, который он не знает, как убрать.
+// На телефоне навигация — выезжающий слева сайдбар. Открывается одной кнопкой,
+// а группы внутри него сразу развёрнуты: второго «бургера в бургере» нет.
 const _burger = $("#member-burger");
 
 function setBurger(open) {
   const tabs = $("#member-tabs");
   if (!tabs || !_burger) return;
   tabs.classList.toggle("open", open);
+  $("#member")?.classList.toggle("member-nav-open", open);
   _burger.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open && !_memberNavDesktop.matches) {
+    _memberNavGroups.forEach((group) => { group.open = true; });
+  }
 }
 
 if (_burger) {
@@ -418,15 +469,66 @@ if (_burger) {
   });
 }
 
+// На компьютере это hover-витрина: кнопки появляются, только пока курсор над
+// карточкой. Клик по заголовку там не нужен и не должен оставлять её открытой.
+// На телефоне hover отсутствует, поэтому остаётся обычный details по нажатию.
+const _memberNavDesktop = window.matchMedia('(min-width: 761px)');
+const _memberNavGroups = $$('details.member-nav-group');
+
+_memberNavGroups.forEach((group) => {
+  const summary = group.querySelector('summary');
+  let closeTimer = null;
+  const openOnDesktop = () => {
+    if (!_memberNavDesktop.matches) return;
+    if (closeTimer) clearTimeout(closeTimer);
+    group.open = true;
+  };
+  const closeOnDesktop = () => {
+    if (!_memberNavDesktop.matches) return;
+    closeTimer = setTimeout(() => { group.open = false; }, 90);
+  };
+
+  group.addEventListener('pointerenter', openOnDesktop);
+  group.addEventListener('pointerleave', closeOnDesktop);
+  group.addEventListener('focusin', openOnDesktop);
+  group.addEventListener('focusout', () => {
+    setTimeout(() => {
+      if (!group.contains(document.activeElement)) closeOnDesktop();
+    }, 0);
+  });
+  summary.addEventListener('click', (event) => {
+    if (!_memberNavDesktop.matches) {
+      event.preventDefault();
+      return;
+    }
+    if (_memberNavDesktop.matches && event.detail !== 0) event.preventDefault();
+  });
+
+  // На большом экране две открытые витрины перекрывали бы друг друга. В
+  // мобильном сайдбаре, наоборот, все группы видны сразу.
+  group.addEventListener('toggle', () => {
+    if (!_memberNavDesktop.matches) return;
+    if (!group.open) return;
+    _memberNavGroups.forEach((other) => {
+      if (other !== group) other.open = false;
+    });
+  });
+});
+
+_memberNavDesktop.addEventListener('change', (event) => {
+  if (event.matches) _memberNavGroups.forEach((group) => { group.open = false; });
+});
+
 function switchMemberTab(name, push = true) {
   const выбранная = $$(".member-tab").find((b) => b.dataset.mtab === name);
   if (!выбранная) return;
   writeNavUrl("member", name, push);
   $$(".member-tab").forEach((b) => b.classList.toggle("active", b.dataset.mtab === name));
   // Вложенные группы держат меню коротким. При переходе по URL или ссылке
-  // раскрываем группу активного раздела, чтобы он не оказался спрятан.
+  // раскрываем группу активного раздела только на телефоне: на десктопе
+  // кнопки намеренно появляются лишь при наведении.
   const группа = выбранная.closest("details.member-nav-group");
-  if (группа) группа.open = true;
+  if (группа && !_memberNavDesktop.matches) группа.open = true;
   // Название текущего раздела на кнопке: свёрнутый список иначе не говорит,
   // где ты находишься.
   const подпись = $("#member-burger-label");
@@ -1210,11 +1312,14 @@ function toggleKeysHelp(force) {
   document.body.appendChild(overlay);
 }
 
-$("#keys-help").addEventListener("click", () => toggleKeysHelp());
+on("#keys-help", "click", () => toggleKeysHelp());
 
 document.addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  if ($("#app").classList.contains("hidden")) return;  // на экране входа не мешаем
+  // На страницах кабинета админская оболочка вообще не отдана сервером.
+  // Горячие клавиши тогда не нужны, но отсутствие #app не должно ронять JS.
+  const adminShell = $("#app");
+  if (!adminShell || adminShell.classList.contains("hidden")) return;
 
   if (e.key === "Escape") {
     const overlay = $(".keys-overlay");
@@ -1248,8 +1353,12 @@ document.addEventListener("keydown", (e) => {
 // --- каркас ---------------------------------------------------------------
 
 function showApp() {
+  if (!$("#app")) {
+    location.replace("/admin/send");
+    return;
+  }
   $("#auth").classList.add("hidden");
-  $("#member").classList.add("hidden");
+  $("#member")?.classList.add("hidden");
   $("#app").classList.remove("hidden");
   $("#who").textContent = `${me.username} · ${me.role === "owner" ? "владелец" : "администратор"}`;
   if (me.role === "owner") $$(".owner-only").forEach((el) => el.classList.remove("hidden"));
@@ -1291,9 +1400,9 @@ async function refreshMe() {
 // Слушатель вешаем один раз при загрузке страницы, как у соседних кнопок
 // этого экрана: настройки перерисовывают только свой список, а карточка
 // рубильника живёт в разметке и никуда не девается.
-$("#infinite-toggle").addEventListener("change", saveInfiniteMoney);
+on("#infinite-toggle", "change", saveInfiniteMoney);
 
-$("#tg-link-save").addEventListener("click", async () => {
+on("#tg-link-save", "click", async () => {
   const code = $("#tg-link-code").value.trim();
   if (!code) return;
   try {
@@ -1307,7 +1416,7 @@ $("#tg-link-save").addEventListener("click", async () => {
   }
 });
 
-$("#tg-link-open-member").addEventListener("click", () => {
+on("#tg-link-open-member", "click", () => {
   writeNavUrl("member", "prof");
   showMember();
 });
@@ -1375,6 +1484,7 @@ function switchAdminView(view, push = true) {
     if (view === "tgadmins") loadTgAdmins();
     if (view === "chatroles") loadChatRoles();
     if (view === "moderation") { loadRestRequests(); loadWordFilter(); }
+    if (view === "confirmations") loadMarketRequests();
     if (view === "complaints") loadComplaintTargets();
     if (view === "actions") { loadActions(); loadGestures(); loadProposeActions(); }
     if (view === "cmdtree") { loadCommandTree(); loadRewardLevels(); }
@@ -1634,6 +1744,9 @@ async function loadChats() {
     if (chats.length) {
       loadMembers();
       loadFeed();
+      // При прямом входе на /admin/confirmations вкладка открывается раньше,
+      // чем доезжает рабочий чат. Повторяем загрузку, когда chat_id уже есть.
+      if (!$("#view-confirmations").classList.contains("hidden")) loadMarketRequests();
     }
   } catch (err) {
     say("#global-msg", err.message, "err");
@@ -1688,12 +1801,12 @@ async function loadMembers() {
   }
 }
 
-$("#members-role").addEventListener("change", loadMembers);
-$("#members-q").addEventListener("input", () => {
+on("#members-role", "change", loadMembers);
+on("#members-q", "input", () => {
   clearTimeout(window._memberSearch);
   window._memberSearch = setTimeout(loadMembers, 300);
 });
-$("#members-sort").addEventListener("change", loadMembers);
+on("#members-sort", "change", loadMembers);
 
 // Карточка инфо о пользователе — общий рендер для админской модалки и экрана
 // участника (своя инфа).
@@ -1922,7 +2035,7 @@ $$("#actions-kind .chip").forEach((chip) => {
   chip.addEventListener("click", () => { actionKind = chip.dataset.kind; loadActions(); });
 });
 
-$("#action-add").addEventListener("submit", async (e) => {
+on("#action-add", "submit", async (e) => {
   e.preventDefault();
   const key = $("#action-key").value.trim();
   const phrase = $("#action-phrase").value.trim();
@@ -1936,7 +2049,7 @@ $("#action-add").addEventListener("submit", async (e) => {
   } catch (err) { say("#global-msg", err.message, "err"); }
 });
 
-$("#synonym-add").addEventListener("submit", async (e) => {
+on("#synonym-add", "submit", async (e) => {
   e.preventDefault();
   const synonym = $("#synonym-word").value.trim();
   const key = $("#synonym-key").value.trim();
@@ -2129,7 +2242,7 @@ function bindProposeActionControls(canEdit) {
   });
 }
 
-$("#propose-action-add").addEventListener("submit", async (e) => {
+on("#propose-action-add", "submit", async (e) => {
   e.preventDefault();
   const action_key = $("#propose-action-key").value.trim();
   const phrase = $("#propose-action-phrase").value.trim();
@@ -2143,7 +2256,7 @@ $("#propose-action-add").addEventListener("submit", async (e) => {
   } catch (err) { say("#global-msg", err.message, "err"); }
 });
 
-$("#propose-synonym-add").addEventListener("submit", async (e) => {
+on("#propose-synonym-add", "submit", async (e) => {
   e.preventDefault();
   const synonym = $("#propose-synonym-word").value.trim().toLowerCase();
   const action_key = $("#propose-synonym-key").value.trim();
@@ -2161,7 +2274,7 @@ $("#propose-synonym-add").addEventListener("submit", async (e) => {
 
 const GESTURE_PAIR_LABELS = { mf: "М + Ж", mm: "М + М", ff: "Ж + Ж", all: "Общие (любая пара)" };
 
-$("#gesture-add").addEventListener("submit", async (e) => {
+on("#gesture-add", "submit", async (e) => {
   e.preventDefault();
   const key = $("#gesture-key").value.trim();
   const name = $("#gesture-name").value.trim();
@@ -2412,7 +2525,7 @@ async function loadWordFilter() {
   }
 }
 
-$("#word-filter-add").addEventListener("submit", async (e) => {
+on("#word-filter-add", "submit", async (e) => {
   e.preventDefault();
   const word = $("#word-filter-input").value.trim();
   if (!word) return;
@@ -2483,6 +2596,59 @@ async function loadRestRequests() {
       b.addEventListener("click", () => decide(b.dataset.restNo, false, b.closest("[data-rest]"))));
   } catch (err) {
     $("#rest-requests-card").classList.add("hidden");
+  }
+}
+
+// --- подтверждения рынка ---------------------------------------------------
+
+async function loadMarketRequests() {
+  const chatId = чат();
+  const listNode = $("#market-requests-list");
+  if (!chatId || !listNode) return;
+  try {
+    const data = await api(`/api/market-requests?chat_id=${chatId}`);
+    const list = data.requests || [];
+    $("#market-requests-count").textContent = list.length;
+    listNode.innerHTML = list.length ? list.map((r) => `
+      <div class="role-row" data-market-request="${r.id}">
+        <div class="person">
+          ${avatar(r.full_name, r.seller_id)}
+          <span class="picker-name">
+            <b>${escapeHtml(r.full_name || `ID ${r.seller_id}`)}</b>
+            ${r.username ? `<span class="muted">@${escapeHtml(r.username)}</span>` : ""}
+          </span>
+        </div>
+        <div class="role-info">
+          <span><b>${escapeHtml(r.name)}</b> <code>${escapeHtml(r.key)}</code> · ${Number(r.price).toLocaleString("ru")} i¢</span>
+          <span class="role-actions">
+            <button class="ghost small ok" data-market-request-yes="${r.id}">${icon("check")}Принять</button>
+            <button class="ghost small danger" data-market-request-no="${r.id}">${icon("ban")}Отклонить</button>
+          </span>
+        </div>
+      </div>`).join("") : `<p class="muted">Заявок на рынок нет.</p>`;
+
+    const decide = async (id, approve, row) => {
+      row.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+      try {
+        await api(`/api/market-requests/${id}/decision`, {
+          method: "POST", body: { chat_id: chatId, approve },
+        });
+        say("#global-msg", approve ? "Заявка рынка принята" : "Заявка рынка отклонена");
+        loadMarketRequests();
+      } catch (err) {
+        say("#global-msg", err.message, "err");
+        row.querySelectorAll("button").forEach((b) => { b.disabled = false; });
+      }
+    };
+    $$('[data-market-request-yes]').forEach((b) =>
+      b.addEventListener("click", () => decide(b.dataset.marketRequestYes, true,
+        b.closest("[data-market-request]"))));
+    $$('[data-market-request-no]').forEach((b) =>
+      b.addEventListener("click", () => decide(b.dataset.marketRequestNo, false,
+        b.closest("[data-market-request]"))));
+  } catch (err) {
+    $("#market-requests-count").textContent = "0";
+    listNode.innerHTML = `<p class="muted">Не удалось загрузить заявки: ${escapeHtml(err.message)}</p>`;
   }
 }
 
@@ -2755,7 +2921,7 @@ async function loadChatRoles() {
   }
 }
 
-$("#chatrole-add").addEventListener("submit", async (e) => {
+on("#chatrole-add", "submit", async (e) => {
   e.preventDefault();
   const name = $("#chatrole-name").value.trim();
   if (!name) return;
@@ -2783,8 +2949,8 @@ $("#chatrole-add").addEventListener("submit", async (e) => {
   }
 });
 
-$("#chatroles-category").addEventListener("change", loadChatRoles);
-$("#chatroles-q").addEventListener("input", () => {
+on("#chatroles-category", "change", loadChatRoles);
+on("#chatroles-q", "input", () => {
   clearTimeout(window._chatRoleSearch);
   window._chatRoleSearch = setTimeout(loadChatRoles, 300);
 });
@@ -2944,7 +3110,7 @@ document.addEventListener("visibilitychange", () => {
 
 // Счётчик длины: лимит Telegram — 4096 символов, и упереться в него легко,
 // когда текст пишут прямо в панели.
-$("#send-text").addEventListener("input", () => {
+on("#send-text", "input", () => {
   const len = $("#send-text").value.length;
   const counter = $("#send-counter");
   counter.textContent = `${len} / 4096`;
@@ -2954,14 +3120,14 @@ $("#send-text").addEventListener("input", () => {
 // Ctrl+Enter (на маке — ⌘+Enter) отправляет. Жмём саму кнопку, а не дублируем
 // отправку: иначе горячая клавиша прошла бы мимо блокировки кнопки и с зажатым
 // Ctrl+Enter можно было бы наплодить дублей.
-$("#send-text").addEventListener("keydown", (e) => {
+on("#send-text", "keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     if (!$("#send-btn").disabled) $("#send-btn").click();
   }
 });
 
-$("#send-btn").addEventListener("click", async () => {
+on("#send-btn", "click", async () => {
   const text = $("#send-text").value.trim();
   if (!text) return say("#global-msg", "Сначала напишите текст", "err");
   const btn = $("#send-btn");
@@ -2990,7 +3156,7 @@ $("#send-btn").addEventListener("click", async () => {
   }
 });
 
-$("#send-photo-btn").addEventListener("click", async () => {
+on("#send-photo-btn", "click", async () => {
   const file = $("#send-photo").files[0];
   if (!file) return say("#global-msg", "Выберите файл", "err");
   const form = new FormData();
@@ -3045,7 +3211,7 @@ async function loadWarns() {
   }
 }
 
-$("#mod-warn").addEventListener("click", async () => {
+on("#mod-warn", "click", async () => {
   if (!modPicked) { say("#global-msg", "Сначала выберите участника", "err"); return; }
   const days = Number($("#mod-warn-days").value) || null;
   try {
@@ -3073,7 +3239,7 @@ $("#mod-warn").addEventListener("click", async () => {
   }
 });
 
-$("#mod-unwarn").addEventListener("click", async () => {
+on("#mod-unwarn", "click", async () => {
   if (!modPicked) return;
   try {
     const res = await api("/api/warns/remove", {
@@ -3168,12 +3334,12 @@ async function suggestMembers() {
   }
 }
 
-$("#mod-search").addEventListener("input", () => {
+on("#mod-search", "input", () => {
   clearTimeout(window._modSearch);
   window._modSearch = setTimeout(suggestMembers, 250);
 });
-$("#mod-search").addEventListener("focus", suggestMembers);
-$("#mod-role").addEventListener("change", suggestMembers);
+on("#mod-search", "focus", suggestMembers);
+on("#mod-role", "change", suggestMembers);
 // клик мимо подсказок — закрыть их
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#mod-suggest") && e.target !== $("#mod-search") && e.target !== $("#mod-role")) {
@@ -3477,12 +3643,12 @@ function renderTgPicked() {
   $("#tga-clear").addEventListener("click", () => { tgPicked = null; renderTgPicked(); });
 }
 
-$("#tga-search").addEventListener("input", () => {
+on("#tga-search", "input", () => {
   clearTimeout(window._tgSearch);
   window._tgSearch = setTimeout(suggestTgCandidates, 250);
 });
 
-$("#tga-promote").addEventListener("click", async () => {
+on("#tga-promote", "click", async () => {
   if (!tgPicked) return say("#global-msg", "Сначала выберите, кого назначаем", "err");
   const rights = readRights("#tga-rights", "newright");
   try {
@@ -3670,11 +3836,11 @@ async function saveStockSettings() {
 $$("#stock-presets .preset").forEach((btn) => {
   btn.addEventListener("click", () => applyStockPreset(btn.dataset.preset));
 });
-$("#stock-load").addEventListener("click", loadStockData);
-$("#stock-period").addEventListener("change", loadStockData);
-$("#stock-save").addEventListener("click", saveStockSettings);
+on("#stock-load", "click", loadStockData);
+on("#stock-period", "change", loadStockData);
+on("#stock-save", "click", saveStockSettings);
 ["#stock-min", "#stock-max", "#stock-div"].forEach((sel) => {
-  $(sel).addEventListener("input", refreshStockForecast);
+  on(sel, "input", refreshStockForecast);
 });
 
 // --- случайные события чата -----------------------------------------------
@@ -3825,7 +3991,7 @@ async function loadStatsData() {
   }
 }
 
-$("#stats-load").addEventListener("click", loadStatsData);
+on("#stats-load", "click", loadStatsData);
 
 // Журнал: поиск + фильтры + постраничная выдача.
 const LOGS_PAGE = 50;
@@ -4137,7 +4303,7 @@ async function loadUsers() {
   }
 }
 
-$("#nu-create").addEventListener("click", async () => {
+on("#nu-create", "click", async () => {
   try {
     await api("/api/users", {
       method: "POST",
@@ -4155,7 +4321,7 @@ $("#nu-create").addEventListener("click", async () => {
   }
 });
 
-$("#pw-save").addEventListener("click", async () => {
+on("#pw-save", "click", async () => {
   try {
     await api("/api/password", { method: "POST", body: { password: $("#pw-new").value } });
     $("#pw-new").value = "";
@@ -4187,8 +4353,6 @@ document.addEventListener("keydown", (e) => {
   logo.classList.add("tumble");
   say("#global-msg", "Бот сделал сальто. Больше он ничего не умеет.");
 });
-
-boot();
 
 // ===== Настройки чата ======================================================
 // Форма собирается из ответа API: панель не знает ни про банк, ни про рынок.
@@ -5727,6 +5891,7 @@ async function loadProfScreen(вид, заголовок) {
       экран.addEventListener("click", onCardClick);
       экран.addEventListener("click", onGalleryClick);
       экран.addEventListener("change", onCardChange);
+      экран.addEventListener("input", onCardInput);
       // focusout, а не blur: blur не всплывает, и на самом экране его не
       // поймать — правка молча терялась бы.
       экран.addEventListener("focusout", onCardBlur);
@@ -5797,6 +5962,13 @@ function renderProfile() {
       </div>
     </div>
     <div class="tiles">${плитки}</div>
+    <h3 class="block-head">Быстрый доступ</h3>
+    <div class="profile-shortcuts">
+      <button type="button" class="btn ghost" data-member-open="farm">${icon("sprout")}Ферма</button>
+      <button type="button" class="btn ghost" data-member-open="work">${icon("work")}Работа</button>
+      <button type="button" class="btn ghost" data-member-open="fish">${icon("fish")}Рыбалка</button>
+      <button type="button" class="btn ghost" data-member-open="shop">${icon("cart")}Магазин</button>
+    </div>
     ${занятия.length ? `<h3 class="block-head">Занятия</h3>
       <div class="tiles">${занятия.join("")}</div>` : ""}
     <h3 class="block-head">Активность</h3>
@@ -5856,7 +6028,7 @@ function renderGallery() {
     <div class="coll-list">${(d.collections?.items || []).map((c) => {
       const доля = c.total ? Math.round(c.done * 100 / c.total) : 0;
       return `<div class="coll-row ${c.rewarded ? "done" : ""}">
-        <div class="coll-head">${gicon("coll", c.key, "lg")} <b>${escapeHtml(c.name)}</b>
+        <div class="coll-head"><span class="coll-emoji" aria-hidden="true">${escapeHtml(c.emoji)}</span> <b>${escapeHtml(c.name)}</b>
           ${c.rewarded ? `<span class="coll-mark">${icon("check")}титул получен</span>` : ""}
           <span class="push">${c.done}/${c.total}</span></div>
         <div class="coll-bar"><i style="width:${доля}%"></i></div>
@@ -5896,6 +6068,7 @@ async function loadCardBlock() {
     const d = await api(`/api/member/game/card`);
     _card.state = d.card;
     _card.titles = d.titles;
+    _card.pins = d.pins;
   } catch (err) {
     блок.innerHTML = "";
     return;
@@ -5906,7 +6079,7 @@ async function loadCardBlock() {
 function cardField(поле, подпись, значение, предел, многострочно) {
   const общее = `id="card-${поле}" data-card-field="${поле}" maxlength="${предел}"`;
   return `<label class="bet-field card-field">
-    <span>${escapeHtml(подпись)} <em class="tip">до ${предел} симв. · пусто — убрать</em></span>
+    <span>${escapeHtml(подпись)} <em class="tip"><b data-card-count="${поле}">${String(значение || "").length}</b>/${предел} · пусто — убрать</em></span>
     ${многострочно
       ? `<textarea ${общее} rows="3" autocomplete="off">${escapeHtml(значение)}</textarea>`
       : `<input type="text" ${общее} value="${escapeHtml(значение)}" autocomplete="off">`}
@@ -5914,19 +6087,44 @@ function cardField(поле, подпись, значение, предел, м�
 }
 
 function renderCardBlock() {
-  const c = _card.state, t = _card.titles, блок = $("#member-card-block");
-  if (!c || !t || !блок) return;
+  const c = _card.state, t = _card.titles, pins = _card.pins, блок = $("#member-card-block");
+  if (!c || !t || !pins || !блок) return;
 
   // Списки берём с запасом: половина ответа роняла бы весь «Профиль», а он
   // тут главный — анкета внизу и приложена к нему.
   const все = (t.for_sale || []).concat(t.earned_only || []);
   const надет = все.find((x) => x.key === t.active);
   const свои = все.filter((x) => x.owned);
+  const заполнено = [c.title, c.motto, c.gender, c.city, c.about].filter(Boolean).length;
+  const процент = Math.round(заполнено * 100 / 5);
+  const pinNames = { item: "Предмет", achievement: "Достижение", business: "Бизнес", pet: "Питомец", fish: "Трофей", doll: "Кукла" };
+  const vitrina = Object.entries(pinNames).map(([key, name]) => {
+    const options = pins.options[key] || [];
+    const selected = pins.selected[key] == null ? "" : String(pins.selected[key]);
+    return `<label class="pin-field"><span>${name}</span><select data-profile-pin="${key}" ${options.length ? "" : "disabled"}>
+      <option value="">${options.length ? "Не показывать" : "Пока нечего выбрать"}</option>
+      ${options.map((x) => `<option value="${escapeHtml(x.value)}" ${String(x.value) === selected ? "selected" : ""}>${escapeHtml(x.label)}</option>`).join("")}
+    </select></label>`;
+  }).join("");
 
   блок.innerHTML = `
     <h3 class="block-head">${icon("id")}Анкета</h3>
+    <div class="profile-completion">
+      <div><b>Заполненность анкеты · ${заполнено} из 5</b><span>${процент}%</span></div>
+      <i><i style="width:${процент}%"></i></i>
+      <small>Заполненная анкета делает профиль в чате узнаваемее.</small>
+    </div>
     ${cardField("title", "Звание", c.title, c.limits.title, false)}
     ${cardField("motto", "Девиз", c.motto, c.limits.motto, false)}
+    <label class="bet-field card-field">
+      <span>Пол <em class="tip">необязательно · влияет на РП-превью</em></span>
+      <select id="card-gender" data-card-gender autocomplete="off">
+        <option value="" ${!c.gender ? "selected" : ""}>Не указывать</option>
+        <option value="м" ${c.gender === "м" ? "selected" : ""}>♂ Мужской</option>
+        <option value="ж" ${c.gender === "ж" ? "selected" : ""}>♀ Женский</option>
+        <option value="др" ${c.gender === "др" ? "selected" : ""}>⚧ Другой</option>
+      </select>
+    </label>
     ${cardField("city", "Город", c.city, c.limits.city, false)}
     ${cardField("about", "О себе", c.about, c.limits.about, true)}
     <label class="check">
@@ -5939,6 +6137,10 @@ function renderCardBlock() {
              ${c.visible ? "checked" : ""} autocomplete="off">
       <span>Анкету видно другим</span>
     </label>
+
+    <h3 class="block-head">${icon("pin")}Витрина профиля</h3>
+    <div class="profile-pins">${vitrina}</div>
+    <div class="hint">Выбранные вещи показываются в вашей карточке в чате. Закреп не расходует предмет и не меняет его свойства.</div>
 
     <h3 class="block-head">${icon("medal")}Титулы</h3>
     <div class="card-title-now">
@@ -5992,6 +6194,11 @@ async function saveCardFlag(поле, включено) {
 }
 
 async function onCardClick(e) {
+  const переход = e.target.closest("[data-member-open]");
+  if (переход) {
+    switchMemberTab(переход.dataset.memberOpen);
+    return;
+  }
   const el = e.target.closest("[data-title-act]");
   if (!el || el.disabled) return;
   const act = el.dataset.titleAct;
@@ -6019,8 +6226,30 @@ function onCardBlur(e) {
 }
 
 function onCardChange(e) {
+  const пол = e.target.closest("[data-card-gender]");
+  if (пол) { saveCardField("gender", пол.value); return; }
+  const витрина = e.target.closest("[data-profile-pin]");
+  if (витрина) { saveProfilePin(витрина.dataset.profilePin, витрина.value); return; }
   const флаг = e.target.closest("[data-card-flag]");
   if (флаг) saveCardFlag(флаг.dataset.cardFlag, флаг.checked);
+}
+
+async function saveProfilePin(поле, значение) {
+  try {
+    const r = await api(`/api/member/game/card/pin`, { method: "POST", body: { field: поле, value: значение || null } });
+    _card.pins = r.pins;
+    say("#member-card-msg", значение ? "Закреплено в профиле." : "Закреп снят.");
+    renderCardBlock();
+  } catch (err) {
+    say("#member-card-msg", err.message, "err");
+  }
+}
+
+function onCardInput(e) {
+  const поле = e.target.closest("[data-card-field]");
+  if (!поле) return;
+  const счётчик = $(`[data-card-count="${поле.dataset.cardField}"]`);
+  if (счётчик) счётчик.textContent = String(поле.value || "").length;
 }
 
 async function loadTops() {
@@ -6118,8 +6347,14 @@ function goodHtml(g) {
       ${g.sale ? `<s>${g.base_price.toLocaleString("ru")}</s>` : ""}
       ${g.discount && !g.sale ? `<s>${g.base_price.toLocaleString("ru")}</s>` : ""}</div>
     ${остаток}
-    <button type="button" class="btn" data-sact="buy" data-key="${escapeHtml(g.key)}"
-            data-bm="${g.black_market ? "1" : ""}" ${g.affordable ? "" : "disabled"}>Купить</button>
+    <div class="good-buy">
+      <label class="sr-only" for="shop-qty-${escapeHtml(g.key)}">Количество «${escapeHtml(g.name)}»</label>
+      <input id="shop-qty-${escapeHtml(g.key)}" class="good-qty" data-shop-qty
+             type="text" inputmode="numeric" value="1" maxlength="4"
+             aria-label="Количество" title="Количество или «все»" autocomplete="off">
+      <button type="button" class="btn" data-sact="buy" data-key="${escapeHtml(g.key)}"
+              data-bm="${g.black_market ? "1" : ""}" ${g.affordable ? "" : "disabled"}>Купить</button>
+    </div>
   </div>`;
 }
 
@@ -6566,8 +6801,8 @@ async function onShopClick(e) {
   let адрес = "buy";
   if (act === "buy") {
     тело.black_market = el.dataset.bm === "1";
-    const сколько = prompt("Сколько купить? Можно слово «все».", "1");
-    if (сколько === null) return;
+    const полеКоличества = el.closest(".good")?.querySelector("[data-shop-qty]");
+    const сколько = полеКоличества?.value.trim() || "1";
     тело.qty = /^\s*(все|всё|all)\s*$/i.test(сколько) ? "все" : Number(сколько) || 1;
   } else {
     адрес = "sell";
@@ -6982,7 +7217,36 @@ function renderBank() {
       <div class="bank-wallet"><b>${s.coins.toLocaleString("ru")} i¢</b>
         <span>в кошельке</span></div>
     </div>
-    <div class="bank-grid">${вклад}${кредит}</div>`;
+    <div class="bank-grid">${вклад}${кредит}</div>
+    <h3 class="block-head">${icon("coins")}Переводы</h3>
+    ${s.transfers?.length ? `<div class="money-history">
+      ${s.transfers.map((t) => {
+        const отправлен = t.direction === "sent";
+        const дата = t.created_at ? new Date(t.created_at).toLocaleString("ru-RU", {
+          day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+        }) : "";
+        return `<div class="money-row ${отправлен ? "out" : "in"}">
+          <span class="money-sign">${отправлен ? "↑" : "↓"}</span>
+          <span class="grow"><b>${отправлен ? "Перевод" : "Получено"}</b>
+            <small>${отправлен ? "для" : "от"} ${escapeHtml(t.counterparty)}${дата ? ` · ${escapeHtml(дата)}` : ""}</small></span>
+          <b>${отправлен ? "−" : "+"}${Number(t.amount).toLocaleString("ru")} i¢</b>
+        </div>`;
+      }).join("")}
+    </div>` : `<div class="empty bank-history-empty">${icon("coins")}<span>Переводов пока нет. Здесь появятся отправленные и полученные i¢.</span></div>`}
+    <h3 class="block-head">${icon("coins")}Заработки</h3>
+    ${s.earnings?.length ? `<div class="money-history">
+      ${s.earnings.map((e) => {
+        const дата = e.created_at ? new Date(e.created_at).toLocaleString("ru-RU", {
+          day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+        }) : "";
+        return `<div class="money-row in">
+          <span class="money-sign">+</span>
+          <span class="grow"><b>${escapeHtml(e.source)}</b>
+            <small>${дата ? escapeHtml(дата) : ""}</small></span>
+          <b>+${Number(e.amount).toLocaleString("ru")} i¢</b>
+        </div>`;
+      }).join("")}
+    </div>` : `<div class="empty bank-history-empty">${icon("coins")}<span>Заработков пока нет. История записывается после обновления бота.</span></div>`}`;
   bankRefreshHints();
 }
 
@@ -7064,3 +7328,11 @@ function bankSaid(r) {
   }
   return `Заявка на ${r.amount.toLocaleString("ru")} i¢ отправлена администраторам. К возврату ${r.debt.toLocaleString("ru")} i¢ за ${r.term_days} дн.`;
 }
+
+// Запуск только после объявления состояния всех экранов. Раньше boot стоял
+// посередине файла: на быстром ответе /api/me профиль мог обратиться к _prof
+// в его temporal dead zone и оставлял /member/profile пустым.
+boot().catch((err) => {
+  $("#auth")?.classList.remove("hidden");
+  say("#auth-msg", err.message || "Не удалось открыть панель", "err");
+});

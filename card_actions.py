@@ -30,6 +30,7 @@ TITLE_MAX = 30          # звание
 MOTTO_MAX = 100         # девиз
 CITY_MAX = 64
 ABOUT_MAX = 1000
+GENDER_OPTIONS = ("м", "ж", "др")
 
 # Поле → (предел, как называется в отказе). Список закрытый: всё, чего здесь
 # нет, экран править не может, и это не забывчивость — остальные поля карточки
@@ -106,3 +107,20 @@ async def set_visible(chat_id: int, user_id: int, on: bool) -> CardResult:
     иначе человек не смог бы её править вслепую."""
     await db.set_anketa_visibility(chat_id, user_id, on)
     return CardResult(True, field="visible", value="1" if on else "")
+
+
+async def set_gender(chat_id: int, user_id: int, value: Optional[str]) -> CardResult:
+    """Установить пол из того же закрытого набора, что понимает чат-команда.
+
+    В базе это VARCHAR из-за старых установок, но принимать произвольную строку
+    из кабинета нельзя: карточка профиля бота знает подписи только трёх кодов.
+    Пустой выбор означает снять поле — как команда «-мой пол».
+    """
+    code = (value or "").strip().casefold()
+    if not code:
+        await db.clear_gender(chat_id, user_id)
+        return CardResult(True, field="gender", cleared=True)
+    if code not in GENDER_OPTIONS:
+        return CardResult(False, "Выберите вариант из списка.")
+    await db.set_gender(chat_id, user_id, code)
+    return CardResult(True, field="gender", value=code)

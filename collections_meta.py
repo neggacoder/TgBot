@@ -61,6 +61,26 @@ COLLECTIONS: tuple[Collection, ...] = (
         f"Попасть в призы {SEASON_STREAK} сезона подряд",
         "🏆 Династия", "collection_dynasty",
     ),
+    Collection(
+        "barn", "Полный хлев", "🐄",
+        "Завести хотя бы по одному животному каждого вида",
+        "🐄 Хозяин хлева", "collection_barn",
+    ),
+    Collection(
+        "angler", "Полный садок", "🎣",
+        "Собрать в сетке рыбу каждой настоящей редкости",
+        "🎣 Рыболов-коллекционер", "collection_angler",
+    ),
+    Collection(
+        "crafts", "Мастерская", "🔨",
+        "Собрать все предметы, доступные через крафт",
+        "🔨 Мастер-ремесленник", "collection_crafts",
+    ),
+    Collection(
+        "equipped", "Холдинг под ключ", "🛡",
+        "Оснастить каждый бизнес всеми видами оборудования",
+        "🛡 Управляющий холдингом", "collection_equipped",
+    ),
 )
 
 BY_KEY: dict[str, Collection] = {c.key: c for c in COLLECTIONS}

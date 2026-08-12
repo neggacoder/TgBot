@@ -157,18 +157,27 @@
     <svg class="ic burger-chevron"><use href="#ic-chevron"/></svg>
   </button>
   <nav class="member-tabs" id="member-tabs">
-    <details class="member-nav-group" open><summary>Главное</summary><div>
+    <details class="member-nav-group"><summary>
+      <span class="member-nav-icon"><svg class="ic"><use href="#ic-user"/></svg></span>
+      <span class="member-nav-copy"><b>Главное</b><small>Профиль и чат</small></span>
+    </summary><div>
       <button type="button" class="member-tab active" data-mtab="prof"><svg class="ic"><use href="#ic-user"/></svg>Профиль</button>
       <button type="button" class="member-tab" data-mtab="tops"><svg class="ic"><use href="#ic-trophy"/></svg>Топы</button>
       <button type="button" class="member-tab" data-mtab="caps"><svg class="ic"><use href="#ic-message"/></svg>Возможности</button>
       <button type="button" class="member-tab" data-mtab="suggest"><svg class="ic"><use href="#ic-message"/></svg>Предложения</button>
     </div></details>
-    <details class="member-nav-group"><summary>Сообщество</summary><div>
+    <details class="member-nav-group"><summary>
+      <span class="member-nav-icon"><svg class="ic"><use href="#ic-heart"/></svg></span>
+      <span class="member-nav-copy"><b>Сообщество</b><small>Люди рядом</small></span>
+    </summary><div>
       <button type="button" class="member-tab" data-mtab="rel"><svg class="ic"><use href="#ic-heart"/></svg>Отношения</button>
       <button type="button" class="member-tab" data-mtab="family"><svg class="ic"><use href="#ic-crown"/></svg>Семья</button>
       <button type="button" class="member-tab" data-mtab="clans"><svg class="ic"><use href="#ic-shield"/></svg>Кланы</button>
     </div></details>
-    <details class="member-nav-group"><summary>Игры и занятия</summary><div>
+    <details class="member-nav-group"><summary>
+      <span class="member-nav-icon"><svg class="ic"><use href="#ic-casino"/></svg></span>
+      <span class="member-nav-copy"><b>Игры и занятия</b><small>Заработать и развлечься</small></span>
+    </summary><div>
       <button type="button" class="member-tab" data-mtab="farm"><svg class="ic"><use href="#ic-sprout"/></svg>Ферма</button>
       <button type="button" class="member-tab" data-mtab="casino"><svg class="ic"><use href="#ic-casino"/></svg>Казино</button>
       <button type="button" class="member-tab" data-mtab="biz"><svg class="ic"><use href="#ic-building"/></svg>Бизнесы</button>
@@ -176,7 +185,10 @@
       <button type="button" class="member-tab" data-mtab="work"><svg class="ic"><use href="#ic-work"/></svg>Работа</button>
       <button type="button" class="member-tab" data-mtab="pets"><svg class="ic"><use href="#ic-paw"/></svg>Питомцы</button>
     </div></details>
-    <details class="member-nav-group"><summary>Финансы</summary><div>
+    <details class="member-nav-group"><summary>
+      <span class="member-nav-icon"><svg class="ic"><use href="#ic-coins"/></svg></span>
+      <span class="member-nav-copy"><b>Финансы</b><small>Деньги и активы</small></span>
+    </summary><div>
       <button type="button" class="member-tab" data-mtab="shop"><svg class="ic"><use href="#ic-cart"/></svg>Магазин</button>
       <button type="button" class="member-tab" data-mtab="stock"><svg class="ic"><use href="#ic-chart"/></svg>Биржа</button>
       <button type="button" class="member-tab" data-mtab="bank"><svg class="ic"><use href="#ic-coins"/></svg>Банк</button>
@@ -229,6 +241,7 @@
       <button class="nav-btn" data-view="chats"><svg class="ic"><use href="#ic-chats"/></svg>Чаты и люди</button>
       <button class="nav-btn" data-view="chatroles"><svg class="ic"><use href="#ic-mask"/></svg>Роли чата</button>
       <button class="nav-btn" data-view="moderation"><svg class="ic"><use href="#ic-shield"/></svg>Модерация</button>
+      <button class="nav-btn" data-view="confirmations"><svg class="ic"><use href="#ic-check"/></svg>Подтверждения</button>
       <button class="nav-btn" data-view="complaints"><svg class="ic"><use href="#ic-alert"/></svg>Жалобы
         <span class="nav-count hidden" id="complaints-badge">0</span></button>
       <button class="nav-btn owner-only hidden" data-view="tgadmins"><svg class="ic"><use href="#ic-crown"/></svg>Админы чата</button>
@@ -545,6 +558,20 @@
           <span class="sep"></span>
           <button class="danger" id="mod-warn"><svg class="ic"><use href="#ic-alert"/></svg>Выдать варн</button>
         </div>
+      </div>
+    </section>
+
+    <!-- Подтверждения рынка -->
+    <section class="view hidden" id="view-confirmations">
+      <header class="page-head">
+        <h2><svg class="ic"><use href="#ic-check"/></svg>Подтверждения</h2>
+        <p class="sub">Заявки на рынок из чата и кабинета участника. Решение сразу появляется у продавца.</p>
+      </header>
+
+      <div class="card">
+        <h3><svg class="ic"><use href="#ic-basket"/></svg>Заявки на рынок
+          <span class="rights-count" id="market-requests-count">0</span></h3>
+        <div id="market-requests-list"></div>
       </div>
     </section>
 

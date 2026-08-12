@@ -49,6 +49,14 @@ _ACTION_COMMANDS = {
     "repay": "bank_repay",
 }
 
+_EARNING_LABELS = {
+    "daily_bonus": "Ежедневный бонус",
+    "side_job": "Подработка",
+    "farm": "Ферма",
+    "fishing": "Рыбалка",
+    "treasure": "Клад",
+}
+
 
 class BankBody(BaseModel):
     amount: Optional[Union[int, str]] = None
@@ -62,16 +70,40 @@ async def _чат() -> int:
     return chat_id
 
 
+async def _состояние(chat_id: int, user_id: int) -> dict:
+    """Состояние банка с историями переводов и заработков."""
+    состояние = await bank_actions.state(chat_id, user_id)
+    состояние["gate_ready"] = await chats.gate_chat_id() is not None
+    история = []
+    for row in await db.list_coin_transfers(chat_id, user_id, limit=30):
+        отправил = int(row.get("actor_id") or 0) == user_id
+        собеседник = int((row.get("target_id") if отправил else row.get("actor_id")) or 0)
+        known = await db.get_known_user(chat_id, собеседник) if собеседник else None
+        история.append({
+            "direction": "sent" if отправил else "received",
+            "amount": max(0, int(row.get("details") or 0)),
+            "counterparty": (known or {}).get("full_name")
+                            or (known or {}).get("username") or str(собеседник),
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        })
+    состояние["transfers"] = история
+    состояние["earnings"] = [
+        {
+            "amount": int(row["amount"]),
+            "source": _EARNING_LABELS.get(row["activity_key"], row["activity_key"]),
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        }
+        for row in await db.list_earning_history(chat_id, user_id, limit=30)
+    ]
+    return состояние
+
+
 @router.get("/api/member/game/bank")
 async def api_member_bank(user: PanelUser = Depends(auth.require_member)):
     chat_id = await _чат()
     await require_member_in_chat(user, chat_id)
     await permissions.ensure(user, _LIST_COMMAND)
-    состояние = await bank_actions.state(chat_id, user.tg_user_id)
-    # Есть ли кому показать заявку. Экран говорит это заранее: отказ по факту
-    # нажатия читается как поломка, а не как правило.
-    состояние["gate_ready"] = await chats.gate_chat_id() is not None
-    return состояние
+    return await _состояние(chat_id, user.tg_user_id)
 
 
 async def _показать_заявку(chat_id: int, user_id: int, имя: str,
@@ -143,8 +175,7 @@ async def api_member_bank_action(
 
     await db.add_log(f"bank_{action}", chat_id=chat_id, actor_id=user_id,
                      details=str(result.amount))
-    состояние = await bank_actions.state(chat_id, user_id)
-    состояние["gate_ready"] = await chats.gate_chat_id() is not None
+    состояние = await _состояние(chat_id, user_id)
     return {
         "ok": True, "action": result.action, "amount": result.amount,
         "payout": result.payout, "days": result.days, "rate": result.rate,

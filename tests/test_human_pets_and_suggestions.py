@@ -21,6 +21,19 @@ def test_принять_и_отклонить_может_только_будущ
     assert "callback.from_user.id != pet_id" in declined
 
 
+def test_человек_питомец_вызывается_через_челопет():
+    source = inspect.getsource(bot.cmd_human_pet_request)
+    assert "челопет" in source
+    assert bot.resolve_command_key("челопет @username") == "human_pet"
+
+
+def test_сво_имеет_все_шуточные_команды_и_отдельные_ключи_чата():
+    source = inspect.getsource(bot.cmd_svo)
+    assert all(word in source for word in ("отправить", "вернуть", "выкл", "вкл", "статус"))
+    assert bot.resolve_command_key("СВО статус") == "svo"
+    assert bot._svo_enabled_key(-100) != bot._svo_sent_key(-100)
+
+
 def test_анкета_показывает_обе_стороны_кликабельными():
     source = inspect.getsource(bot.build_profile_card)
     assert 'href="tg://user?id={other_id}"' in source

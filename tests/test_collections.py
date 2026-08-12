@@ -14,7 +14,11 @@ import os
 import pytest
 
 import businesses as B
+import collection_actions
 import collections_meta as C
+import crafting
+import fishing
+import livestock
 import pets as P
 import seasons as S
 
@@ -85,12 +89,27 @@ def test_цепочка_переходит_через_январь():
     assert keys == ["2026-01", "2025-12", "2025-11"]
 
 
+def test_уведомление_сайта_называет_автора_ссылкой(monkeypatch):
+    async def known(chat_id, user_id):
+        return {"username": "player", "full_name": "Игрок"}
+
+    async def nickname(chat_id, user_id):
+        return None
+
+    monkeypatch.setattr(collection_actions.db, "get_known_user", known)
+    monkeypatch.setattr(collection_actions.db, "get_nickname", nickname)
+    text = asyncio.run(collection_actions.site_announcement(CHAT_ID, ME, C.BY_KEY["junk"]))
+    assert 'От <a href="https://telegram.me/player">@player</a>:' in text
+    assert "Собрана коллекция «Барахольщик»!" in text
+
+
 # --- подсчёт прогресса -----------------------------------------------------
 
 @pytest.fixture
 def world(monkeypatch):
     state = {"businesses": [], "pets": [], "titles": [], "granted": [],
-             "achievements": [], "announced": [], "inventory": []}
+             "achievements": [], "announced": [], "inventory": [],
+             "animals": [], "fish": [], "business_upgrades": {}}
 
     async def list_user_businesses(chat_id, user_id):
         return list(state["businesses"])
@@ -106,14 +125,30 @@ def world(monkeypatch):
         # предметы магазина, спецэффектов у них нет.
         return [{"item_key": k} for k in state["inventory"]]
 
+    async def list_farm_animals(chat_id, user_id):
+        return [{"animal_key": k} for k in state["animals"]]
+
+    async def list_net(chat_id, user_id):
+        return [{"species_key": k} for k in state["fish"]]
+
+    async def list_business_upgrades(chat_id, user_id, business_key):
+        return set(state["business_upgrades"].get(business_key, ()))
+
     async def grant_title(chat_id, user_id, key):
         if key in state["granted"]:
             return False
         state["granted"].append(key)
         return True
 
-    async def grant_achievement(chat_id, user_id, code, announce=True, **kw):
+    async def grant_achievement(chat_id, user_id, code, **kw):
         state["achievements"].append(code)
+        return True
+
+    async def get_pet(chat_id, user_id, key):
+        return None
+
+    async def add_pet(chat_id, user_id, key, now, **kw):
+        state["pets"].append(key)
         return True
 
     async def send_message(chat_id, text, **kw):
@@ -123,15 +158,20 @@ def world(monkeypatch):
     monkeypatch.setattr(bot_module.db, "list_pets", list_pets, raising=False)
     monkeypatch.setattr(bot_module.db, "list_user_titles", list_user_titles, raising=False)
     monkeypatch.setattr(bot_module.db, "list_inventory", list_inventory, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_farm_animals", list_farm_animals, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_net", list_net, raising=False)
+    monkeypatch.setattr(bot_module.db, "list_business_upgrades", list_business_upgrades, raising=False)
+    monkeypatch.setattr(bot_module.db, "grant_achievement", grant_achievement, raising=False)
     monkeypatch.setattr(bot_module.db, "grant_title", grant_title, raising=False)
     monkeypatch.setattr(bot_module.db, "add_title_if_missing", _noop, raising=False)
     monkeypatch.setattr(bot_module.db, "add_log", _noop, raising=False)
     monkeypatch.setattr(bot_module.db, "ensure_pet_catalog", _returns(0), raising=False)
+    monkeypatch.setattr(bot_module.db, "get_pet", get_pet, raising=False)
+    monkeypatch.setattr(bot_module.db, "add_pet", add_pet, raising=False)
     monkeypatch.setattr(bot_module.db, "list_pet_catalog", _returns(
         [{"pet_key": p.key, "name": p.name, "emoji": p.emoji, "price": p.price,
           "sound": p.sound, "ability": p.ability, "is_active": True,
           "max_count": None} for p in P.PETS]), raising=False)
-    monkeypatch.setattr(bot_module, "grant_achievement", grant_achievement, raising=False)
     monkeypatch.setattr(bot_module, "display_name_by_id", _returns("Игрок"), raising=False)
     monkeypatch.setattr(bot_module.bot, "send_message", send_message, raising=False)
     return state
@@ -239,7 +279,8 @@ def test_несколько_коллекций_сразу(world):
 def test_коллекционный_титул_нельзя_купить():
     """Заводится без цены, а «титул купить» отвергает всё без цены."""
     import inspect
-    src = inspect.getsource(bot_module._check_collections)
+    import collection_actions
+    src = inspect.getsource(collection_actions.check_collections)
     assert "add_title_if_missing(collection.title_key, collection.title_name)" in src
 
 
@@ -258,6 +299,36 @@ def test_барахольщик_собирается_полностью(world):
     world["inventory"] = list(db_module.JUNK_ITEM_KEYS)
     done, total = _progress(world)["junk"]
     assert done == total
+
+
+def test_полный_хлев_считает_виды_а_не_поголовье(world):
+    world["animals"] = [animal.key for animal in livestock.ANIMALS]
+    assert _progress(world)["barn"] == (len(livestock.ANIMALS), len(livestock.ANIMALS))
+
+
+def test_полный_садок_требует_все_настоящие_редкости(world):
+    real = [spec for spec in fishing.SPECIES if not spec.is_junk]
+    world["fish"] = [
+        next(spec.key for spec in real if spec.rarity == rarity)
+        for rarity in {spec.rarity for spec in real}
+    ]
+    done, total = _progress(world)["angler"]
+    assert done == total == len({spec.rarity for spec in real})
+
+
+def test_мастерская_считает_все_результаты_крафта_кроме_куклы(world):
+    results = {recipe.result for recipe in crafting.RECIPES if recipe.result}
+    world["inventory"] = list(results)
+    assert _progress(world)["crafts"] == (len(results), len(results))
+
+
+def test_холдинг_под_ключ_считает_каждый_слот_оборудования(world):
+    world["business_upgrades"] = {
+        business.key: {upgrade.key for upgrade in B.UPGRADES}
+        for business in B.BUSINESSES
+    }
+    total = len(B.BUSINESSES) * len(B.UPGRADES)
+    assert _progress(world)["equipped"] == (total, total)
 
 
 def test_ключи_хлама_есть_в_магазине():

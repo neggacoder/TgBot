@@ -70,10 +70,11 @@ import owner_flags
 import relationships_v2
 import rest_rules
 import rp_photos
+import site_access
 import webapp_auth
 import tz_settings
 
-from . import auth, roles
+from . import auth, permissions, roles
 from .auth import PanelUser
 
 logger = logging.getLogger(__name__)
@@ -1946,6 +1947,8 @@ async def _require_member_in_chat(user: PanelUser, chat_id: int) -> None:
         raise HTTPException(403, "Кабинет работает только в основном чате")
     if not await db.get_known_user(chat_id, user.tg_user_id):
         raise HTTPException(403, "Бот не видел вас в этом чате")
+    if not await site_access.is_enabled(chat_id):
+        raise HTTPException(403, "Кабинет участников выключен администрацией этого чата")
 
 
 class MemberChatBody(BaseModel):
@@ -3634,6 +3637,102 @@ async def api_rest_decision(
 
 
 # ---------------------------------------------------------------------------
+# Подтверждения рынка
+#
+# Заявки рынка решаются либо инлайн-кнопками в Telegram, либо здесь. Текстовых
+# «рынок принять/отклонить» больше нет: оба интерфейса используют одну и ту же
+# атомарную операцию db.decide_market_good, поэтому второй админ не проведёт
+# уже разобранную заявку.
+# ---------------------------------------------------------------------------
+
+async def _market_seller(chat_id: int, seller_id: int) -> tuple[str, str | None]:
+    """(Имя для интерфейса, username) без падения на старой записи пользователя."""
+    row = await db.get_known_user(chat_id, seller_id)
+    if not row:
+        return str(seller_id), None
+    return str(row.get("full_name") or row.get("username") or seller_id), row.get("username")
+
+
+@app.get("/api/market-requests")
+async def api_market_requests(chat_id: int, user: PanelUser = Depends(auth.require_user)):
+    await permissions.ensure(user, "market_manage")
+    rows = await db.list_market_goods(chat_id, status="pending")
+    out = []
+    for row in rows:
+        name, username = await _market_seller(chat_id, int(row["seller_id"]))
+        created_at = row.get("created_at")
+        out.append({
+            "id": int(row["id"]),
+            "seller_id": int(row["seller_id"]),
+            "full_name": name,
+            "username": username,
+            "key": row["item_key"],
+            "name": row["name"],
+            "price": int(row["price"]),
+            "created_at": created_at.isoformat() if created_at else None,
+        })
+    return {"requests": out}
+
+
+class MarketDecisionBody(BaseModel):
+    chat_id: int
+    approve: bool
+
+
+@app.post("/api/market-requests/{good_id}/decision")
+async def api_market_decision(
+    good_id: int, body: MarketDecisionBody, request: Request,
+    user: PanelUser = Depends(auth.require_user),
+):
+    auth.verify_csrf(request)
+    await permissions.ensure(user, "market_manage")
+
+    good = await db.get_market_good_by_id(body.chat_id, good_id)
+    if good is None:
+        raise HTTPException(404, "Заявка не найдена")
+    if good.get("status") != "pending":
+        raise HTTPException(409, "Заявка уже обработана")
+
+    actor_id = user.tg_user_id or user.id
+    if not await db.decide_market_good(body.chat_id, good_id, body.approve, actor_id):
+        raise HTTPException(409, "Заявка уже обработана")
+
+    seller_id = int(good["seller_id"])
+    await db.add_log(
+        "market_approve" if body.approve else "market_reject",
+        chat_id=body.chat_id, actor_id=actor_id, target_id=seller_id,
+        details=good["item_key"],
+    )
+    seller_name, _ = await _market_seller(body.chat_id, seller_id)
+    item_name = html.escape(str(good["name"]))
+    item_key = html.escape(str(good["item_key"]))
+    if body.approve:
+        announcement = (
+            f"✅ Заявка №{good_id} одобрена: {html.escape(seller_name)} торгует "
+            f"«{item_name}» (<code>{item_key}</code>) по {int(good['price'])} i¢."
+        )
+        notice = f"✅ Ваш товар одобрен: «{item_name}»."
+    else:
+        announcement = (
+            f"🚫 Заявка №{good_id} отклонена. Ключ <code>{item_key}</code> снова свободен."
+        )
+        notice = f"🚫 Ваша заявка отклонена: «{item_name}»."
+
+    # Уведомления не откатывают уже принятое решение: пользователь мог закрыть
+    # личку бота, а исходное сообщение в чате — удалить.
+    try:
+        await get_bot().send_message(body.chat_id, announcement)
+    except Exception:
+        logger.warning("Не удалось объявить решение заявки рынка %s", good_id, exc_info=True)
+    try:
+        await get_bot().send_message(seller_id, notice)
+    except Exception:
+        logger.info("Не удалось уведомить продавца по заявке рынка %s", good_id)
+
+    return {"ok": True, "approved": body.approve}
+
+
+# ---------------------------------------------------------------------------
 # Лента последних сообщений чата (плашка на вкладке «Написать»)
 #
 # Пишет ленту сам бот — см. _remember_recent_message в bot.py. Панель только
@@ -4378,7 +4477,27 @@ async def api_set_setting(
 # Статика
 # ---------------------------------------------------------------------------
 
-def _index_html() -> HTMLResponse:
+def _without_div(markup: str, element_id: str) -> str:
+    """Убирает один корневой ``div`` вместе с вложенными div.
+
+    Шаблон панели статический и намеренно без HTML-парсера в рантайме. Нам
+    нужна ровно одна безопасная операция: для /member убрать админскую
+    оболочку, для /admin — кабинет. Счётчик открывающих тегов надёжнее
+    вырезания до ближайшего ``</div>``, потому что внутри сотни карточек.
+    """
+    start = markup.find(f'<div id="{element_id}"')
+    if start < 0:
+        return markup
+    depth = 0
+    for match in re.finditer(r"</?div\b[^>]*>", markup[start:], re.IGNORECASE):
+        depth += -1 if match.group(0).startswith("</") else 1
+        if depth == 0:
+            end = start + match.end()
+            return markup[:start] + markup[end:]
+    raise RuntimeError(f"Не закрыт div #{element_id} в index.html")
+
+
+def _index_html(shell: Optional[str] = None, *, show_auth: bool = False) -> HTMLResponse:
     """index.html с кэш-бастингом статики. К /static/app.js и /static/style.css
     дописываем ?v=<mtime>: поменялся файл — поменялась версия, и браузер/CDN
     берут новую копию, а не старую из кэша (иначе правки панели и, например,
@@ -4386,6 +4505,16 @@ def _index_html() -> HTMLResponse:
     свежий ?v= всегда доезжал."""
     with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
         html = f.read()
+    if shell == "member":
+        html = _without_div(html, "app")
+    elif shell == "admin":
+        html = _without_div(html, "member")
+    # Гостю не нужен JavaScript, чтобы хотя бы увидеть форму входа. Иначе
+    # сбой в клиентском коде оставлял /member/clans с двумя скрытыми экранами
+    # и визуально пустым body.
+    if show_auth:
+        html = html.replace('<div id="auth" class="auth hidden">',
+                            '<div id="auth" class="auth">', 1)
     try:
         version = int(max(
             os.path.getmtime(os.path.join(STATIC_DIR, "app.js")),
@@ -4401,6 +4530,53 @@ def _index_html() -> HTMLResponse:
 @app.get("/")
 async def index():
     return _index_html()
+
+
+async def _shell_page(request: Request, shell: str) -> HTMLResponse:
+    """Оболочка страницы; гостю форма входа видна ещё до выполнения JS."""
+    return _index_html(shell, show_auth=await auth.current_user(request) is None)
+
+
+# Страницы кабинета и админки — это одна клиентская оболочка, но у каждого
+# экрана есть собственный URL. Нельзя отдавать index.html на любой неизвестный
+# путь: опечатка в ссылке должна оставаться 404, а не тихо открывать главную.
+# Список синхронизирован с маршрутами в static/app.js.
+MEMBER_PAGE_ROUTES = frozenset({
+    "profile", "tops", "capabilities", "suggestions", "relationships",
+    "family", "clans", "farm", "casino", "businesses", "fishing", "work",
+    "pets", "shop", "stock", "bank",
+})
+ADMIN_PAGE_ROUTES = frozenset({
+    "send", "chats", "chatroles", "moderation", "confirmations", "complaints", "tgadmins",
+    "stats", "stock", "logs", "actions", "cmdtree", "chatsettings",
+    "settings", "users",
+})
+
+
+@app.get("/member")
+@app.get("/member/")
+async def member_root(request: Request):
+    return await _shell_page(request, "member")
+
+
+@app.get("/member/{section}")
+async def member_page(section: str, request: Request):
+    if section not in MEMBER_PAGE_ROUTES:
+        raise HTTPException(404, "Такой страницы кабинета нет")
+    return await _shell_page(request, "member")
+
+
+@app.get("/admin")
+@app.get("/admin/")
+async def admin_root(request: Request):
+    return await _shell_page(request, "admin")
+
+
+@app.get("/admin/{section}")
+async def admin_page(section: str, request: Request):
+    if section not in ADMIN_PAGE_ROUTES:
+        raise HTTPException(404, "Такой страницы админки нет")
+    return await _shell_page(request, "admin")
 
 
 @app.get("/api/webapp-check")
@@ -4498,6 +4674,7 @@ app.include_router(member_profile_router)
 
 from . import member_shop_api  # noqa: E402
 from .member_shop_api import router as member_shop_router  # noqa: E402
+member_shop_api.get_bot = get_bot
 member_shop_api.require_member_in_chat = _require_member_in_chat
 app.include_router(member_shop_router)
 

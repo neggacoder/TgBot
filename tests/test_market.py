@@ -447,9 +447,7 @@ def test_заявка_уходит_в_чат_уведомлений(monkeypatch)
 
 
 def test_кнопки_заявки_несут_исходный_чат(monkeypatch):
-    """Команда «рынок принять» ищет заявку по чату, где её написали, а жмут
-    кнопку в ЧУЖОМ чате уведомлений — без id исходного чата решение ушло бы
-    не туда."""
+    """Кнопку жмут в чате уведомлений, а решение нужно исходному чату."""
     spy = _Spy()
     _apply_setup(monkeypatch, spy)
     monkeypatch.setitem(bot_module.settings, "notify_chat_id", NOTIFY_CHAT)
@@ -468,14 +466,15 @@ def test_кнопки_заявки_несут_исходный_чат(monkeypatc
         assert len(payload.encode()) <= 64, "callback_data не влезет в лимит Telegram"
 
 
-def test_без_настроенного_чата_заявка_разбирается_на_месте(monkeypatch):
-    """Иначе заявка зависла бы молча и о ней никто не узнал."""
+def test_без_настроенного_чата_заявка_ждёт_панель(monkeypatch):
+    """Текстовых команд решения нет: резервный путь — админ-панель."""
     spy = _Spy()
     _apply_setup(monkeypatch, spy)
     monkeypatch.setitem(bot_module.settings, "notify_chat_id", None)
 
     asyncio.run(bot_module.cmd_market_apply(spy.message("рынок заявка ogurcy 500 Огурцы")))
-    assert any("рынок принять 42" in s for s in spy.said)
+    assert any("ждёт решения администрации в панели" in s.lower() for s in spy.said)
+    assert not any("рынок принять" in s or "рынок отклонить" in s for s in spy.said)
 
 
 def _decide_setup(monkeypatch, spy, good=None):

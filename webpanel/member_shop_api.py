@@ -16,6 +16,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import chats
+import casino_actions
+import collection_actions
 import db
 import farm_actions
 import shop_actions
@@ -27,12 +29,33 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+get_bot = None
 require_member_in_chat = None
 
 FROZEN = "🧊 Ваш счёт заморожен администрацией."
 
 _LIST_COMMAND = "shop_list"
 _ACTION_COMMANDS = {"buy": "shop_buy", "sell": "item_sell"}
+
+
+async def _check_collections(chat_id: int, user_id: int) -> None:
+    """Последний кусок хлама, купленный в кабинете, завершает коллекцию."""
+    try:
+        awards = await collection_actions.check_collections(
+            chat_id, user_id, today=await casino_actions.local_today())
+    except Exception as exc:
+        logger.warning("Магазин кабинета: не проверились коллекции: %s: %s",
+                       type(exc).__name__, exc)
+        return
+    for collection in awards:
+        try:
+            await get_bot().send_message(
+                chat_id,
+                await collection_actions.site_announcement(chat_id, user_id, collection),
+            )
+        except Exception as exc:
+            logger.warning("Магазин кабинета: объявление о коллекции в чат %s не ушло: %s: %s",
+                           chat_id, type(exc).__name__, exc)
 
 
 class ShopBody(BaseModel):
@@ -84,6 +107,8 @@ async def api_member_shop_action(
 
     await db.add_log("member_game", chat_id=chat_id, actor_id=user_id,
                      details=f"shop/{action} {result.key}:{result.qty}")
+    if action == "buy" and result.key in db.JUNK_ITEM_KEYS:
+        await _check_collections(chat_id, user_id)
     return {
         "ok": True, "action": action, "key": result.key, "name": result.name,
         "emoji": result.emoji, "qty": result.qty, "price": result.price,

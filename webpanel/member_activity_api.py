@@ -17,6 +17,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import chats
+import casino_actions
+import collection_actions
 import db
 import farm_actions
 import fishing_actions
@@ -70,6 +72,26 @@ async def _announce(chat_id: int, result) -> None:
             await get_bot().send_message(chat_id, text)
         except Exception as exc:
             logger.warning("Занятия кабинета: объявление в чат %s не ушло: %s: %s",
+                           chat_id, type(exc).__name__, exc)
+
+
+async def _check_collections(chat_id: int, user_id: int) -> None:
+    """Заброс в кабинете может закрыть «Полный садок»."""
+    try:
+        awards = await collection_actions.check_collections(
+            chat_id, user_id, today=await casino_actions.local_today())
+    except Exception as exc:
+        logger.warning("Рыбалка кабинета: не проверились коллекции: %s: %s",
+                       type(exc).__name__, exc)
+        return
+    for collection in awards:
+        try:
+            await get_bot().send_message(
+                chat_id,
+                await collection_actions.site_announcement(chat_id, user_id, collection),
+            )
+        except Exception as exc:
+            logger.warning("Рыбалка кабинета: объявление о коллекции в чат %s не ушло: %s: %s",
                            chat_id, type(exc).__name__, exc)
 
 
@@ -128,6 +150,8 @@ async def api_member_fishing_action(
 
     await db.add_log("member_game", chat_id=chat_id, actor_id=user_id,
                      details=f"fishing/{action}")
+    if action == "cast":
+        await _check_collections(chat_id, user_id)
     await _announce(chat_id, result)
     return {
         "ok": True, "action": action,

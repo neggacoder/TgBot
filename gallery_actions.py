@@ -84,6 +84,45 @@ async def collection_progress(chat_id: int, user_id: int,
     инвентарь = {row["item_key"] for row in await db.list_inventory(chat_id, user_id)}
     из_каталога["junk"] = (len(инвентарь & set(db.JUNK_ITEM_KEYS)), len(db.JUNK_ITEM_KEYS))
 
+    # Хлев и рыба — те же «собрать по одному виду», только их естественный
+    # дом не инвентарь. Для садка важны не конкретные рыбы, а все реальные
+    # редкости: хлам в сетку не попадает, поэтому требовать его было бы
+    # невозможно.
+    import livestock
+    свои_животные = {row["animal_key"] for row in await db.list_farm_animals(chat_id, user_id)}
+    виды_животных = set(livestock.BY_KEY)
+    из_каталога["barn"] = (len(свои_животные & виды_животных), len(виды_животных))
+
+    import fishing
+    редкости = {spec.rarity for spec in fishing.SPECIES if not spec.is_junk}
+    сетка = await db.list_net(chat_id, user_id)
+    свои_редкости = {
+        spec.rarity for row in сетка
+        if (spec := fishing.BY_KEY.get(row["species_key"])) is not None and not spec.is_junk
+    }
+    из_каталога["angler"] = (len(свои_редкости & редкости), len(редкости))
+
+    # Кукла вуду — именной сувенир в отдельной таблице, поэтому в эту
+    # коллекцию не входит. Остальные результаты рецептов лежат в инвентаре
+    # и не расходуются другими рецептами.
+    import crafting
+    крафты = {recipe.result for recipe in crafting.RECIPES if recipe.result}
+    из_каталога["crafts"] = (len(инвентарь & крафты), len(крафты))
+
+    # Оснащение хранится отдельно для каждого бизнеса. Считаем слоты, а не
+    # только полностью экипированные бизнесы: так витрина честно показывает,
+    # какая именно часть большого набора уже закрыта.
+    все_слоты = {
+        (business.key, upgrade.key)
+        for business in business_catalog.BUSINESSES
+        for upgrade in business_catalog.UPGRADES
+    }
+    свои_слоты = set()
+    for business in business_catalog.BUSINESSES:
+        upgrades = await db.list_business_upgrades(chat_id, user_id, business.key)
+        свои_слоты.update((business.key, upgrade) for upgrade in upgrades)
+    из_каталога["equipped"] = (len(свои_слоты & все_слоты), len(все_слоты))
+
     титулы = {row["title_key"] for row in await db.list_user_titles(chat_id, user_id)}
     if season_key:
         import seasons

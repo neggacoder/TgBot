@@ -18,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import chats
+import casino_actions
+import collection_actions
 import db
 import farm_actions
 
@@ -115,6 +117,26 @@ async def _announce(chat_id: int, result: farm_actions.FarmResult) -> None:
                            chat_id, type(exc).__name__, exc)
 
 
+async def _check_collections(chat_id: int, user_id: int) -> None:
+    """Последний вид животного в кабинете закрывает «Полный хлев»."""
+    try:
+        awards = await collection_actions.check_collections(
+            chat_id, user_id, today=await casino_actions.local_today())
+    except Exception as exc:
+        logger.warning("Ферма кабинета: не проверились коллекции: %s: %s",
+                       type(exc).__name__, exc)
+        return
+    for collection in awards:
+        try:
+            await get_bot().send_message(
+                chat_id,
+                await collection_actions.site_announcement(chat_id, user_id, collection),
+            )
+        except Exception as exc:
+            logger.warning("Ферма кабинета: объявление о коллекции в чат %s не ушло: %s: %s",
+                           chat_id, type(exc).__name__, exc)
+
+
 @router.get("/api/member/game/farm")
 async def api_member_farm(user: PanelUser = Depends(auth.require_member)):
     chat_id = await chats.work_chat_id()
@@ -185,6 +207,8 @@ async def api_member_farm_action(
     # зависеть от того, дошло ли поздравление до чата.
     await db.add_log("member_game", chat_id=chat_id, actor_id=user_id,
                      details=f"farm/{action}")
+    if action == "barn_buy":
+        await _check_collections(chat_id, user_id)
     await _announce(chat_id, result)
 
     # Состояние возвращаем сразу: экран перерисовывается ответом на действие, а

@@ -2809,6 +2809,22 @@ async def search_logs(
     return rows, total
 
 
+async def list_coin_transfers(chat_id: int, user_id: int, limit: int = 30) -> list[dict]:
+    """Последние переводы пользователя в пределах одного чата.
+
+    Перевод уже атомарно меняет оба кошелька и пишет ``coin_transfer`` в
+    общий журнал. Отдельный журнал «для кабинета» был бы второй правдой и не
+    показал бы переводы, сделанные до появления экрана истории.
+    """
+    return await _fetchall(
+        "SELECT actor_id, target_id, details, created_at FROM logs "
+        "WHERE chat_id = %s AND event_type = 'coin_transfer' "
+        "AND (actor_id = %s OR target_id = %s) "
+        "ORDER BY created_at DESC, id DESC LIMIT %s",
+        (chat_id, user_id, user_id, max(1, min(int(limit), 100))),
+    )
+
+
 # ----------------------------------------------------------------------------
 # Награды (медали) — модуль «Награды», по образцу Iris. 8 степеней, привязаны
 # к чату. Нумерация награды в списке пользователя (для «снять награду N») —
@@ -7162,6 +7178,36 @@ async def ensure_earning_activity_table() -> None:
     await _add_column_if_missing("earning_activity", "day_times", "INT NOT NULL DEFAULT 0")
 
 
+async def ensure_earning_history_table() -> None:
+    """Поштучная история успешных заработков.
+
+    ``earning_activity`` хранит только общий счётчик для кулдаунов и отчёта
+    «экономика»; по нему невозможно ответить, когда именно и за что пришли
+    монеты. Эта таблица — журнал последних начислений пользователя.
+    """
+    await _execute(
+        "CREATE TABLE IF NOT EXISTS earning_history ("
+        "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+        "chat_id BIGINT NOT NULL, "
+        "user_id BIGINT NOT NULL, "
+        "activity_key VARCHAR(32) NOT NULL, "
+        "amount BIGINT NOT NULL, "
+        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "INDEX idx_earning_history_user (chat_id, user_id, id)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+
+async def list_earning_history(chat_id: int, user_id: int, limit: int = 30) -> list[dict]:
+    """Последние начисления, новые после появления журнала."""
+    return await _fetchall(
+        "SELECT activity_key, amount, created_at FROM earning_history "
+        "WHERE chat_id = %s AND user_id = %s "
+        "ORDER BY id DESC LIMIT %s",
+        (chat_id, user_id, max(1, min(int(limit), 100))),
+    )
+
+
 async def count_activity_today(chat_id: int, user_id: int, activity_key: str, day) -> int:
     """Сколько раз источник сработал сегодня. Вчерашний счётчик — это ноль."""
     row = await _fetchone(
@@ -7215,6 +7261,12 @@ async def touch_earning_activity(
     при каждой подработке — то есть лимита не было бы вовсе. Раньше day
     передавал только бонус, поэтому вопрос не стоял.
     """
+    if earned > 0:
+        await _execute(
+            "INSERT INTO earning_history (chat_id, user_id, activity_key, amount, created_at) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (chat_id, user_id, activity_key, int(earned), now),
+        )
     await _execute(
         "INSERT INTO earning_activity "
         "(chat_id, user_id, activity_key, last_at, streak, last_day, total_earned, times) "
