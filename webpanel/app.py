@@ -511,8 +511,19 @@ class PasswordBody(BaseModel):
     password: str
 
 
+def _session_cookie_secure(request: Request) -> bool:
+    """Сохраняет secure-куки на HTTPS, но позволяет вход через LAN-NGINX.
+
+    NGINX всегда передаёт исходную схему в X-Forwarded-Proto. При отсутствии
+    заголовка выбираем безопасный вариант: браузер получит только secure-куку.
+    """
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    return forwarded_proto.split(",", 1)[0].strip().lower() != "http"
+
+
 def _set_session_cookies(
-    response: Response, user_id: int, password_hash: Optional[str] = None
+    request: Request, response: Response, user_id: int,
+    password_hash: Optional[str] = None,
 ) -> None:
     """Кладёт сессионную и CSRF-куки.
 
@@ -521,16 +532,16 @@ def _set_session_cookies(
     auth.session_fingerprint). У аккаунта-участника пароля нет — None.
     """
     csrf = auth.new_csrf_token()
-    # secure=True — Funnel всегда отдаёт https, так что кука не уйдёт по http
+    secure = _session_cookie_secure(request)
     response.set_cookie(
         auth.SESSION_COOKIE, auth.issue_session(user_id, password_hash),
-        httponly=True, secure=True, samesite="lax", max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True, secure=secure, samesite="lax", max_age=auth.SESSION_TTL_SECONDS,
     )
     # CSRF-куку намеренно НЕ делаем httponly: её читает наш же скрипт,
     # чтобы отправить обратно заголовком
     response.set_cookie(
         auth.CSRF_COOKIE, csrf,
-        httponly=False, secure=True, samesite="lax", max_age=auth.SESSION_TTL_SECONDS,
+        httponly=False, secure=secure, samesite="lax", max_age=auth.SESSION_TTL_SECONDS,
     )
 
 
@@ -554,7 +565,7 @@ async def api_setup(body: SetupBody, request: Request):
     await db.add_panel_login_attempt(body.username, auth.client_ip(request), True)
 
     response = JSONResponse({"ok": True, "role": auth.ROLE_OWNER})
-    _set_session_cookies(response, user_id, password_hash)
+    _set_session_cookies(request, response, user_id, password_hash)
     return response
 
 
@@ -581,7 +592,7 @@ async def api_login(body: LoginBody, request: Request):
     await db.touch_panel_login(row["id"])
 
     response = JSONResponse({"ok": True, "role": row["role"], "username": row["username"]})
-    _set_session_cookies(response, row["id"], password_hash)
+    _set_session_cookies(request, response, row["id"], password_hash)
     return response
 
 
@@ -592,8 +603,9 @@ async def api_logout(request: Request):
     response = JSONResponse({"ok": True})
     # Флаги должны совпадать с теми, с которыми куки ставились, иначе браузер
     # не сопоставит их с существующими и те останутся жить до истечения срока.
-    response.delete_cookie(auth.SESSION_COOKIE, httponly=True, secure=True, samesite="lax")
-    response.delete_cookie(auth.CSRF_COOKIE, httponly=False, secure=True, samesite="lax")
+    secure = _session_cookie_secure(request)
+    response.delete_cookie(auth.SESSION_COOKIE, httponly=True, secure=secure, samesite="lax")
+    response.delete_cookie(auth.CSRF_COOKIE, httponly=False, secure=secure, samesite="lax")
     return response
 
 
@@ -760,7 +772,7 @@ async def api_change_password(
     # куку успели угнать) — поэтому себе тут же выдаём новую, иначе панель
     # выкинула бы на форму входа сразу после смены пароля.
     response = JSONResponse({"ok": True})
-    _set_session_cookies(response, user.id, password_hash)
+    _set_session_cookies(request, response, user.id, password_hash)
     return response
 
 

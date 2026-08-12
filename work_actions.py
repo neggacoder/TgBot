@@ -90,6 +90,30 @@ class WorkResult:
     user_id: int = 0
 
 
+async def join(chat_id: int, user_id: int, raw_key: Optional[str], *,
+               now: Optional[datetime] = None) -> WorkResult:
+    """Устроиться на профессию — общая версия команды и кнопки сайта."""
+    key = (raw_key or "").strip().casefold()
+    prof = professions.PROFESSIONS.get(key)
+    if prof is None:
+        return WorkResult(False, "Выберите профессию из списка.")
+    stats = await db.get_profession_stats(chat_id, user_id)
+    if stats.get("profession_key"):
+        return WorkResult(False, "У вас уже есть профессия. Сначала увольтесь в чате.")
+    now = now or datetime.utcnow()
+    first_seen = await db.get_member_first_seen(chat_id, user_id)
+    days_in_chat = (now - first_seen).days if first_seen else 0
+    if days_in_chat < prof["req_days"]:
+        return WorkResult(False, f"Нужно быть в чате минимум {prof['req_days']} дн. "
+                                 f"(сейчас {days_in_chat}).")
+    wallet = await db.get_wallet(chat_id, user_id) or {}
+    if int(wallet.get("coins") or 0) < prof["req_coins"]:
+        return WorkResult(False, f"Нужно {prof['req_coins']} i¢ на входе "
+                                 f"(у вас {int(wallet.get('coins') or 0)} i¢).")
+    await db.set_profession(chat_id, user_id, key)
+    return WorkResult(True, profession=key, level=1, user_id=user_id)
+
+
 async def shift(chat_id: int, user_id: int, *,
                 now: Optional[datetime] = None,
                 today: Optional[date] = None) -> WorkResult:

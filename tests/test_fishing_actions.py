@@ -203,8 +203,16 @@ async def test_открепление_трофея_освобождает_рыб
     номер = await мир.add_to_net(CHAT, USER, ЩУКА.key, ЩУКА.max_grams, datetime.utcnow())
     await fishing_actions.pin(CHAT, USER, номер)
     итог = await fishing_actions.pin(CHAT, USER, None)
-    assert итог.ok and мир.card["pinned_fish"] is None
+    assert итог.ok and мир.pinned is None
     assert (await fishing_actions.sell(CHAT, USER, номер)).ok
+
+
+@_sync
+async def test_состояние_видит_строковый_id_закреплённой_рыбы(мир):
+    номер = await мир.add_to_net(CHAT, USER, ЩУКА.key, ЩУКА.max_grams, datetime.utcnow())
+    мир.pinned = str(номер)  # BIGINT из MySQL иногда приходит строкой
+    итог = await fishing_actions.state(CHAT, USER)
+    assert итог["net"][0]["pinned"] is True
 
 
 @_sync

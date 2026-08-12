@@ -311,7 +311,11 @@ async def state(chat_id: int, user_id: int, *,
             "weight": fishing.format_weight(int(row["grams"])),
             "price": цена, "hours": round(часов, 1),
             "freshness": fishing.freshness_label(часов),
-            "pinned": row["id"] == закреплена,
+            # Драйвер БД иногда отдаёт BIGINT строкой, а id сетки — числом.
+            # Строгое сравнение тогда рисовало «Закрепить» уже закреплённой
+            # рыбе, и с сайта её было невозможно снять.
+            "pinned": (закреплена is not None
+                       and int(row["id"]) == int(закреплена)),
         })
 
     return {

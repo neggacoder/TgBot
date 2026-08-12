@@ -63,6 +63,25 @@ journalctl -u botpanel -f          # тут будет ссылка /setup?token
 
 ## 5. Публикация панели наружу
 
+### Локальная сеть через NGINX
+
+Если панель нужна в домашней сети, NGINX может отдавать её на
+`http://IP_СЕРВЕРА:80`, а сама панель останется на `127.0.0.1:8080`.
+Конфигурация лежит в `deploy/nginx/tgbot-panel.conf`:
+
+```bash
+sudo install -m 644 deploy/nginx/tgbot-panel.conf /etc/nginx/sites-available/tgbot-panel
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -s /etc/nginx/sites-available/tgbot-panel /etc/nginx/sites-enabled/tgbot-panel
+sudo nginx -t
+sudo systemctl enable --now nginx
+```
+
+Это обычный HTTP для LAN: не открывайте порт 80 в интернет. Для Telegram Mini
+App продолжайте использовать HTTPS-адрес `PANEL_PUBLIC_URL`.
+
+### Публичный HTTPS через Tailscale Funnel
+
 ```bash
 tailscale funnel --bg 8080
 tailscale funnel status
@@ -70,6 +89,11 @@ tailscale funnel status
 
 `--bg` делает правило постоянным — оно переживёт перезагрузку, отдельный юнит
 для этого не нужен.
+
+Публичной ссылкой будет значение `PANEL_PUBLIC_URL` из `.env` (адрес вида
+`https://имя-устройства.tailnet.ts.net`). Не задавайте `PANEL_SITE_URL`: тогда
+бот использует этот же HTTPS-адрес для кнопки «Открыть панель» и для Telegram
+Mini App.
 
 ⚠️ `funnel` открывает панель **всему интернету**. Если доступ нужен только с
 ваших устройств, возьмите `tailscale serve --bg 8080` — тогда она будет

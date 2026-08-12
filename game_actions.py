@@ -27,6 +27,7 @@ from typing import Awaitable, Callable, Optional
 
 import collections_meta
 import db
+import owner_flags
 import pets as pets_catalog
 import pins
 
@@ -890,9 +891,8 @@ async def walk_all(chat_id: int, user_id: int) -> ActionResult:
 # и sell_pet принимают проверку АРГУМЕНТОМ: бот передаёт свою is_account_frozen
 # и spend_coins (те же функции, что и раньше — их можно подменить в тестах, и
 # заморозка в чате не перестаёт проверяться), а вызов без аргумента (сайт,
-# прямой вызов модуля) использует версию ниже — она беднее (нет обхода для
-# владельца с «+бесконечность», сайту он ни к чему), но честно ходит в ту же
-# базу.
+# прямой вызов модуля) использует версию ниже: она читает тот же флаг
+# «+бесконечность» из owner_flags и ходит в ту же базу.
 
 async def _default_is_frozen(chat_id: int, user_id: int) -> bool:
     row = await db.get_data(f"frozen:{chat_id}:{user_id}")
@@ -901,6 +901,8 @@ async def _default_is_frozen(chat_id: int, user_id: int) -> bool:
 
 async def _default_spend(chat_id: int, user_id: int, amount: int) -> bool:
     if amount <= 0:
+        return True
+    if await owner_flags.has_infinite_money(user_id):
         return True
     return await db.try_spend_coins(chat_id, user_id, amount)
 
@@ -1313,6 +1315,38 @@ async def my_pets_cards(chat_id: int, user_id: int) -> dict:
         "food_emoji": pets_catalog.FOOD_ITEM_EMOJI,
         "food_price": pets_catalog.FOOD_ITEM_PRICE,
     }
+
+
+async def pet_catalog_cards(chat_id: int, user_id: int) -> list[dict]:
+    """Витрина питомцев для сайта без второй копии каталога и ограничений."""
+    owned = {row["pet_key"] for row in await db.list_pets(chat_id, user_id)}
+    specs = await _pet_specs(chat_id)
+    cards: list[dict] = []
+    for spec in sorted(specs.values(), key=lambda item: (item.price, item.name)):
+        conf = _pet_settings.get(spec.key) or {}
+        limit = conf.get("max_count")
+        taken = await db.count_pet_owners(chat_id, spec.key) if limit is not None else 0
+        available = (not spec.by_achievement and spec.key not in owned
+                     and conf.get("is_active", True)
+                     and (limit is None or taken < int(limit)))
+        if spec.by_achievement:
+            reason = "Выдаётся за достижение"
+        elif spec.key in owned:
+            reason = "Уже у вас"
+        elif not conf.get("is_active", True):
+            reason = "Сейчас недоступен"
+        elif limit is not None and taken >= int(limit):
+            reason = "Все уже нашли хозяев"
+        else:
+            reason = ""
+        cards.append({
+            "key": spec.key, "name": html.unescape(spec.name),
+            "emoji": html.unescape(spec.emoji), "price": spec.price,
+            "ability": pets_catalog.ability_text(spec.ability),
+            "available": available, "reason": reason,
+            "limit": limit, "taken": taken,
+        })
+    return cards
 
 
 async def catalog_text(chat_id: int, user_id: int, *,

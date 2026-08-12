@@ -93,6 +93,15 @@ def client(monkeypatch):
         # список не ушёл в неподнятый пул соединений.
         return [{"key": "kot", "name": "Кот", "emoji": "🐈"}]
 
+    async def pet_catalog_cards(chat_id, user_id):
+        return [{"key": "pes", "name": "Пёс", "emoji": "🐕", "price": 10_000,
+                 "ability": "Верный друг", "available": True, "reason": "",
+                 "limit": None, "taken": 0}]
+
+    async def buy_pet(chat_id, user_id, key):
+        сделано.append(("buy", chat_id, user_id, key))
+        return game_actions.ActionResult(True, "🐾 У вас появился Пёс!")
+
     class _Bot:
         async def send_message(self, chat_id, text, **kw):
             отправлено.append((chat_id, text))
@@ -106,6 +115,8 @@ def client(monkeypatch):
     monkeypatch.setattr(member_game.game_actions, "my_pets_text", my_pets_text)
     monkeypatch.setattr(member_game.game_actions, "my_pets_list", my_pets_list)
     monkeypatch.setattr(member_game.game_actions, "my_pets_cards", my_pets_cards)
+    monkeypatch.setattr(member_game.game_actions, "pet_catalog_cards", pet_catalog_cards)
+    monkeypatch.setattr(member_game.game_actions, "buy_pet", buy_pet)
     monkeypatch.setattr(member_game, "get_bot", lambda: _Bot())
     monkeypatch.setattr(member_game, "require_member_in_chat", in_chat)
     monkeypatch.setattr(panel.auth, "verify_csrf", lambda request: None)
@@ -282,19 +293,18 @@ def test_неудача_по_правилам_это_не_ошибка_http(clie
     assert r.json()["ok"] is False
 
 
-@pytest.mark.parametrize("action", ["buy", "sell"])
-def test_покупка_и_продажа_кабинету_недоступны(client, action):
-    """Бот покупает с on_bought=_check_collections, а кабинет так не может:
-    функция в bot.py, и импортировать его панели нельзя. Купивший с сайта
-    последнего питомца «Зоопарка» не получил бы ни титула, ни ачивки, ни
-    Единорога. Пока пересчёт не переехал в общий модуль, наружу это не
-    выставляем — но отвечаем объяснением, а не «такого действия нет»."""
+def test_питомца_можно_купить_в_кабинете(client):
     _as_member()
-    r = client.post(f"/api/member/game/pets/{action}",
-                    json={"key": "kot", "confirm": True})
+    r = client.post("/api/member/game/pets/buy", json={"key": "pes"})
+    assert r.status_code == 200, r.text
+    assert client.сделано[-1] == ("buy", -100, 7, "pes")
+
+
+def test_продажа_кабинету_недоступна(client):
+    _as_member()
+    r = client.post("/api/member/game/pets/sell", json={"key": "kot", "confirm": True})
     assert r.status_code == 400, r.text
-    assert "в чате" in r.json()["detail"], "отказ должен объяснять, куда идти"
-    assert not client.сделано
+    assert "в чате" in r.json()["detail"]
 
 
 def test_отключённое_действие_объясняет_причину_а_не_молчит():

@@ -201,13 +201,13 @@ def test_pool_item_out_of_rotation_is_not_for_sale(monkeypatch):
 
 def test_shop_window_hides_pool_items(monkeypatch):
     """Витрина «магазин» не должна перечислять то, что продаётся в лавке."""
-    async def seed(chat_id, items, is_active=True):
-        return 0
+    async def ensure_catalog(chat_id):
+        return None
 
     async def list_shop_items(chat_id, active_only=True):
         return [_shop_item("binokl"), _shop_item("pechenka")]
 
-    monkeypatch.setattr(bot_module.db, "seed_extra_shop_items", seed)
+    monkeypatch.setattr(bot_module.shop_actions, "ensure_catalog", ensure_catalog)
     monkeypatch.setattr(bot_module.db, "list_shop_items", list_shop_items)
 
     text, _ = asyncio.run(bot_module.shop_list_page(CHAT_ID, 0))

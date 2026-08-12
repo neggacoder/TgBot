@@ -1187,6 +1187,10 @@ hr { border: 0; border-top: 1px solid var(--line); margin: var(--gap-4) 0; }
 .member-tabs {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--gap-1);
   max-width: 980px; margin: 0 auto; padding: var(--gap-3) var(--gap-4) 0;
+  /* У grid по умолчанию элементы растягиваются на высоту самой длинной
+     колонки. Для раскрывающихся групп это превращало закрытые пункты в
+     большие пустые карточки. */
+  align-items: start;
 }
 .member-nav-group > div { display: flex; flex-direction: column; padding: 0 var(--gap-1) var(--gap-1); }
 .member-tab {
@@ -3410,6 +3414,8 @@ img, svg, canvas { max-width: 100%; }
 .pet-card { gap: var(--gap-1); }
 .pet-card .pet-key { font-size: var(--text-xs); color: var(--muted); }
 .pet-card .pet-species { font-size: var(--text-xs); color: var(--muted); }
+.pet-catalog { margin-top: var(--gap-4); padding-top: var(--gap-3); border-top: 1px solid var(--line-soft); }
+.pet-store-card { min-height: 150px; }
 .pet-stat { display: flex; align-items: center; gap: var(--gap-1); }
 .pet-stat .ic { width: 15px; height: 15px; }
 .pet-stat .val {

@@ -5594,11 +5594,12 @@ function renderWork() {
   if (!s || !body) return;
   if (!s.profession) {
     body.innerHTML = `<div class="empty">${icon("empty")}<span>Профессии пока нет.
-      Устроиться можно в чате: <code>!работа устроиться {профессия}</code>.</span></div>
+      Выберите подходящую ниже.</span></div>
       <div class="prof-list mt-3">${s.catalog.map((p) => `
         <div class="prof-card"><div class="name"><span class="game-emoji">${escapeHtml(p.emoji || "💼")}</span> ${escapeHtml(p.name)}</div>
           <div class="meta">${p.income[0].toLocaleString("ru")}–${p.income[1].toLocaleString("ru")} i¢ · ${icon("spark")}${p.energy}
-          ${p.req_days ? ` · от ${p.req_days} дн.` : ""}</div></div>`).join("")}</div>`;
+          ${p.req_days ? ` · от ${p.req_days} дн.` : ""}${p.req_coins ? ` · вход от ${p.req_coins.toLocaleString("ru")} i¢` : ""}</div>
+          <button type="button" class="btn small" data-aact="join" data-key="${escapeHtml(p.key)}">Устроиться</button></div>`).join("")}</div>`;
     return;
   }
   const ждать = s.next_at ? actLeft(s.next_at) : "";
@@ -5641,6 +5642,7 @@ async function onActivityClick(вид, e) {
   const адрес = вид === "fish" ? "fishing" : "work";
   const тело = { };
   if (el.dataset.id) тело.fish_id = Number(el.dataset.id);
+  if (el.dataset.key) тело.key = el.dataset.key;
   el.disabled = true;
   try {
     const r = await api(`/api/member/game/${адрес}/${act}`, { method: "POST", body: тело });
@@ -5678,6 +5680,7 @@ function activityReport(вид, act, r) {
     if (act === "unpin") return "Трофей откреплён.";
     return "Готово.";
   }
+  if (act === "join") return `Вы устроились: ${r.state.name}. Первая смена уже доступна.`;
   if (act === "rest") return "Отдохнули." + (r.burnout ? " Выгорание снято." : "");
   const части = [`Смена: +${r.income.toLocaleString("ru")} i¢, +${r.xp} XP`];
   if (r.level_up) части.push(`повышение до ${r.level}`);
@@ -6650,11 +6653,21 @@ function renderPets() {
   // чата, с полосками из ▰▱, и на сайте читается как стена. Текст оставлен
   // запасным путём — если сервер старый и чисел не прислал.
   const карточки = d.cards || [];
+  const каталог = d.catalog || [];
+  const витрина = каталог.length ? `<section class="pet-catalog">
+    <h3 class="block-head">${icon("paw")}Завести питомца</h3>
+    <div class="pet-list">${каталог.map((p) => `<div class="pet-card pet-store-card">
+      <div class="good-head"><span class="good-emoji">${escapeHtml(p.emoji || "🐾")}</span>
+        <span class="good-name">${escapeHtml(p.name)}</span></div>
+      ${p.ability ? `<div class="pet-note">${escapeHtml(безЭмодзи(p.ability))}</div>` : ""}
+      ${p.limit !== null && p.limit !== undefined ? `<div class="pet-note">Хозяев: ${p.taken}/${p.limit}</div>` : ""}
+      ${p.available ? `<div class="good-price"><b>${p.price.toLocaleString("ru")} i¢</b></div>
+        <button type="button" class="btn" data-pact="buy" data-key="${escapeHtml(p.key)}">Завести</button>`
+        : `<div class="good-stock">${escapeHtml(p.reason || "Недоступен")}</div>`}
+    </div>`).join("")}</div>
+  </section>` : "";
   if (!карточки.length) {
-    body.innerHTML = d.pets && d.pets.length
-      ? `<div class="card">${escapeHtml(безЭмодзи(String(d.text || "").replace(/<[^>]+>/g, "")))}</div>`
-      : `<div class="empty">${icon("empty")}<span>Питомцев пока нет. Завести — в чате:
-          <code>пет купить {ключ}</code>.</span></div>`;
+    body.innerHTML = `<div class="empty">${icon("empty")}<span>Питомцев пока нет — выберите друга в каталоге ниже.</span></div>${витрина}`;
     return;
   }
   body.innerHTML = `
@@ -6666,7 +6679,8 @@ function renderPets() {
       <button type="button" class="btn" data-pact="feed_all">${icon("bowl")} Покормить всех</button>
       <button type="button" class="btn" data-pact="care_all" data-verb="pet">${icon("heart")} Приласкать всех</button>
       <button type="button" class="btn" data-pact="walk_all">${icon("walk")} Погулять со всеми</button>
-    </div>`;
+    </div>
+    ${витрина}`;
 }
 
 async function onPetsClick(e) {

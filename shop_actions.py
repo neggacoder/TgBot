@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 BUY_MAX_QTY = 100          # столько же, сколько в чате
 SELL_PERCENT = 80          # за сколько магазин принимает предмет обратно
+_black_market_locks: dict[int, asyncio.Lock] = {}
 
 
 async def ensure_catalog(chat_id: int) -> None:
@@ -52,6 +54,40 @@ async def ensure_catalog(chat_id: int) -> None:
     await db.seed_extra_shop_items(chat_id, pets_catalog.SHOP_ITEMS)
     # Урожай в каталоге нужен для названий и продажи, но покупаться не должен.
     await db.seed_extra_shop_items(chat_id, farming.SHOP_ITEMS, is_active=False)
+
+
+def _black_market_lock(chat_id: int) -> asyncio.Lock:
+    """Один чат — одна ротация, даже если сайт и бот пришли одновременно."""
+    lock = _black_market_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _black_market_locks[chat_id] = lock
+    return lock
+
+
+async def ensure_black_market_rotation(
+    chat_id: int, *, today: Optional[date] = None,
+) -> bool:
+    """Выставить ассортимент лавки на сутки, если он ещё не выставлен.
+
+    Функция общая для Telegram-бота, фонового цикла и веб-панели. Поэтому
+    лавка не зависит от того, какой интерфейс пользователь открыл первым.
+    """
+    today = today or datetime.utcnow().date()
+    keys = sorted(black_market.POOL_KEYS)
+    async with _black_market_lock(chat_id):
+        if await db.get_rotation_day(chat_id, keys) == today:
+            return False
+        # Лавка должна уметь завезтись и до первого открытия обычного
+        # магазина. Досеиваем только её собственный каталог: это сохраняет
+        # лёгкий путь фонового цикла и не меняет настройки обычной витрины.
+        await db.seed_extra_shop_items(chat_id, black_market.NEW_ITEMS)
+        await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
+        await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
+        await db.clear_rotation_stock(chat_id, keys)
+        for item_key, stock in black_market.pick_rotation().items():
+            await db.set_shop_item_rotation(chat_id, item_key, stock, today)
+        return True
 
 
 @dataclass
@@ -112,6 +148,8 @@ async def buy(chat_id: int, user_id: int, item_key: str, qty=1, *,
     """Купить товар. qty — число или слово «все»."""
     today = today or datetime.utcnow().date()
     item_key = (item_key or "").strip().casefold()
+    if from_black_market:
+        await ensure_black_market_rotation(chat_id, today=today)
     всё = isinstance(qty, str) and qty.strip().casefold() in ("все", "всё", "all")
     if not всё:
         try:
@@ -245,6 +283,7 @@ async def state(chat_id: int, user_id: int, *,
     """Витрина, лавка и инвентарь — всё, что рисует экран."""
     today = today or datetime.utcnow().date()
     await ensure_catalog(chat_id)
+    await ensure_black_market_rotation(chat_id, today=today)
     wallet = await db.get_wallet(chat_id, user_id) or {}
     монеты = int(wallet.get("coins") or 0)
 

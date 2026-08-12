@@ -49,11 +49,12 @@ _FISH_COMMANDS = {"cast": "fishing_run", "sell": "fishing_net",
                   "unpin": "fishing_net"}
 _WORK_LIST = "prof_profile"
 # Перерыв в чате идёт без отдельного права — берём то же, что у смены.
-_WORK_COMMANDS = {"shift": "prof_run", "rest": "prof_run"}
+_WORK_COMMANDS = {"join": "prof_join", "shift": "prof_run", "rest": "prof_run"}
 
 
 class ActivityBody(BaseModel):
     fish_id: Optional[int] = None     # какую рыбу продать/выпустить/закрепить
+    key: Optional[str] = None         # профессия для устройства на работу
 
 
 async def _announce(chat_id: int, result) -> None:
@@ -164,10 +165,13 @@ async def api_member_work_action(
         raise HTTPException(400, "Такого действия нет")
     await _gate(user, chat_id, _WORK_COMMANDS[action])
     user_id = user.tg_user_id
-    if await farm_actions.is_account_frozen(chat_id, user_id):
+    # Устройство на работу не тратит деньги и в Telegram разрешено даже при
+    # заморозке; заморозка блокирует именно смены и перерывы с экономикой.
+    if action != "join" and await farm_actions.is_account_frozen(chat_id, user_id):
         raise HTTPException(400, FROZEN)
 
-    result = (await work_actions.shift(chat_id, user_id) if action == "shift"
+    result = (await work_actions.join(chat_id, user_id, body.key) if action == "join"
+              else await work_actions.shift(chat_id, user_id) if action == "shift"
               else await work_actions.rest(chat_id, user_id))
     if not result.ok:
         raise HTTPException(400, result.error or "Не вышло.",

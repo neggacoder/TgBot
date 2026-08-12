@@ -113,6 +113,7 @@ import professions
 import ru_text
 from dataclasses import dataclass
 import shop_effects
+import shop_actions
 from quote_render import QuoteMessage, render_quote
 from quote_render import assets as quote_assets
 
@@ -4041,10 +4042,11 @@ async def _show_main_menu(message: Message, state: FSMContext) -> None:
 # ----------------------------------------------------------------------------
 PANEL_LINK_CODE_TTL_MIN = 10
 _PANEL_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих 0/O/1/I
-# Адрес панели снаружи. Берётся из PANEL_PUBLIC_URL (см. rp_photos) — тем же
-# значением бот собирает ссылки на картинки-реакции, так что переезд на
-# другой домен правится в одном месте, а не в двух.
-PANEL_SITE_URL = rp_photos.public_base_url() + "/"
+# Обычная ссылка на панель для кнопок и сообщения «сайт». Её можно направить
+# на локальный NGINX (например, http://192.168.1.166:80), не трогая
+# PANEL_PUBLIC_URL: последний должен оставаться HTTPS-адресом для Telegram
+# Mini App и публичных картинок реакций.
+PANEL_SITE_URL = (os.getenv("PANEL_SITE_URL") or rp_photos.public_base_url()).rstrip("/") + "/"
 
 # Дублирует webpanel/auth.py: MIN_PASSWORD_LENGTH/_hasher/validate_password/
 # validate_username/hash_password — панель отдельный процесс, импортировать
@@ -34975,36 +34977,9 @@ async def cmd_chat_event_force(message: Message):
 #
 # Цикл при этом ротацию тоже дёргает — ради объявления в чат. Функция
 # идемпотентна в пределах суток, так что два вызова безопасны.
-_black_market_locks: dict[int, asyncio.Lock] = {}
-
-
-def _black_market_lock(chat_id: int) -> asyncio.Lock:
-    """Свой замок на чат: две одновременные «лавки» не должны разыграть
-    ассортимент дважды. Хватает внутрипроцессного замка — ротацию делает
-    только бот, а он один процесс."""
-    lock = _black_market_locks.get(chat_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _black_market_locks[chat_id] = lock
-    return lock
-
-
 async def ensure_black_market_rotation(chat_id: int) -> bool:
-    """Выставляет ассортимент лавки на сегодня. True — если обновили сейчас."""
-    keys = sorted(black_market.POOL_KEYS)
-    today = local_today()
-    async with _black_market_lock(chat_id):
-        if await db.get_rotation_day(chat_id, keys) == today:
-            return False
-        # Строки должны существовать до выбора: в чате, где магазин ни разу
-        # не открывали, выбирать было бы нечего.
-        await db.seed_extra_shop_items(chat_id, black_market.NEW_ITEMS)
-        await db.seed_extra_shop_items(chat_id, robbery.ROBBERY_SHOP_ITEMS)
-        await db.seed_extra_shop_items(chat_id, shop_effects.shop_rows())
-        await db.clear_rotation_stock(chat_id, keys)
-        for item_key, stock in black_market.pick_rotation().items():
-            await db.set_shop_item_rotation(chat_id, item_key, stock, today)
-        return True
+    """Совместимая точка входа Telegram-бота для суточной ротации лавки."""
+    return await shop_actions.ensure_black_market_rotation(chat_id, today=local_today())
 
 
 # Час завоза — по настроенной зоне: с message_daily завоз никак не связан,
@@ -35136,6 +35111,25 @@ async def shop_restock_loop() -> None:
             raise
         except Exception:
             logger.exception("Сбой в цикле пополнения магазина")
+
+
+async def black_market_rotation_loop() -> None:
+    """Автозавоз лавки без ожидания первой команды или открытия сайта.
+
+    Проверка идемпотентна: её можно выполнять часто, но новая партия появится
+    ровно один раз за локальные сутки. Первый проход идёт сразу после старта,
+    поэтому рестарт ночью не оставит лавку пустой до следующего завоза.
+    """
+    while True:
+        try:
+            chat_id = _shop_chat_id()
+            if chat_id:
+                await ensure_black_market_rotation(chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Сбой в автозавозе лавки")
+        await asyncio.sleep(SHOP_RESTOCK_CHECK_INTERVAL)
 
 
 # Здесь лежал недописанный черновик birthday_congrats_loop: он подставлял в
@@ -41197,6 +41191,7 @@ async def _run_bot():
     asyncio.create_task(weekly_digest_loop())
     asyncio.create_task(daily_top_reward_loop())
     asyncio.create_task(shop_restock_loop())
+    asyncio.create_task(black_market_rotation_loop())
     asyncio.create_task(stock_market_loop())
     asyncio.create_task(chat_events_loop())
     asyncio.create_task(businesses_loop())
